@@ -176,33 +176,32 @@ static int create_indexes(sqlite3 *db)
 {
 	int ret;
 
+	/*
+	 * Drop indexes that only duplicate the leftmost prefix of a UNIQUE
+	 * constraint's automatic index, so sqlite never picks them: ino_subvol
+	 * duplicates UNIQUE(ino, subvol); extents/blocks fileid duplicate
+	 * UNIQUE(fileid, loff[, len]). They cost space in the hashfile and an
+	 * extra index update on every insert for no query benefit. Drop them so
+	 * hashfiles written by older versions shed them too (space is reclaimed
+	 * on the next vacuum).
+	 */
+#define DROP_REDUNDANT_INDEXES						\
+"drop index if exists idx_files_ino_subvol;"				\
+"drop index if exists idx_extents_fileid;"				\
+"drop index if exists idx_blocks_fileid;"
+	ret = sqlite3_exec(db, DROP_REDUNDANT_INDEXES, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
 #define CREATE_BLOCKS_DIGEST_INDEX					\
 "create index if not exists idx_blocks_digest on blocks(digest);"
 	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
-#define CREATE_BLOCKS_FILEID_INDEX					\
-"create index if not exists idx_blocks_fileid on blocks(fileid);"
-	ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
 #define CREATE_EXTENTS_DIGEST_LEN_INDEX					\
 "create index if not exists idx_extents_digest_len on extents(digest, len);"
 	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_EXTENTS_FILEID_INDEX					\
-"create index if not exists idx_extents_fileid on extents(fileid);"
-	ret = sqlite3_exec(db, CREATE_EXTENTS_FILEID_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-#define CREATE_FILES_INO_SUBVOL_INDEX					\
-"create index if not exists idx_files_ino_subvol on files(ino, subvol);"
-	ret = sqlite3_exec(db, CREATE_FILES_INO_SUBVOL_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
