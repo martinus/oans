@@ -149,7 +149,6 @@ static int add_file_hash_head(struct dupe_blocks_list *dups,
 	rb_init_node(&head->h_node);
 	INIT_LIST_HEAD(&head->h_blocks);
 	insert_file_hash_head(dups, head);
-	dups->dl_num_files++;
 add:
 	/* This list get sorted later */
 	list_add_tail(&block->b_head_list, &head->h_blocks);
@@ -266,7 +265,6 @@ int insert_hashed_block(struct hash_tree *tree,	unsigned char *digest,
 		memcpy(d->dl_hash, digest, DIGEST_LEN);
 		rb_init_node(&d->dl_node);
 		INIT_LIST_HEAD(&d->dl_list);
-		INIT_LIST_HEAD(&d->dl_size_list);
 		d->dl_files_root = RB_ROOT;
 
 		insert_block_list(tree, d);
@@ -287,8 +285,6 @@ int insert_hashed_block(struct hash_tree *tree,	unsigned char *digest,
 	insert_block_into_filerec(file, e);
 
 	d->dl_num_elem++;
-	if (d->dl_num_elem > 1 && list_empty(&d->dl_size_list))
-		list_add(&d->dl_size_list, &tree->size_list);
 	list_add_tail(&e->b_list, &d->dl_list);
 
 	tree->num_blocks++;
@@ -317,7 +313,6 @@ int remove_hashed_block(struct hash_tree *tree,
 	blocklist->dl_num_elem--;
 	if (blocklist->dl_num_elem == 0) {
 		rb_erase(&blocklist->dl_node, &tree->root);
-		list_del(&blocklist->dl_size_list);
 		tree->num_hashes--;
 
 		free_dupe_blocks_list(blocklist);
@@ -333,7 +328,6 @@ void init_hash_tree(struct hash_tree *tree)
 {
 	tree->root = RB_ROOT;
 	tree->num_blocks = tree->num_hashes = 0;
-	INIT_LIST_HEAD(&tree->size_list);
 }
 
 void free_hash_tree(struct hash_tree *tree)

@@ -178,7 +178,6 @@ static struct dupe_extents *dupe_extents_new(unsigned char *digest,
 
 	memcpy(dext->de_hash, digest, DIGEST_LEN);
 	dext->de_len = len;
-	dext->de_score = len;
 
 	INIT_LIST_HEAD(&dext->de_extents);
 	dext->de_extents_root = RB_ROOT;
@@ -190,12 +189,9 @@ static struct dupe_extents *dupe_extents_new(unsigned char *digest,
 
 static struct dupe_extents *find_alloc_dext(struct results_tree *res,
 					    unsigned char *digest,
-					    uint64_t len, int *add_score)
+					    uint64_t len)
 {
 	struct dupe_extents *dext, *new;
-
-	if (add_score)
-		*add_score = 1;
 
 	g_mutex_lock(&res->tree_mutex);
 	dext = find_dupe_extents(res, digest, len);
@@ -212,8 +208,6 @@ static struct dupe_extents *find_alloc_dext(struct results_tree *res,
 		}
 		insert_dupe_extents(res, new);
 		g_mutex_unlock(&res->tree_mutex);
-		if (add_score)
-			*add_score = 0;
 		return new;
 	}
 	return dext;
@@ -236,7 +230,7 @@ int insert_one_result(struct results_tree *res, unsigned char *digest,
 	extent_poff(extent) = poff;
 	extent_plen(extent) = len;
 	extent_shared_bytes(extent) = 0;
-	dext = find_alloc_dext(res, digest, len, NULL);
+	dext = find_alloc_dext(res, digest, len);
 	if (!dext)
 		return ENOMEM;
 
@@ -264,12 +258,11 @@ int insert_result(struct results_tree *res, unsigned char *digest,
 	struct extent *e1 = alloc_extent(recs[1], startoff[1]);
 	struct dupe_extents *dext;
 	uint64_t len = endoff[0] - startoff[0] + 1;
-	int add_score;
 
 	if (!e0 || !e1)
 		return ENOMEM;
 
-	dext = find_alloc_dext(res, digest, len, &add_score);
+	dext = find_alloc_dext(res, digest, len);
 	if (!dext)
 		return ENOMEM;
 
@@ -278,12 +271,6 @@ int insert_result(struct results_tree *res, unsigned char *digest,
 	g_mutex_lock(&dext->de_mutex);
 	insert_extent_list_free(dext, &e0);
 	insert_extent_list_free(dext, &e1);
-	if (add_score) {
-		if (e0)
-			dext->de_score += len;
-		if (e1)
-			dext->de_score += len;
-	}
 	g_mutex_unlock(&dext->de_mutex);
 
 	g_mutex_lock(&res->tree_mutex);
@@ -303,7 +290,6 @@ unsigned int remove_extent(struct results_tree *res, struct extent *extent)
 	unsigned int result;
 
 again:
-	p->de_score -= p->de_len;
 	p->de_num_dupes--;
 	result = p->de_num_dupes;
 

@@ -185,9 +185,7 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
 	 * - Kernels before 4.2 rejected unaligned lengths, so we can
 	 *   have a residual tail extent to dedupe.
 	 */
-	if (extent_plen(extent) < dext->de_len)
-		return 1;
-	return 0;
+	return extent_plen(extent) < dext->de_len;
 }
 
 /*

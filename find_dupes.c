@@ -97,11 +97,6 @@ static void record_match(struct results_tree *res, unsigned char *digest,
 		(unsigned long long)eoff[1] / blocksize);
 }
 
-struct find_dupes_cmp {
-	struct filerec *file1;
-	struct filerec *file2;
-};
-declare_alloc_tracking(find_dupes_cmp);
 
 static inline struct file_block *get_next_block(struct file_block *b)
 {
@@ -252,14 +247,6 @@ static int search_extent(struct filerec *file, struct file_extent *extent,
 	/* No dupe block so no possible dupe. */
 	if (!block)
 		return 0;
-
-#if 0
-	dprintf("Search file %s loff %"PRIu64" len %"PRIu64" hash ",
-		file->filename, extent->loff, extent->len);
-	if (debug)
-		debug_print_digest_short(stdout, block->b_parent->dl_hash);
-	dprintf("\n");
-#endif
 
 	blocklist = block->b_parent;
 

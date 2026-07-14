@@ -34,8 +34,6 @@ struct dupe_extents {
 	uint64_t	de_len;
 	unsigned char		de_hash[DIGEST_LEN];
 
-	uint64_t	de_score;
-
 	struct list_head	de_extents;
 	struct rb_root		de_extents_root;
 

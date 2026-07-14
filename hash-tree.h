@@ -23,19 +23,16 @@ extern unsigned int blocksize;
 
 struct hash_tree {
 	struct rb_root	root;
-	struct list_head size_list; /* This is for sorting by dl_num_elem  */
 	uint64_t	num_blocks;
 	uint64_t	num_hashes;
 };
 
 struct dupe_blocks_list {
 	struct rb_node		dl_node; /* sorted by hash */
-	struct list_head	dl_size_list; /* sorted by dl_num_elem */
 
 	unsigned long long	dl_num_elem;
 	struct list_head	dl_list;
 
-	unsigned int		dl_num_files;
 	struct rb_root		dl_files_root; /* stores file_hash_head nodes */
 
 	unsigned char		dl_hash[DIGEST_LEN];

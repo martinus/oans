@@ -725,7 +725,7 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 	 * Old path and new paths differs. Could be hardlink,
 	 * so we check if the old still exists.
 	 */
-	return true ? lstat(path_in_db, &st) : false;
+	return lstat(path_in_db, &st);
 }
 
 /*

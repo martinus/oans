@@ -66,8 +66,6 @@ static void dbfile_config_defaults(struct dbfile_config *cfg)
 
 	cfg->major = DB_FILE_MAJOR;
 	cfg->minor = DB_FILE_MINOR;
-
-	cfg->blocksize = blocksize;
 }
 
 static int dbfile_get_dbpath(sqlite3 *db, char *path)
@@ -1158,6 +1156,22 @@ int dbfile_load_one_filerec(struct dbhandle *db, int64_t fileid,
 	return 0;
 }
 
+/* Return the cached filerec for fileid, loading it from the db if needed. */
+static int find_or_load_filerec(struct dbhandle *db, int64_t fileid,
+				struct filerec **file)
+{
+	int ret;
+
+	*file = filerec_find(fileid);
+	if (*file)
+		return 0;
+
+	ret = dbfile_load_one_filerec(db, fileid, file);
+	if (ret)
+		eprintf("Error loading filerec (%"PRIu64") from db\n", fileid);
+	return ret;
+}
+
 int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 			     unsigned int seq)
 {
@@ -1179,16 +1193,9 @@ int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 		fileid = sqlite3_column_int64(stmt, 1);
 		loff = sqlite3_column_int64(stmt, 2);
 
-		file = filerec_find(fileid);
-		if (!file) {
-			ret = dbfile_load_one_filerec(db, fileid, &file);
-			if (ret) {
-				eprintf("Error loading filerec (%"
-					PRIu64") from db\n",
-					fileid);
-				return ret;
-			}
-		}
+		ret = find_or_load_filerec(db, fileid, &file);
+		if (ret)
+			return ret;
 
 		ret = insert_hashed_block(hash_tree, digest, file, loff);
 		if (ret)
@@ -1227,16 +1234,9 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 		len = sqlite3_column_int64(stmt, 3);
 		poff = sqlite3_column_int64(stmt, 4);
 
-		file = filerec_find(fileid);
-		if (!file) {
-			ret = dbfile_load_one_filerec(db, fileid, &file);
-			if (ret) {
-				eprintf("Error loading filerec (%"
-					PRIu64") from db\n",
-					fileid);
-				return ret;
-			}
-		}
+		ret = find_or_load_filerec(db, fileid, &file);
+		if (ret)
+			return ret;
 
 		ret = insert_one_result(res, digest, file, loff, len, poff);
 		if (ret)
@@ -1292,7 +1292,7 @@ int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_nondupe_extents;
-	uint64_t count = 0, i;
+	uint64_t count = 0, capacity = 0;
 	struct file_extent *extents = NULL;
 
 	ret = sqlite3_bind_int64(stmt, 1, file->fileid);
@@ -1301,21 +1301,25 @@ int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 		goto out;
 	}
 
-	i = 0;
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		count++;
+		if (count == capacity) {
+			struct file_extent *tmp;
 
-		extents = realloc(extents, count * sizeof(struct file_extent));
-		if (!extents) {
-			ret = ENOMEM;
-			goto out;
+			/* Grow geometrically to avoid O(n^2) copying. */
+			capacity = capacity ? capacity * 2 : 16;
+			tmp = realloc(extents, capacity * sizeof(struct file_extent));
+			if (!tmp) {
+				ret = ENOMEM;
+				goto out;
+			}
+			extents = tmp;
 		}
 
-		extents[i].loff = sqlite3_column_int64(stmt, 0);
-		extents[i].len = sqlite3_column_int64(stmt, 1);
-		extents[i].poff = sqlite3_column_int64(stmt, 2);
+		extents[count].loff = sqlite3_column_int64(stmt, 0);
+		extents[count].len = sqlite3_column_int64(stmt, 1);
+		extents[count].poff = sqlite3_column_int64(stmt, 2);
 
-		++i;
+		count++;
 	}
 
 	*num_extents = count;

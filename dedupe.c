@@ -261,7 +261,7 @@ static void populate_dedupe_request(struct dedupe_ctxt *ctxt,
 	}
 }
 
-/* Returns 1 when there are no more dedupes to process. */
+/* Applies one round of ioctl results, requeuing extents that need more work. */
 static void process_dedupes(struct dedupe_ctxt *ctxt,
 			    struct file_dedupe_range *same)
 {

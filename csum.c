@@ -40,12 +40,16 @@ void debug_print_digest_len(FILE *stream, unsigned char *digest, unsigned int le
 		fprintf(stream, "%.2x", digest[i]);
 }
 
-void checksum_block(char *buf, int len, unsigned char *digest)
+/* Serialize a 128-bit xxhash into digest. The one place the layout is defined. */
+static inline void store_digest(unsigned char *digest, XXH128_hash_t hash)
 {
-	XXH128_hash_t hash = XXH128(buf, len, 0);
-
 	((uint64_t*)digest)[0] = hash.low64;
 	((uint64_t*)digest)[1] = hash.high64;
+}
+
+void checksum_block(char *buf, int len, unsigned char *digest)
+{
+	store_digest(digest, XXH128(buf, len, 0));
 }
 
 struct running_checksum *start_running_checksum(void)
@@ -70,9 +74,7 @@ void finish_running_checksum(struct running_checksum *_c, unsigned char *digest)
 
 	XXH128_hash_t hash = XXH3_128bits_digest(c->state);
 
-	if (digest) {
-		((uint64_t*)digest)[0] = hash.low64;
-		((uint64_t*)digest)[1] = hash.high64;
-	}
+	if (digest)
+		store_digest(digest, hash);
 	XXH3_freeState(c->state);
 }
