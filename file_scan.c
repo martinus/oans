@@ -316,6 +316,63 @@ static inline dev_t stx_to_dev(struct statx *stx)
 	return makedev(stx->stx_dev_major, stx->stx_dev_minor);
 }
 
+/*
+ * Cache of btrfs subvolume ids, keyed by device.
+ *
+ * btrfs assigns a distinct anonymous st_dev to every subvolume, and
+ * lookup_btrfs_subvol() returns the same tree id for every file within a
+ * subvolume. So rather than open()+ioctl() on each individual file just to
+ * learn its subvolume (in the single-threaded listing phase), we do it once
+ * per subvolume and reuse the result for every later file on the same device.
+ *
+ * Only touched from the listing thread, so no locking is needed.
+ */
+struct subvol_cache_entry {
+	dev_t				dev;
+	uint64_t			subvol;
+	struct subvol_cache_entry	*next;
+};
+static struct subvol_cache_entry *subvol_cache;
+
+static bool subvol_cache_get(dev_t dev, uint64_t *subvol)
+{
+	struct subvol_cache_entry *e;
+
+	for (e = subvol_cache; e; e = e->next) {
+		if (e->dev == dev) {
+			*subvol = e->subvol;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void subvol_cache_put(dev_t dev, uint64_t subvol)
+{
+	struct subvol_cache_entry *e = malloc(sizeof(*e));
+
+	/* On OOM just skip caching; the caller still has a valid subvol. */
+	if (!e)
+		return;
+
+	e->dev = dev;
+	e->subvol = subvol;
+	e->next = subvol_cache;
+	subvol_cache = e;
+}
+
+static void subvol_cache_free(void)
+{
+	struct subvol_cache_entry *e = subvol_cache, *next;
+
+	while (e) {
+		next = e->next;
+		free(e);
+		e = next;
+	}
+	subvol_cache = NULL;
+}
+
 static char *extract_first_device(const char *fs_source)
 {
 	char *first_device = NULL;
@@ -698,7 +755,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	abort_on(!S_ISREG(st->stx_mode));
 
-	if (locked_fs.is_btrfs) {
+	if (locked_fs.is_btrfs && !subvol_cache_get(stx_to_dev(st), &dbfile.subvol)) {
 		_cleanup_(closefd) int fd;
 		fd = open(path, O_RDONLY);
 		if (fd == -1) {
@@ -710,7 +767,8 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		/*
 		 * Inodes between subvolumes on a btrfs file system
 		 * can have the same i_ino. Get the subvolume id of
-		 * our file so hard link detection works.
+		 * our file so hard link detection works. This is constant
+		 * within a subvolume (one st_dev), so cache it per device.
 		 */
 		ret = lookup_btrfs_subvol(fd, &(dbfile.subvol));
 		if (ret) {
@@ -719,6 +777,8 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 				path);
 			return 0;
 		}
+
+		subvol_cache_put(stx_to_dev(st), dbfile.subvol);
 	}
 
 	/*
@@ -1436,6 +1496,7 @@ void filescan_free(void)
 	free_pool(&scan_pool);
 	/* All workers have joined: flush and drop the scan writer. */
 	scan_writer_close();
+	subvol_cache_free();
 	if (seen_inodes) {
 		g_hash_table_destroy(seen_inodes);
 		seen_inodes = NULL;
