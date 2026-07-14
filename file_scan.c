@@ -211,6 +211,7 @@ struct scan_ctxt {
 	size_t filesize;
 	size_t off; /* file offset of the last processed bytes */
 	struct fiemap *fiemap;
+	unsigned int extent_cursor; /* resume hint for get_extent() in process_extents */
 	struct running_checksum *file_csum;
 	struct running_checksum *extent_csum;
 };
@@ -1061,7 +1062,7 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 	size_t to_add;
 
 	while (file_off < ctxt->off + bytes) {
-		extent = get_extent(ctxt->fiemap, file_off, NULL);
+		extent = get_extent(ctxt->fiemap, file_off, &ctxt->extent_cursor);
 		if (!extent) {
 			eprintf("process_extents: unable to get extent\n");
 

@@ -43,13 +43,29 @@ static unsigned int fiemap_count_extents(int fd)
 	return fiemap.fm_mapped_extents;
 }
 
+/*
+ * Find the first extent whose range reaches loff (i.e. ends at or after it).
+ *
+ * `index` is an optional in/out resume cursor. Extents are sorted by logical
+ * offset, so a caller that queries monotonically increasing offsets (the scan
+ * of one file) can pass the previous result's index to avoid rescanning from 0
+ * every call, turning an O(extents^2) walk into O(extents). We only trust the
+ * hint when the extent it points at starts at or before loff; otherwise the
+ * real target could be before it, so we fall back to a full scan. Either way
+ * the answer is identical to scanning from 0.
+ */
 struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 				 unsigned int *index)
 {
 	struct fiemap_extent *extent;
 	size_t ext_end_off;
+	unsigned int start = 0;
 
-	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
+	if (index && *index < fiemap->fm_mapped_extents &&
+	    fiemap->fm_extents[*index].fe_logical <= loff)
+		start = *index;
+
+	for (unsigned int i = start; i < fiemap->fm_mapped_extents; i++) {
 		extent = &fiemap->fm_extents[i];
 		ext_end_off = extent->fe_logical + extent->fe_length - 1;
 		if (ext_end_off < loff)
