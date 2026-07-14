@@ -584,6 +584,113 @@ struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *
 	return db;
 }
 
+/*
+ * Batched write transactions.
+ *
+ * Every database write is serialized behind io_mutex (see dbfile_lock()):
+ * our connections are opened with SQLITE_OPEN_NOMUTEX and WAL only allows a
+ * single writer. Committing one transaction per file therefore dominates the
+ * scan of large file sets - each commit forces its own WAL frames and fcntl
+ * locking, all funnelled through that single writer.
+ *
+ * Instead, the scan uses one dedicated writer connection and keeps a single
+ * transaction open across many files, committing once every WRITE_BATCH_FILES
+ * files (or when the scan ends). Read paths keep using their own connections,
+ * so read concurrency is unchanged.
+ *
+ * The write_db handle and the helpers below must only be used with io_mutex
+ * held (via dbfile_lock()), except for open/close which bracket the scan while
+ * no worker is running.
+ */
+#define WRITE_BATCH_FILES	1000
+static struct dbhandle *write_db = NULL;
+static bool batch_trans_open = false;
+static unsigned int batch_nr_pending = 0;
+
+int dbfile_open_scan_writer(void)
+{
+	if (write_db)
+		return 0;
+	write_db = dbfile_open_handle(options.hashfile);
+	return write_db ? 0 : -1;
+}
+
+struct dbhandle *dbfile_get_scan_writer(void)
+{
+	return write_db;
+}
+
+/* Ensures a batch transaction is open. Call with io_mutex held. */
+int dbfile_write_trans_begin(void)
+{
+	int ret;
+
+	if (batch_trans_open)
+		return 0;
+
+	ret = dbfile_begin_trans(write_db->db);
+	if (ret)
+		return ret;
+
+	batch_trans_open = true;
+	batch_nr_pending = 0;
+	return 0;
+}
+
+/* Commit any open batch transaction. Call with io_mutex held. */
+int dbfile_write_trans_flush(void)
+{
+	int ret;
+
+	if (!batch_trans_open)
+		return 0;
+
+	ret = dbfile_commit_trans(write_db->db);
+	batch_trans_open = false;
+	batch_nr_pending = 0;
+	return ret;
+}
+
+/*
+ * Marks one file as written into the current batch, committing the batch once
+ * it is full. Call with io_mutex held.
+ */
+int dbfile_write_trans_end(void)
+{
+	if (!batch_trans_open)
+		return 0;
+
+	if (++batch_nr_pending < WRITE_BATCH_FILES)
+		return 0;
+
+	return dbfile_write_trans_flush();
+}
+
+/* Roll back the current batch. Call with io_mutex held. */
+void dbfile_write_trans_abort(void)
+{
+	if (!batch_trans_open)
+		return;
+
+	dbfile_abort_trans(write_db->db);
+	batch_trans_open = false;
+	batch_nr_pending = 0;
+}
+
+/* Flush and close the writer. Call while no worker thread is running. */
+void dbfile_close_scan_writer(void)
+{
+	if (!write_db)
+		return;
+
+	dbfile_lock();
+	dbfile_write_trans_flush();
+	dbfile_unlock();
+
+	dbfile_close_handle(write_db);
+	write_db = NULL;
+}
+
 uint64_t count_file_by_digest(struct dbhandle *db, unsigned char *digest,
 				bool show_block_hashes)
 {

@@ -71,6 +71,8 @@ struct exclude_file {
 SLIST_HEAD(exclude_list, exclude_file) exclude_head = SLIST_HEAD_INITIALIZER(exclude_head);
 
 static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
+static bool seen_inode(uint64_t ino, uint64_t subvol);
+static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 
 static struct threads_pool scan_pool;
 
@@ -626,6 +628,15 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	}
 
 	/*
+	 * Another hardlink to an inode we already wrote this scan. Its filerec
+	 * is pending in the uncommitted batch and thus invisible to the read
+	 * connection below, so re-storing it would corrupt the batch (see
+	 * seen_inodes). One filerec per inode is enough, so skip it.
+	 */
+	if (seen_inode(st->stx_ino, dbfile.subvol))
+		return 0;
+
+	/*
 	 * Check the database to see if that file need rescan or not.
 	 */
 	ret = dbfile_describe_file(db, st->stx_ino, dbfile.subvol, &dbfile);
@@ -655,13 +666,21 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	dbfile.mtime = timestamp_to_nano(st->stx_mtime);
 	dbfile.dedupe_seq = seq;
 
+	/* Reads use the caller's handle; all writes go to the shared writer. */
+	struct dbhandle *wdb = dbfile_get_scan_writer();
+
 	dbfile_lock();
-	dbfile_begin_trans(db->db);
+	ret = dbfile_write_trans_begin();
+	if (ret) {
+		dbfile_unlock();
+		return 0;
+	}
 
 	if (file_renamed) {
-		ret = dbfile_rename_file(db, dbfile.id, path);
+		ret = dbfile_rename_file(wdb, dbfile.id, path);
 		if (ret) {
 			vprintf("dbfile_rename_file failed\n");
+			dbfile_unlock();
 			return 0;
 		}
 	}
@@ -671,19 +690,22 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		 * The file was scanned in a previous run.
 		 * We will rescan it, so let's remove old hashes
 		 */
-		dbfile_remove_hashes(db, dbfile.id);
+		dbfile_remove_hashes(wdb, dbfile.id);
 	}
 
 	/* Upsert the file record */
-	fileid = dbfile_store_file_info(db, &dbfile);
+	fileid = dbfile_store_file_info(wdb, &dbfile);
 	if (!fileid) {
-		dbfile_abort_trans(db->db);
+		dbfile_write_trans_abort();
 		dbfile_unlock();
 		return 0;
 	}
 
-	dbfile_commit_trans(db->db);
+	dbfile_write_trans_end();
 	dbfile_unlock();
+
+	/* Remember this inode so later hardlinks to it are skipped. */
+	mark_inode_seen(dbfile.ino, dbfile.subvol);
 
 	/* Schedule the file for scan */
 	file = malloc(sizeof(struct file_to_scan)); /* Freed by csum_whole_file() */
@@ -1006,10 +1028,11 @@ static void csum_whole_file(struct file_to_scan *file)
 	_cleanup_(free_scan_ctxt) struct scan_ctxt ctxt = {0,};
 	unsigned char file_digest[DIGEST_LEN];
 
-	/* Those variables will be initialized only once
-	 * during the thread lifetime
+	/*
+	 * All writes go through the single shared scan writer connection,
+	 * serialized (and batched) behind the write lock.
 	 */
-	static struct dbhandle *db = NULL;
+	struct dbhandle *db = dbfile_get_scan_writer();
 	static __thread struct buffer buffer = {0,};
 	static __thread struct pscan_thread *tls_progress = NULL;
 
@@ -1038,8 +1061,6 @@ static void csum_whole_file(struct file_to_scan *file)
 		buffer.dl_len = 0;
 	}
 
-	if (!db)
-		db = dbfile_open_handle_thread(options.hashfile, &scan_pool);
 	if (!db) {
 		eprintf("csum_whole_file: unable to connect to the database\n");
 		return;
@@ -1157,7 +1178,7 @@ static void csum_whole_file(struct file_to_scan *file)
 	tprogress->status = thread_waiting_lock;
 	dbfile_lock();
 	tprogress->status = thread_committing;
-	ret = dbfile_begin_trans(db->db);
+	ret = dbfile_write_trans_begin();
 	if (ret) {
 		dbfile_unlock();
 		return;
@@ -1168,7 +1189,7 @@ static void csum_whole_file(struct file_to_scan *file)
 		ret = dbfile_store_block_hashes(db, file->fileid,
 						hashes.blocks_index, hashes.blocks);
 		if (ret) {
-			dbfile_abort_trans(db->db);
+			dbfile_write_trans_abort();
 			dbfile_unlock();
 			return;
 		}
@@ -1178,7 +1199,7 @@ static void csum_whole_file(struct file_to_scan *file)
 	if (hashes.extents_index != 0) {
 		ret = dbfile_store_extent_hashes(db, file->fileid, hashes.extents_index, hashes.extents);
 		if (ret) {
-			dbfile_abort_trans(db->db);
+			dbfile_write_trans_abort();
 			dbfile_unlock();
 			return;
 		}
@@ -1191,12 +1212,12 @@ static void csum_whole_file(struct file_to_scan *file)
 	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
 			is_inlined(&ctxt) ? FILE_INLINED : 0);
 	if (ret) {
-		dbfile_abort_trans(db->db);
+		dbfile_write_trans_abort();
 		dbfile_unlock();
 		return;
 	}
 
-	ret = dbfile_commit_trans(db->db);
+	ret = dbfile_write_trans_end();
 	if (ret) {
 		dbfile_unlock();
 		return;
@@ -1236,9 +1257,76 @@ int add_exclude_pattern(const char *pattern)
 	return 0;
 }
 
+/*
+ * Set of inodes, keyed by (ino, subvol), that this scan has already written a
+ * filerec for.
+ *
+ * The scan batches many files into a single uncommitted transaction on the
+ * shared writer connection. The change-detection lookup in __scan_file() runs
+ * on a separate read connection, which under WAL cannot see rows the writer has
+ * not committed yet. So when two hardlinks to the same inode are visited within
+ * one batch, the second lookup misses the first's pending row and we would
+ * INSERT OR REPLACE the same (ino, subvol) again. That REPLACE deletes the
+ * pending row - cascade-deleting the hashes a worker is still writing for it -
+ * and the resulting constraint failure aborts the whole batch, silently losing
+ * every file in it.
+ *
+ * duperemove keeps exactly one filerec per inode anyway (UNIQUE(ino, subvol)),
+ * so track the inodes written this scan and skip any further hardlink to one we
+ * have already handled. Only touched from the single listing thread, so it
+ * needs no locking.
+ */
+static GHashTable *seen_inodes;
+
+struct ino_key {
+	uint64_t	ino;
+	uint64_t	subvol;
+};
+
+static guint ino_key_hash(gconstpointer p)
+{
+	const struct ino_key *k = p;
+
+	return g_int64_hash(&k->ino) ^ g_int64_hash(&k->subvol);
+}
+
+static gboolean ino_key_equal(gconstpointer a, gconstpointer b)
+{
+	const struct ino_key *ka = a, *kb = b;
+
+	return ka->ino == kb->ino && ka->subvol == kb->subvol;
+}
+
+static bool seen_inode(uint64_t ino, uint64_t subvol)
+{
+	struct ino_key k = { .ino = ino, .subvol = subvol };
+
+	return seen_inodes && g_hash_table_contains(seen_inodes, &k);
+}
+
+static void mark_inode_seen(uint64_t ino, uint64_t subvol)
+{
+	struct ino_key *k;
+
+	if (!seen_inodes)
+		return;
+
+	k = malloc(sizeof(*k));
+	if (!k)	/* On OOM just skip; the worst case is the pre-fix behavior. */
+		return;
+
+	k->ino = ino;
+	k->subvol = subvol;
+	g_hash_table_add(seen_inodes, k);
+}
+
 void filescan_init(void)
 {
 	abort_on(scan_pool.pool);
+	abort_on(dbfile_open_scan_writer());
+	seen_inodes = g_hash_table_new_full(ino_key_hash, ino_key_equal,
+					    free, NULL);
+	abort_on(!seen_inodes);
 	setup_pool(&scan_pool, csum_whole_file, NULL, options.io_threads);
 	abort_on(!scan_pool.pool);
 }
@@ -1246,6 +1334,12 @@ void filescan_init(void)
 void filescan_free(void)
 {
 	free_pool(&scan_pool);
+	/* All workers have joined: flush and drop the shared writer. */
+	dbfile_close_scan_writer();
+	if (seen_inodes) {
+		g_hash_table_destroy(seen_inodes);
+		seen_inodes = NULL;
+	}
 }
 
 void add_file_fdupes(char *path)

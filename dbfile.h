@@ -80,6 +80,19 @@ struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *
 void dbfile_lock(void);
 void dbfile_unlock(void);
 
+/*
+ * Shared, batched writer used by the scan phase. See dbfile.c for details.
+ * open/close bracket the scan; the trans helpers must be called with the
+ * write lock held.
+ */
+int dbfile_open_scan_writer(void);
+void dbfile_close_scan_writer(void);
+struct dbhandle *dbfile_get_scan_writer(void);
+int dbfile_write_trans_begin(void);
+int dbfile_write_trans_end(void);
+int dbfile_write_trans_flush(void);
+void dbfile_write_trans_abort(void);
+
 struct dbfile_config {
 	unsigned int	blocksize;
 	int		major;
