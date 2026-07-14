@@ -76,6 +76,100 @@ static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 
 static struct threads_pool scan_pool;
 
+/*
+ * Scan-phase batched writer.
+ *
+ * Every hashfile write is serialized behind the write lock (dbfile_lock()):
+ * our sqlite connections use SQLITE_OPEN_NOMUTEX and WAL only permits a single
+ * writer. Committing one transaction per file therefore dominates the scan of
+ * a large tree - each commit forces its own WAL frames and fcntl locking,
+ * funnelled through that single writer, and extra io-threads just pile up on
+ * the lock.
+ *
+ * So the scan routes every write (the file-record upsert while listing and the
+ * hash store while csumming) through one dedicated connection and keeps a
+ * single transaction open across many files, committing once every
+ * WRITE_BATCH_FILES. Reads keep using their own connections, so read
+ * concurrency is unchanged.
+ *
+ * scan_write_{begin,end,abort}() must be called with the write lock held.
+ * scan_writer_{open,close}() bracket the scan while no worker is running.
+ */
+#define WRITE_BATCH_FILES	1000
+static struct dbhandle *scan_writer;
+static bool scan_trans_open;
+static unsigned int scan_trans_pending;
+
+static int scan_writer_open(void)
+{
+	scan_writer = dbfile_open_handle(options.hashfile);
+	return scan_writer ? 0 : -1;
+}
+
+/* Ensure a batch transaction is open. Call with the write lock held. */
+static int scan_write_begin(void)
+{
+	int ret;
+
+	if (scan_trans_open)
+		return 0;
+
+	ret = dbfile_begin_trans(scan_writer->db);
+	if (ret)
+		return ret;
+
+	scan_trans_open = true;
+	scan_trans_pending = 0;
+	return 0;
+}
+
+/* Commit any open batch. Call with the write lock held. */
+static int scan_write_flush(void)
+{
+	int ret;
+
+	if (!scan_trans_open)
+		return 0;
+
+	ret = dbfile_commit_trans(scan_writer->db);
+	scan_trans_open = false;
+	scan_trans_pending = 0;
+	return ret;
+}
+
+/* Count one written file, committing the batch once it is full. */
+static int scan_write_end(void)
+{
+	if (scan_trans_open && ++scan_trans_pending >= WRITE_BATCH_FILES)
+		return scan_write_flush();
+	return 0;
+}
+
+/* Roll back the current batch. Call with the write lock held. */
+static void scan_write_abort(void)
+{
+	if (!scan_trans_open)
+		return;
+
+	dbfile_abort_trans(scan_writer->db);
+	scan_trans_open = false;
+	scan_trans_pending = 0;
+}
+
+/* Flush and drop the writer. Call while no worker thread is running. */
+static void scan_writer_close(void)
+{
+	if (!scan_writer)
+		return;
+
+	dbfile_lock();
+	scan_write_flush();
+	dbfile_unlock();
+
+	dbfile_close_handle(scan_writer);
+	scan_writer = NULL;
+}
+
 #define READ_BUF_LEN (8*1024*1024) // 8MB
 
 struct buffer {
@@ -666,11 +760,11 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	dbfile.mtime = timestamp_to_nano(st->stx_mtime);
 	dbfile.dedupe_seq = seq;
 
-	/* Reads use the caller's handle; all writes go to the shared writer. */
-	struct dbhandle *wdb = dbfile_get_scan_writer();
+	/* Reads use the caller's handle; all writes go to the scan writer. */
+	struct dbhandle *wdb = scan_writer;
 
 	dbfile_lock();
-	ret = dbfile_write_trans_begin();
+	ret = scan_write_begin();
 	if (ret) {
 		dbfile_unlock();
 		return 0;
@@ -696,12 +790,12 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	/* Upsert the file record */
 	fileid = dbfile_store_file_info(wdb, &dbfile);
 	if (!fileid) {
-		dbfile_write_trans_abort();
+		scan_write_abort();
 		dbfile_unlock();
 		return 0;
 	}
 
-	dbfile_write_trans_end();
+	scan_write_end();
 	dbfile_unlock();
 
 	/* Remember this inode so later hardlinks to it are skipped. */
@@ -1032,7 +1126,7 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * All writes go through the single shared scan writer connection,
 	 * serialized (and batched) behind the write lock.
 	 */
-	struct dbhandle *db = dbfile_get_scan_writer();
+	struct dbhandle *db = scan_writer;
 	static __thread struct buffer buffer = {0,};
 	static __thread struct pscan_thread *tls_progress = NULL;
 
@@ -1175,21 +1269,27 @@ static void csum_whole_file(struct file_to_scan *file)
 	finish_running_checksum(ctxt.file_csum, file_digest);
 	ctxt.file_csum = NULL;
 
+	/*
+	 * Whether the last extent is inlined is a pure fiemap scan; compute it
+	 * once here rather than twice under the write lock below.
+	 */
+	bool inlined = is_inlined(&ctxt);
+
 	tprogress->status = thread_waiting_lock;
 	dbfile_lock();
 	tprogress->status = thread_committing;
-	ret = dbfile_write_trans_begin();
+	ret = scan_write_begin();
 	if (ret) {
 		dbfile_unlock();
 		return;
 	}
 
 	/* Do not store the blocks if the file is inlined */
-	if (hashes.blocks_index != 0 && !is_inlined(&ctxt)) {
+	if (hashes.blocks_index != 0 && !inlined) {
 		ret = dbfile_store_block_hashes(db, file->fileid,
 						hashes.blocks_index, hashes.blocks);
 		if (ret) {
-			dbfile_write_trans_abort();
+			scan_write_abort();
 			dbfile_unlock();
 			return;
 		}
@@ -1199,7 +1299,7 @@ static void csum_whole_file(struct file_to_scan *file)
 	if (hashes.extents_index != 0) {
 		ret = dbfile_store_extent_hashes(db, file->fileid, hashes.extents_index, hashes.extents);
 		if (ret) {
-			dbfile_write_trans_abort();
+			scan_write_abort();
 			dbfile_unlock();
 			return;
 		}
@@ -1210,14 +1310,14 @@ static void csum_whole_file(struct file_to_scan *file)
 	 * of needless work: https://github.com/markfasheh/duperemove/issues/316
 	 */
 	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
-			is_inlined(&ctxt) ? FILE_INLINED : 0);
+			inlined ? FILE_INLINED : 0);
 	if (ret) {
-		dbfile_write_trans_abort();
+		scan_write_abort();
 		dbfile_unlock();
 		return;
 	}
 
-	ret = dbfile_write_trans_end();
+	ret = scan_write_end();
 	if (ret) {
 		dbfile_unlock();
 		return;
@@ -1323,7 +1423,7 @@ static void mark_inode_seen(uint64_t ino, uint64_t subvol)
 void filescan_init(void)
 {
 	abort_on(scan_pool.pool);
-	abort_on(dbfile_open_scan_writer());
+	abort_on(scan_writer_open());
 	seen_inodes = g_hash_table_new_full(ino_key_hash, ino_key_equal,
 					    free, NULL);
 	abort_on(!seen_inodes);
@@ -1334,8 +1434,8 @@ void filescan_init(void)
 void filescan_free(void)
 {
 	free_pool(&scan_pool);
-	/* All workers have joined: flush and drop the shared writer. */
-	dbfile_close_scan_writer();
+	/* All workers have joined: flush and drop the scan writer. */
+	scan_writer_close();
 	if (seen_inodes) {
 		g_hash_table_destroy(seen_inodes);
 		seen_inodes = NULL;
