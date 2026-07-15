@@ -31,6 +31,7 @@ struct pscan_thread {
 struct pscan_global {
 	uint64_t		total_files_count;
 	uint64_t		total_bytes_count;
+	uint64_t		files_examined;	/* visited during listing */
 	bool			listing_completed;
 
 	/* Each thread tracks its own progress separately */
@@ -43,6 +44,9 @@ void pscan_finish_listing(void);
 
 /* Used to increment the global todo list */
 void pscan_set_progress(uint64_t added_files, uint64_t added_bytes);
+
+/* Count one file visited by the listing walk (scanned or skipped as up-to-date). */
+void pscan_examined(void);
 
 /* Used by each scan threads to grab its own struct pscan_thread */
 struct pscan_thread *pscan_register_thread(pid_t tid);

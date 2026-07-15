@@ -86,6 +86,11 @@ void pscan_set_progress(uint64_t added_files, uint64_t added_bytes)
 	pscan.total_bytes_count += added_bytes;
 }
 
+void pscan_examined(void)
+{
+	pscan.files_examined++;	/* listing is single-threaded; plain ++ is fine */
+}
+
 #define BUF_LEN 10*1024
 static void print_thread_progress(struct pscan_thread *tprogress)
 {
@@ -126,15 +131,28 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 
 static void print_total_progress(void)
 {
+	uint64_t tf = pscan.total_files_count;
+	uint64_t tb = pscan.total_bytes_count;
+
+	if (!pscan.listing_completed) {
+		/*
+		 * During discovery the total isn't known yet (and most files may
+		 * be up to date, so total_files_count stays low). Show what we do
+		 * know - files walked and how many need (re)hashing - rather than
+		 * a misleading 0/0.
+		 */
+		s_printf("\tListing files: %lu examined\n", pscan.files_examined);
+		s_printf("\t%lu need hashing\n", tf);
+		s_printf("\tFile listing: in progress\n");
+		return;
+	}
+
 	s_printf("\tFiles scanned: %lu/%lu (%05.2f%%)\n",
-	      files_scanned, pscan.total_files_count,
-	      (double)files_scanned / (double)pscan.total_files_count * 100);
+	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)\n",
-	      pretty_size(bytes_scanned),
-	      pretty_size(pscan.total_bytes_count),
-	      (double)bytes_scanned / (double)pscan.total_bytes_count * 100);
-	s_printf("\tFile listing: %s\n",
-		pscan.listing_completed ? "completed" : "in progress");
+	      pretty_size(bytes_scanned), pretty_size(tb),
+	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
+	s_printf("\tFile listing: completed\n");
 }
 
 static void prepare_screen_area(void)
@@ -162,6 +180,7 @@ static void *print_progress(void)
 {
 	files_scanned = 0;
 	bytes_scanned = 0;
+	pscan.files_examined = 0;
 
 	s_restore_pos();
 

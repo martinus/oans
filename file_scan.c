@@ -765,6 +765,8 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	abort_on(!S_ISREG(st->stx_mode));
 
+	pscan_examined();	/* count every file the listing walk visits */
+
 	if (locked_fs.is_btrfs && !subvol_cache_get(stx_to_dev(st), &dbfile.subvol)) {
 		_cleanup_(closefd) int fd;
 		fd = open(path, O_RDONLY);
