@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # perf-profile.sh - profile a duperemove run with perf and print the report
-# format the maintainers ask for (a self/leaf view and a caller/stack view,
-# plus perf stat and a syscall summary). Copy the whole output back into the
-# issue / chat.
+# format the maintainers ask for: a self/leaf hotspot view, a caller/stack view
+# (which also shows the syscall cost breakdown), and the profiled run's
+# wall-clock. Copy the whole output back into the issue / chat.
 #
 # Usage:
 #   scripts/perf-profile.sh [options] -- <duperemove args...>
@@ -107,8 +107,13 @@ fi
 [ "$COLD" = 1 ] && drop_caches
 
 echo "-- recording --" >&2
+# The profiled command mutates its hashfile, so a second run would be a warm
+# no-op - the recorded run is the only representative one. Time it directly
+# (includes perf's sampling overhead, so treat it as a ballpark).
+_t0=$(date +%s.%N)
 perf record -g --call-graph dwarf -F "$FREQ" -o "$PERF_DATA" -- "$BINARY" "$@" >/dev/null 2>&1 || \
 	die "perf record failed (permissions? see --help)"
+RUN_ELAPSED=$(awk "BEGIN{printf \"%.2f\", $(date +%s.%N) - $_t0}")
 
 emit() {
 	# Best-effort reporting: head closing a pipe early raises SIGPIPE, which
@@ -121,17 +126,16 @@ emit() {
 		| grep -vE '^#|^$' | head -40
 	echo
 	echo "===== CALLERS (cumulative, with stacks) ====="
+	# The syscall cost breakdown (statx/openat/getdents/pread ...) is visible
+	# here, so no separate perf-trace pass is needed.
 	perf report -i "$PERF_DATA" --stdio -g graph,0.5,caller --percent-limit 1 2>/dev/null \
 		| grep -vE '^#|^$' | head -120
 	echo
-	echo "===== perf stat (task-clock / cycles / instructions) ====="
-	[ "$COLD" = 1 ] && drop_caches
-	perf stat -e task-clock,cycles,instructions -- "$BINARY" "$@" 2>&1 >/dev/null \
-		| grep -E 'task-clock|cycles|instructions|elapsed' || true
-	echo
-	echo "===== SYSCALLS (perf trace -s; may be empty without privileges) ====="
-	[ "$COLD" = 1 ] && drop_caches
-	perf trace -s -- "$BINARY" "$@" 2>&1 >/dev/null | tail -30 || true
+	echo "===== TIMING ====="
+	echo "profiled run: ${RUN_ELAPSED}s ($([ "$COLD" = 1 ] && echo cold || echo warm) run, includes perf sampling overhead)"
+	echo "For a precise A/B wall-clock, 'time' the binary directly with a fresh"
+	echo "hashfile each run (the command mutates its hashfile, so a re-run is a"
+	echo "no-op)$([ "$COLD" = 1 ] && echo ", dropping caches before each cold run" || echo "")."
 }
 
 if [ -n "$OUT" ]; then
