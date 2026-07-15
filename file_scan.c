@@ -360,10 +360,11 @@ static inline dev_t stx_to_dev(struct statx *stx)
  * btrfs assigns a distinct anonymous st_dev to every subvolume, and
  * lookup_btrfs_subvol() returns the same tree id for every file within a
  * subvolume. So rather than open()+ioctl() on each individual file just to
- * learn its subvolume (in the single-threaded listing phase), we do it once
- * per subvolume and reuse the result for every later file on the same device.
+ * learn its subvolume, we do it once per subvolume and reuse the result for
+ * every later file on the same device.
  *
- * Only touched from the listing thread, so no locking is needed.
+ * Touched only from the single __scan_file() consumer (not the walker threads),
+ * so no locking is needed.
  */
 struct subvol_cache_entry {
 	dev_t				dev;
@@ -426,15 +427,22 @@ struct verified_dev_entry {
 	struct verified_dev_entry	*next;
 };
 static struct verified_dev_entry *verified_devs;
+/* check_file() runs on the parallel walker threads, so this cache is shared. */
+static GMutex verified_dev_lock;
 
 static bool verified_dev_get(dev_t dev)
 {
 	struct verified_dev_entry *e;
+	bool found = false;
 
+	g_mutex_lock(&verified_dev_lock);
 	for (e = verified_devs; e; e = e->next)
-		if (e->dev == dev)
-			return true;
-	return false;
+		if (e->dev == dev) {
+			found = true;
+			break;
+		}
+	g_mutex_unlock(&verified_dev_lock);
+	return found;
 }
 
 static void verified_dev_put(dev_t dev)
@@ -446,8 +454,10 @@ static void verified_dev_put(dev_t dev)
 		return;
 
 	e->dev = dev;
+	g_mutex_lock(&verified_dev_lock);
 	e->next = verified_devs;
 	verified_devs = e;
+	g_mutex_unlock(&verified_dev_lock);
 }
 
 static void verified_dev_free(void)
@@ -749,32 +759,100 @@ static int get_dirent_type(struct dirent *entry, int fd, const char *path)
 /*
  * Returns nonzero on fatal errors only
  */
-static int walk_dir(char *path, struct dbhandle *db)
+/*
+ * Parallel directory walk.
+ *
+ * Walker threads traverse the tree - opendir/readdir/statx plus the
+ * directory-level check_file() - which is the listing cost and scales nearly
+ * linearly across cores. Every regular file they find is handed to a single
+ * consumer (the main thread) that runs __scan_file() exactly as the serial code
+ * did, so all the DB write / dedupe_seq / seen_inodes / batched-read logic stays
+ * single-threaded and untouched.
+ *
+ * locked_fs is initialised by the main thread while seeding the roots (before
+ * any walker starts), so the walkers only read it; the one cache they share,
+ * verified_devs, is locked. Each walker gets its own db handle so a stray
+ * check_file() config read never races on a shared connection.
+ */
+struct scan_item {
+	struct statx	st;
+	char		path[];		/* NUL-terminated path follows */
+};
+
+#define WALK_STOP	((void *)1)	/* queue sentinel */
+
+static GAsyncQueue	*walk_dirq;	/* char* directories to visit */
+static GAsyncQueue	*walk_fileq;	/* struct scan_item* for the consumer */
+/*
+ * Outstanding directories, plus a +1 "seeding" token held until
+ * filescan_walk_run() releases it, so the count can't hit zero while roots are
+ * still being queued. process_dir() enqueues a directory's files before
+ * dirq_finished() decrements, so when this reaches zero every file has been
+ * queued: we then stop the walkers and tell the consumer no more are coming.
+ */
+static gint		walk_dir_pending;
+static unsigned int	walk_nthreads;
+
+static void dirq_stop_walkers(void)
 {
-	int ret = 0;
+	unsigned int i;
+
+	for (i = 0; i < walk_nthreads; i++)
+		g_async_queue_push(walk_dirq, WALK_STOP);
+	g_async_queue_push(walk_fileq, WALK_STOP);
+}
+
+/* Queue a directory for the walkers. Takes ownership of path. */
+static void dirq_push(char *path)
+{
+	g_atomic_int_inc(&walk_dir_pending);
+	g_async_queue_push(walk_dirq, path);
+}
+
+/* Called when a directory is done (or to release the seeding token). */
+static void dirq_finished(void)
+{
+	if (g_atomic_int_dec_and_test(&walk_dir_pending))
+		dirq_stop_walkers();
+}
+
+/* Hand a regular file to the consumer. */
+static void fileq_push(const char *path, struct statx *st)
+{
+	size_t n = strlen(path) + 1;
+	struct scan_item *it = malloc(sizeof(*it) + n);
+
+	if (!it) {
+		eprintf("scan: out of memory queuing %s\n", path);
+		return;
+	}
+	it->st = *st;
+	memcpy(it->path, path, n);
+	g_async_queue_push(walk_fileq, it);
+}
+
+/* Read one directory: queue subdirs, hand regular files to the consumer. */
+static void process_dir(const char *path, struct dbhandle *db)
+{
 	struct dirent *entry;
 	struct statx st;
 	_cleanup_(closedirectory) DIR *dirp = opendir(path);
-
-	/* Overallocate to peace the compiler. An abort will check the actual values. */
 	char child[PATH_MAX + 257] = { 0, };
 
 	if (dirp == NULL) {
 		eprintf("Error %d: %s while opening directory %s\n",
 			errno, strerror(errno), path);
-		return 0;
+		return;
 	}
 
-	while(true) {
+	while (true) {
 		errno = 0;
 		entry = readdir(dirp);
-		if (!entry && errno == 0) /* End of directory */
+		if (!entry) {
+			if (errno)
+				eprintf("Error %d: %s while reading directory %s\n",
+					errno, strerror(errno), path);
 			break;
-
-		if (errno != 0) {
-			eprintf("Error %d: %s while reading directory %s\n",
-				errno, strerror(errno), path);
-			return 0;
 		}
 
 		if (strcmp(entry->d_name, ".") == 0
@@ -787,18 +865,17 @@ static int walk_dir(char *path, struct dbhandle *db)
 		    !(options.recurse_dirs && entry->d_type == DT_DIR))
 			continue;
 
-		/* This should never happen */
-		abort_on(strlen(path) + strlen(entry->d_name) > PATH_MAX);
+		if (strlen(path) + 1 + strlen(entry->d_name) > PATH_MAX)
+			continue;
 
 		if (strcmp(path, "/") == 0)
 			sprintf(child, "/%s", entry->d_name);
 		else
 			sprintf(child, "%s/%s", path, entry->d_name);
 
-		ret = statx(0, child, 0, STATX_BASIC_STATS, &st);
-		if (ret || !(st.stx_mask | STATX_BASIC_STATS)) {
-			eprintf("Failed to stat %s: %s\n",
-					path, strerror(errno));
+		if (statx(0, child, 0, STATX_BASIC_STATS, &st) ||
+		    !(st.stx_mask & STATX_BASIC_STATS)) {
+			eprintf("Failed to stat %s: %s\n", child, strerror(errno));
 			continue;
 		}
 
@@ -806,14 +883,83 @@ static int walk_dir(char *path, struct dbhandle *db)
 			continue;
 
 		if (entry->d_type == DT_REG)
-			ret = __scan_file(child, db, &st);
+			fileq_push(child, &st);
 		else
-			ret = walk_dir(child, db);
-		if (ret)
-			return ret;
+			dirq_push(strdup(child));
+	}
+}
+
+static gpointer walk_thread(gpointer arg)
+{
+	struct dbhandle *db = arg;	/* this walker's own read handle */
+
+	for (;;) {
+		char *path = g_async_queue_pop(walk_dirq);
+
+		if (path == WALK_STOP)
+			break;
+		process_dir(path, db);
+		free(path);
+		dirq_finished();
 	}
 
-	return 0;
+	dbfile_close_handle(db);
+	return NULL;
+}
+
+/* Set up the walk queues. Call before seeding roots via scan_file(). */
+void filescan_walk_begin(void)
+{
+	walk_nthreads = options.io_threads ? options.io_threads : 1;
+	walk_dirq = g_async_queue_new();
+	walk_fileq = g_async_queue_new();
+	walk_dir_pending = 1;	/* seeding token; released by filescan_walk_run() */
+}
+
+/*
+ * Start the walkers and consume every file they find on the current thread.
+ * The roots have already been seeded (scan_file), so locked_fs is set.
+ */
+int filescan_walk_run(struct dbhandle *db)
+{
+	GThread **threads = calloc(walk_nthreads, sizeof(*threads));
+	unsigned int i;
+	int ret = 0;
+
+	abort_on(!threads);
+
+	for (i = 0; i < walk_nthreads; i++) {
+		struct dbhandle *wdb = dbfile_open_handle(options.hashfile);
+
+		abort_on(!wdb);
+		threads[i] = g_thread_new("walker", walk_thread, wdb);
+	}
+
+	/*
+	 * Release the seeding token now the roots are queued. If nothing was
+	 * queued this drops the count to zero and stops the walkers at once;
+	 * otherwise the last directory to finish does it.
+	 */
+	dirq_finished();
+
+	/* Consumer: single-threaded __scan_file() for every file found. */
+	for (;;) {
+		struct scan_item *it = g_async_queue_pop(walk_fileq);
+
+		if (it == WALK_STOP)
+			break;
+		if (!ret)
+			ret = __scan_file(it->path, db, &it->st);
+		free(it);
+	}
+
+	for (i = 0; i < walk_nthreads; i++)
+		g_thread_join(threads[i]);
+	free(threads);
+	g_async_queue_unref(walk_dirq);
+	g_async_queue_unref(walk_fileq);
+	walk_dirq = walk_fileq = NULL;
+	return ret;
 }
 
 static inline bool is_file_renamed(char *path_in_db, char *path)
@@ -1019,13 +1165,21 @@ int scan_file(char *in_path, struct dbhandle *db)
 		return 0;
 	}
 
+	/*
+	 * Seed the parallel walk. check_file() here runs on the main thread and
+	 * locks onto the target filesystem (initialising locked_fs) before any
+	 * walker starts. Regular files go straight to the consumer queue;
+	 * directories are handed to the walker pool. filescan_walk_run() then
+	 * does the actual traversal and scanning.
+	 */
 	if (!check_file(db, path, &st, false))
 		return 0;
 
 	if (S_ISREG(st.stx_mode))
-		return __scan_file(path, db, &st);
+		fileq_push(path, &st);
 	else
-		return walk_dir(path, db);
+		dirq_push(strdup(path));
+	return 0;
 }
 
 /* Check if the block starting at buf is full of zeroes */
@@ -1550,8 +1704,8 @@ int add_exclude_pattern(const char *pattern)
  *
  * duperemove keeps exactly one filerec per inode anyway (UNIQUE(ino, subvol)),
  * so track the inodes written this scan and skip any further hardlink to one we
- * have already handled. Only touched from the single listing thread, so it
- * needs no locking.
+ * have already handled. Touched only from the single __scan_file() consumer
+ * (not the walker threads), so it needs no locking.
  */
 static GHashTable *seen_inodes;
 

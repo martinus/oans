@@ -18,6 +18,15 @@
  */
 int scan_file(char *name, struct dbhandle *db);
 
+/*
+ * Parallel directory walk. Bracket the scan_file() seeding calls with
+ * filescan_walk_begin()/filescan_walk_run(): begin sets up the walk queues,
+ * scan_file() seeds each root, and run() spawns the walker pool and consumes
+ * every file found on the calling thread.
+ */
+void filescan_walk_begin(void);
+int filescan_walk_run(struct dbhandle *db);
+
 void fs_get_locked_uuid(uuid_t *uuid);
 
 /* For dbfile.c */
