@@ -116,6 +116,12 @@ running `duperemove` on very large files (like virtual machines etc).
 
     By default, batching is set to 1024.
 
+**-m** `N`, **\--min-filesize**=`N`
+  ~ Skip all regular files smaller than `N` bytes (suffixes like `K`, `M`, `G`
+are accepted). Trees with many tiny files can be scanned much faster this way,
+since such files rarely dedupe usefully. The default of `1` only skips empty
+files.
+
 **-h**
   ~ Print numbers in human-readable format.
 

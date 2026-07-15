@@ -15,6 +15,7 @@
 #define	__OPT_H__
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct options {
 	int run_dedupe;
@@ -28,6 +29,7 @@ struct options {
 	unsigned int batch_size;
 	bool fdupes_mode : 1;
 	char *hashfile;
+	uint64_t min_filesize;	/* skip regular files smaller than this */
 };
 
 extern struct options options;

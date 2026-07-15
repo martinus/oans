@@ -209,6 +209,7 @@ enum {
 	EXCLUDE_OPTION,
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
+	MIN_FILESIZE_OPTION,
 };
 
 static int process_fdupes(void)
@@ -322,6 +323,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
+		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -329,7 +331,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		help(); /* Never returns */
 	}
 
-	while ((c = getopt_long(argc, argv, "b:vdDrh?LRqB:", long_ops, NULL))
+	while ((c = getopt_long(argc, argv, "b:vdDrh?LRqB:m:", long_ops, NULL))
 	       != -1) {
 		switch (c) {
 		case 'b':
@@ -411,6 +413,14 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case NO_COLOR_OPTION:
 			opt_no_color = 1;
+			break;
+		case MIN_FILESIZE_OPTION:
+		case 'm':
+			options.min_filesize = parse_size(optarg);
+			if (options.min_filesize == 0) {
+				eprintf("Error: --min-filesize must be greater than zero\n");
+				return EINVAL;
+			}
 			break;
 		case EXCLUDE_OPTION:
 			if (add_exclude_pattern(optarg))

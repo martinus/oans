@@ -604,7 +604,7 @@ bool is_fs_supported(char *path)
 /* Check if path should be processed:
  * - is path not excluded ?
  * - is path a file or directory ?
- * - is path not an empty file ?
+ * - is path at least --min-filesize bytes (empty files by default) ?
  * - does path lives on our locked filesystem ?
  *   for files, we only do that check if the parent is not checked
  *
@@ -625,8 +625,9 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		return false;
 	}
 
-	if (S_ISREG(st->stx_mode) && st->stx_size == 0) {
-		vprintf("Skipping empty file %s\n", path);
+	if (S_ISREG(st->stx_mode) && st->stx_size < options.min_filesize) {
+		vprintf("Skipping file below --min-filesize: %s (%llu < %"PRIu64")\n",
+			path, st->stx_size, options.min_filesize);
 		return false;
 	}
 
