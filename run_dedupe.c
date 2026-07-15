@@ -336,7 +336,14 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 				dbfile_remove_file(dbfile_get_handle(), extent->e_file->filename);
 				dbfile_unlock();
 			}
-			eprintf("%s: Skipping dedupe.\n",
+			/*
+			 * Verbose-only: worker threads run while the in-place
+			 * dedupe status bar is redrawing, and an eprintf here
+			 * lands in the middle of that line. This matches the
+			 * other per-file dedupe notices (vprintf), and the bar
+			 * is disabled under -v anyway, so it prints cleanly.
+			 */
+			vprintf("%s: Skipping dedupe.\n",
 				extent->e_file->filename);
 			/*
 			 * If this was our last duplicate extent in
