@@ -1348,6 +1348,9 @@ static void csum_whole_file(struct file_to_scan *file)
 		return;
 	}
 
+	/* We read each file once, front to back: ask for aggressive readahead. */
+	posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
 	ctxt.fiemap = do_fiemap(ctxt.fd);
 	if (!ctxt.fiemap)
 		return;
@@ -1433,6 +1436,13 @@ static void csum_whole_file(struct file_to_scan *file)
 
 	finish_running_checksum(ctxt.file_csum, file_digest);
 	ctxt.file_csum = NULL;
+
+	/*
+	 * We've read the whole file once and won't touch it again this scan.
+	 * Drop it from the page cache so hashing a large tree doesn't evict
+	 * everything else and push page allocation into the reclaim slowpath.
+	 */
+	posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_DONTNEED);
 
 	/*
 	 * Whether the last extent is inlined is a pure fiemap scan; compute it
