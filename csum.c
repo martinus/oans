@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "csum.h"
 #include "debug.h"
@@ -50,6 +51,11 @@ static inline void store_digest(unsigned char *digest, XXH128_hash_t hash)
 void checksum_block(char *buf, int len, unsigned char *digest)
 {
 	store_digest(digest, XXH128(buf, len, 0));
+}
+
+uint64_t csum_path(const char *path)
+{
+	return XXH3_64bits(path, strlen(path));
 }
 
 struct running_checksum *start_running_checksum(void)

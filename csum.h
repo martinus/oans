@@ -17,6 +17,7 @@
 #define __CSUM_H__
 
 #include <stdio.h>
+#include <stdint.h>
 
 #define	DIGEST_LEN	16
 #define	HASH_TYPE	"XXHASH3 "
@@ -34,6 +35,13 @@ static inline void debug_print_digest_short(FILE *stream, unsigned char *digest)
 
 /* Checksums a single block in one go. */
 void checksum_block(char *buf, int len, unsigned char *digest);
+
+/*
+ * Hash a NUL-terminated path to a 64-bit value. Used as a compact stand-in for
+ * the full path in the files table's uniqueness index (the path text itself is
+ * still stored, since files must be opened by name to dedupe).
+ */
+uint64_t csum_path(const char *path);
 
 /* Keeping a 'running' checksum - we add data to it a bit at a time */
 struct running_checksum;

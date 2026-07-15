@@ -139,12 +139,18 @@ static int create_tables(sqlite3 *db)
 	if (ret)
 		goto out;
 
+/*
+ * path_hash is csum_path(filename): a compact 64-bit stand-in for the full
+ * path in the uniqueness index. The path text is still stored (files must be
+ * opened by name to dedupe), but UNIQUE is enforced on the hash so its
+ * automatic index costs 8 bytes/row instead of a second copy of every path.
+ */
 #define	CREATE_TABLE_FILES						\
 "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY NOT NULL, "	\
-"filename TEXT NOT NULL, "						\
+"filename TEXT NOT NULL, path_hash INTEGER NOT NULL, "			\
 "ino INTEGER, subvol INTEGER, size INTEGER, "				\
 "mtime INTEGER, dedupe_seq INTEGER, digest BLOB, "			\
-"flags INTEGER, UNIQUE(ino, subvol), UNIQUE(filename));"
+"flags INTEGER, UNIQUE(ino, subvol), UNIQUE(path_hash));"
 	ret = sqlite3_exec(db, CREATE_TABLE_FILES, NULL, NULL, NULL);
 	if (ret)
 		goto out;
@@ -441,8 +447,8 @@ struct dbhandle *dbfile_open_handle(char *filename)
 	dbfile_prepare_stmt(update_extent_poff, UPDATE_EXTENT_POFF);
 
 #define	WRITE_FILE							\
-"insert or replace into files (ino, subvol, filename, size, mtime, "	\
-"dedupe_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6);"
+"insert or replace into files (ino, subvol, filename, path_hash, size, "\
+"mtime, dedupe_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);"
 	dbfile_prepare_stmt(write_file, WRITE_FILE);
 
 #define REMOVE_BLOCK_HASHES						\
@@ -518,7 +524,8 @@ struct dbhandle *dbfile_open_handle(char *filename)
 "(1 = (SELECT COUNT(*) FROM extents as e where e.digest = extents.digest));"
 	dbfile_prepare_stmt(get_nondupe_extents, GET_NONDUPE_EXTENTS);
 
-#define DELETE_FILE "delete from files where filename = ?1;"
+#define DELETE_FILE \
+"delete from files where path_hash = ?1 and filename = ?2;"
 	dbfile_prepare_stmt(delete_file, DELETE_FILE);
 
 #define SELECT_FILE_CHANGES						\
@@ -541,7 +548,7 @@ struct dbhandle *dbfile_open_handle(char *filename)
 	dbfile_prepare_stmt(delete_unscanned_files, DELETE_UNSCANNED_FILES);
 
 #define RENAME_FILE							\
-"update or replace files set filename = ?1 where id = ?2;"
+"update or replace files set filename = ?1, path_hash = ?2 where id = ?3;"
 	dbfile_prepare_stmt(rename_file, RENAME_FILE);
 	return result;
 
@@ -937,15 +944,19 @@ int64_t dbfile_store_file_info(struct dbhandle *db, struct file *dbfile)
 	if (ret)
 		goto bind_error;
 
-	ret = sqlite3_bind_int64(stmt, 4, dbfile->size);
+	ret = sqlite3_bind_int64(stmt, 4, csum_path(dbfile->filename));
 	if (ret)
 		goto bind_error;
 
-	ret = sqlite3_bind_int64(stmt, 5, dbfile->mtime);
+	ret = sqlite3_bind_int64(stmt, 5, dbfile->size);
 	if (ret)
 		goto bind_error;
 
-	ret = sqlite3_bind_int(stmt, 6, dbfile->dedupe_seq);
+	ret = sqlite3_bind_int64(stmt, 6, dbfile->mtime);
+	if (ret)
+		goto bind_error;
+
+	ret = sqlite3_bind_int(stmt, 7, dbfile->dedupe_seq);
 	if (ret)
 		goto bind_error;
 
@@ -1376,7 +1387,13 @@ int dbfile_remove_file(struct dbhandle *db, const char *filename)
 
 	dprintf("Remove file \"%s\" from the db\n", filename);
 
-	ret = sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
+	ret = sqlite3_bind_int64(stmt, 1, csum_path(filename));
+	if (ret) {
+		perror_sqlite(ret, "binding path_hash for sql");
+		return ret;
+	}
+
+	ret = sqlite3_bind_text(stmt, 2, filename, -1, SQLITE_STATIC);
 	if (ret) {
 		perror_sqlite(ret, "binding filename for sql");
 		return ret;
@@ -1517,7 +1534,13 @@ int dbfile_rename_file(struct dbhandle *db, int64_t fileid, char *path)
 		return ret;
 	}
 
-	ret = sqlite3_bind_int64(stmt, 2, fileid);
+	ret = sqlite3_bind_int64(stmt, 2, csum_path(path));
+	if (ret) {
+		perror_sqlite(ret, "binding values");
+		return ret;
+	}
+
+	ret = sqlite3_bind_int64(stmt, 3, fileid);
 	if (ret) {
 		perror_sqlite(ret, "binding values");
 		return ret;
