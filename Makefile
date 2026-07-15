@@ -1,5 +1,14 @@
-VERSION ?= $(shell git describe --abbrev=4 --dirty --always --tags;)
-IS_RELEASE ?= $(if $(filter $(shell git rev-list $(shell git describe --abbrev=0 --tags --exclude '*dev';)..HEAD --count;),0),1,0)
+# Derive the version from git once (not per-compile), and stay quiet on clones
+# without tags: git describe then prints "fatal: No names found" to stderr.
+# --always makes VERSION fall back to a short hash; the release check treats a
+# missing tag as "not a release".
+ifndef VERSION
+VERSION := $(shell git describe --abbrev=4 --dirty --always --tags 2>/dev/null)
+endif
+ifndef IS_RELEASE
+LATEST_TAG := $(shell git describe --abbrev=0 --tags --exclude '*dev' 2>/dev/null)
+IS_RELEASE := $(if $(LATEST_TAG),$(if $(filter 0,$(shell git rev-list $(LATEST_TAG)..HEAD --count 2>/dev/null)),1,0),0)
+endif
 
 CC ?= gcc
 CFLAGS ?= -Wall -ggdb -std=gnu11 -Werror=strict-prototypes -MMD

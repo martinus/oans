@@ -61,6 +61,9 @@ static enum {
 	H_UPDATE,
 } use_hashfile = H_UPDATE;
 
+/* Upper bound for the auto-detected worker thread count (overridable). */
+#define DEFAULT_MAX_AUTO_THREADS	8
+
 static void print_file(char *filename, char *ino, char *subvol)
 {
 	if (verbose)
@@ -692,6 +695,18 @@ int main(int argc, char **argv)
 	/* Set the default CPU limits before parsing the user options */
 	get_num_cpus(&(options.cpu_threads), &(options.io_threads));
 
+	/*
+	 * The detected core count can be very high (e.g. 64). Dedup is I/O
+	 * bound - reading and checksumming files, then FIDEDUPERANGE ioctls -
+	 * so beyond a handful of threads we mostly add lock contention and a
+	 * wall of progress lines. Cap the auto-detected default; an explicit
+	 * --io-threads / --cpu-threads (parsed below) still overrides it.
+	 */
+	if (options.io_threads > DEFAULT_MAX_AUTO_THREADS)
+		options.io_threads = DEFAULT_MAX_AUTO_THREADS;
+	if (options.cpu_threads > DEFAULT_MAX_AUTO_THREADS)
+		options.cpu_threads = DEFAULT_MAX_AUTO_THREADS;
+
 	ret = parse_options(argc, argv, &filelist_idx);
 	if (ret) {
 		exit(1);
@@ -742,8 +757,9 @@ int main(int argc, char **argv)
 		if (ret)
 			goto out;
 
-		qprintf("Hashfile \"%s\" written\n",
-			options.hashfile);
+		if (options.hashfile)
+			qprintf("Hashfile \"%s\" written\n",
+				options.hashfile);
 	}
 
 	if (use_hashfile == H_READ || use_hashfile == H_UPDATE)
