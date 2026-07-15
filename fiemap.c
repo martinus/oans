@@ -23,16 +23,17 @@
 #include "util.h"
 
 /*
- * Invoke an empty fiemap ioctl to fetch the number
- * of extent for this file.
- * Returns 0 on error.
+ * Empty fiemap ioctl to count the extents overlapping [start, start+length).
+ * Pass start=0, length=~0ULL for the whole file. Returns 0 on error.
  */
-static unsigned int fiemap_count_extents(int fd)
+static unsigned int fiemap_count_extents(int fd, uint64_t start,
+					 uint64_t length)
 {
 	struct fiemap fiemap = {0,};
 	int err;
 
-	fiemap.fm_length = ~0ULL;
+	fiemap.fm_start = start;
+	fiemap.fm_length = length;
 
 	err = ioctl(fd, FS_IOC_FIEMAP, &fiemap);
 	if (err < 0) {
@@ -84,7 +85,7 @@ struct fiemap *do_fiemap(int fd)
 	int err;
 
 	struct fiemap *fiemap = NULL;
-	unsigned int count = fiemap_count_extents(fd);
+	unsigned int count = fiemap_count_extents(fd, 0, ~0ULL);
 
 	/*
 	 * Our structure must be large enough to fit:
@@ -114,6 +115,43 @@ struct fiemap *do_fiemap(int fd)
 	return fiemap;
 }
 
+/*
+ * Like do_fiemap() but only maps the [start, start+length) byte range. The
+ * dedupe phase only needs the extent(s) at one offset, so this avoids
+ * enumerating the whole (possibly huge/fragmented) file's extent map.
+ */
+struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length)
+{
+	int err;
+	struct fiemap *fiemap = NULL;
+	unsigned int count = fiemap_count_extents(fd, start, length);
+
+	if (count == 0)
+		return NULL;
+
+	fiemap = calloc(1, sizeof(struct fiemap) +
+			count * (sizeof(struct fiemap_extent) +
+			sizeof(struct fiemap_extent *)));
+	if (!fiemap)
+		return NULL;
+
+	fiemap->fm_start = start;
+	fiemap->fm_length = length;
+	fiemap->fm_extent_count = count;
+
+	err = ioctl(fd, FS_IOC_FIEMAP, fiemap);
+	if (err < 0) {
+		perror("do_fiemap_range");
+		free(fiemap);
+		return NULL;
+	}
+
+	if (fiemap->fm_mapped_extents != count)
+		dprintf("do_fiemap_range: file changed between fiemap calls\n");
+
+	return fiemap;
+}
+
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared)
 {
 	_cleanup_(freep) struct fiemap *fiemap = NULL;
@@ -124,9 +162,11 @@ int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shar
 
 	abort_on(start_off >= end_off);
 
-	fiemap = do_fiemap(fd);
-	if (!fiemap)
-		return 1;
+	fiemap = do_fiemap_range(fd, start_off, end_off - start_off);
+	if (!fiemap) {
+		*shared = 0;
+		return 0;
+	}
 
 	*shared = 0;
 
