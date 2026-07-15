@@ -3,7 +3,6 @@ byte-for-byte, while duplicates actually get shared. The catch-all that would
 flag any dedupe path that corrupts, truncates, or loses data."""
 
 import os
-import subprocess
 from harness import DuperemoveTest, requires_reflink
 
 MiB = 1 << 20
@@ -11,9 +10,6 @@ MiB = 1 << 20
 
 @requires_reflink
 class IntegrityTest(DuperemoveTest):
-    def _sync(self):
-        subprocess.run(["sync"])
-
     def test_mixed_tree_integrity(self):
         t = self.path("tree")
 
@@ -38,13 +34,13 @@ class IntegrityTest(DuperemoveTest):
         self.make_sparse("tree/sparse/s1", head, 262144, tail)
         self.make_sparse("tree/sparse/s2", head, 262144, tail)
 
-        self._sync()
+        self.sync()
         before = self.tree_digest(t)
         nfiles = sum(len(f) for _r, _d, f in os.walk(t))
 
         self.dedupe(t)
         self.assertDmOk()
-        self._sync()
+        self.sync()
 
         # Nothing corrupted or lost.
         self.assertEqual(before, self.tree_digest(t), "every file byte-identical after dedupe")
@@ -64,11 +60,11 @@ class IntegrityTest(DuperemoveTest):
         t = self.path("tree")
         self.mkdup("tree/a", "tree/b", MiB)
         self.mkrand("tree/c", MiB)
-        self._sync()
+        self.sync()
 
-        self.dedupe(t); self.assertDmOk(); self._sync()
+        self.dedupe(t); self.assertDmOk(); self.sync()
         after_first = self.tree_digest(t)
 
-        self.dedupe(t); self.assertDmOk(); self._sync()
+        self.dedupe(t); self.assertDmOk(); self.sync()
         self.assertEqual(after_first, self.tree_digest(t), "second full run preserves data")
         self.assertNoNewSharing()

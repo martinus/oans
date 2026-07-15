@@ -259,6 +259,10 @@ class DuperemoveTest(unittest.TestCase):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         return p
 
+    def sync(self):
+        """Flush to disk so FIEMAP / on-disk sharing checks see settled state."""
+        subprocess.run(["sync"])
+
     def write(self, relpath, data):
         p = self.path(relpath)
         with open(p, "wb") as f:

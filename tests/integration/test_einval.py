@@ -8,15 +8,11 @@ need a reflink-capable filesystem.
 """
 
 import os
-import subprocess
 from harness import DuperemoveTest, requires_reflink
 
 
 @requires_reflink
 class EinvalTest(DuperemoveTest):
-    def _sync(self):
-        subprocess.run(["sync"])
-
     def test_unaligned_shared_tail(self):
         # Unique aligned head, a hole, then an identical unaligned tail. The
         # tail is the shared extent whose block-rounded length overshoots EOF.
@@ -24,25 +20,25 @@ class EinvalTest(DuperemoveTest):
         tail = os.urandom(12345)
         a = self.make_sparse_headtail("tree/a", head_a, 327680, tail)
         b = self.make_sparse_headtail("tree/b", head_b, 327680, tail)
-        self._sync()
+        self.sync()
 
         before = self.tree_digest(self.path("tree"))
         self.dedupe(self.path("tree"))
         self.assertDmOk()                            # specifically: no EINVAL
         self.assertNotIn("Invalid argument", self.out, "EINVAL must not appear")
-        self._sync()
+        self.sync()
         self.assertShared(a, b, "the unaligned tail got shared")
         self.assertEqual(before, self.tree_digest(self.path("tree")),
                          "data preserved through clamp")
 
     def test_small_unaligned_whole_file(self):
         a, b = self.mkdup("tree/a", "tree/b", 196608 + 777)   # 192K + unaligned tail
-        self._sync()
+        self.sync()
         before = self.tree_digest(self.path("tree"))
         self.dedupe(self.path("tree"))
         self.assertDmOk()
         self.assertNotIn("Invalid argument", self.out, "no EINVAL on unaligned whole file")
-        self._sync()
+        self.sync()
         self.assertShared(a, b, "unaligned copies shared")
         self.assertEqual(before, self.tree_digest(self.path("tree")), "data preserved")
 
