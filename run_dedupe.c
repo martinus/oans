@@ -606,28 +606,63 @@ static int push_extents(struct results_tree *res)
  */
 static GThread *dedupe_status_thread_h;
 static volatile int dedupe_status_running;
+static unsigned long long dedupe_total_groups;	/* estimate, for the bar/ETA */
+
+static void draw_dedupe_status(void)
+{
+	const int width = 22;
+	unsigned long long done = dedupe_groups_done;
+	unsigned long long total = dedupe_total_groups;
+	double elapsed = elapsed_seconds();
+	int i, pos;
+	char eta[16] = "";
+
+	if (total && done > total)	/* estimate was low; don't overflow */
+		total = done;
+	pos = total ? (int)((double)done / total * width) : 0;
+
+	printf("\r\33[K  %sDeduplicating%s  ", col_bold, col_reset);
+	if (total) {
+		printf("%s", col_cyan);
+		for (i = 0; i < width; i++)
+			putchar(i < pos ? '#' : (i == pos ? '>' : '-'));
+		printf("%s %llu/%llu (%d%%)", col_reset, done, total,
+		       total ? (int)(100.0 * done / total) : 0);
+	} else {
+		printf("%s%llu groups%s", col_cyan, done, col_reset);
+	}
+	printf(" · %s%s%s · %s", col_green, human_size(dedupe_total_bytes),
+	       col_reset, human_duration(elapsed));
+	if (total && done > 0 && done < total) {
+		double rate = done / (elapsed > 0 ? elapsed : 1);
+		snprintf(eta, sizeof(eta), "%s", human_duration((total - done) / rate));
+		printf(" · ETA ~%s", eta);
+	}
+	fflush(stdout);
+}
 
 static void *dedupe_status_thread(void *arg [[maybe_unused]])
 {
 	do {
-		printf("\r\33[K  %sDeduplicating%s  %s%llu%s groups · %s%s%s "
-		       "reclaimed", col_bold, col_reset, col_cyan,
-		       dedupe_groups_done, col_reset, col_green,
-		       human_size(dedupe_total_bytes), col_reset);
-		fflush(stdout);
-		usleep(100000);
+		draw_dedupe_status();
+		usleep(200000);
 	} while (dedupe_status_running);
 	printf("\r\33[K");	/* erase the status line; dedupe_end() summarizes */
 	fflush(stdout);
 	return NULL;
 }
 
-/* Begin the dedupe phase: reset totals and start the in-place status line. */
-void dedupe_begin(void)
+/*
+ * Begin the dedupe phase: reset totals and start the in-place status line.
+ * total_groups is an estimate used for the progress bar and ETA (0 = unknown,
+ * in which case the status shows an indeterminate group count).
+ */
+void dedupe_begin(unsigned long long total_groups)
 {
 	dedupe_groups_done = 0;
 	dedupe_total_bytes = 0;
 	dedupe_total_kern = 0;
+	dedupe_total_groups = total_groups;
 
 	if (!quiet && !verbose && isatty(STDOUT_FILENO)) {
 		dedupe_status_running = 1;

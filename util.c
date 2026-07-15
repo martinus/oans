@@ -72,6 +72,20 @@ double elapsed_seconds(void)
 	       (now.tv_nsec - timer_start.tv_nsec) / 1e9;
 }
 
+/* Compact human-readable duration: "45s", "2m14s", "1h03m". */
+int human_duration_snprintf(double seconds, char *str, size_t str_bytes)
+{
+	unsigned long s = (unsigned long)(seconds + 0.5);
+
+	if (str_bytes == 0)
+		return 0;
+	if (s < 60)
+		return snprintf(str, str_bytes, "%lus", s);
+	if (s < 3600)
+		return snprintf(str, str_bytes, "%lum%02lus", s / 60, s % 60);
+	return snprintf(str, str_bytes, "%luh%02lum", s / 3600, (s % 3600) / 60);
+}
+
 /* Human-readable size, always (pretty_size_snprintf honors --human; this does not). */
 int human_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 {

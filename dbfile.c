@@ -1609,6 +1609,42 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 	return sqlite3_column_int64(stmt, 0);
 }
 
+static uint64_t count_one(sqlite3 *db, const char *sql)
+{
+	sqlite3_stmt *stmt;
+	uint64_t n = 0;
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return 0;
+	if (sqlite3_step(stmt) == SQLITE_ROW)
+		n = sqlite3_column_int64(stmt, 0);
+	sqlite3_finalize(stmt);
+	return n;
+}
+
+uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only)
+{
+	uint64_t files, extents;
+
+	files = count_one(db->db,
+		"select count(*) from (select 1 from files "
+		"where digest is not null and not (flags & 1) "
+		"group by digest, size having count(*) > 1)");
+	if (whole_file_only)
+		return files;
+
+	extents = count_one(db->db,
+		"select count(*) from (select 1 from extents "
+		"group by digest, len having count(*) > 1)");
+	/*
+	 * The whole-file and extent groups overlap heavily (a duplicate file is
+	 * also a set of duplicate extents), so summing overshoots. The larger of
+	 * the two is a closer, under-biased estimate for the bar; the caller
+	 * clamps the total up if the running count exceeds it.
+	 */
+	return files > extents ? files : extents;
+}
+
 /*
  * Remove entries from the files table that were listed but never csummed, i.e.
  * whose digest is still NULL. This happens when a previous run was interrupted

@@ -184,6 +184,13 @@ void dbfile_set_gdb(struct dbhandle *db);
 int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid);
 
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
+
+/*
+ * Approximate number of duplicate groups the dedupe phase will process, for a
+ * progress total/ETA. Counts identical-file groups plus, unless whole_file_only,
+ * duplicate-extent groups across the whole hashfile.
+ */
+uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
 
 /* Build the find-dupes-phase indexes (deferred past the scan). See dbfile.c. */

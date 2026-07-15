@@ -599,9 +599,18 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
-	/* One status line + one summary spanning every pass below. */
-	if (options.run_dedupe)
-		dedupe_begin();
+	/* One status line + one summary spanning every pass below. Estimate the
+	 * total dup-group count first so the progress bar and ETA have a scale. */
+	if (options.run_dedupe) {
+		unsigned long long total;
+
+		if (!quiet && isatty(STDOUT_FILENO)) {
+			printf("  %sAnalyzing duplicates...%s\r", col_dim, col_reset);
+			fflush(stdout);
+		}
+		total = dbfile_count_dupe_groups(db, options.only_whole_files);
+		dedupe_begin(total);
+	}
 
 	for (unsigned int i = dedupe_seq; i < max; i++) {
 		/* Drop all filerecs from the previous iteration. Needed filerecs will be

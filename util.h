@@ -53,6 +53,15 @@ int human_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 		_hs;							\
 	})
 
+/* Compact human-readable duration ("2m14s"). */
+int human_duration_snprintf(double seconds, char *str, size_t str_bytes);
+#define human_duration(secs)						\
+	({								\
+		static __thread char _hd[16];				\
+		(void)human_duration_snprintf((secs), _hd, sizeof(_hd));\
+		_hd;							\
+	})
+
 /*
  * ANSI colors for status output. color_init() decides once whether to emit
  * escapes (stdout is a tty, NO_COLOR unset, and colors not disabled); the
