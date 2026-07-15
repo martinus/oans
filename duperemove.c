@@ -538,7 +538,7 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 	init_results_tree(&res);
 	init_hash_tree(&dups_tree);
 
-	qprintf("%sLoading identical files...%s\n", col_dim, col_reset);
+	vprintf("Loading identical files...\n");
 	ret = dbfile_load_same_files(db, &res, seq + 1);
 	if (ret)
 		goto out;
@@ -554,13 +554,13 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 	if (!options.only_whole_files) {
 		init_results_tree(&res);
 
-		qprintf("%sLoading duplicated hashes...%s\n", col_dim, col_reset);
+		vprintf("Loading duplicated hashes...\n");
 
 		ret = dbfile_load_extent_hashes(db, &res, seq + 1);
 		if (ret)
 			goto out;
 
-		qprintf("%sFound%s %llu identical extents\n", col_dim, col_reset, res.num_extents);
+		vprintf("Found %llu identical extents\n", res.num_extents);
 		if (options.do_block_hash) {
 			ret = dbfile_load_block_hashes(db, &dups_tree, seq + 1);
 			if (ret)
@@ -599,6 +599,10 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
+	/* One status line + one summary spanning every pass below. */
+	if (options.run_dedupe)
+		dedupe_begin();
+
 	for (unsigned int i = dedupe_seq; i < max; i++) {
 		/* Drop all filerecs from the previous iteration. Needed filerecs will be
 		 * recreated by __process_duplicates()
@@ -617,6 +621,9 @@ static void process_duplicates(struct dbhandle *db)
 			dbfile_sync_config(db, &dbfile_cfg);
 		}
 	}
+
+	if (options.run_dedupe)
+		dedupe_end();
 
 	if (options.do_block_hash)
 		extents_search_free();
