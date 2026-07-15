@@ -61,9 +61,15 @@ class IncrementalTest(DuperemoveTest):
         self.scan(self.path("tree"))
         ghost = self.path("tree/ghost")
         with __import__("sqlite3").connect(self.hf) as con:
+            cols = [r[1] for r in con.execute("pragma table_info(files)")]
+            # Newer schemas carry a NOT NULL path_hash; a real interrupted scan
+            # sets it at insert time (only the digest is filled in later).
+            extra_c = ", path_hash" if "path_hash" in cols else ""
+            extra_v = ", 987654321" if "path_hash" in cols else ""
             con.execute(
                 "insert into files (filename, ino, subvol, size, mtime, dedupe_seq, "
-                "digest, flags) values (?, 999999, 0, 123, 0, 0, NULL, 0)", (ghost,))
+                f"digest, flags{extra_c}) values (?, 999999, 0, 123, 0, 0, NULL, 0{extra_v})",
+                (ghost,))
         self.assertEqual(2, self.hf_count("files"), "stale row inserted")
         self.scan(self.path("tree"))                 # prune runs before scanning
         self.assertDmOk()

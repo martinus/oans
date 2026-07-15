@@ -19,7 +19,7 @@ struct results_tree;
 struct dbfile_config;
 
 #define DB_FILE_MAJOR	4
-#define DB_FILE_MINOR	1
+#define DB_FILE_MINOR	2
 
 struct stmts {
 	sqlite3_stmt *insert_block;
