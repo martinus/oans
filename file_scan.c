@@ -411,6 +411,57 @@ static void subvol_cache_free(void)
 	subvol_cache = NULL;
 }
 
+/*
+ * Cache of devices already confirmed to belong to the locked filesystem.
+ *
+ * On btrfs check_file() verifies each directory lives on the locked fs by
+ * comparing its fs UUID, because subvolumes have distinct st_dev values so a
+ * plain device compare can't span them. That costs an open()+statfs()+ioctl per
+ * directory. Since the answer is stable per device, we - like the subvolume
+ * cache above - remember each confirmed device and skip the recheck for every
+ * later directory on the same subvolume. Listing thread only, so no locking.
+ */
+struct verified_dev_entry {
+	dev_t				dev;
+	struct verified_dev_entry	*next;
+};
+static struct verified_dev_entry *verified_devs;
+
+static bool verified_dev_get(dev_t dev)
+{
+	struct verified_dev_entry *e;
+
+	for (e = verified_devs; e; e = e->next)
+		if (e->dev == dev)
+			return true;
+	return false;
+}
+
+static void verified_dev_put(dev_t dev)
+{
+	struct verified_dev_entry *e = malloc(sizeof(*e));
+
+	/* On OOM just skip caching; correctness is unaffected. */
+	if (!e)
+		return;
+
+	e->dev = dev;
+	e->next = verified_devs;
+	verified_devs = e;
+}
+
+static void verified_dev_free(void)
+{
+	struct verified_dev_entry *e = verified_devs, *next;
+
+	while (e) {
+		next = e->next;
+		free(e);
+		e = next;
+	}
+	verified_devs = NULL;
+}
+
 static char *extract_first_device(const char *fs_source)
 {
 	char *first_device = NULL;
@@ -554,6 +605,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	int ret;
 	struct dbfile_config cfg;
 	uuid_t uuid = {0,};
+	dev_t dev;
 
 	if (is_excluded(path))
 		return false;
@@ -629,12 +681,24 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	if (!locked_fs.is_btrfs)
 		return locked_fs.dev == stx_to_dev(st);
 
-	/* On btrfs, we must always fetch the UUID */
+	/*
+	 * On btrfs each subvolume has a distinct st_dev, so verify by fs UUID
+	 * rather than by device. That costs an open()+statfs()+ioctl, so cache
+	 * devices already confirmed to be on the locked fs and skip the recheck.
+	 */
+	dev = stx_to_dev(st);
+	if (verified_dev_get(dev))
+		return true;
+
 	ret = get_uuid(path, &uuid);
 	if (ret)
 		return false;
 
-	return uuid_compare(uuid, locked_fs.uuid) == 0;
+	if (uuid_compare(uuid, locked_fs.uuid) != 0)
+		return false;
+
+	verified_dev_put(dev);
+	return true;
 }
 
 void fs_get_locked_uuid(uuid_t *uuid)
@@ -1541,6 +1605,7 @@ void filescan_free(void)
 	scan_read_flush();
 	scan_writer_close();
 	subvol_cache_free();
+	verified_dev_free();
 	if (seen_inodes) {
 		g_hash_table_destroy(seen_inodes);
 		seen_inodes = NULL;
