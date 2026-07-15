@@ -315,24 +315,17 @@ void filerec_close_open_list(struct open_once *open_files)
 int fiemap_scan_extent(struct extent *extent)
 {
 	int ret = 0;
-	_cleanup_(freep) struct fiemap *fiemap = NULL;
 
 	ret = filerec_open(extent->e_file, true);
 	if (ret)
 		return ret;
 
 	/*
-	 * Only map the extent we care about. On a large/fragmented file,
-	 * do_fiemap() would enumerate every extent just to fetch this one.
+	 * We only need this one extent's physical offset. On a large/fragmented
+	 * file, do_fiemap() would enumerate every extent just to fetch it.
 	 */
-	fiemap = do_fiemap_range(extent->e_file->fd, extent->e_loff,
-				 extent_len(extent));
-	if (!fiemap || fiemap->fm_mapped_extents == 0) {
-		filerec_close(extent->e_file);
-		return -1;
-	}
-
-	extent->e_poff = fiemap->fm_extents[0].fe_physical;
+	ret = fiemap_first_extent_poff(extent->e_file->fd, extent->e_loff,
+				       extent_len(extent), &extent->e_poff);
 	filerec_close(extent->e_file);
 	return ret;
 }

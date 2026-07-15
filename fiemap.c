@@ -152,6 +152,38 @@ struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length)
 	return fiemap;
 }
 
+/*
+ * Physical offset of the first extent overlapping [start, start+length).
+ *
+ * The dedupe rescan only needs that one extent, so unlike do_fiemap_range()
+ * this issues a single ioctl (no separate count pass) into a one-extent buffer.
+ * Returns 0 and stores the offset in *poff on success, -1 on ioctl error or
+ * when the range maps no extents (a hole).
+ */
+int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
+			     uint64_t *poff)
+{
+	struct {
+		struct fiemap		fiemap;
+		struct fiemap_extent	extent;
+	} buf = {0,};
+
+	buf.fiemap.fm_start = start;
+	buf.fiemap.fm_length = length;
+	buf.fiemap.fm_extent_count = 1;
+
+	if (ioctl(fd, FS_IOC_FIEMAP, &buf.fiemap) < 0) {
+		perror("fiemap_first_extent_poff");
+		return -1;
+	}
+
+	if (buf.fiemap.fm_mapped_extents == 0)
+		return -1;
+
+	*poff = buf.fiemap.fm_extents[0].fe_physical;
+	return 0;
+}
+
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared)
 {
 	_cleanup_(freep) struct fiemap *fiemap = NULL;

@@ -32,6 +32,14 @@ struct fiemap *do_fiemap(int fd);
 struct fiemap *do_fiemap_range(int fd, uint64_t start, uint64_t length);
 
 /*
+ * Physical offset of the first extent overlapping [start, start+length), via a
+ * single fiemap ioctl. Returns 0 and sets *poff on success, -1 on error or when
+ * the range maps no extents.
+ */
+int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
+			     uint64_t *poff);
+
+/*
  * Count how much of the area between start_off and end_off is shared.
  */
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared);
