@@ -304,6 +304,20 @@ static int dbfile_set_modes(sqlite3 *db)
 	}
 
 	/*
+	 * Wait out transient lock contention instead of failing immediately.
+	 * The hashfile is touched by several connections (the listing reader,
+	 * the batched writer, the csum and dedupe workers); without a timeout a
+	 * brief overlap - e.g. a WAL checkpoint racing a write - surfaces as
+	 * "database is locked" (SQLITE_BUSY). 30s comfortably covers the ~10s
+	 * batched write transaction.
+	 */
+	ret = sqlite3_exec(db, "PRAGMA busy_timeout = 30000", NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "setting busy timeout");
+		return ret;
+	}
+
+	/*
 	 * The default (no --hashfile) database is an in-memory shared-cache db
 	 * (see MEMDB_FILENAME) shared by the listing reader, the batched writer
 	 * and the csum workers - all separate connections. Shared-cache does
