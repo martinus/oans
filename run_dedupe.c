@@ -284,8 +284,9 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 
 	abort_on(dext->de_num_dupes < 2);
 
-	/* Dedupe extents with id %s*/
-	if (!quiet) {
+	/* Per-group detail is noisy on large runs; show it only with -v. The
+	 * default view is the live progress bar started in dedupe_results(). */
+	if (verbose) {
 		g_mutex_lock(&console_mutex);
 		printf("[%p] (%0*llu/%llu) Try to dedupe extents with id ",
 		       g_thread_self(), leading_spaces, passno,
@@ -402,7 +403,7 @@ run_dedupe:
 		 * case but always do cleanup.
 		 */
 		if (ctxt->num_queued) {
-			if (!quiet) {
+			if (verbose) {
 				g_mutex_lock(&console_mutex);
 				printf("[%p] Dedupe %u extents (id: ",
 				       g_thread_self(), ctxt->num_queued);
@@ -588,6 +589,39 @@ static int push_extents(struct results_tree *res)
 	return 0;
 }
 
+/*
+ * Live progress for the dedupe phase, drawn only on a tty. A flag (not a
+ * count) controls termination, so it can't hang if some groups are skipped.
+ */
+static volatile int dedupe_progress_running;
+
+static void draw_dedupe_bar(unsigned long long done, unsigned long long total,
+			    const char *bar_color)
+{
+	const int width = 30;
+	int pos = total ? (int)((double)done / total * width) : width;
+	int i;
+
+	if (pos > width)
+		pos = width;
+	printf("\r  %sDeduplicating%s  %s", col_bold, col_reset, bar_color);
+	for (i = 0; i < width; i++)
+		putchar(i < pos ? '#' : (i == pos ? '>' : ' '));
+	printf("%s  %llu/%llu", col_reset, done, total);
+	fflush(stdout);
+}
+
+static void *dedupe_progress_thread(void *arg [[maybe_unused]])
+{
+	while (dedupe_progress_running) {
+		draw_dedupe_bar(curr_dedupe_pass, total_dedupe_passes, col_cyan);
+		usleep(50000);
+	}
+	draw_dedupe_bar(total_dedupe_passes, total_dedupe_passes, col_green);
+	printf("\n");
+	return NULL;
+}
+
 void dedupe_results(struct results_tree *res, bool whole_file)
 {
 	int ret;
@@ -603,14 +637,15 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	whole_file_dedup = whole_file;
 
-	print_dupes_table(res, whole_file);
+	/* The pre-dedupe listing is a wall of text on large runs; the summary
+	 * below reports the outcome. Show the full table only with -v. */
+	if (verbose)
+		print_dupes_table(res, whole_file);
 
-	if (RB_EMPTY_ROOT(&res->root)) {
-		printf("Nothing to dedupe.\n");
+	if (RB_EMPTY_ROOT(&res->root))
 		return;
-	}
 
-	qprintf("Using %u threads for dedupe phase\n", options.io_threads);
+	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
 
 	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, &counts,
 					options.io_threads, TRUE, &err);
@@ -623,20 +658,48 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	total_dedupe_passes = res->num_dupes;
 	leading_spaces = num_digits(total_dedupe_passes);
+
+	GThread *progress = NULL;
+	if (!quiet && !verbose && isatty(STDOUT_FILENO)) {
+		dedupe_progress_running = 1;
+		progress = g_thread_new("dedupe_progress",
+					dedupe_progress_thread, NULL);
+	}
+
 	ret = push_extents(res);
 	if (ret) {
 		eprintf("Fatal error while deduping: %s\n", err->message);
 		g_error_free(err);
 	}
 
-	g_thread_pool_free(dedupe_pool, FALSE, TRUE);
+	g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for all work */
+
+	if (progress) {
+		dedupe_progress_running = 0;
+		g_thread_join(progress);
+	}
 
 	if (ret == 0) {
-		vprintf("Kernel processed data (excludes target files): "
-			"%s\n", pretty_size(counts.kern_bytes));
-		printf("Comparison of extent info shows a net "
-		       "change in shared extents of: %s\n",
-		       pretty_size(counts.fiemap_bytes));
+		printf("\n%s%sSummary%s\n", col_bold, col_blue, col_reset);
+		printf("  %sDeduplicated%s   %s%s%s across %llu group%s\n",
+		       col_dim, col_reset, col_green,
+		       human_size(counts.fiemap_bytes), col_reset,
+		       total_dedupe_passes,
+		       total_dedupe_passes == 1 ? "" : "s");
+		if (counts.kern_bytes)
+			printf("  %sKernel scanned%s %s\n", col_dim, col_reset,
+			       human_size(counts.kern_bytes));
+		printf("  %sElapsed%s        %.1fs\n",
+		       col_dim, col_reset, elapsed_seconds());
+
+		/*
+		 * Stable, exact machine-readable line for scripts (and tests).
+		 * Kept off the interactive view - a human has the summary above.
+		 */
+		if (!isatty(STDOUT_FILENO))
+			printf("Comparison of extent info shows a net change in "
+			       "shared extents of: %s\n",
+			       pretty_size(counts.fiemap_bytes));
 	}
 }
 

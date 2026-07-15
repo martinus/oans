@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <time.h>
 #ifdef __GLIBC__
 #include <execinfo.h>
 #endif
@@ -40,6 +41,55 @@
 #include "util.h"
 
 int human_readable = 0;
+
+const char *col_reset = "", *col_bold = "", *col_dim = "";
+const char *col_red = "", *col_green = "", *col_yellow = "";
+const char *col_blue = "", *col_cyan = "";
+
+void color_init(bool disable)
+{
+	if (disable || !isatty(STDOUT_FILENO) || getenv("NO_COLOR"))
+		return;	/* leave every color string empty */
+
+	col_reset = "\033[0m"; col_bold = "\033[1m"; col_dim = "\033[2m";
+	col_red = "\033[31m"; col_green = "\033[32m"; col_yellow = "\033[33m";
+	col_blue = "\033[34m"; col_cyan = "\033[36m";
+}
+
+static struct timespec timer_start;
+
+void start_timer(void)
+{
+	clock_gettime(CLOCK_MONOTONIC, &timer_start);
+}
+
+double elapsed_seconds(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (now.tv_sec - timer_start.tv_sec) +
+	       (now.tv_nsec - timer_start.tv_nsec) / 1e9;
+}
+
+/* Human-readable size, always (pretty_size_snprintf honors --human; this does not). */
+int human_size_snprintf(uint64_t size, char *str, size_t str_bytes)
+{
+	static const char * const units[] = { "B", "KiB", "MiB", "GiB",
+					      "TiB", "PiB", "EiB" };
+	unsigned int u = 0;
+	double v = (double)size;
+
+	if (str_bytes == 0)
+		return 0;
+	while (v >= 1024.0 && u < ARRAY_SIZE(units) - 1) {
+		v /= 1024.0;
+		u++;
+	}
+	if (u == 0)
+		return snprintf(str, str_bytes, "%"PRIu64" B", size);
+	return snprintf(str, str_bytes, "%.1f %s", v, units[u]);
+}
 
 uint64_t parse_size(char *s)
 {

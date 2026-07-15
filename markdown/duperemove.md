@@ -124,7 +124,13 @@ running `duperemove` on very large files (like virtual machines etc).
 any dedupe.
 
 **-v**
-  ~ Be verbose.
+  ~ Be verbose. Restores the per-group dedupe listing that is hidden by
+default in favor of a progress bar and summary.
+
+**\--no-color**
+  ~ Disable colored output. Colors are also disabled automatically when
+standard output is not a terminal or when the `NO_COLOR` environment
+variable is set.
 
 **\--help**
   ~ Prints help text.

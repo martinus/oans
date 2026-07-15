@@ -19,6 +19,7 @@
 #define	__UTIL_H__
 
 #include <stdlib.h>
+#include <stdbool.h>
 #include <dirent.h>
 #include <stdint.h>
 #include <sys/time.h>
@@ -42,6 +43,28 @@ int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 		(void)pretty_size_snprintf((size), _str, sizeof(_str));	\
 		_str;							\
 	})
+
+/* Always human-readable (KiB/MiB/...), regardless of the --human option. */
+int human_size_snprintf(uint64_t size, char *str, size_t str_bytes);
+#define human_size(size)						\
+	({								\
+		static __thread char _hs[32];				\
+		(void)human_size_snprintf((size), _hs, sizeof(_hs));	\
+		_hs;							\
+	})
+
+/*
+ * ANSI colors for status output. color_init() decides once whether to emit
+ * escapes (stdout is a tty, NO_COLOR unset, and colors not disabled); the
+ * strings below are empty when color is off, so they are always safe to print.
+ */
+extern const char *col_reset, *col_bold, *col_dim;
+extern const char *col_red, *col_green, *col_yellow, *col_blue, *col_cyan;
+void color_init(bool disable);
+
+/* Monotonic seconds since the process recorded its start (see start_timer). */
+void start_timer(void);
+double elapsed_seconds(void);
 
 /* Trivial wrapper around gettimeofday */
 struct elapsed_time {
