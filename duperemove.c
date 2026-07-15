@@ -646,14 +646,20 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	int ret;
 
 	filescan_init();
+	filescan_walk_begin();
 	if (!quiet)
 		pscan_run();
 
+	/* Seed the walk with the roots (this only queues them). */
 	if (stdin_filelist)
 		ret = add_files_from_stdin(db);
 	else
 		ret = scan_files_from_cmdline(argc - filelist_idx,
 					     &argv[filelist_idx], db);
+
+	/* Run the parallel walk + scan over everything seeded above. */
+	if (!ret)
+		ret = filescan_walk_run(db);
 
 	pscan_finish_listing();
 	filescan_free();
