@@ -22,6 +22,7 @@ maintainer decision or is too risky to change unilaterally).
 | [#396](https://github.com/markfasheh/duperemove/issues/396) / [#407](https://github.com/markfasheh/duperemove/issues/407) | Infinite loop / hang during dedupe | #27 — stop when a round dedupes 0 bytes with no error (zero-progress guard). |
 | [#388](https://github.com/markfasheh/duperemove/issues/388) | `show-shared-extents` not installed | #28 — install the shipped script. |
 | [#387](https://github.com/markfasheh/duperemove/issues/387) | Tarball build has no version | #29 — `version` file fallback; `make tarball` embeds it. |
+| [#374](https://github.com/markfasheh/duperemove/issues/374) | "Compressed FS" extent handling broken (really: sparse trailing hole) | #31 — store the last extent + stop cleanly at a trailing hole (`test_sparse.py`). Compression itself maps fine on current kernels. |
 
 ## Already addressed by earlier fork work
 
@@ -48,7 +49,6 @@ investigation/hardware, or a behavior change the maintainer should decide.
 
 | # | Title | Why deferred |
 |---|-------|--------------|
-| [#374](https://github.com/markfasheh/duperemove/issues/374) | Extent handling broken on compressed FS | 🔒 Genuine bug: fiemap `fe_logical/fe_length` describe the on-disk (compressed) layout, not the logical offsets the scanner compares. A correct fix needs `FIEMAP_EXTENT_ENCODED`-aware handling and testing on compressed subvolumes — a substantial change of its own. |
 | [#331](https://github.com/markfasheh/duperemove/issues/331) | Re-dedupes already-shared extents | 🔒 `clean_deduped()` already skips extents seen shared within a run, but cross-run already-shared extents are still re-issued. A pre-ioctl "already shared?" check risks skipping legitimate work; needs design + measurement. |
 | [#382](https://github.com/markfasheh/duperemove/issues/382) | `-d <path>` dedupes the whole hashfile, not `<path>` | 🔒 Deliberate design (dedupe works from hashfile generations). Restricting to the path argument changes long-standing behavior — a maintainer call. |
 | [#401](https://github.com/markfasheh/duperemove/issues/401) / [#371](https://github.com/markfasheh/duperemove/issues/371) / [#393](https://github.com/markfasheh/duperemove/issues/393) / [#306](https://github.com/markfasheh/duperemove/issues/306) | io-threads slow on HDD | 🔒 Auto-detecting rotational devices is unreliable behind btrfs multi-device / LVM / dm. Fork caps threads at 8; recommend `--io-threads=1` on HDD. |
@@ -93,5 +93,5 @@ investigation/hardware, or a behavior change the maintainer should decide.
 
 - **Upstream the #398 EINVAL fix and the #27 zero-progress guard** — both are
   absent upstream and fix real hangs/failures.
-- **#374 compressed-FS extents** — the most impactful remaining correctness bug;
-  deserves its own change with tests on compressed subvolumes.
+- **#331 already-shared re-dedupe** and **#382 path-scoped dedupe** remain the
+  notable open items, both needing a maintainer decision (see the deferred table).
