@@ -542,7 +542,9 @@ static void print_header(void)
 	qprintf("%s%sScanning%s files...\n", col_bold, col_cyan, col_reset);
 }
 
-static void __process_duplicates(struct dbhandle *db, unsigned int seq)
+/* Process the dedupe generations in (seq_lo, seq_hi]. */
+static void __process_duplicates(struct dbhandle *db, unsigned int seq_lo,
+				 unsigned int seq_hi)
 {
 	int ret;
 	struct results_tree res;
@@ -553,7 +555,7 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 
 	vprintf("Loading identical files...\n");
 	pdedupe_set_activity("loading identical files");
-	ret = dbfile_load_same_files(db, &res, seq + 1);
+	ret = dbfile_load_same_files(db, &res, seq_lo, seq_hi);
 	if (ret)
 		goto out;
 
@@ -571,13 +573,14 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 		vprintf("Loading duplicated hashes...\n");
 		pdedupe_set_activity("loading duplicate extents");
 
-		ret = dbfile_load_extent_hashes(db, &res, seq + 1);
+		ret = dbfile_load_extent_hashes(db, &res, seq_lo, seq_hi);
 		if (ret)
 			goto out;
 
 		vprintf("Found %llu identical extents\n", res.num_extents);
 		if (options.do_block_hash) {
-			ret = dbfile_load_block_hashes(db, &dups_tree, seq + 1);
+			ret = dbfile_load_block_hashes(db, &dups_tree,
+						       seq_lo, seq_hi);
 			if (ret)
 				goto out;
 
@@ -597,10 +600,26 @@ out:
 	free_hash_tree(&dups_tree);
 }
 
+/*
+ * How many files' worth of dedupe generations to process per pass. The scan
+ * seals a generation every --batchsize (default 1024) files, and processing
+ * one generation per pass made each pass a barrier: the thread pool drained
+ * at every 1024 files, so one large group regularly left every other worker
+ * idle, thousands of times over on a big hashfile. Merging generations keeps
+ * the pool full; the cap keeps the per-pass filerec/results memory bounded.
+ */
+#define DEDUPE_FILES_PER_PASS	(64 * 1024)
+
 static void process_duplicates(struct dbhandle *db)
 {
 	unsigned int max = get_max_dedupe_seq(db);
 	unsigned int first_seq = dedupe_seq;	/* bumped inside the loop */
+	unsigned int stride = DEDUPE_FILES_PER_PASS / options.batch_size;
+	unsigned int passes, pass = 0;
+
+	if (stride < 1)
+		stride = 1;
+	passes = max > first_seq ? (max - first_seq + stride - 1) / stride : 0;
 
 	/*
 	 * Ensure the find-dupes indexes exist. Normally built at the end of the
@@ -626,25 +645,27 @@ static void process_duplicates(struct dbhandle *db)
 			fflush(stdout);
 		}
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
-		pdedupe_begin(total, max > dedupe_seq ? max - dedupe_seq : 0);
+		pdedupe_begin(total, passes);
 	}
 
-	for (unsigned int i = first_seq; i < max; i++) {
+	for (unsigned int i = first_seq; i < max; i += stride) {
+		unsigned int hi = i + stride < max ? i + stride : max;
+
 		if (options.run_dedupe)
-			pdedupe_set_batch(i - first_seq + 1);
+			pdedupe_set_batch(++pass);
 
 		/* Drop all filerecs from the previous iteration. Needed filerecs will be
 		 * recreated by __process_duplicates()
 		 */
 		free_all_filerecs();
-		__process_duplicates(db, i);
+		__process_duplicates(db, i, hi);
 
 		if (options.run_dedupe) {
 			/*
 			 * Bump dedupe_seq, this effectively marks the files
 			 * in our hashfile as having been through dedupe.
 			 */
-			dedupe_seq++;
+			dedupe_seq = hi;
 			dbfile_cfg.dedupe_seq = dedupe_seq;
 			dbfile_cfg.blocksize = blocksize;
 			dbfile_sync_config(db, &dbfile_cfg);
