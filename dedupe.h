@@ -51,6 +51,13 @@ struct dedupe_ctxt {
 	struct list_head	in_progress;
 	struct list_head	completed;
 
+	/*
+	 * Optional live progress counter: when set, dedupe_extents() adds the
+	 * bytes deduped after every ioctl round, so a status display can show
+	 * movement inside large requests instead of one jump at the end.
+	 */
+	uint64_t		*progress;
+
 	struct file_dedupe_range *same;
 };
 

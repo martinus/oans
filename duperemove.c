@@ -552,6 +552,7 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 	init_hash_tree(&dups_tree);
 
 	vprintf("Loading identical files...\n");
+	pdedupe_set_activity("loading identical files");
 	ret = dbfile_load_same_files(db, &res, seq + 1);
 	if (ret)
 		goto out;
@@ -568,6 +569,7 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq)
 		init_results_tree(&res);
 
 		vprintf("Loading duplicated hashes...\n");
+		pdedupe_set_activity("loading duplicate extents");
 
 		ret = dbfile_load_extent_hashes(db, &res, seq + 1);
 		if (ret)
@@ -598,6 +600,7 @@ out:
 static void process_duplicates(struct dbhandle *db)
 {
 	unsigned int max = get_max_dedupe_seq(db);
+	unsigned int first_seq = dedupe_seq;	/* bumped inside the loop */
 
 	/*
 	 * Ensure the find-dupes indexes exist. Normally built at the end of the
@@ -612,8 +615,9 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
-	/* One status line + one summary spanning every pass below. Estimate the
-	 * total dup-group count first so the progress bar and ETA have a scale. */
+	/* One status area + one summary spanning every batch below. Estimate
+	 * the total dup-group count first so the progress and ETA have a
+	 * scale. */
 	if (options.run_dedupe) {
 		unsigned long long total;
 
@@ -622,10 +626,13 @@ static void process_duplicates(struct dbhandle *db)
 			fflush(stdout);
 		}
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
-		dedupe_begin(total);
+		pdedupe_begin(total, max > dedupe_seq ? max - dedupe_seq : 0);
 	}
 
-	for (unsigned int i = dedupe_seq; i < max; i++) {
+	for (unsigned int i = first_seq; i < max; i++) {
+		if (options.run_dedupe)
+			pdedupe_set_batch(i - first_seq + 1);
+
 		/* Drop all filerecs from the previous iteration. Needed filerecs will be
 		 * recreated by __process_duplicates()
 		 */

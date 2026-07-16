@@ -51,11 +51,6 @@ static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
 static bool whole_file_dedup;
 
-/* Cross-pass dedupe stats, accumulated across every dedupe_results() call. */
-static volatile unsigned long long dedupe_groups_done;
-static uint64_t dedupe_total_bytes;
-static uint64_t dedupe_total_kern;
-
 void print_dupes_table(struct results_tree *res, bool whole_file)
 {
 	struct rb_root *root = &res->root;
@@ -306,8 +301,10 @@ static void pick_least_fragmented_target(struct dupe_extents *dext)
 }
 
 #define	DEDUPE_EXTENTS_CLEANED	(-1)
-static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
-			      uint64_t *kern_bytes, unsigned long long passno)
+static int dedupe_extent_list(struct dupe_extents *dext,
+			      struct pscan_thread *slot,
+			      uint64_t *fiemap_bytes, uint64_t *kern_bytes,
+			      unsigned long long passno)
 {
 	int ret = 0;
 	int last = 0;
@@ -359,6 +356,14 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 	 */
 	if (whole_file_dedup)
 		pick_least_fragmented_target(dext);
+
+	/* clean_deduped/target selection may have changed the group; show the
+	 * real target and remaining work on this thread's status line. */
+	strncpy(slot->file_path,
+		list_first_entry(&dext->de_extents, struct extent,
+				 e_list)->e_file->filename, PATH_MAX);
+	slot->file_total_bytes = len * (dext->de_num_dupes - 1);
+	slot->file_scanned_bytes = 0;
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		if (list_is_last(&extent->e_list, &dext->de_extents))
@@ -422,6 +427,8 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 				ret = ENOMEM;
 				goto out;
 			}
+			/* Tick the status line as ioctl rounds complete. */
+			ctxt->progress = &slot->file_scanned_bytes;
 
 			/*
 			 * If we just picked the target, it got added
@@ -526,13 +533,8 @@ out:
 	return ret;
 }
 
-static GMutex dedupe_counts_mutex;
-struct dedupe_counts {
-	uint64_t	kern_bytes;
-	uint64_t	fiemap_bytes;
-};
-
 static int extent_dedupe_worker(struct dupe_extents *dext,
+				struct pscan_thread *slot,
 				uint64_t *fiemap_bytes, uint64_t *kern_bytes)
 {
 	int ret;
@@ -541,7 +543,7 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	struct extent *extent;
 	struct dbhandle *db = dbfile_get_handle();
 
-	ret = dedupe_extent_list(dext, fiemap_bytes, kern_bytes, passno);
+	ret = dedupe_extent_list(dext, slot, fiemap_bytes, kern_bytes, passno);
 	if (ret) {
 		if (ret == DEDUPE_EXTENTS_CLEANED)
 			return 0;
@@ -549,7 +551,9 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 		return ret;
 	}
 
+	slot->status = thread_waiting_lock;
 	dbfile_lock();
+	slot->status = thread_committing;
 	/*
 	 * Wrap all of this group's hashfile updates in a single transaction.
 	 * Otherwise every dbfile_update_extent_poff()/remove is its own implicit
@@ -587,18 +591,29 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	return 0;
 }
 
-static void dedupe_worker(void *priv, struct dedupe_counts *counts)
+static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 {
 	uint64_t fiemap_bytes = 0ULL;
 	uint64_t kern_bytes = 0ULL;
+	struct dupe_extents *dext = priv;
+	_cleanup_(pscan_reset_thread) struct pscan_thread *slot =
+						pdedupe_claim_slot(gettid());
 
-	extent_dedupe_worker(priv, &fiemap_bytes, &kern_bytes);
+	/*
+	 * Seed the display line from the group before any work: first member
+	 * as the (provisional) target path, and the data the kernel has to
+	 * byte-verify - group length times the number of copies to dedupe -
+	 * as the work total.
+	 */
+	strncpy(slot->file_path,
+		list_first_entry(&dext->de_extents, struct extent,
+				 e_list)->e_file->filename, PATH_MAX);
+	slot->file_total_bytes = dext->de_len * (dext->de_num_dupes - 1);
+	slot->file_scanned_bytes = 0;
 
-	g_mutex_lock(&dedupe_counts_mutex);
-	counts->fiemap_bytes += fiemap_bytes;
-	counts->kern_bytes += kern_bytes;
-	dedupe_groups_done++;		/* for the live status line */
-	g_mutex_unlock(&dedupe_counts_mutex);
+	extent_dedupe_worker(dext, slot, &fiemap_bytes, &kern_bytes);
+
+	pdedupe_group_done(fiemap_bytes, kern_bytes);
 }
 
 static GThreadPool *dedupe_pool = NULL;
@@ -637,115 +652,36 @@ static int push_extents(struct results_tree *res)
 			g_error_free(err);
 			return 1;
 		}
+		pdedupe_add_queued(1);
 	}
 	return 0;
 }
 
 /*
- * Cross-pass dedupe stats and a single, stable, in-place status line.
- *
- * duperemove runs the dedupe in a loop (per dedupe_seq batch, whole-file then
- * extent pass), so dedupe_results() is called many times. To keep the output
- * from scrolling, we accumulate the totals in these globals across every call
- * and draw one status line that updates in place; dedupe_end() prints a single
- * final summary. Nothing here is per-pass.
+ * Close the dedupe phase (the live status is started by pdedupe_begin() and
+ * fed from the workers; see progress.c) and print one aggregated summary
+ * spanning every dedupe_results() call.
  */
-static GThread *dedupe_status_thread_h;
-static volatile int dedupe_status_running;
-static unsigned long long dedupe_total_groups;	/* estimate, for the bar/ETA */
-
-static void draw_dedupe_status(void)
-{
-	const int width = 22;
-	unsigned long long done = dedupe_groups_done;
-	unsigned long long total = dedupe_total_groups;
-	double elapsed = elapsed_seconds();
-
-	printf("\r\33[K  %sDeduplicating%s  ", col_bold, col_reset);
-
-	/*
-	 * A determinate bar + ETA is only shown while the running count is below
-	 * the estimated total. duperemove revisits groups once per dedupe_seq
-	 * batch (already-deduped ones are quick skips but still counted), so on a
-	 * repeatedly-deduped hashfile the count can exceed the distinct-group
-	 * estimate. Rather than pin a misleading "100%" while work continues, we
-	 * fall back to an honest live count with no percentage or ETA.
-	 */
-	if (total && done < total) {
-		int pos = (int)((double)done / total * width);
-		int i;
-
-		printf("%s", col_cyan);
-		for (i = 0; i < width; i++)
-			putchar(i < pos ? '#' : (i == pos ? '>' : '-'));
-		printf("%s %llu/%llu (%d%%) · %s%s%s · %s", col_reset, done, total,
-		       (int)(100.0 * done / total), col_green,
-		       human_size(dedupe_total_bytes), col_reset,
-		       human_duration(elapsed));
-		if (done > 0) {
-			double rate = done / (elapsed > 0 ? elapsed : 1);
-			printf(" · ETA ~%s", human_duration((total - done) / rate));
-		}
-	} else {
-		printf("%s%llu%s groups · %s%s%s reclaimed · %s", col_cyan, done,
-		       col_reset, col_green, human_size(dedupe_total_bytes),
-		       col_reset, human_duration(elapsed));
-	}
-	fflush(stdout);
-}
-
-static void *dedupe_status_thread(void *arg [[maybe_unused]])
-{
-	do {
-		draw_dedupe_status();
-		usleep(200000);
-	} while (dedupe_status_running);
-	printf("\r\33[K");	/* erase the status line; dedupe_end() summarizes */
-	fflush(stdout);
-	return NULL;
-}
-
-/*
- * Begin the dedupe phase: reset totals and start the in-place status line.
- * total_groups is an estimate used for the progress bar and ETA (0 = unknown,
- * in which case the status shows an indeterminate group count).
- */
-void dedupe_begin(unsigned long long total_groups)
-{
-	dedupe_groups_done = 0;
-	dedupe_total_bytes = 0;
-	dedupe_total_kern = 0;
-	dedupe_total_groups = total_groups;
-
-	if (!quiet && !verbose && isatty(STDOUT_FILENO)) {
-		dedupe_status_running = 1;
-		dedupe_status_thread_h = g_thread_new("dedupe_status",
-						      dedupe_status_thread, NULL);
-	}
-}
-
-/* End the dedupe phase: stop the status line and print one final summary. */
 void dedupe_end(void)
 {
-	if (dedupe_status_thread_h) {
-		dedupe_status_running = 0;
-		g_thread_join(dedupe_status_thread_h);
-		dedupe_status_thread_h = NULL;
-	}
+	uint64_t groups, reclaimed, kern;
+
+	pdedupe_end();
+	pdedupe_counters(&groups, &reclaimed, &kern);
 
 	/* Human summary: skipped by -q. */
 	if (!quiet) {
-		if (dedupe_groups_done == 0) {
+		if (groups == 0) {
 			printf("%sNothing to deduplicate.%s\n", col_dim, col_reset);
 		} else {
 			printf("%s%sSummary%s\n", col_bold, col_blue, col_reset);
-			printf("  %sDeduplicated%s   %s%s%s across %llu group%s\n",
+			printf("  %sDeduplicated%s   %s%s%s across %lu group%s\n",
 			       col_dim, col_reset, col_green,
-			       human_size(dedupe_total_bytes), col_reset,
-			       dedupe_groups_done, dedupe_groups_done == 1 ? "" : "s");
-			if (dedupe_total_kern)
+			       human_size(reclaimed), col_reset,
+			       groups, groups == 1 ? "" : "s");
+			if (kern)
 				printf("  %sKernel scanned%s %s\n", col_dim,
-				       col_reset, human_size(dedupe_total_kern));
+				       col_reset, human_size(kern));
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
@@ -758,13 +694,12 @@ void dedupe_end(void)
 	 */
 	if (!isatty(STDOUT_FILENO) || quiet)
 		printf("Comparison of extent info shows a net change in "
-		       "shared extents of: %s\n", pretty_size(dedupe_total_bytes));
+		       "shared extents of: %s\n", pretty_size(reclaimed));
 }
 
 void dedupe_results(struct results_tree *res, bool whole_file)
 {
 	int ret;
-	struct dedupe_counts counts = { 0ULL, };
 	GError *err = NULL;
 
 	/*
@@ -785,7 +720,10 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
 
-	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, &counts,
+	pdedupe_set_activity(whole_file ? "deduplicating identical files"
+					: "deduplicating duplicate extents");
+
+	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, NULL,
 					options.io_threads, TRUE, &err);
 	if (err) {
 		eprintf("Unable to create dedupe thread pool: %s\n",
@@ -804,10 +742,6 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 	}
 
 	g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for all work */
-
-	/* Roll this pass's totals into the cross-pass accumulators. */
-	dedupe_total_bytes += counts.fiemap_bytes;
-	dedupe_total_kern += counts.kern_bytes;
 }
 
 int fdupes_dedupe(void)

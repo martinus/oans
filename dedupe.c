@@ -235,12 +235,23 @@ static void add_dedupe_request(struct dedupe_ctxt *ctxt,
 		(unsigned long long)req->req_loff, same->dest_count);
 }
 
+/*
+ * Cap on the length a single ioctl round requests. Modern kernels dedupe the
+ * whole requested length in one call, which would make a large group a single
+ * opaque multi-second syscall; short rounds keep the requeue loop (and with it
+ * the live status and cancellation points) turning over. The per-round setup
+ * cost is trivial next to the kernel's byte-compare of the data itself.
+ */
+#define DEDUPE_ROUND_LEN	(32ULL * 1024 * 1024)
+
 static void set_aligned_same_length(struct dedupe_ctxt *ctxt,
 				    struct file_dedupe_range *same)
 {
 	same->src_length = ctxt->len;
-	if (fs_blocksize != 0 && ctxt->len > fs_blocksize)
-		same->src_length = ctxt->len & ~(fs_blocksize - 1);
+	if (same->src_length > DEDUPE_ROUND_LEN)
+		same->src_length = DEDUPE_ROUND_LEN;
+	if (fs_blocksize != 0 && same->src_length > fs_blocksize)
+		same->src_length &= ~((uint64_t)fs_blocksize - 1);
 }
 
 static void populate_dedupe_request(struct dedupe_ctxt *ctxt,
@@ -390,6 +401,14 @@ retry:
 		}
 
 		process_dedupes(ctxt, ctxt->same);
+
+		if (ctxt->progress) {
+			uint64_t round = 0;
+
+			for (unsigned int i = 0; i < ctxt->same->dest_count; i++)
+				round += ctxt->same->info[i].bytes_deduped;
+			*ctxt->progress += round;
+		}
 	}
 
 	return ret;
