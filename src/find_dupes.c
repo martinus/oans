@@ -365,7 +365,7 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 
 	qprintf("Using %u threads to search within extents for "
 		"additional dedupe. This process will take some time, during "
-		"which Duperemove can safely be ctrl-c'd.\n", options.cpu_threads);
+		"which oans can safely be ctrl-c'd.\n", options.cpu_threads);
 
 	psearch_run(num_filerec);
 

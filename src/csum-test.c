@@ -1,7 +1,7 @@
 /*
  * csum-test.c
  *
- * Test the checksumming code of duperemove. You can compare the
+ * Test the checksumming code of oans. You can compare the
  * output of this software with that of 'sha256sum'
  *
  * Copyright (C) 2014 SUSE.  All rights reserved.

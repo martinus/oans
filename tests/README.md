@@ -1,4 +1,4 @@
-# duperemove tests
+# oans tests
 
 Two layers:
 
@@ -6,7 +6,7 @@ Two layers:
   pure functions (`get_extent`, block length, the scan's seen-inode set, …).
 - **Integration tests** — `integration/`, run by `make integration`. Python
   stdlib `unittest` (no third-party dependencies). They drive the built
-  `duperemove` binary against a scratch directory tree and assert on the
+  `oans` binary against a scratch directory tree and assert on the
   resulting hashfile (a SQLite database, read with the stdlib `sqlite3` module)
   and on actual on-disk extent sharing (read with the `FIEMAP` ioctl). This
   covers behavior the unit tests can't reach: the scan/dedupe pipeline,
@@ -20,7 +20,7 @@ Run both with `make check`.
 ## Running
 
 ```sh
-make integration                         # build duperemove and run the suite
+make integration                         # build oans and run the suite
 python3 tests/run.py                      # run directly (binary must be built)
 python3 tests/run.py hardlink dedupe      # only tests whose id matches a pattern
 python3 -m unittest discover -s tests/integration -v   # plain unittest, no banner
@@ -28,7 +28,7 @@ python3 -m unittest discover -s tests/integration -v   # plain unittest, no bann
 
 Environment:
 
-- `DUPEREMOVE=/path/to/duperemove` — test a specific binary (defaults to the one
+- `DUPEREMOVE=/path/to/oans` — test a specific binary (defaults to the one
   in the repo root). Handy for A/B-ing against another build.
 - `DUPEREMOVE_TEST_DIR=/mnt/scratch` — where scratch trees are created. **Dedupe
   tests need this to be on a reflink-capable filesystem** (btrfs or xfs); they
@@ -70,9 +70,9 @@ Key helpers on `DuperemoveTest` (see `harness.py` for the full set):
 
 | Helper | Purpose |
 |---|---|
-| `scan(path, *extra)` / `dedupe(path, *extra)` | run duperemove readonly / with `-d` into `self.hf` |
+| `scan(path, *extra)` / `dedupe(path, *extra)` | run oans readonly / with `-d` into `self.hf` |
 | `dm(*args)` | run with arbitrary args; output in `self.out`, code in `self.rc` |
-| `assertDmOk()` | fail if the run printed any error signature (exit code alone is unreliable — duperemove can exit 0 after per-file failures) |
+| `assertDmOk()` | fail if the run printed any error signature (exit code alone is unreliable — oans can exit 0 after per-file failures) |
 | `hf_count(table)` / `hf_query(sql)` / `hf_scalar(sql)` | query the hashfile via stdlib `sqlite3` |
 | `files_fingerprint()` / `extents_fingerprint()` | stable digest of a table, for equivalence checks |
 | `assertShared(a, b)` / `assertNotShared(a, b)` | do two files share physical extents? (via `FIEMAP`) |

@@ -23,23 +23,27 @@ CC ?= gcc
 CFLAGS ?= -Wall -ggdb -std=gnu11 -Werror=strict-prototypes -MMD
 PKG_CONFIG ?= pkg-config
 
-MANPAGES=duperemove.8 btrfs-extent-same.8 hashstats.8 show-shared-extents.8
-ZSH_COMPLETION=completion/zsh/_duperemove
+MANPAGES=docs/man/oans.8 docs/man/btrfs-extent-same.8 docs/man/hashstats.8 \
+	docs/man/show-shared-extents.8
+ZSH_COMPLETION=completion/zsh/_oans
 
-# tests.c is ulgy: it includes lots of c files, to get access to inlined code
-CFILES = $(filter-out tests.c,$(sort $(wildcard *.c)))
+# All C sources live under src/. tests.c is ugly: it includes lots of c files,
+# to get access to inlined code, so it is built separately (see the test rule).
+CFILES = $(filter-out src/tests.c,$(sort $(wildcard src/*.c)))
 DEPENDS := $(CFILES:.c=.d)
 OBJECTS := $(CFILES:.c=.o)
-install_progs = duperemove hashstats btrfs-extent-same
+# Main program is 'oans' (compat 'duperemove' symlink added on install).
+install_progs = oans hashstats btrfs-extent-same
 # Shipped helper scripts (not build targets) that also belong in $(BINDIR).
 install_scripts = show-shared-extents
 progs = $(install_progs) csum-test
-PROGS_OBJECTS := $(addsuffix .o,$(basename $(progs)))
+# The object holding each prog's main() lives at src/<prog>.o.
+PROGS_OBJECTS := $(addprefix src/,$(addsuffix .o,$(progs)))
 SHARED_OBJECTS := $(filter-out $(PROGS_OBJECTS),$(OBJECTS))
 
-DIST_SOURCES:=$(CFILES) $(sort $(wildcard *.h)) LICENSE Makefile \
-	rbtree.txt README.md $(MANPAGES) SubmittingPatches docs/duperemove.html
-DIST=duperemove-$(VERSION)
+DIST_SOURCES:=$(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
+	rbtree.txt README.md $(MANPAGES) SubmittingPatches docs/oans.html
+DIST=oans-$(VERSION)
 DIST_TARBALL=$(VERSION).tar.gz
 TEMP_INSTALL_DIR:=$(shell mktemp -du -p .)
 
@@ -75,17 +79,17 @@ all: $(progs)
 debug:
 	@echo "Deprecated, use \"make DEBUG=1\" instead please."
 
-$(MANPAGES): %.8: markdown/%.md
-	pandoc --standalone markdown/$(subst .8,,$@).md --to man -o $(subst .8,,$@).8
-	pandoc --standalone markdown/$(subst .8,,$@).md --to html -o docs/$(subst .8,,$@).html
+$(MANPAGES): docs/man/%.8: docs/man/%.md
+	pandoc --standalone $< --to man -o $@
+	pandoc --standalone $< --to html -o docs/$*.html
 
 -include $(DEPENDS)
 $(progs): $(OBJECTS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(SHARED_OBJECTS) $@.o -o $@ $(LIBRARY_FLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(SHARED_OBJECTS) src/$@.o -o $@ $(LIBRARY_FLAGS)
 
 .PHONY: test
 test:
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests.c -o $@ $(LIBRARY_FLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o $@ $(LIBRARY_FLAGS)
 	./test
 
 # End-to-end tests: drive the built binary against a scratch tree and assert on
@@ -93,8 +97,8 @@ test:
 # Needs a reflink-capable scratch fs for the dedupe cases (override with
 # DUPEREMOVE_TEST_DIR=/path on e.g. btrfs/xfs).
 .PHONY: integration
-integration: duperemove
-	DUPEREMOVE=./duperemove python3 tests/run.py
+integration: oans
+	DUPEREMOVE=./oans python3 tests/run.py
 
 # Everything: unit tests plus the integration suite.
 .PHONY: check
@@ -105,21 +109,26 @@ install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	for prog in $(install_progs) $(install_scripts); do \
 		install -m 0755 $$prog $(DESTDIR)$(BINDIR); \
 	done
+	# Backward-compatible 'duperemove' name pointing at 'oans'.
+	ln -sf oans $(DESTDIR)$(BINDIR)/duperemove
 	mkdir -p -m 0755 $(DESTDIR)$(MANDIR)/man8
 	for man in $(MANPAGES); do \
 		install -m 0644 $$man $(DESTDIR)$(MANDIR)/man8; \
 	done
+	ln -sf oans.8 $(DESTDIR)$(MANDIR)/man8/duperemove.8
 	mkdir -p -m 0755 $(DESTDIR)$(SHAREDIR)/zsh/site-functions
 	for completion in $(ZSH_COMPLETION); do \
 		install -m 0644 $$completion $(DESTDIR)$(SHAREDIR)/zsh/site-functions; \
 	done
 
 uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/duperemove
 	for prog in $(install_progs) $(install_scripts); do \
 		rm -f $(DESTDIR)$(BINDIR)/$$prog; \
 	done
+	rm -f $(DESTDIR)$(MANDIR)/man8/duperemove.8
 	for man in $(MANPAGES); do \
-		rm -f $(DESTDIR)$(MANDIR)/man8/$$man; \
+		rm -f $(DESTDIR)$(MANDIR)/man8/$${man##*/}; \
 	done
 	for completion in $(ZSH_COMPLETION); do \
 		rm -f $(DESTDIR)$(SHAREDIR)/zsh/site-functions/$${completion##*/}; \

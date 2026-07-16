@@ -817,7 +817,7 @@ void dedupe_end(void)
 	/*
 	 * Stable, exact machine-readable line for scripts. Printed whenever the
 	 * output is not an interactive summary - i.e. piped/redirected, or under
-	 * -q (scripts commonly do `duperemove -qd ... | grep 'net change'`).
+	 * -q (scripts commonly do `oans -qd ... | grep 'net change'`).
 	 */
 	if (!isatty(STDOUT_FILENO) || quiet)
 		printf("Comparison of extent info shows a net change in "

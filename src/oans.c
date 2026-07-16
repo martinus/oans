@@ -1,5 +1,5 @@
 /*
- * duperemove.c
+ * oans.c
  *
  * Copyright (C) 2013 SUSE.  All rights reserved.
  *
@@ -140,7 +140,7 @@ static void print_version(void)
 #ifdef	DEBUG_BUILD
 	s = " (debug build)";
 #endif
-	printf("duperemove %s%s\n", VERSTRING, s ? s : "");
+	printf("oans %s%s\n", VERSTRING, s ? s : "");
 }
 
 /* adapted from ocfs2-tools */
@@ -293,7 +293,7 @@ static int scan_files_from_cmdline(int numfiles, char **files, struct dbhandle *
 
 static void help(void)
 {
-	execlp("man", "man", "8", "duperemove", NULL);
+	execlp("man", "man", "8", "oans", NULL);
 }
 
 /*

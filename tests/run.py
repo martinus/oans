@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the duperemove integration tests.
+"""Run the oans integration tests.
 
 Thin wrapper over unittest that prints a short banner (which binary, where the
 scratch lives, whether reflink works) and lets you filter tests by substring.
@@ -37,7 +37,7 @@ def main(argv):
                              capture_output=True, text=True).stdout.strip()
     fstype = subprocess.run(["stat", "-f", "-c", "%T", harness.TEST_ROOT],
                             capture_output=True, text=True).stdout.strip()
-    print("duperemove integration tests")
+    print("oans integration tests")
     print(f"  binary : {harness.DUPEREMOVE} ({version})")
     print(f"  scratch: {harness.TEST_ROOT} ({fstype})")
     print(f"  reflink: {'yes' if harness.REFLINK else 'no (dedupe tests will skip)'}")

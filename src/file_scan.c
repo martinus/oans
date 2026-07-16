@@ -1707,7 +1707,7 @@ int add_exclude_pattern(const char *pattern)
  * and the resulting constraint failure aborts the whole batch, silently losing
  * every file in it.
  *
- * duperemove keeps exactly one filerec per inode anyway (UNIQUE(ino, subvol)),
+ * oans keeps exactly one filerec per inode anyway (UNIQUE(ino, subvol)),
  * so track the inodes written this scan and skip any further hardlink to one we
  * have already handled. Touched only from the single __scan_file() consumer
  * (not the walker threads), so it needs no locking.
