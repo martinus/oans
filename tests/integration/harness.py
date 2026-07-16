@@ -167,13 +167,16 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- running duperemove ------------------------------------------------
 
-    def dm(self, *args, hashfile=True):
-        """Run duperemove; capture combined output in self.out and code in self.rc."""
+    def dm(self, *args, hashfile=True, stdin=None):
+        """Run duperemove; capture combined output in self.out and code in self.rc.
+
+        Pass stdin=<str> to feed the process on standard input (e.g. --fdupes).
+        """
         cmd = [DUPEREMOVE, "-q", "--io-threads=4"]
         if hashfile:
             cmd += ["--hashfile", self.hf]
         cmd += list(args)
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+        proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
         self.out = proc.stdout
         self.rc = proc.returncode
