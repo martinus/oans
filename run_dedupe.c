@@ -669,34 +669,59 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 
 static GThreadPool *dedupe_pool = NULL;
 
+/*
+ * The kernel byte-verifies group length times (copies - 1), so that product
+ * is the work a group costs. Largest first (longest-processing-time
+ * scheduling): a giant group started early runs concurrently with everything
+ * else, instead of alone at the tail of the pass while the other workers
+ * sit idle.
+ */
+static int cmp_dext_work(const void *pa, const void *pb)
+{
+	const struct dupe_extents *a = *(const struct dupe_extents **)pa;
+	const struct dupe_extents *b = *(const struct dupe_extents **)pb;
+	uint64_t wa = a->de_len * (a->de_num_dupes - 1);
+	uint64_t wb = b->de_len * (b->de_num_dupes - 1);
+
+	return wa > wb ? -1 : wa < wb ? 1 : 0;
+}
+
 /* Errors from this function are fatal. */
 static int push_extents(struct results_tree *res)
 {
-	struct rb_root *root = &res->root;
-	struct rb_node *node = rb_first(root);
+	struct rb_node *node;
 	struct dupe_extents *dext;
+	_cleanup_(freep) struct dupe_extents **sorted = NULL;
+	unsigned int nr = 0, i;
 	GError *err = NULL;
 
-	while (node) {
-		dext = rb_entry(node, struct dupe_extents, de_node);
+	/*
+	 * Nothing is pushed until the array is complete, so no worker owns any
+	 * group yet and the tree is stable while we collect and sort.
+	 */
+	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
+	if (!sorted) {
+		eprintf("Out of memory while sorting dupe groups.\n");
+		return 1;
+	}
 
-		/*
-		 * dext may be free'd by the dedupe threads, so get
-		 * the next node now. In addition we want to lock
-		 * around the rbtree code here so rb_erase doesn't
-		 * change the tree underneath us.
-		 */
-		g_mutex_lock(&mutex);
-		node = rb_next(node);
-		g_mutex_unlock(&mutex);
+	for (node = rb_first(&res->root); node; node = rb_next(node)) {
+		dext = rb_entry(node, struct dupe_extents, de_node);
 
 		if (dext->de_num_dupes < 2) {
 			qprintf("Skipping extent - insufficient duplicates (%u)\n",
 				   dext->de_num_dupes);
 			continue;
 		}
+		if (nr >= res->num_dupes)	/* should not happen */
+			break;
+		sorted[nr++] = dext;
+	}
 
-		g_thread_pool_push(dedupe_pool, dext, &err);
+	qsort(sorted, nr, sizeof(*sorted), cmp_dext_work);
+
+	for (i = 0; i < nr; i++) {
+		g_thread_pool_push(dedupe_pool, sorted[i], &err);
 		if (err) {
 			eprintf("Fatal error while deduping: %s\n",
 				err->message);

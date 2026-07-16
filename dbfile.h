@@ -110,11 +110,15 @@ struct hash_tree;
 /*
  * Load hashes into hash_tree only if they have a duplicate in the db.
  * The extent search is later run on the resulting hash_tree.
+ *
+ * All three loaders process one dedupe pass: the groups with at least one
+ * member whose generation is in (seq_lo, seq_hi], plus their partners from
+ * any generation <= seq_hi.
  */
 int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
-			     unsigned int seq);
+			     unsigned int seq_lo, unsigned int seq_hi);
 int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
-			      unsigned int seq);
+			      unsigned int seq_lo, unsigned int seq_hi);
 
 struct file_extent {
 	uint64_t	poff;
@@ -164,7 +168,7 @@ void dbfile_list_files(struct dbhandle *db, int (*callback)(void*, int, char**, 
 int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 				struct file *dbfile);
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
-			   unsigned int seq);
+			   unsigned int seq_lo, unsigned int seq_hi);
 
 int dbfile_rename_file(struct dbhandle *db, int64_t fileid, char *path);
 

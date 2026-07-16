@@ -530,13 +530,13 @@ struct dbhandle *dbfile_open_handle(char *filename)
 #define GET_DUPLICATE_BLOCKS						\
 "select blocks.digest, fileid, loff from blocks "			\
 "join files on fileid = id "						\
-"where dedupe_seq <= ?1 and blocks.digest in ( "			\
+"where dedupe_seq <= ?2 and blocks.digest in ( "			\
 "	select blocks.digest from blocks "				\
 "	join files on fileid = id "					\
-"	where dedupe_seq <= ?1 and blocks.digest in ( "			\
+"	where dedupe_seq <= ?2 and blocks.digest in ( "			\
 "		select blocks.digest from blocks "			\
 "		join files on fileid = id "				\
-"		where dedupe_seq = ?1) "				\
+"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
 "	group by blocks.digest having count(*) > 1);"
 	dbfile_prepare_stmt(get_duplicate_blocks, GET_DUPLICATE_BLOCKS);
 
@@ -550,28 +550,31 @@ struct dbhandle *dbfile_open_handle(char *filename)
 #define GET_DUPLICATE_EXTENTS						\
 "select extents.digest, fileid, loff, len, poff from extents "		\
 "join files on fileid = id "						\
-"where dedupe_seq <= ?1 and (extents.digest, len) in ( "		\
+"where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
 "	select extents.digest, len from extents "			\
 "	join files on fileid = id "					\
-"	where dedupe_seq <= ?1 and (extents.digest, len) in ( "		\
+"	where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
 "		select extents.digest, len from extents "		\
 "		join files on fileid = id "				\
-"		where dedupe_seq = ?1) "				\
+"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
 "	group by extents.digest, len having count(*) > 1);"
 	dbfile_prepare_stmt(get_duplicate_extents, GET_DUPLICATE_EXTENTS);
 
 /*
  * Select duplicates, excluding future files.
- * Then, only keep duplicates if at least one entry lives is related
- * to the current batch.
+ * Then, only keep duplicates if at least one entry is related to the
+ * current pass: the (?1, ?2] range of dedupe generations. Loading many
+ * generations per pass keeps the dedupe thread pool full instead of
+ * draining it at every 1024-file scan batch.
  */
 #define GET_DUPLICATE_FILES							\
 "select id, size, digest, filename from files "					\
-"where dedupe_seq <= ?1 and not (flags & 1) and (digest, size) in ( "		\
+"where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "		\
 "	select digest, size from files "					\
-"	where dedupe_seq <= ?1 and not (flags & 1) and (digest, size) in ( "	\
+"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
 "		select digest, size from files "				\
-"		where dedupe_seq = ?1 and not (flags & 1)) "			\
+"		where dedupe_seq > ?1 and dedupe_seq <= ?2 "			\
+"		and not (flags & 1)) "						\
 "	group by digest, size having count(*) > 1);"
 	dbfile_prepare_stmt(get_duplicate_files, GET_DUPLICATE_FILES);
 
@@ -1309,7 +1312,7 @@ static int find_or_load_filerec(struct dbhandle *db, int64_t fileid,
 }
 
 int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
-			     unsigned int seq)
+			     unsigned int seq_lo, unsigned int seq_hi)
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_duplicate_blocks;
@@ -1318,7 +1321,9 @@ int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 	unsigned char *digest;
 	struct filerec *file;
 
-	ret = sqlite3_bind_int64(stmt, 1, seq);
+	ret = sqlite3_bind_int64(stmt, 1, seq_lo);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 2, seq_hi);
 	if (ret) {
 		perror_sqlite(ret, "binding value");
 		return ret;
@@ -1348,7 +1353,7 @@ int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 }
 
 int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
-			      unsigned int seq)
+			      unsigned int seq_lo, unsigned int seq_hi)
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_duplicate_extents;
@@ -1357,7 +1362,9 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 	unsigned char *digest;
 	struct filerec *file;
 
-	ret = sqlite3_bind_int64(stmt, 1, seq);
+	ret = sqlite3_bind_int64(stmt, 1, seq_lo);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 2, seq_hi);
 	if (ret) {
 		perror_sqlite(ret, "binding value");
 		return ret;
@@ -1597,7 +1604,7 @@ out:
 }
 
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
-			   unsigned int seq)
+			   unsigned int seq_lo, unsigned int seq_hi)
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_duplicate_files;
@@ -1607,7 +1614,9 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 	struct filerec *file;
 	const unsigned char *filename;
 
-	ret = sqlite3_bind_int64(stmt, 1, seq);
+	ret = sqlite3_bind_int64(stmt, 1, seq_lo);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 2, seq_hi);
 	if (ret) {
 		perror_sqlite(ret, "binding value");
 		return ret;
