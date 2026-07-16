@@ -39,6 +39,14 @@ struct dupe_extents {
 
 	struct rb_node		de_node;
 	GMutex			de_mutex;
+
+	/*
+	 * Set when this group already contains an anchor member from an earlier
+	 * dedupe pass (loaded first). The dedupe must keep that anchor as the
+	 * target so every pass converges the copies onto the same physical
+	 * extent, rather than re-picking a least-fragmented target per pass.
+	 */
+	bool			de_anchored;
 };
 
 struct extent {
@@ -72,7 +80,7 @@ int insert_result(struct results_tree *res, unsigned char *digest,
 		  uint64_t endoff[2]);
 int insert_one_result(struct results_tree *res, unsigned char *digest,
 		      struct filerec *file, uint64_t startoff, uint64_t len,
-		      uint64_t poff);
+		      uint64_t poff, bool is_anchor);
 
 void init_results_tree(struct results_tree *res);
 void free_results_tree(struct results_tree *res);

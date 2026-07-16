@@ -614,8 +614,15 @@ static void process_duplicates(struct dbhandle *db)
 {
 	unsigned int max = get_max_dedupe_seq(db);
 	unsigned int first_seq = dedupe_seq;	/* bumped inside the loop */
-	unsigned int stride = DEDUPE_FILES_PER_PASS / options.batch_size;
-	unsigned int passes, pass = 0;
+	unsigned int files_per_pass = DEDUPE_FILES_PER_PASS;
+	unsigned int stride, passes, pass = 0;
+	/* Tests force many small passes to exercise the cross-generation path. */
+	const char *env = getenv("DUPEREMOVE_FILES_PER_PASS");
+	int env_val = env ? atoi(env) : 0;
+
+	if (env_val > 0)
+		files_per_pass = (unsigned int)env_val;
+	stride = files_per_pass / options.batch_size;
 
 	if (stride < 1)
 		stride = 1;

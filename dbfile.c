@@ -527,17 +527,27 @@ struct dbhandle *dbfile_open_handle(char *filename)
 "select filename, size from files where id = ?1;"
 	dbfile_prepare_stmt(load_filerec, LOAD_FILEREC);
 
+/* Same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed on digest. */
 #define GET_DUPLICATE_BLOCKS						\
-"select blocks.digest, fileid, loff from blocks "			\
-"join files on fileid = id "						\
-"where dedupe_seq <= ?2 and blocks.digest in ( "			\
+"with grp(digest) as ( "						\
 "	select blocks.digest from blocks "				\
 "	join files on fileid = id "					\
 "	where dedupe_seq <= ?2 and blocks.digest in ( "			\
 "		select blocks.digest from blocks "			\
 "		join files on fileid = id "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
-"	group by blocks.digest having count(*) > 1);"
+"	group by blocks.digest having count(*) > 1) "			\
+"select blocks.digest, fileid, loff from blocks "			\
+"join files on fileid = id "						\
+"where blocks.digest in (select digest from grp) and ( "		\
+"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
+"	or blocks.rowid in ( "						\
+"		select min(b.rowid) from blocks b "			\
+"		join files f on b.fileid = f.id "			\
+"		where f.dedupe_seq <= ?1 "				\
+"		and b.digest in (select digest from grp) "		\
+"		group by b.digest)) "					\
+"order by (dedupe_seq > ?1), fileid;"
 	dbfile_prepare_stmt(get_duplicate_blocks, GET_DUPLICATE_BLOCKS);
 
 /*
@@ -547,17 +557,33 @@ struct dbhandle *dbfile_open_handle(char *filename)
  * results tree, which will get very angry when it has a
  * result of only one extent.
  */
+/*
+ * Same generation-pass reduction as GET_DUPLICATE_FILES: load the extents new
+ * this pass plus one already-deduped representative per group (min rowid among
+ * members from an earlier pass), rather than every member. Extent dedupe takes
+ * the first list entry as target, so ordering the representative first keeps a
+ * stable target across passes (convergence) without a per-group flag.
+ */
 #define GET_DUPLICATE_EXTENTS						\
-"select extents.digest, fileid, loff, len, poff from extents "		\
-"join files on fileid = id "						\
-"where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
+"with grp(digest, len) as ( "						\
 "	select extents.digest, len from extents "			\
 "	join files on fileid = id "					\
 "	where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
 "		select extents.digest, len from extents "		\
 "		join files on fileid = id "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
-"	group by extents.digest, len having count(*) > 1);"
+"	group by extents.digest, len having count(*) > 1) "		\
+"select extents.digest, fileid, loff, len, poff from extents "		\
+"join files on fileid = id "						\
+"where (extents.digest, len) in (select digest, len from grp) and ( "	\
+"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
+"	or extents.rowid in ( "						\
+"		select min(e.rowid) from extents e "			\
+"		join files f on e.fileid = f.id "			\
+"		where f.dedupe_seq <= ?1 "				\
+"		and (e.digest, e.len) in (select digest, len from grp) "\
+"		group by e.digest, e.len)) "				\
+"order by (dedupe_seq > ?1), fileid;"
 	dbfile_prepare_stmt(get_duplicate_extents, GET_DUPLICATE_EXTENTS);
 
 /*
@@ -567,15 +593,33 @@ struct dbhandle *dbfile_open_handle(char *filename)
  * generations per pass keeps the dedupe thread pool full instead of
  * draining it at every 1024-file scan batch.
  */
+/*
+ * A group whose copies span many scan generations was reprocessed once per
+ * pass, dragging every already-deduped copy along each time (loaded and
+ * re-fiemap-checked, only to be skipped). A pass only needs the copies new in
+ * its generation range (?1, ?2] plus ONE already-deduped copy to act as the
+ * dedupe target; the new copies converge on it, and the old copies - already
+ * mutually shared from their own pass - never need reloading. `grp` is the set
+ * of qualifying groups (a member in range, and >1 member overall).
+ */
 #define GET_DUPLICATE_FILES							\
-"select id, size, digest, filename from files "					\
-"where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "		\
-"	select digest, size from files "					\
+"with grp(digest, size) as ( "							\
+"	select digest, size from files "				\
 "	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
 "		select digest, size from files "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2 "			\
 "		and not (flags & 1)) "						\
-"	group by digest, size having count(*) > 1);"
+"	group by digest, size having count(*) > 1) "			\
+"select id, size, digest, filename, dedupe_seq from files "			\
+"where not (flags & 1) "						\
+"and (digest, size) in (select digest, size from grp) and ( "		\
+"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
+"	or id in ( "							\
+"		select min(id) from files "				\
+"		where dedupe_seq <= ?1 and not (flags & 1) "		\
+"		and (digest, size) in (select digest, size from grp) "	\
+"		group by digest, size)) "				\
+"order by (dedupe_seq > ?1), id;"
 	dbfile_prepare_stmt(get_duplicate_files, GET_DUPLICATE_FILES);
 
 #define GET_FILE_EXTENT							\
@@ -1381,7 +1425,8 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 		if (ret)
 			return ret;
 
-		ret = insert_one_result(res, digest, file, loff, len, poff);
+		ret = insert_one_result(res, digest, file, loff, len, poff,
+					false);
 		if (ret)
 			return ENOMEM;
 	}
@@ -1623,10 +1668,17 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 	}
 
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		unsigned int seq;
+		bool is_anchor;
+
 		fileid = sqlite3_column_int64(stmt, 0);
 		size = sqlite3_column_int64(stmt, 1);
 		digest = (unsigned char *)sqlite3_column_blob(stmt, 2);
 		filename = sqlite3_column_text(stmt, 3);
+		seq = sqlite3_column_int64(stmt, 4);
+		/* A member from an earlier pass (seq <= seq_lo) is the anchor:
+		 * the group must keep it as target so copies keep converging. */
+		is_anchor = seq <= seq_lo;
 
 		file = filerec_find(fileid);
 		if (!file) {
@@ -1635,7 +1687,7 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 				return ENOMEM;
 		}
 
-		ret = insert_one_result(res, digest, file, 0, size, 0);
+		ret = insert_one_result(res, digest, file, 0, size, 0, is_anchor);
 		if (ret)
 			return ENOMEM;
 	}

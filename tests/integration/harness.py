@@ -167,17 +167,21 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- running duperemove ------------------------------------------------
 
-    def dm(self, *args, hashfile=True, stdin=None):
+    def dm(self, *args, hashfile=True, stdin=None, env=None):
         """Run duperemove; capture combined output in self.out and code in self.rc.
 
-        Pass stdin=<str> to feed the process on standard input (e.g. --fdupes).
+        Pass stdin=<str> to feed the process on standard input (e.g. --fdupes),
+        or env={...} to add environment variables for this run.
         """
         cmd = [DUPEREMOVE, "-q", "--io-threads=4"]
         if hashfile:
             cmd += ["--hashfile", self.hf]
         cmd += list(args)
+        run_env = None
+        if env:
+            run_env = dict(os.environ, **env)
         proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True)
+                              stderr=subprocess.STDOUT, text=True, env=run_env)
         self.out = proc.stdout
         self.rc = proc.returncode
         return self.out
