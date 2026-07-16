@@ -378,9 +378,12 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 
 	/*
 	 * Prefer the least-fragmented copy as the dedupe target so the others
-	 * don't inherit a bad on-disk layout. Only meaningful for whole files.
+	 * don't inherit a bad on-disk layout. Only for whole files, and only
+	 * when the group has no anchor from an earlier pass - an anchored group
+	 * must keep its anchor (loaded first) as target so every pass converges
+	 * the copies onto the same physical extent.
 	 */
-	if (whole_file_dedup)
+	if (whole_file_dedup && !dext->de_anchored)
 		pick_least_fragmented_target(dext);
 
 	/* clean_deduped/target selection may have changed the group; show the

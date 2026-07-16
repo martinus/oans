@@ -89,8 +89,18 @@ onto the walker threads.**
 Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
 1024). `process_duplicates` loops `for i=dedupe_seq; i<max` over generations;
 each group is deduped exactly once regardless of batch size (verified — a
-no-change rerun nets 0). Don't "fix" cross-generation reprocessing; it isn't
-happening.
+no-change rerun nets 0).
+
+The group is never *re-deduped*, but until the cross-pass fix the loaders did
+re-load and re-fiemap-check every already-deduped member of a group each pass
+it appeared in — wasted work, not a correctness bug — and
+`pick_least_fragmented_target` picked a fresh target per pass, so a group
+spanning many passes converged to one cluster *per pass* instead of a single
+extent. The `GET_DUPLICATE_*` loaders now load only the members new in a pass
+plus one stable representative (min id/rowid) as the target, and mark that
+dext `de_anchored` to pin the target. Force many small passes with
+`DUPEREMOVE_FILES_PER_PASS` to exercise it (see `test_cross_pass.py`). Don't
+reintroduce loading all `dedupe_seq <= ?2` members.
 
 ## Correctness invariants
 
