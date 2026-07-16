@@ -4,6 +4,15 @@
 # missing tag as "not a release".
 ifndef VERSION
 VERSION := $(shell git describe --abbrev=4 --dirty --always --tags 2>/dev/null)
+# Outside a git checkout (e.g. a release tarball) git prints nothing; fall back
+# to a shipped `version` file, then a placeholder, so the build never fails and
+# still reports a version (#387). `make tarball` writes the file below.
+ifeq ($(VERSION),)
+VERSION := $(shell cat version 2>/dev/null)
+endif
+ifeq ($(VERSION),)
+VERSION := unknown
+endif
 endif
 ifndef IS_RELEASE
 LATEST_TAG := $(shell git describe --abbrev=0 --tags --exclude '*dev' 2>/dev/null)
@@ -119,6 +128,9 @@ uninstall:
 tarball: clean $(DIST_SOURCES)
 	mkdir -p $(TEMP_INSTALL_DIR)/$(DIST)
 	cp $(DIST_SOURCES) $(TEMP_INSTALL_DIR)/$(DIST)
+	# Embed the resolved version so builds from the tarball (no .git) report
+	# it instead of falling back to "unknown" (#387).
+	echo '$(VERSION)' > $(TEMP_INSTALL_DIR)/$(DIST)/version
 	tar -C $(TEMP_INSTALL_DIR) -zcf $(DIST_TARBALL) $(DIST)
 	rm -fr $(TEMP_INSTALL_DIR)
 

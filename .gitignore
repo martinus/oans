@@ -8,3 +8,4 @@ test
 *.d
 .itest-scratch/
 __pycache__/
+version
