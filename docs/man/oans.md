@@ -2,7 +2,7 @@
 title: oans
 section: 8
 header: System Manager’s Manual
-footer: oans 1.1.0
+footer: oans 1.1.1
 date: July 2026
 ---
 # NAME
