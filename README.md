@@ -56,8 +56,9 @@ compatible with upstream. The theme is **doing less redundant work** and
 - **Parallel directory walk.** The `opendir`/`readdir`/`statx` walk runs on a
   pool of walker threads (`--io-threads`), with a default cap tuned to where
   btrfs metadata contention plateaus.
-- **Smaller hashfile / less memory** via a path-hash index and directory
-  (path-tree) interning.
+- **Compact path-hash index.** Files are looked up in the hashfile by a 64-bit
+  hash of their path (`csum_path`) rather than a full-path string index, for
+  faster path lookups on large trees.
 
 #### Measured
 
