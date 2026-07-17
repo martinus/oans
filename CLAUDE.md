@@ -1,15 +1,20 @@
-# duperemove — working notes for Claude
+# oans — working notes for Claude
 
-`duperemove` finds duplicate extents and deduplicates them via the kernel
-`FIDEDUPERANGE` ioctl (atomic, byte-verified). Hashes live in a SQLite
-**hashfile** (WAL mode, `synchronous=OFF`, `cache_size=-256000`).
+`oans` (a fork of duperemove) finds duplicate extents and deduplicates them via
+the kernel `FIDEDUPERANGE` ioctl (atomic, byte-verified). Hashes live in a
+SQLite **hashfile** (WAL mode, `synchronous=OFF`, `cache_size=-256000`).
+
+All C sources live under `src/` (main program `src/oans.c`); man page sources
+under `docs/man/`. The binary is `oans`; `make install` adds a `duperemove`
+compat symlink. Some identifiers keep the old name on purpose: the
+`DUPEREMOVE*` env vars and the `DuperemoveTest` python test base class.
 
 ## Build & test
 
 ```sh
-make -j$(nproc)                         # builds duperemove + helpers
-make check                              # C unit tests (test.c) + Python integration suite
-DUPEREMOVE=./duperemove python3 tests/run.py     # integration suite only
+make -j$(nproc)                         # builds oans + helpers
+make check                              # C unit tests (src/tests.c) + Python integration suite
+DUPEREMOVE=./oans python3 tests/run.py           # integration suite only
 ```
 
 Integration tests are Python stdlib `unittest` (no extra deps); they drive the
@@ -28,7 +33,7 @@ the repo — don't commit it.
 
 Startup/scan cost has burned us before. The rules:
 
-- **`scripts/perf-profile.sh`** wraps all of this: it runs a duperemove command
+- **`scripts/perf-profile.sh`** wraps all of this: it runs an oans command
   under `perf` and prints the self/leaf view, the caller/stack view, `perf stat`,
   and a syscall summary. E.g.
   `scripts/perf-profile.sh --cold -- -dr --hashfile=/tmp/prof.db ~/git`.
