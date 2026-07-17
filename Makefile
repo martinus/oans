@@ -23,8 +23,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -ggdb -std=gnu11 -Werror=strict-prototypes -MMD
 PKG_CONFIG ?= pkg-config
 
-MANPAGES=docs/man/oans.8 docs/man/btrfs-extent-same.8 docs/man/hashstats.8 \
-	docs/man/show-shared-extents.8
+MANPAGES=docs/man/oans.8 docs/man/btrfs-extent-same.8 docs/man/hashstats.8
 ZSH_COMPLETION=completion/zsh/_oans
 
 # All C sources live under src/. tests.c is ugly: it includes lots of c files,
@@ -34,15 +33,13 @@ DEPENDS := $(CFILES:.c=.d)
 OBJECTS := $(CFILES:.c=.o)
 # Main program is 'oans' (compat 'duperemove' symlink added on install).
 install_progs = oans hashstats btrfs-extent-same
-# Shipped helper scripts (not build targets) that also belong in $(BINDIR).
-install_scripts = show-shared-extents
 progs = $(install_progs) csum-test
 # The object holding each prog's main() lives at src/<prog>.o.
 PROGS_OBJECTS := $(addprefix src/,$(addsuffix .o,$(progs)))
 SHARED_OBJECTS := $(filter-out $(PROGS_OBJECTS),$(OBJECTS))
 
 DIST_SOURCES:=$(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
-	rbtree.txt README.md $(MANPAGES) SubmittingPatches docs/oans.html
+	README.md $(MANPAGES) docs/oans.html
 DIST=oans-$(VERSION)
 DIST_TARBALL=$(VERSION).tar.gz
 TEMP_INSTALL_DIR:=$(shell mktemp -du -p .)
@@ -106,7 +103,7 @@ check: test integration
 
 install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	mkdir -p -m 0755 $(DESTDIR)$(BINDIR)
-	for prog in $(install_progs) $(install_scripts); do \
+	for prog in $(install_progs); do \
 		install -m 0755 $$prog $(DESTDIR)$(BINDIR); \
 	done
 	# Backward-compatible 'duperemove' name pointing at 'oans'.
@@ -123,7 +120,7 @@ install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/duperemove
-	for prog in $(install_progs) $(install_scripts); do \
+	for prog in $(install_progs); do \
 		rm -f $(DESTDIR)$(BINDIR)/$$prog; \
 	done
 	rm -f $(DESTDIR)$(MANDIR)/man8/duperemove.8
