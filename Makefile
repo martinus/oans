@@ -11,7 +11,8 @@ endif
 endif
 
 CC ?= gcc
-CFLAGS ?= -Wall -ggdb -std=gnu11 -Werror=strict-prototypes -MMD
+CFLAGS ?= -Wall -Wextra -Wno-unused-parameter -ggdb -std=gnu11 \
+	-Werror=strict-prototypes -MMD
 PKG_CONFIG ?= pkg-config
 
 MANPAGE    = docs/man/oans.8
@@ -27,11 +28,15 @@ EXTRA_CFLAGS = $(shell $(PKG_CONFIG) --cflags glib-2.0,sqlite3,blkid,mount,uuid,
 EXTRA_LIBS   = $(shell $(PKG_CONFIG) --libs glib-2.0,sqlite3,blkid,mount,uuid)
 
 ifdef DEBUG
+	# We link the system libsqlite3, so SQLITE_* build defines don't apply here.
 	DEBUG_FLAGS = -ggdb3 -fsanitize=address -fno-omit-frame-pointer -O0 \
-		-DDEBUG_BUILD -DSQLITE_DEBUG -DSQLITE_MEMDEBUG \
-		-DSQLITE_ENABLE_EXPLAIN_COMMENTS -fsanitize-address-use-after-scope
+		-DDEBUG_BUILD -fsanitize-address-use-after-scope
 else
-	CFLAGS += -O2
+	# Release hardening (needs optimization, hence not in the debug build).
+	# Override with HARDENING= to disable.
+	HARDENING ?= -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fstack-clash-protection
+	CFLAGS += -O2 $(HARDENING)
+	LIBRARY_FLAGS += -Wl,-z,relro -Wl,-z,now
 endif
 
 override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE \

@@ -1678,10 +1678,15 @@ int add_exclude_pattern(const char *pattern)
 	if (pattern[0] == '/') {
 		exclude->pattern = strdup(pattern);
 	} else {
-		getcwd(cwd, PATH_MAX);
+		if (!getcwd(cwd, PATH_MAX)) {
+			eprintf("Error: cannot read cwd for pattern %s\n", pattern);
+			free(exclude);
+			return 1;
+		}
 
 		if (strlen(cwd) + strlen(pattern) > PATH_MAX) {
 			eprintf("Error: cannot prepend cwd to %s\n", pattern);
+			free(exclude);
 			return 1;
 		}
 
