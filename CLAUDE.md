@@ -113,6 +113,24 @@ dext `de_anchored` to pin the target. Force many small passes with
 `DUPEREMOVE_FILES_PER_PASS` to exercise it (see `test_cross_pass.py`). Don't
 reintroduce loading all `dedupe_seq <= ?2` members.
 
+## Valgrind
+
+Run with the suppressions file, which filters the one class of library
+false-positive:
+
+```sh
+valgrind --leak-check=full --track-origins=yes \
+    --suppressions=tests/valgrind.supp ./oans -rd --hashfile=/tmp/h.db <tree>
+```
+
+The suppressed noise is GLib/glibc **thread TLS** ("possibly lost" under
+`pthread_create` -> `_dl_allocate_tls`): GLib caches idle pool threads instead
+of joining them all at exit. Not an oans leak. Everything else must be clean —
+`definitely lost` and any uninitialised-value / invalid-access errors are real.
+(One such was fixed: `__dbfile_get_config` read an unterminated UUID buffer;
+config string buffers from `get_config_text` are raw `memcpy`, so anything
+`strlen`'d must be zero-initialised.)
+
 ## Correctness invariants
 
 - Ctrl+C is safe: `FIDEDUPERANGE` is atomic and the hashfile stays WAL-consistent

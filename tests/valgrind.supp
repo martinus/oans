@@ -1,0 +1,19 @@
+# Valgrind suppressions for oans.
+#
+# These are library-level false positives, NOT leaks in oans code. Run with:
+#   valgrind --leak-check=full --suppressions=tests/valgrind.supp ./oans ...
+#
+# GLib/glibc thread TLS: every thread GLib spawns (the walker/dedupe thread
+# pools and the progress thread) allocates its stack + thread-local storage via
+# pthread_create -> _dl_allocate_tls. GLib caches idle worker threads rather
+# than joining all of them at exit, so valgrind reports that TLS as "possibly
+# lost". The oans thread pools are freed (g_thread_pool_free with wait=TRUE);
+# the residue is glibc/GLib internal thread bookkeeping we do not own.
+{
+   glib-glibc-thread-tls-possibly-lost
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:_dl_allocate_tls
+   ...
+}
