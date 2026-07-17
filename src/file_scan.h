@@ -35,6 +35,13 @@ int filescan_walk_run(struct dbhandle *db);
  */
 int64_t filescan_prune_deleted(struct dbhandle *db);
 
+/*
+ * Whole-file mode: hash the files the walk deferred whose size is shared by
+ * another (potential whole-file duplicates); unique-sized files are left
+ * unread. Call after filescan_walk_run() and before filescan_free().
+ */
+int filescan_hash_size_collisions(struct dbhandle *db);
+
 void fs_get_locked_uuid(uuid_t *uuid);
 
 /* For dbfile.c */

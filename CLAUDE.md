@@ -149,6 +149,21 @@ build is at insert density (random-key `path_hash`/digest indexes fill ~2/3), so
 it lands ~15-20% smaller than the un-vacuumed size. Normal incremental runs
 still only VACUUM once ≥25% of the file is free.
 
+## Whole-file mode: skip reading unique-sized files
+
+In `--dedupe-options=only_whole_files`, a duplicate must have the same size, so a
+file whose size is unique cannot dedupe and need not be read. `__scan_file()`
+defers hashing in this mode (stores metadata, digest stays NULL);
+`filescan_hash_size_collisions()` runs after the walk and hashes only files whose
+size is shared (`size in (select size ... group by size having count>1)`).
+Unique-sized files keep a NULL digest and are never opened. Consequences that
+must stay in sync: `dbfile_prune_unscanned_files()` is skipped in this mode (it
+deletes NULL-digest rows, which are now legitimate), and `GET_DUPLICATE_FILES`
+excludes `digest is null`. Incremental stays correct because the collision set
+is recomputed over the whole DB each run — a file skipped as unique gets hashed
+once a same-size file appears. Default extent mode is unchanged (it hashes
+everything; differently-sized files can share an extent).
+
 ## Correctness invariants
 
 - Ctrl+C is safe: `FIDEDUPERANGE` is atomic and the hashfile stays WAL-consistent

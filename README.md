@@ -63,6 +63,12 @@ redundant work** and
 - **Compact path-hash index.** Files are looked up in the hashfile by a 64-bit
   hash of their path (`csum_path`) rather than a full-path string index, for
   faster path lookups on large trees.
+- **Skip reading unique-sized files (whole-file mode).** With
+  `--dedupe-options=only_whole_files`, a duplicate must have the same size, so
+  oans reads only files whose size is shared by another; a file with a unique
+  size is never opened. On trees dominated by unique files this avoids most of
+  the scan's data reads. (Default extent mode still hashes everything, since
+  differently-sized files can share an extent.)
 
 #### Measured
 

@@ -706,6 +706,14 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	if (!ret)
 		ret = filescan_walk_run(db);
 
+	/*
+	 * Whole-file mode defers hashing during the walk; now that every file's
+	 * size is known, hash only the ones whose size is shared (see
+	 * filescan_hash_size_collisions).
+	 */
+	if (!ret && options.only_whole_files)
+		ret = filescan_hash_size_collisions(db);
+
 	pscan_finish_listing();
 	filescan_free();
 	if (!quiet)
@@ -798,10 +806,19 @@ int main(int argc, char **argv)
 	print_header();
 
 	if (use_hashfile == H_WRITE || use_hashfile == H_UPDATE) {
-		ret = dbfile_prune_unscanned_files(db);
-		if (ret) {
-			eprintf("Unable to prune unscanned files\n");
-			goto out;
+		/*
+		 * Not in whole-file mode: there, files whose size is unique are
+		 * intentionally left with a NULL digest, so the NULL-digest prune
+		 * would wrongly delete them (and re-listing costs nothing they'd
+		 * save). filescan_hash_size_collisions() also recovers any row
+		 * left NULL by an interrupted run.
+		 */
+		if (!options.only_whole_files) {
+			ret = dbfile_prune_unscanned_files(db);
+			if (ret) {
+				eprintf("Unable to prune unscanned files\n");
+				goto out;
+			}
 		}
 
 		ret = scan_files(argc, argv, filelist_idx, db);

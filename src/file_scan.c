@@ -1117,6 +1117,16 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	/* Remember this inode so later hardlinks to it are skipped. */
 	mark_inode_seen(dbfile.ino, dbfile.subvol);
 
+	/*
+	 * Whole-file mode: don't hash yet. A whole-file duplicate must have the
+	 * same size, so we only need to read files whose size is shared by
+	 * another. That is only known once the whole tree is listed, so the
+	 * metadata row (digest still NULL) is stored above and the actual
+	 * hashing is deferred to filescan_hash_size_collisions() after the walk.
+	 */
+	if (options.only_whole_files)
+		return 0;
+
 	/* Schedule the file for scan */
 	file = malloc(sizeof(struct file_to_scan)); /* Freed by csum_whole_file() */
 
@@ -1780,6 +1790,104 @@ int64_t filescan_prune_deleted(struct dbhandle *db)
 	seen_files = NULL;
 	seen_files_nwords = 0;
 	return pruned;
+}
+
+/*
+ * Whole-file mode phase two: __scan_file() stored metadata for every file but
+ * deferred hashing. A whole-file duplicate must have the same size, so only
+ * files whose size is shared by another need to be read; a file with a unique
+ * size keeps its NULL digest and is never opened. Push those size-collision
+ * files (still lacking a digest) to the hashing pool, which csum_whole_file()
+ * drains via filescan_free(). Call after the walk, while scan_writer is open.
+ */
+struct pending_hash {
+	int64_t		id;
+	char		*path;
+	uint64_t	size;
+};
+
+int filescan_hash_size_collisions(struct dbhandle *db [[maybe_unused]])
+{
+	struct pending_hash *list = NULL;
+	size_t n = 0, cap = 0, i;
+	sqlite3_stmt *stmt = NULL;
+	uint64_t position = 0;
+	int rc = 0, ret;
+
+	/*
+	 * Commit the walk's metadata so the query below (on the same writer
+	 * connection) sees every file. We query and collect fully before pushing
+	 * anything: the hashing workers write through scan_writer, so we must not
+	 * be stepping a statement on that same connection while they run.
+	 */
+	scan_write_flush();
+
+	ret = sqlite3_prepare_v2(scan_writer->db,
+		"select id, filename, size from files where digest is null "
+		"and size in (select size from files group by size "
+		"having count(*) > 1);", -1, &stmt, NULL);
+	if (ret != SQLITE_OK) {
+		eprintf("preparing size-collision query: %s\n",
+			sqlite3_errmsg(scan_writer->db));
+		return 1;
+	}
+
+	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const char *fn = (const char *)sqlite3_column_text(stmt, 1);
+
+		if (!fn)
+			continue;
+		if (n == cap) {
+			size_t ncap = cap ? cap * 2 : 1024;
+			struct pending_hash *tmp = realloc(list, ncap * sizeof(*tmp));
+
+			if (!tmp) {
+				rc = 1;
+				break;
+			}
+			list = tmp;
+			cap = ncap;
+		}
+		list[n].id = sqlite3_column_int64(stmt, 0);
+		list[n].size = sqlite3_column_int64(stmt, 2);
+		list[n].path = strdup(fn);
+		n++;
+	}
+	if (rc == 0 && ret != SQLITE_DONE) {
+		eprintf("size-collision query: %s\n", sqlite3_errmsg(scan_writer->db));
+		rc = 1;
+	}
+	sqlite3_finalize(stmt);
+
+	for (i = 0; rc == 0 && i < n; i++) {
+		struct file_to_scan *file = malloc(sizeof(*file));
+		GError *err = NULL;
+
+		if (!file) {
+			rc = 1;
+			break;
+		}
+		file->path = list[i].path;	/* ownership moves to csum_whole_file() */
+		list[i].path = NULL;
+		file->fileid = list[i].id;
+		file->filesize = list[i].size;
+		file->file_position = ++position;
+
+		pscan_set_progress(1, file->filesize);
+
+		if (!g_thread_pool_push(scan_pool.pool, file, &err)) {
+			eprintf("g_thread_pool_push: %s\n", err->message);
+			g_error_free(err);
+			free(file->path);
+			free(file);
+			rc = 1;
+		}
+	}
+
+	for (i = 0; i < n; i++)
+		free(list[i].path);	/* frees only paths not moved above */
+	free(list);
+	return rc;
 }
 
 struct ino_key {

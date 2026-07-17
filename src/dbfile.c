@@ -671,16 +671,23 @@ struct dbhandle *dbfile_open_handle(char *filename)
  * mutually shared from their own pass - never need reloading. `grp` is the set
  * of qualifying groups (a member in range, and >1 member overall).
  */
+/*
+ * digest is not null excludes files left unhashed on purpose: in
+ * only_whole_files mode a file whose size is unique cannot have a whole-file
+ * duplicate, so it is never read and keeps a NULL digest. In extent mode no
+ * kept row has a NULL digest, so this is a no-op there.
+ */
 #define GET_DUPLICATE_FILES							\
 "with grp(digest, size) as ( "							\
 "	select digest, size from files "				\
-"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
+"	where dedupe_seq <= ?2 and not (flags & 1) and digest is not null "	\
+"	and (digest, size) in ( "					\
 "		select digest, size from files "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2 "			\
-"		and not (flags & 1)) "						\
+"		and not (flags & 1) and digest is not null) "			\
 "	group by digest, size having count(*) > 1) "			\
 "select id, size, digest, filename, dedupe_seq from files "			\
-"where not (flags & 1) "						\
+"where not (flags & 1) and digest is not null "				\
 "and (digest, size) in (select digest, size from grp) and ( "		\
 "	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
 "	or id in ( "							\
