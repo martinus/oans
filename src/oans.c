@@ -411,7 +411,6 @@ enum {
 	IO_THREADS_OPTION,
 	CPU_THREADS_OPTION,
 	SKIP_ZEROES_OPTION,
-	FDUPES_OPTION,
 	DEDUPE_OPTS_OPTION,
 	QUIET_OPTION,
 	EXCLUDE_OPTION,
@@ -420,28 +419,6 @@ enum {
 	MIN_FILESIZE_OPTION,
 	STATS_OPTION,
 };
-
-/* A blank line ends an fdupes duplicate group; anything else is a member. */
-static int fdupes_one_line(char *path, void *arg [[maybe_unused]])
-{
-	int ret;
-
-	if (path[0] == '\0') {
-		ret = fdupes_dedupe();
-		if (ret)
-			return ret;
-		free_all_filerecs();
-		return 0;
-	}
-
-	add_file_fdupes(path);
-	return 0;
-}
-
-static int process_fdupes(void)
-{
-	return for_each_stdin_line(fdupes_one_line, NULL);
-}
 
 static int add_one_stdin_file(char *path, void *db)
 {
@@ -498,7 +475,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "io-threads", 1, NULL, IO_THREADS_OPTION },
 		{ "cpu-threads", 1, NULL, CPU_THREADS_OPTION },
 		{ "skip-zeroes", 0, NULL, SKIP_ZEROES_OPTION },
-		{ "fdupes", 0, NULL, FDUPES_OPTION },
 		{ "dedupe-options", 1, NULL, DEDUPE_OPTS_OPTION },
 		{ "quiet", 0, NULL, QUIET_OPTION },
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
@@ -565,9 +541,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case SKIP_ZEROES_OPTION:
 			options.skip_zeroes = true;
-			break;
-		case FDUPES_OPTION:
-			options.fdupes_mode = 1;
 			break;
 		case DEDUPE_OPTS_OPTION:
 			if (parse_dedupe_opts(optarg))
@@ -636,22 +609,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		add_exclude_pattern(tmp);
 	}
 
-	if (options.fdupes_mode) {
-		if (options.hashfile) {
-			eprintf("Error: cannot mix hashfile option with "
-				"--fdupes option\n");
-			return 1;
-		}
-
-		if (numfiles) {
-			eprintf("Error: fdupes option does not take a file "
-				"list argument\n");
-			return 1;
-		}
-		/* rest of fdupes mode is implemented in main() */
-		return 0;
-	}
-
 	*filelist_idx = optind;
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
@@ -675,7 +632,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		}
 	}
 
-	if (!(options.fdupes_mode || list_only_opt || stats_only_opt)
+	if (!(list_only_opt || stats_only_opt)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
@@ -926,9 +883,6 @@ int main(int argc, char **argv)
 	 * files.
 	 */
 	increase_limits();
-
-	if (options.fdupes_mode)
-		return process_fdupes();
 
 	if (list_only_opt)
 		return list_db_files(options.hashfile);

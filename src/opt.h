@@ -27,7 +27,6 @@ struct options {
 	bool do_block_hash : 1;
 	bool dedupe_same_file : 1;
 	unsigned int batch_size;
-	bool fdupes_mode : 1;
 	char *hashfile;
 	uint64_t min_filesize;	/* skip regular files smaller than this */
 };

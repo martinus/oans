@@ -27,9 +27,6 @@ Thus you can run \f[CR]oans\f[R] repeatedly on your data as it changes,
 without having to re\-checksum unchanged data.
 For more on hashfiles see the \f[CR]\-\-hashfile\f[R] option below as
 well as the \f[CR]Examples\f[R] section.
-.PP
-\f[CR]oans\f[R] can also take input from the \f[CR]fdupes\f[R] program,
-see the \f[CR]\-\-fdupes\f[R] option below.
 .SH GENERAL
 oans has two major modes of operation, one of which is a subset of the
 other.
@@ -146,13 +143,6 @@ terminal or when the \f[CR]NO_COLOR\f[R] environment variable is set.
 Prints help text.
 .SS Advanced options
 .TP
-\f[B]\-\-fdupes\f[R]
-Run in \f[CR]fdupes\f[R] mode.
-With this option you can pipe the output of \f[CR]fdupes\f[R] to oans to
-dedupe any duplicate files found.
-When receiving a file list in this manner, oans will skip the hashing
-phase.
-.TP
 \f[B]\-L\f[R]
 Print all files in the hashfile and exit.
 Requires the \f[CR]\-\-hashfile\f[R] option.
@@ -252,12 +242,6 @@ You only want to use this for small data sets:
 .IP
 .EX
 oans \-dr /foo
-.EE
-.PP
-Use oans with fdupes to dedupe identical files below directory foo:
-.IP
-.EX
-fdupes \-r /foo | oans \-\-fdupes
 .EE
 .SS Using Hashfiles
 oans can optionally store the hashes it calculates in a hashfile.
@@ -412,7 +396,5 @@ duperemove
 \f[CR]btrfs(8)\f[R]
 .IP \[bu] 2
 \f[CR]xfs(8)\f[R]
-.IP \[bu] 2
-\f[CR]fdupes(1)\f[R]
 .IP \[bu] 2
 \f[CR]ioctl_fideduprange(2)\f[R]

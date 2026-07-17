@@ -23,6 +23,5 @@ struct options options = {
 	.do_block_hash = false,
 	.dedupe_same_file = true,
 	.batch_size = 1024,
-	.fdupes_mode = false,
 	.min_filesize = 1,	/* default: only skip empty files */
 };

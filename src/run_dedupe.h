@@ -11,6 +11,4 @@ void dedupe_results(struct results_tree *res, bool whole_file);
  * live status (see pdedupe_begin()) and prints one aggregated summary. */
 void dedupe_end(void);
 
-int fdupes_dedupe(void);
-
 #endif	/* __RUN_DEDUPE_H__ */

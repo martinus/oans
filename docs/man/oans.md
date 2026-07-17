@@ -29,9 +29,6 @@ for those files which have changed since the last run. Thus you can run
 re-checksum unchanged data. For more on hashfiles see the
 `--hashfile` option below as well as the `Examples` section.
 
-`oans` can also take input from the `fdupes` program, see the
-`--fdupes` option below.
-
 # GENERAL
 oans has two major modes of operation, one of which is a subset
 of the other.
@@ -141,11 +138,6 @@ variable is set.
 
 ## Advanced options
 
-**\--fdupes**
-  ~ Run in `fdupes` mode. With this option you can pipe the output of
-`fdupes` to oans to dedupe any duplicate files found. When
-receiving a file list in this manner, oans will skip the hashing phase.
-
 **-L**
   ~ Print all files in the hashfile and exit. Requires the `--hashfile` option.
 Will print additional information about each file when run with `-v`.
@@ -224,10 +216,6 @@ pattern is `oans --exclude "/path/to/dir/file*" /path/to/dir`
 Dedupe the files in directory /foo, recurse into all subdirectories. You only want to use this for small data sets:
 
 	oans -dr /foo
-
-Use oans with fdupes to dedupe identical files below directory foo:
-
-	fdupes -r /foo | oans --fdupes
 
 ## Using Hashfiles
 oans can optionally store the hashes it calculates in a
@@ -365,5 +353,4 @@ oans is a fork of [duperemove](https://github.com/markfasheh/duperemove).
 * `filesystems(5)`
 * `btrfs(8)`
 * `xfs(8)`
-* `fdupes(1)`
 * `ioctl_fideduprange(2)`

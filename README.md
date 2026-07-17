@@ -163,8 +163,8 @@ Summary
   Already shared 350708 files skipped (no work needed)
 ```
 
-For the complete set of options and examples (including hashfile and `fdupes`
-input), see the [oans man page](docs/man/oans.md).
+For the complete set of options and examples, see the
+[oans man page](docs/man/oans.md).
 
 ## Credits & license
 

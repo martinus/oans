@@ -170,8 +170,8 @@ class DuperemoveTest(unittest.TestCase):
     def dm(self, *args, hashfile=True, stdin=None, env=None):
         """Run oans; capture combined output in self.out and code in self.rc.
 
-        Pass stdin=<str> to feed the process on standard input (e.g. --fdupes),
-        or env={...} to add environment variables for this run.
+        Pass stdin=<str> to feed the process on standard input (e.g. a "-"
+        file list), or env={...} to add environment variables for this run.
         """
         cmd = [DUPEREMOVE, "-q", "--io-threads=4"]
         if hashfile:
