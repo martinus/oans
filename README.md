@@ -24,7 +24,10 @@ data.
 oans can store the hashes it computes in a **hashfile**. Given an existing
 hashfile it only re-hashes files that changed since the last run, so you can
 run it repeatedly on your data as it changes without re-checksumming
-everything. The hashfile format is unchanged from upstream duperemove.
+everything. The hashfile is a SQLite database branded with oans's own
+`application_id`, so oans and upstream duperemove will not read each other's
+hashfiles (each rebuilds its own) — but they are just caches, so nothing is
+lost.
 
 See [the upstream duperemove man page](http://markfasheh.github.io/duperemove/duperemove.html)
 for the full reference (options, FAQ, and examples) — this fork keeps the same
@@ -34,8 +37,9 @@ command-line interface.
 
 ## What's different in this fork
 
-Everything below is additive: the CLI, hashfile format, and behavior stay
-compatible with upstream. The theme is **doing less redundant work** and
+Everything below is additive: the CLI and behavior stay compatible with
+upstream (the hashfile is oans-branded, see above). The theme is **doing less
+redundant work** and
 **telling you more clearly what happened**.
 
 ### Performance

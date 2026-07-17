@@ -18,8 +18,21 @@ struct extent_csum;
 struct results_tree;
 struct dbfile_config;
 
-#define DB_FILE_MAJOR	4
-#define DB_FILE_MINOR	2
+/*
+ * oans's own hashfile format generation. Forked from upstream duperemove's 4.1;
+ * bumped to 5.0 as a deliberate clean break so oans and duperemove never share
+ * a version number.
+ */
+#define DB_FILE_MAJOR	5
+#define DB_FILE_MINOR	0
+
+/*
+ * SQLite application_id stamped into every oans hashfile ("oans" in ASCII).
+ * oans requires this brand: dbfile_check() refuses any hashfile that does not
+ * carry it (a foreign file, or a pre-brand/duperemove one). A brand-new empty
+ * hashfile is stamped before the check; existing files must already carry it.
+ */
+#define OANS_APP_ID	0x6f616e73
 
 struct stmts {
 	sqlite3_stmt *insert_block;

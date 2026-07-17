@@ -131,6 +131,18 @@ of joining them all at exit. Not an oans leak. Everything else must be clean —
 config string buffers from `get_config_text` are raw `memcpy`, so anything
 `strlen`'d must be zero-initialised.)
 
+## Hashfile identity (oans vs duperemove)
+
+The hashfile schema version is `DB_FILE_MAJOR.MINOR` in `dbfile.h` (5.0; oans
+forked at upstream duperemove's 4.1 and jumped to 5.0 as a deliberate clean
+break). Every oans hashfile is also stamped with SQLite `PRAGMA application_id =
+OANS_APP_ID` ("oans" in ASCII) and `dbfile_check()` **strictly** refuses any file
+that doesn't carry the brand — foreign, or a pre-brand/duperemove file. A
+brand-new empty file (`dbfile_config_empty()`) is stamped *before* the check, so
+a fresh scan doesn't recreate-loop; existing files must already carry the brand.
+A failed check unlinks and recreates the hashfile (it's only a cache). Bump
+`DB_FILE_MINOR` on any schema change.
+
 ## Correctness invariants
 
 - Ctrl+C is safe: `FIDEDUPERANGE` is atomic and the hashfile stays WAL-consistent

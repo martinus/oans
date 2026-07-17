@@ -132,9 +132,62 @@ static int dbfile_get_dbpath(sqlite3 *db, char *path)
 	return 0;
 }
 
+static int dbfile_get_application_id(sqlite3 *db, int *out)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	int ret;
+
+	*out = 0;
+	ret = sqlite3_prepare_v2(db, "PRAGMA application_id;", -1, &stmt, NULL);
+	if (ret)
+		return ret;
+	if (sqlite3_step(stmt) == SQLITE_ROW)
+		*out = sqlite3_column_int(stmt, 0);
+	return 0;
+}
+
+/* Best-effort: a read-only handle can't write the header, which is fine. */
+static void dbfile_stamp_application_id(sqlite3 *db)
+{
+	char sql[64];
+
+	snprintf(sql, sizeof(sql), "PRAGMA application_id = %d;", OANS_APP_ID);
+	sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
+/* True for a brand-new hashfile: create_tables() has run but nothing has
+ * written the config rows yet (that happens after the check, in sync_config). */
+static bool dbfile_config_empty(sqlite3 *db)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	bool empty = true;
+
+	if (sqlite3_prepare_v2(db, "select 1 from config limit 1;", -1,
+			       &stmt, NULL) == SQLITE_OK)
+		empty = (sqlite3_step(stmt) != SQLITE_ROW);
+	return empty;
+}
+
 static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 {
 	char path[PATH_MAX + 1];
+	int app_id = 0;
+
+	dbfile_get_dbpath(db, path);
+
+	/*
+	 * oans requires its brand. A brand-new file was stamped before this
+	 * check (see dbfile_prepare); anything reaching here without the brand
+	 * is a foreign or pre-brand (e.g. duperemove) hashfile - refuse it, and
+	 * the caller recreates it as an oans file.
+	 */
+	dbfile_get_application_id(db, &app_id);
+	if (app_id != OANS_APP_ID) {
+		eprintf("Hashfile %s is not an oans hashfile "
+			"(application_id 0x%08x); refusing to use it\n", path,
+			(unsigned)app_id);
+		return EIO;
+	}
 
 	if (cfg->major != DB_FILE_MAJOR || cfg->minor != DB_FILE_MINOR) {
 		eprintf("Hash db version mismatch (mine: %d.%d, file: %d.%d)\n",
@@ -142,7 +195,6 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 		return EIO;
 	}
 
-	dbfile_get_dbpath(db, path);
 
 	if (strncasecmp(cfg->hash_type, HASH_TYPE, 8)) {
 		eprintf("Error: Hashfile %s uses \"%.*s\" for checksums "
@@ -364,6 +416,14 @@ static int dbfile_prepare(sqlite3 *db)
 			return ret;
 		}
 	}
+
+	/*
+	 * A brand-new hashfile (empty config) is ours: brand it now, before the
+	 * strict application_id check below. An existing file must already carry
+	 * the brand or dbfile_check() rejects it and we recreate it fresh.
+	 */
+	if (dbfile_config_empty(db))
+		dbfile_stamp_application_id(db);
 
 	ret = dbfile_get_config(db, &cfg);
 	if (ret) {
