@@ -27,6 +27,16 @@ Thus you can run \f[CR]oans\f[R] repeatedly on your data as it changes,
 without having to re\-checksum unchanged data.
 For more on hashfiles see the \f[CR]\-\-hashfile\f[R] option below as
 well as the \f[CR]Examples\f[R] section.
+.PP
+The hashfile is also \f[B]self\-describing\f[R]: each run records its
+scan\-shaping options (\f[CR]\-d\f[R], \f[CR]\-r\f[R],
+\f[CR]\-\-skip\-zeroes\f[R], \f[CR]\-\-min\-filesize\f[R],
+\f[CR]\-\-dedupe\-options\f[R]), its paths, and its
+\f[CR]\-\-exclude\f[R] patterns.
+Running \f[CR]oans \-\-hashfile=FILE\f[R] with no file arguments replays
+that stored configuration, so a periodic job only needs to name the
+hashfile.
+See the \f[CR]Examples\f[R] section.
 .SH GENERAL
 oans has two major modes of operation, one of which is a subset of the
 other.
@@ -93,6 +103,15 @@ For that reason you probably want to provide the same \f[CR]files\f[R]
 list and \f[CR]\-r\f[R] arguments on each run of \f[CR]oans\f[R].
 The file discovery algorithm is efficient and will only visit each file
 once, even if it is already in the \f[CR]hashfile\f[R].
+.PP
+You need not repeat them, though: each run records its scan\-shaping
+options, paths and \f[CR]\-\-exclude\f[R] patterns in the hashfile, so
+running \f[CR]oans \-\-hashfile=FILE\f[R] with no file arguments replays
+the last such run (any other options given on that command line are
+ignored).
+If none of the stored paths still exist, oans refuses to run rather than
+prune every entry (guarding against, for example, an unmounted drive);
+paths that are individually missing are skipped with a warning.
 .PP
 Adding a new path to a hashfile is as simple as adding it to the
 \f[CR]files\f[R] argument.
@@ -265,15 +284,16 @@ dedupe changed or newly added files:
 oans \-dr \-\-hashfile=foo.hash foo/
 .EE
 .PP
-Don\[cq]t scan for new files, only update changed or deleted files, then
-dedupe:
+Replay the last run: with no file arguments, oans reuses the options,
+paths and excludes saved in the hashfile.
+Handy for a cron job, which then only needs to name the hashfile:
 .IP
 .EX
-oans \-dr \-\-hashfile=foo.hash
+oans \-\-hashfile=foo.hash
 .EE
 .PP
 Add directory bar to our hashfile and discover any files that were
-recently added to foo:
+recently added to foo (this also becomes the new stored configuration):
 .IP
 .EX
 oans \-dr \-\-hashfile=foo.hash foo/ bar/

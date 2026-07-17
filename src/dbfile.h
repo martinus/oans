@@ -100,6 +100,37 @@ int dbfile_get_config(sqlite3 *db, struct dbfile_config *cfg);
 int __dbfile_sync_config(sqlite3 *db, struct dbfile_config *cfg);
 int dbfile_sync_config(struct dbhandle *db, struct dbfile_config *cfg);
 
+/*
+ * Self-describing hashfile: the scan-shaping options plus the roots and
+ * user exclude patterns of a run, so `oans --hashfile=X` (no file arguments)
+ * can replay the last run. Ephemeral knobs (threads, verbosity, colour,
+ * batchsize) are deliberately not stored; blocksize/hash live in dbfile_config
+ * already. roots/excludes are heap arrays owned by the struct.
+ */
+struct scan_config {
+	int		run_dedupe;
+	int		recurse;
+	int		skip_zeroes;
+	int		only_whole_files;
+	int		do_block_hash;
+	int		dedupe_same_file;
+	uint64_t	min_filesize;
+	char		**roots;
+	int		nroots;
+	char		**excludes;
+	int		nexcludes;
+};
+
+/* Persist sc (options + roots + excludes), replacing any previously stored set. */
+int dbfile_store_scan_config(struct dbhandle *db, const struct scan_config *sc);
+/*
+ * Load the stored scan config into sc (zeroed first). Returns 1 if a stored
+ * configuration was present, 0 if none, <0 on error. Caller frees with
+ * scan_config_free().
+ */
+int dbfile_load_scan_config(struct dbhandle *db, struct scan_config *sc);
+void scan_config_free(struct scan_config *sc);
+
 struct dbfile_stats {
 	uint64_t	num_b_hashes;
 	uint64_t	num_e_hashes;

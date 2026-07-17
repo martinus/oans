@@ -92,6 +92,10 @@ and filesystem.
 - A **human-readable, colorful summary** (respecting `NO_COLOR` and non-TTY
   output) instead of a wall of per-extent text.
 - A **live dedupe progress bar** with throughput rate and ETA.
+- A **self-describing hashfile**: each run records its options, paths and
+  excludes, so `oans --hashfile=FILE` with no arguments replays the last run —
+  a cron job need only name the hashfile. If the stored paths have all vanished
+  (e.g. an unmounted drive) it refuses rather than pruning the hashfile.
 
 ### Testing
 
@@ -148,6 +152,9 @@ oans -dhr file1 file2 dir1/
 
 # Recursively dedupe a tree, reusing a hashfile across runs:
 oans -dr --hashfile=/path/to/hashfile /my/data
+
+# Replay that run later — the hashfile remembers the options and paths:
+oans --hashfile=/path/to/hashfile
 
 # Report what a hashfile holds (files, hashes, duplication):
 oans --stats --hashfile=/path/to/hashfile

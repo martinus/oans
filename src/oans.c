@@ -55,6 +55,11 @@ static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
 static int opt_no_color = 0;
+
+/* User-supplied --exclude patterns, captured for the self-describing hashfile
+ * (the auto-added hashfile sidecar patterns are re-derived each run, not here). */
+static char **user_excludes;
+static int n_user_excludes;
 struct dbfile_config dbfile_cfg;
 
 /* Upper bound for the auto-detected worker thread count (overridable). */
@@ -571,8 +576,14 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			}
 			break;
 		case EXCLUDE_OPTION:
-			if (add_exclude_pattern(optarg))
+			if (add_exclude_pattern(optarg)) {
 				eprintf("Error: cannot exclude %s\n", optarg);
+			} else {
+				user_excludes = realloc(user_excludes,
+					(n_user_excludes + 1) * sizeof(*user_excludes));
+				abort_on(!user_excludes);
+				user_excludes[n_user_excludes++] = strdup(optarg);
+			}
 			break;
 		case BATCH_SIZE_OPTION:
 		case 'B':
@@ -632,8 +643,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		}
 	}
 
+	/*
+	 * A bare `oans --hashfile=X` (no files) is allowed: main() replays the
+	 * scan config stored in the hashfile. Without a hashfile there is nothing
+	 * to replay, so a file list is still required.
+	 */
 	if (!(list_only_opt || stats_only_opt)
-			&& numfiles == 0) {
+			&& numfiles == 0 && !options.hashfile) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
 	}
@@ -795,7 +811,7 @@ static void process_duplicates(struct dbhandle *db)
 		extents_search_free();
 }
 
-static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *db)
+static int scan_files(char **roots, int nroots, struct dbhandle *db)
 {
 	int ret;
 
@@ -808,8 +824,7 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	if (stdin_filelist)
 		ret = add_files_from_stdin(db);
 	else
-		ret = scan_files_from_cmdline(argc - filelist_idx,
-					     &argv[filelist_idx], db);
+		ret = scan_files_from_cmdline(nroots, roots, db);
 
 	/* Run the parallel walk + scan over everything seeded above. */
 	if (!ret)
@@ -842,9 +857,101 @@ static int scan_files(int argc, char **argv, int filelist_idx, struct dbhandle *
 	return 0;
 }
 
+/* Apply a replayed scan config to the global options (see scan_config). */
+static void apply_scan_config(const struct scan_config *sc)
+{
+	int i;
+
+	options.run_dedupe = sc->run_dedupe;
+	options.recurse_dirs = sc->recurse;
+	options.skip_zeroes = sc->skip_zeroes;
+	options.only_whole_files = sc->only_whole_files;
+	options.do_block_hash = sc->do_block_hash;
+	options.dedupe_same_file = sc->dedupe_same_file;
+	options.min_filesize = sc->min_filesize;
+
+	for (i = 0; i < sc->nexcludes; i++)
+		add_exclude_pattern(sc->excludes[i]);
+}
+
+/*
+ * Drop replayed roots that no longer exist (warn on each), compacting the
+ * array in place. Returns the number that survive. Refusing to run when none
+ * survive is the caller's job: scanning zero roots would let the stat-based
+ * prune wipe the whole hashfile (e.g. an unmounted drive).
+ */
+static int drop_missing_roots(char **roots, int nroots)
+{
+	int i, live = 0;
+
+	for (i = 0; i < nroots; i++) {
+		struct stat st;
+
+		if (stat(roots[i], &st) == 0) {
+			roots[live++] = roots[i];
+		} else {
+			eprintf("Warning: stored path \"%s\" no longer exists, "
+				"skipping.\n", roots[i]);
+			free(roots[i]);
+		}
+	}
+	/*
+	 * Compaction moved survivors to the front; NUL the vacated tail so the
+	 * caller's scan_config_free() (which frees all nroots slots) neither
+	 * double-frees a survivor nor touches a dropped string.
+	 */
+	for (i = live; i < nroots; i++)
+		roots[i] = NULL;
+	return live;
+}
+
+/*
+ * Persist this run's scan-shaping options, roots and user excludes so a later
+ * bare `oans --hashfile=X` replays it. Roots are canonicalised (as the scan
+ * itself does) so replay is independent of the working directory. Best-effort:
+ * a failure only means the next run needs its arguments again.
+ */
+static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
+{
+	struct scan_config sc = {0};
+	char **abs = calloc(nroots, sizeof(*abs));
+	int i;
+
+	abort_on(!abs);
+	for (i = 0; i < nroots; i++) {
+		char buf[PATH_MAX];
+
+		if (realpath(roots[i], buf))
+			abs[sc.nroots++] = strdup(buf);
+	}
+
+	sc.run_dedupe = options.run_dedupe;
+	sc.recurse = options.recurse_dirs;
+	sc.skip_zeroes = options.skip_zeroes;
+	sc.only_whole_files = options.only_whole_files;
+	sc.do_block_hash = options.do_block_hash;
+	sc.dedupe_same_file = options.dedupe_same_file;
+	sc.min_filesize = options.min_filesize;
+	sc.roots = abs;
+	sc.excludes = user_excludes;
+	sc.nexcludes = n_user_excludes;
+
+	if (dbfile_store_scan_config(db, &sc))
+		eprintf("Warning: could not store scan configuration in the "
+			"hashfile.\n");
+
+	for (i = 0; i < sc.nroots; i++)
+		free(abs[i]);
+	free(abs);
+}
+
 int main(int argc, char **argv)
 {
 	int ret, filelist_idx = 0;
+	int numfiles;
+	char **roots;
+	bool replaying = false;
+	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
 	char stdbuf[BUFSIZ];
@@ -903,6 +1010,41 @@ int main(int argc, char **argv)
 
 	dedupe_seq = dbfile_cfg.dedupe_seq;
 
+	numfiles = argc - filelist_idx;
+	roots = &argv[filelist_idx];
+
+	/*
+	 * Self-describing hashfile: with no file arguments, replay the scan
+	 * config (options + roots + excludes) the last run stored.
+	 */
+	if (numfiles == 0 && !stdin_filelist) {
+		int have = dbfile_load_scan_config(db, &replay);
+
+		if (have < 0) {
+			ret = have;
+			goto out;
+		}
+		if (!have) {
+			eprintf("Error: no files given and the hashfile has no "
+				"stored scan configuration to replay.\n");
+			ret = 1;
+			goto out;
+		}
+
+		apply_scan_config(&replay);
+		numfiles = drop_missing_roots(replay.roots, replay.nroots);
+		if (numfiles == 0) {
+			eprintf("Error: none of the stored paths exist; refusing "
+				"to run (this would prune the whole hashfile).\n");
+			ret = 1;
+			goto out;
+		}
+		roots = replay.roots;
+		replaying = true;
+		qprintf("Replaying stored scan of %d path%s from the hashfile.\n",
+			numfiles, numfiles == 1 ? "" : "s");
+	}
+
 	print_header();
 
 	ret = dbfile_prune_unscanned_files(db);
@@ -911,9 +1053,13 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	ret = scan_files(argc, argv, filelist_idx, db);
+	ret = scan_files(roots, numfiles, db);
 	if (ret)
 		goto out;
+
+	/* Remember this run so a later bare `oans --hashfile=X` replays it. */
+	if (!replaying && !stdin_filelist && options.hashfile)
+		persist_scan_config(db, roots, numfiles);
 
 	/*
 	 * Drop rows for files deleted from disk since they were scanned,
@@ -940,6 +1086,7 @@ int main(int argc, char **argv)
 		dbfile_maybe_vacuum(db);
 
 out:
+	scan_config_free(&replay);
 	free_all_filerecs();
 
 #ifdef DEBUG_BUILD
