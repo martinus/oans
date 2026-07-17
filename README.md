@@ -1,130 +1,173 @@
-# Duperemove
+# oans
 
-Duperemove is a simple tool for finding duplicated extents and
-submitting them for deduplication. When given a list of files it will
-hash their contents on an extent by extent basis and compare those hashes
-to each other, finding and categorizing extents that match each
-other. Optionally, a per-block hash can be applied for further duplication lookup.
-When given the -d option, duperemove will submit those
-extents for deduplication using the Linux kernel FIDEDUPRANGE ioctl.
+> **A friendly fork of [markfasheh/duperemove](https://github.com/markfasheh/duperemove).**
+> All of the original design and code is the work of **Mark Fasheh** and the
+> upstream contributors (SUSE, Oracle, and many others). This fork adds a set of
+> performance, correctness, and usability improvements on top of that
+> foundation, and is renamed **oans** (Austrian dialect for "one") to avoid
+> confusion with the upstream project. The improvements were developed with the
+> help of AI tooling, and every change was reviewed, tested, and benchmarked on
+> real btrfs data before landing. Huge thanks to the upstream authors — none of
+> this exists without their work.
+>
+> The `oans` binary installs a `duperemove` compatibility symlink, so existing
+> scripts and habits keep working.
 
-Duperemove can store the hashes it computes in a 'hashfile'. If
-given an existing hashfile, duperemove will only compute hashes
-for those files which have changed since the last run.  Thus you can run
-duperemove repeatedly on your data as it changes, without having to
-re-checksum unchanged data.
+oans is a simple tool for finding duplicated extents and submitting them for
+deduplication. Given a list of files it hashes their contents on an extent
+basis and compares those hashes, finding and categorizing extents that match.
+With the `-d` option it submits matching extents to the kernel for
+deduplication via the `FIDEDUPERANGE` ioctl — an atomic, byte-verified
+operation, so a bug can only waste work or miss a dedupe, never corrupt your
+data.
 
-Duperemove can also take input from the [fdupes](https://github.com/adrianlopezroche/fdupes) program.
+oans can store the hashes it computes in a **hashfile**. Given an existing
+hashfile it only re-hashes files that changed since the last run, so you can
+run it repeatedly on your data as it changes without re-checksumming
+everything. The hashfile format is unchanged from upstream duperemove.
 
-See [the duperemove man page](http://markfasheh.github.io/duperemove/duperemove.html) for further details about running duperemove.
+See [the upstream duperemove man page](http://markfasheh.github.io/duperemove/duperemove.html)
+for the full reference (options, FAQ, and examples) — this fork keeps the same
+command-line interface.
 
+---
 
-# Requirements
+## What's different in this fork
 
-The latest stable code can be found in [the release page](https://github.com/markfasheh/duperemove/releases)
+Everything below is additive: the CLI, hashfile format, and behavior stay
+compatible with upstream. The theme is **doing less redundant work** and
+**telling you more clearly what happened**.
+
+### Performance
+
+- **Skip already-shared files.** Files whose extents are already shared are
+  detected up front and skipped instead of being re-read and re-compared. This
+  is the big win for the common "re-run periodically on a mostly-stable tree"
+  workflow.
+- **No cross-generation reprocessing.** The dedupe phase processes files in
+  generation passes; a group whose copies span many passes used to be reloaded
+  and re-checked in every pass. It now loads only what's new per pass plus one
+  stable target, so large duplicate groups are handled once. This also fixes an
+  inflated "Deduplicated" figure and keeps copies converging onto a single
+  physical extent.
+- **Batched hashfile transactions.** Per-file SQLite read/write transactions
+  are batched on a ~10s cadence, collapsing a lock storm (hundreds of thousands
+  of `F_SETLK` calls on a large rescan down to a few hundred).
+- **Parallel directory walk.** The `opendir`/`readdir`/`statx` walk runs on a
+  pool of walker threads (`--io-threads`), with a default cap tuned to where
+  btrfs metadata contention plateaus.
+- **Smaller hashfile / less memory** via a path-hash index and directory
+  (path-tree) interning.
+
+#### Measured
+
+Real numbers, with honest caveats — your mileage depends heavily on your data
+and filesystem.
+
+- **Re-running on an already-deduped tree** (2.07M files, ~230 GiB on btrfs):
+  **~92s vs ~11m for upstream 0.15.2** (~7× faster). This is the best case for
+  the already-shared skip — a cold first run does the real work and the gap is
+  smaller.
+- **Eliminating cross-generation reprocessing** (same tree, our own
+  before/after): **~294s → ~188s (~36%)**, with kernel dedupe traffic cut
+  roughly in half and accurate dedupe accounting.
+- **Batched read transactions**: ~24% faster rescans on a large hashfile.
+
+### Correctness
+
+- **Hardlink safety fix.** `INSERT OR REPLACE` on the inode key could
+  cascade-delete rows for other hardlinks to the same inode and, in a bad
+  batch, silently empty the hashfile while still exiting 0. Guarded, with a
+  regression test.
+- Fixes for a number of upstream issues surfaced along the way.
+
+### Usability
+
+- A **human-readable, colorful summary** (respecting `NO_COLOR` and non-TTY
+  output) instead of a wall of per-extent text.
+- A **live dedupe progress bar** with throughput rate and ETA.
+
+### Testing
+
+- A **Python `unittest` integration suite** (stdlib only) that drives the built
+  binary against a scratch tree and asserts on the hashfile and on-disk
+  sharing, plus **GitHub Actions CI**.
+
+---
+
+## A note on compressed filesystems
+
+If your btrfs uses compression (e.g. zstd), read the `Deduplicated` figure as a
+**logical/uncompressed** amount — the actual disk space you get back is
+smaller, roughly the compression ratio times that number, because dedupe
+operates on logical extents but frees compressed blocks. To see the true
+reclaimed space, compare `compsize` **Disk Usage** before and after a run;
+`Referenced` should stay constant (that's the proof nothing was lost).
+
+---
+
+## Requirements & building
 
 - Linux kernel 3.13 or later
-- GNU make
-- pkg-config
-- glib2
-- sqlite3
-- libxxhash 0.8.0 or later (libxxhash-dev on Debian)
-- util-linux (for libuuid, libmount, libblkid)
-- libbsd (libbsd-dev on Debian)
+- GNU make, pkg-config
+- glib2, sqlite3
+- libxxhash 0.8.0 or later (`libxxhash-dev` on Debian)
+- util-linux (libuuid, libmount, libblkid)
+- libbsd (`libbsd-dev` on Debian)
 
-Then to build Duperemove run `make`.
+```sh
+make            # build oans + helpers
+make check      # C unit tests + Python integration suite
+sudo make install   # installs oans, a duperemove compat symlink, and helpers
+```
 
-# FAQ
+Sources live under `src/`; man page sources under `docs/man/`; the integration
+suite under `tests/`.
 
-Please see the FAQ section in [the duperemove man page](http://markfasheh.github.io/duperemove/duperemove.html#10)
+## Usage
 
-For bug reports and feature requests please use [the github issue tracker](https://github.com/markfasheh/duperemove/issues)
+oans takes a list of files and directories. A directory scans all regular files
+within it; `-r` recurses. `-d` performs the deduplication (without it, oans
+only reports what it would dedupe).
 
+```sh
+# Dedupe two files:
+oans -dh file1 file2
 
-# Examples
+# Add a directory (its files) to the set:
+oans -dh file1 file2 dir1
 
-Please see the examples section of [the duperemove man
-page](http://markfasheh.github.io/duperemove/duperemove.html#7)
-for a complete set of usage examples, including hashfile usage.
+# Recurse into dir1 as well:
+oans -dhr file1 file2 dir1/
 
-## A simple example, with program output
+# Recursively dedupe a tree, reusing a hashfile across runs:
+oans -dr --hashfile=/path/to/hashfile /my/data
+```
 
-Duperemove takes a list of files and directories to scan for
-dedupe. If a directory is specified, all regular files within it will
-be scanned. Duperemove can also be told to recursively scan
-directories with the '-r' switch. If '-h' is provided, duperemove will
-print numbers in powers of 1024 (e.g., "128K").
+A run ends with a summary like:
 
-Assume this abitrary layout for the following examples.
+```
+Summary
+  Deduplicated   134.8 GiB across 164872 groups
+  Kernel scanned 994.7 MiB
+  Elapsed        92.1s
+  Already shared 350708 files skipped (no work needed)
+```
 
-    .
-    ├── dir1
-    │   ├── file3
-    │   ├── file4
-    │   └── subdir1
-    │       └── file5
-    ├── file1
-    └── file2
+For the complete set of options and examples (including hashfile and `fdupes`
+input), see the
+[upstream man page](http://markfasheh.github.io/duperemove/duperemove.html).
 
-This will dedupe files 'file1' and 'file2':
+## Credits & license
 
-    duperemove -dh file1 file2
+Original author: **Mark Fasheh** and the upstream duperemove contributors.
+Upstream project: <https://github.com/markfasheh/duperemove>.
 
-This does the same but adds any files in dir1 (file3 and file4):
+Licensed under the **GNU General Public License, version 2** — see
+[`LICENSE`](LICENSE). This fork remains GPLv2, same as upstream.
 
-    duperemove -dh file1 file2 dir1
+## Links
 
-This will dedupe exactly the same as above but will recursively walk
-dir1, thus adding file5.
-
-    duperemove -dhr file1 file2 dir1/
-
-
-An actual run, output will differ according to duperemove version.
-
-    Using 128K blocks
-    Using hash: murmur3
-    Using 4 threads for file hashing phase
-    csum: /btrfs/file1 	[1/5] (20.00%)
-    csum: /btrfs/file2 	[2/5] (40.00%)
-    csum: /btrfs/dir1/subdir1/file5 	[3/5] (60.00%)
-    csum: /btrfs/dir1/file3 	[4/5] (80.00%)
-    csum: /btrfs/dir1/file4 	[5/5] (100.00%)
-    Total files:  5
-    Total hashes: 80
-    Loading only duplicated hashes from hashfile.
-    Hashing completed. Calculating duplicate extents - this may take some time.
-    Simple read and compare of file data found 3 instances of extents that might benefit from deduplication.
-    Showing 2 identical extents of length 512.0K with id 0971ffa6
-    Start		Filename
-    512.0K	"/btrfs/file1"
-    1.5M	"/btrfs/dir1/file4"
-    Showing 2 identical extents of length 1.0M with id b34ffe8f
-    Start		Filename
-    0.0	"/btrfs/dir1/file4"
-    0.0	"/btrfs/dir1/file3"
-    Showing 3 identical extents of length 1.5M with id f913dceb
-    Start		Filename
-    0.0	"/btrfs/file2"
-    0.0	"/btrfs/dir1/file3"
-    0.0	"/btrfs/dir1/subdir1/file5"
-    Using 4 threads for dedupe phase
-    [0x147f4a0] Try to dedupe extents with id 0971ffa6
-    [0x147f770] Try to dedupe extents with id b34ffe8f
-    [0x147f680] Try to dedupe extents with id f913dceb
-    [0x147f4a0] Dedupe 1 extents (id: 0971ffa6) with target: (512.0K, 512.0K), "/btrfs/file1"
-    [0x147f770] Dedupe 1 extents (id: b34ffe8f) with target: (0.0, 1.0M), "/btrfs/dir1/file4"
-    [0x147f680] Dedupe 2 extents (id: f913dceb) with target: (0.0, 1.5M), "/btrfs/file2"
-    Kernel processed data (excludes target files): 4.5M
-    Comparison of extent info shows a net change in shared extents of: 5.5M
-
-
-# Links of interest
-
-* [The duperemove wiki](https://github.com/markfasheh/duperemove/wiki)
-  has both design and performance documentation.
-
-* [duperemove-tests](https://github.com/markfasheh/duperemove-tests) has
-  a growing assortment of regression tests.
-
-* [Duperemove web page](http://markfasheh.github.io/duperemove/)
+- [Upstream duperemove](https://github.com/markfasheh/duperemove) — the original project
+- [Upstream man page](http://markfasheh.github.io/duperemove/duperemove.html) — full reference
+- [Upstream wiki](https://github.com/markfasheh/duperemove/wiki) — design & performance notes

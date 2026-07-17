@@ -28,7 +28,7 @@ void print_mem_stats(void)
 {
 	uint64_t sqlite3_highwater, sqlite3_memused;
 
-	printf("Duperemove memory usage statistics:\n");
+	printf("oans memory usage statistics:\n");
 	show_allocs_file_block();
 	show_allocs_dupe_blocks_list();
 	show_allocs_dupe_extents();

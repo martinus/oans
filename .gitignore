@@ -1,4 +1,5 @@
 *.o
+oans
 duperemove
 btrfs-extent-same
 csum-test

@@ -4,7 +4,7 @@
 #include "opt.h"
 #include "results-tree.h"
 
-/* from duperemove.c */
+/* from oans.c */
 extern unsigned int blocksize;
 
 int find_additional_dedupe(struct results_tree *extents);

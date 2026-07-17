@@ -1,6 +1,6 @@
-"""Shared harness for the duperemove integration tests.
+"""Shared harness for the oans integration tests.
 
-These tests drive the built ``duperemove`` binary against a scratch directory
+These tests drive the built ``oans`` binary against a scratch directory
 tree and assert on the resulting hashfile (a SQLite database) and on actual
 on-disk extent sharing. That is coverage the C unit tests cannot reach: the
 scan/dedupe pipeline, incremental rescans, rename and hardlink handling,
@@ -9,7 +9,7 @@ that motivated the suite (the batched-writer hardlink corruption and the
 FIDEDUPERANGE EINVAL rejection), both of which only reproduce end to end.
 
 Configuration via environment:
-  DUPEREMOVE           path to the binary under test (default: repo ./duperemove)
+  DUPEREMOVE           path to the binary under test (default: repo ./oans)
   DUPEREMOVE_TEST_DIR  where scratch trees are created; must be on a reflink-
                        capable fs for the dedupe tests to run (default:
                        <repo>/.itest-scratch)
@@ -33,10 +33,10 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))
-DUPEREMOVE = os.environ.get("DUPEREMOVE", os.path.join(REPO_DIR, "duperemove"))
+DUPEREMOVE = os.environ.get("DUPEREMOVE", os.path.join(REPO_DIR, "oans"))
 TEST_ROOT = os.environ.get("DUPEREMOVE_TEST_DIR", os.path.join(REPO_DIR, ".itest-scratch"))
 
-# duperemove exits 0 even after per-file failures, so we scan its output for
+# oans exits 0 even after per-file failures, so we scan its output for
 # these signatures rather than trusting the exit code.
 _ERROR_RE = re.compile(
     r"Invalid argument|constraint failed|Database error|FAILURE|unable to|Error [0-9]",
@@ -153,7 +153,7 @@ class DuperemoveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not (os.path.isfile(DUPEREMOVE) and os.access(DUPEREMOVE, os.X_OK)):
-            raise unittest.SkipTest(f"duperemove binary not found: {DUPEREMOVE}")
+            raise unittest.SkipTest(f"oans binary not found: {DUPEREMOVE}")
         os.makedirs(TEST_ROOT, exist_ok=True)
 
     def setUp(self):
@@ -165,10 +165,10 @@ class DuperemoveTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.work, ignore_errors=True)
 
-    # -- running duperemove ------------------------------------------------
+    # -- running oans ------------------------------------------------
 
     def dm(self, *args, hashfile=True, stdin=None, env=None):
-        """Run duperemove; capture combined output in self.out and code in self.rc.
+        """Run oans; capture combined output in self.out and code in self.rc.
 
         Pass stdin=<str> to feed the process on standard input (e.g. --fdupes),
         or env={...} to add environment variables for this run.
@@ -197,12 +197,12 @@ class DuperemoveTest(unittest.TestCase):
         hits = [ln for ln in self.out.splitlines() if _ERROR_RE.search(ln)]
         if hits:
             detail = "\n    ".join(hits)
-            self.fail((msg or "duperemove reported errors") + ":\n    " + detail)
+            self.fail((msg or "oans reported errors") + ":\n    " + detail)
 
     def net_change(self):
         """Last reported net-change value as int, or None if not printed.
 
-        duperemove omits the line entirely when there was nothing to dedupe.
+        oans omits the line entirely when there was nothing to dedupe.
         """
         vals = _NET_CHANGE_RE.findall(self.out)
         return int(vals[-1]) if vals else None
@@ -217,7 +217,7 @@ class DuperemoveTest(unittest.TestCase):
     def hf_query(self, sql, params=()):
         # NB: `with sqlite3.connect(...)` commits but does NOT close the
         # connection - a lingering reader would hold a WAL lock and block a
-        # later duperemove run (e.g. its VACUUM). Close it explicitly.
+        # later oans run (e.g. its VACUUM). Close it explicitly.
         con = sqlite3.connect(self.hf)
         try:
             return con.execute(sql, params).fetchall()

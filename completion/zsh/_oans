@@ -1,4 +1,4 @@
-#compdef duperemove
+#compdef oans duperemove
 
 _duperemove_options()
 {
