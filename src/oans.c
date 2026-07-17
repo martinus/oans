@@ -162,8 +162,16 @@ static int print_hashfile_stats(char *filename)
 		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
 		bool header = false;
 
+		/*
+		 * The example is the group's shortest path (ties broken
+		 * alphabetically): usually the canonical copy, and the least
+		 * nested / most readable. min() over a fixed-width length prefix
+		 * picks it; substr() then strips the 10-char prefix back off.
+		 */
 		if (sqlite3_prepare_v2(sq,
-			"select size, count(*) c, min(filename), (count(*)-1)*size w "
+			"select size, count(*) c, "
+			"substr(min(printf('%010d', length(filename)) || filename), 11), "
+			"(count(*)-1)*size w "
 			"from files where digest is not null "
 			"group by digest, size having c > 1 "
 			"order by w desc, size desc limit 10", -1, &s, NULL) == SQLITE_OK) {
