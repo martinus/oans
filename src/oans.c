@@ -85,30 +85,45 @@ static uint64_t stats_u64(sqlite3 *db, const char *sql)
 	return v;
 }
 
+/* Human duration for the timing lines: ms under a second, else seconds. */
+static const char *fmt_dur(char *buf, size_t n, double s)
+{
+	if (s < 1.0)
+		snprintf(buf, n, "%.0f ms", s * 1000.0);
+	else
+		snprintf(buf, n, "%.2f s", s);
+	return buf;
+}
+
 /*
  * Print a human-readable report about a hashfile (folds in the old hashstats
- * tool): identity, contents, and how much whole-file duplication it records.
+ * tool): identity, contents, how much whole-file duplication it records, and
+ * how long the load and the duplicate-analysis queries took on this hashfile.
  */
 static int print_hashfile_stats(char *filename)
 {
-	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle(filename);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 	struct dbfile_config cfg;
 	struct dbfile_stats st = {0};
 	struct stat sb;
+	struct topgrp { uint64_t size, count, waste; char *path; } top[10];
 	char uuid_str[37] = "";
-	char htype[9] = "";
-	int k;
+	char htype[9] = "", b1[16], b2[16];
+	int k, ntop = 0, i;
 	uint64_t files, hashed, unhashed, logical, app_id;
 	uint64_t groups, dupfiles, reclaim;
 	uint64_t page_size, page_count, freelist;
+	double t0, t_load, t_analysis;
 	sqlite3 *sq;
 
+	/* --- load: open the hashfile and read its header + counts --- */
+	t0 = g_get_monotonic_time() / 1e6;
+	db = dbfile_open_handle(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
 	sq = db->db;
-
 	if (dbfile_get_config(sq, &cfg))
 		return -1;
 	dbfile_get_stats(db, &st);
@@ -120,20 +135,50 @@ static int print_hashfile_stats(char *filename)
 	page_size = stats_u64(sq, "PRAGMA page_size");
 	page_count = stats_u64(sq, "PRAGMA page_count");
 	freelist = stats_u64(sq, "PRAGMA freelist_count");
-
 	files    = stats_u64(sq, "select count(*) from files");
 	hashed   = stats_u64(sq, "select count(*) from files where digest is not null");
 	unhashed = files - hashed;
 	logical  = stats_u64(sq, "select ifnull(sum(size),0) from files");
+	t_load = g_get_monotonic_time() / 1e6 - t0;
 
-	/* Whole-file duplication: files sharing (digest, size). */
+	/* --- duplicate analysis: the group-by over (digest, size) --- */
+	t0 = g_get_monotonic_time() / 1e6;
 	groups   = stats_u64(sq, "select count(*) from (select 1 from files "
 		"where digest is not null group by digest, size having count(*) > 1)");
 	dupfiles = stats_u64(sq, "select ifnull(sum(c),0) from (select count(*) c "
 		"from files where digest is not null group by digest, size having c > 1)");
 	reclaim  = stats_u64(sq, "select ifnull(sum((c-1)*size),0) from (select size, "
 		"count(*) c from files where digest is not null group by digest, size having c > 1)");
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
 
+		/*
+		 * The example is the group's shortest path (ties broken
+		 * alphabetically): usually the canonical copy, and the least
+		 * nested / most readable. min() over a fixed-width length prefix
+		 * picks it; substr() then strips the 10-char prefix back off.
+		 */
+		if (sqlite3_prepare_v2(sq,
+			"select size, count(*) c, "
+			"substr(min(printf('%010d', length(filename)) || filename), 11), "
+			"(count(*)-1)*size w "
+			"from files where digest is not null "
+			"group by digest, size having c > 1 "
+			"order by w desc, size desc limit 10", -1, &s, NULL) == SQLITE_OK) {
+			while (ntop < 10 && sqlite3_step(s) == SQLITE_ROW) {
+				const char *fn = (const char *)sqlite3_column_text(s, 2);
+
+				top[ntop].size = sqlite3_column_int64(s, 0);
+				top[ntop].count = sqlite3_column_int64(s, 1);
+				top[ntop].path = fn ? strdup(fn) : NULL;
+				top[ntop].waste = sqlite3_column_int64(s, 3);
+				ntop++;
+			}
+		}
+	}
+	t_analysis = g_get_monotonic_time() / 1e6 - t0;
+
+	/* --- report --- */
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
 	if (stat(filename, &sb) == 0)
 		printf("  %s(%s on disk)%s", col_dim, human_size(sb.st_size), col_reset);
@@ -163,45 +208,26 @@ static int print_hashfile_stats(char *filename)
 	printf("  %sfiles in groups%s %"PRIu64"\n", col_dim, col_reset, dupfiles);
 	printf("  %sreclaimable%s     %s%s%s\n", col_dim, col_reset, col_green,
 	       human_size(reclaim), col_reset);
+	if (ntop)
+		printf("  %stop groups%s      %ssize x copies · reclaimable · example%s\n",
+		       col_dim, col_reset, col_dim, col_reset);
+	for (i = 0; i < ntop; i++) {
+		char szb[48], wb[32];
 
-	/* Top duplicate groups by reclaimable bytes: size x copies, plus one
-	 * example filename so you can see what is duplicated. */
-	{
-		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
-		bool header = false;
-
-		/*
-		 * The example is the group's shortest path (ties broken
-		 * alphabetically): usually the canonical copy, and the least
-		 * nested / most readable. min() over a fixed-width length prefix
-		 * picks it; substr() then strips the 10-char prefix back off.
-		 */
-		if (sqlite3_prepare_v2(sq,
-			"select size, count(*) c, "
-			"substr(min(printf('%010d', length(filename)) || filename), 11), "
-			"(count(*)-1)*size w "
-			"from files where digest is not null "
-			"group by digest, size having c > 1 "
-			"order by w desc, size desc limit 10", -1, &s, NULL) == SQLITE_OK) {
-			while (sqlite3_step(s) == SQLITE_ROW) {
-				uint64_t sz = sqlite3_column_int64(s, 0);
-				uint64_t c = sqlite3_column_int64(s, 1);
-				const char *fn = (const char *)sqlite3_column_text(s, 2);
-				uint64_t w = sqlite3_column_int64(s, 3);
-				char szb[48], wb[32];
-
-				if (!header) {
-					printf("  %stop groups%s      %ssize x copies · reclaimable · example%s\n",
-					       col_dim, col_reset, col_dim, col_reset);
-					header = true;
-				}
-				snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(sz), c);
-				snprintf(wb, sizeof(wb), "%s", human_size(w));
-				printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb,
-				       col_reset, fn ? fn : "");
-			}
-		}
+		snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(top[i].size),
+			 top[i].count);
+		snprintf(wb, sizeof(wb), "%s", human_size(top[i].waste));
+		printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb, col_reset,
+		       top[i].path ? top[i].path : "");
+		free(top[i].path);
 	}
+
+	printf("\n%s%stiming%s\n", col_bold, col_blue, col_reset);
+	printf("  %sload%s            %s\n", col_dim, col_reset,
+	       fmt_dur(b1, sizeof(b1), t_load));
+	printf("  %sdup analysis%s    %s   %s(the group-by over %"PRIu64" files)%s\n",
+	       col_dim, col_reset, fmt_dur(b2, sizeof(b2), t_analysis),
+	       col_dim, hashed, col_reset);
 	return 0;
 }
 

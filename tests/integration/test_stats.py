@@ -24,6 +24,9 @@ class StatsTest(DuperemoveTest):
         # top-groups list: the a/b/c group of 3 shows as "... x 3 ..."
         self.assertIn("top groups", out)
         self.assertRegex(out, r"x 3\b")
+        self.assertIn("timing", out)
+        self.assertRegex(out, r"load\s+\d")
+        self.assertIn("dup analysis", out)
 
     def test_stats_requires_hashfile(self):
         proc = self.dm("--stats", hashfile=False)
