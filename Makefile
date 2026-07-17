@@ -39,7 +39,7 @@ PROGS_OBJECTS := $(addprefix src/,$(addsuffix .o,$(progs)))
 SHARED_OBJECTS := $(filter-out $(PROGS_OBJECTS),$(OBJECTS))
 
 DIST_SOURCES:=$(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
-	README.md $(MANPAGES) docs/oans.html
+	README.md $(MANPAGES)
 DIST=oans-$(VERSION)
 DIST_TARBALL=$(VERSION).tar.gz
 TEMP_INSTALL_DIR:=$(shell mktemp -du -p .)
@@ -78,7 +78,6 @@ debug:
 
 $(MANPAGES): docs/man/%.8: docs/man/%.md
 	pandoc --standalone $< --to man -o $@
-	pandoc --standalone $< --to html -o docs/$*.html
 
 -include $(DEPENDS)
 $(progs): $(OBJECTS)
