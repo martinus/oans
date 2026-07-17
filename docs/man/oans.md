@@ -2,8 +2,8 @@
 title: oans
 section: 8
 header: System Manager’s Manual
-footer: oans 0.15.1
-date: 01 Mar 2025
+footer: oans 1.0.0
+date: July 2026
 ---
 # NAME
 `oans` - Find duplicate regions in files and submit them for deduplication
