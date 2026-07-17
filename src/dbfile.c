@@ -1827,7 +1827,7 @@ int dbfile_prune_unscanned_files(struct dbhandle *db)
  * warm in the dentry cache, so in the common (nothing-deleted) case this is a
  * cheap metadata pass with no disk reads.
  */
-int64_t dbfile_prune_missing_files(struct dbhandle *db)
+int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 {
 	sqlite3_stmt *sel = NULL;
 	sqlite3_stmt *del = db->stmts.delete_file_by_id;
@@ -1846,9 +1846,14 @@ int64_t dbfile_prune_missing_files(struct dbhandle *db)
 	/* Collect the ids first, then delete: don't mutate the table mid-scan. */
 	while ((ret = sqlite3_step(sel)) == SQLITE_ROW) {
 		int64_t id = sqlite3_column_int64(sel, 0);
-		const char *fn = (const char *)sqlite3_column_text(sel, 1);
+		const char *fn;
 		struct stat st;
 
+		/* The walk already confirmed this file on disk - skip the stat. */
+		if (seen && seen(id))
+			continue;
+
+		fn = (const char *)sqlite3_column_text(sel, 1);
 		if (!fn || stat(fn, &st) == 0)
 			continue;
 		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */

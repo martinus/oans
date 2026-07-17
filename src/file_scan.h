@@ -27,6 +27,14 @@ int scan_file(char *name, struct dbhandle *db);
 void filescan_walk_begin(void);
 int filescan_walk_run(struct dbhandle *db);
 
+/*
+ * True if a file with this id was confirmed on disk during the last walk. Used
+ * by the post-scan deleted-file prune to skip re-stat()ing files the scan
+ * already visited. filescan_seen_reset() frees the backing bitset.
+ */
+bool filescan_file_was_seen(int64_t id);
+void filescan_seen_reset(void);
+
 void fs_get_locked_uuid(uuid_t *uuid);
 
 /* For dbfile.c */

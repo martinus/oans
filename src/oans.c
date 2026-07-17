@@ -815,8 +815,10 @@ int main(int argc, char **argv)
 		 * before process_duplicates() so it works on the pruned set.
 		 */
 		{
-			int64_t pruned = dbfile_prune_missing_files(db);
+			int64_t pruned = dbfile_prune_missing_files(db,
+							filescan_file_was_seen);
 
+			filescan_seen_reset();
 			if (pruned > 0)
 				qprintf("Pruned %lld deleted file%s from the "
 					"hashfile\n", (long long)pruned,
