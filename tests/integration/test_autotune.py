@@ -65,6 +65,31 @@ class AutotuneTest(DuperemoveTest):
         self.assertEqual(rc, 0, out)
         self.assertNotIn("autotuned", out)
 
+    def test_samples_recursively_even_without_r(self):
+        # Files live only in a nested subdir; autotune samples a tree by
+        # recursing regardless of -r (which governs the real run).
+        for i in range(4):
+            self.mkrand(f"tree/sub/deep/f{i}.bin", 64 * 1024)
+        rc, out = self._run("--autotune", "--hashfile", self.hf,
+                            self.path("tree"), env=self.ENV)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("no regular files", out)
+        self.assertIn("Recommended:", out)
+
+    def test_persists_scan_config_for_replay(self):
+        tree = self._make_tree()
+        rc, out = self._run("--autotune", "-dr", "--hashfile", self.hf, tree,
+                            env=self.ENV)
+        self.assertEqual(rc, 0, out)
+        # autotune doubles as setup: the scan config is recorded, so a bare
+        # invocation replays it instead of erroring.
+        roots = [r[0] for r in self.hf_query("select path from scan_roots")]
+        self.assertEqual(roots, [os.path.realpath(tree)])
+        self.assertEqual(self.hf_scalar(
+            "select keyval from config where keyname='opt_run_dedupe'"), 1)
+        rc, out = self._run("--hashfile", self.hf)
+        self.assertEqual(rc, 0, out)
+
     def test_requires_a_path(self):
         rc, out = self._run("--autotune", "--hashfile", self.hf)
         self.assertNotEqual(rc, 0)

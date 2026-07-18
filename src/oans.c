@@ -1272,8 +1272,25 @@ int main(int argc, char **argv)
 		return print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
 		return print_metrics_json(options.hashfile);
-	else if (autotune_opt)
-		return autotune_run(&argv[filelist_idx], argc - filelist_idx);
+	else if (autotune_opt) {
+		int nroots = argc - filelist_idx;
+
+		ret = autotune_run(&argv[filelist_idx], nroots);
+		/*
+		 * Record the scan config too, so autotune doubles as setup: a
+		 * later bare `oans --hashfile=X` (or the systemd timer) replays
+		 * these paths and options. Uses whatever -d/-r/... were passed.
+		 */
+		if (ret == 0 && options.hashfile && nroots > 0) {
+			struct dbhandle *adb = dbfile_open_handle(options.hashfile);
+
+			if (adb) {
+				persist_scan_config(adb, &argv[filelist_idx], nroots);
+				dbfile_close_handle(adb);
+			}
+		}
+		return ret;
+	}
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1303,7 +1320,10 @@ int main(int argc, char **argv)
 		}
 		if (!have) {
 			eprintf("Error: no files given and the hashfile has no "
-				"stored scan configuration to replay.\n");
+				"stored scan configuration to replay.\n"
+				"Run once with the paths to record it, e.g.:\n"
+				"  oans -dr --hashfile=%s <dir>...\n",
+				options.hashfile);
 			ret = 1;
 			goto out;
 		}
