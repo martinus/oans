@@ -33,6 +33,33 @@ compat symlink. Some identifiers keep the old name on purpose: the
 - Confirm you are testing *this* build (`./oans`), not a system-installed
   `duperemove`, before diagnosing any runtime behaviour.
 
+## Releasing
+
+The version string comes from `git describe --tags` (Makefile), so **a release
+is just a git tag** — there is no committed `VERSION` file to bump. Convention
+(latest: `v1.2.0`, 2026-07-18):
+
+1. Branch `release/vX.Y.Z` off `origin/master`. Bump the version in **both** man
+   pages — `docs/man/oans.8` (`.TH "oans" "8" "<Month Year>" "oans X.Y.Z" …`) and
+   `docs/man/oans.md` (`footer: oans X.Y.Z`). These are the only two spots.
+2. Run `scripts/verify.sh`, then open a PR titled `Bump version to X.Y.Z` and
+   merge it (with the user's OK, as always).
+3. Annotated tag on the merged master HEAD, then push it:
+   `git tag -a vX.Y.Z -m "oans X.Y.Z\n\n<one-paragraph summary>"` and
+   `git push origin vX.Y.Z`.
+4. `gh release create vX.Y.Z --repo martinus/oans --title "oans vX.Y.Z" --notes …`
+   with notes grouped by theme (Features / Performance / Correctness / Housekeeping).
+   Releases attach **no** build artifacts — source only.
+
+- **Versioning is incremental semver.** The CLI is a superset of duperemove's and
+  hashfiles auto-rebuild, so feature batches are backward-compatible → **minor**
+  bumps (`1.1.1` → `1.2.0`). Reserve major for an actual break. (`v1.0.0`/`1.1.x`
+  were all cut 2026-07-17 *before* the fork's headline features; `1.2.0` was the
+  first release carrying `--stats`, `--history`/`--json`, `--autotune`, systemd
+  timers, self-describing hashfiles and honest reclaimed reporting.)
+- **`gh pr merge --merge` is blocked by the local permission classifier**; use
+  `--squash` (allowed). Prior release commits are merge commits, but squash is fine.
+
 ## Build & test
 
 ```sh
