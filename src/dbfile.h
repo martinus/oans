@@ -77,6 +77,9 @@ struct file {
 };
 
 struct dbhandle *dbfile_open_handle(char *filename);
+/* Read-only open for report modes: no writes, safe to run while another oans
+ * is deduping the same hashfile. NULL if missing or not an oans hashfile. */
+struct dbhandle *dbfile_open_handle_ro(char *filename);
 void dbfile_close_handle(struct dbhandle *db);
 
 /*

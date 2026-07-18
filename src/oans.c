@@ -212,7 +212,7 @@ static int print_hashfile_stats(char *filename)
 	double t0, t_load, t_analysis;
 	sqlite3 *sq;
 
-	db = dbfile_open_handle(filename);
+	db = dbfile_open_handle_ro(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
@@ -391,7 +391,7 @@ static int print_hashfile_history(char *filename)
 	struct run_summary sum;
 	char since[32];
 
-	db = dbfile_open_handle(filename);
+	db = dbfile_open_handle_ro(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
@@ -442,7 +442,7 @@ static int print_metrics_json(char *filename)
 	uint64_t logical, hashed, groups, dupfiles, reclaimable;
 	sqlite3 *sq;
 
-	db = dbfile_open_handle(filename);
+	db = dbfile_open_handle_ro(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
@@ -481,7 +481,7 @@ static int list_db_files(char *filename)
 {
 	int ret;
 
-	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle(filename);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle_ro(filename);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;

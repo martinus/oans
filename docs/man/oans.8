@@ -474,6 +474,15 @@ oans \-\-stats \-\-hashfile=foo.hash
 Deduplication is currently only supported by the \f[CR]btrfs\f[R] and
 \f[CR]xfs\f[R] filesystem.
 .PP
+The report modes (\f[CR]\-\-stats\f[R], \f[CR]\-\-history\f[R],
+\f[CR]\-\-json\f[R], \f[CR]\-L\f[R]) open the hashfile read\-only, so
+they are safe to run against a hashfile that another oans process is
+actively scanning or deduping; they show a consistent snapshot and never
+write to it.
+Running two \f[I]writing\f[R] invocations (e.g.\ two \f[CR]\-d\f[R]
+runs, or \f[CR]\-R\f[R]) on the same hashfile at once is not supported
+and may corrupt it.
+.PP
 The oans project page can be found on \c
 .UR https://github.com/martinus/oans
 github

@@ -127,3 +127,13 @@ oans --json    --hashfile=/var/cache/oans/media.hash    # metrics for a dashboar
   Compare `compsize` before and after for the true reclaimed amount.
 - **First run is slow, later runs are fast:** only changed/new files are
   re-hashed, and files whose extents are already shared are skipped.
+- **Querying while a run is in progress is safe.** The report commands
+  (`--stats`, `--history`, `--json`, `-L`) open the hashfile read-only, so you
+  can run them against a hashfile that a scheduled or manual run is actively
+  using — they show a consistent point-in-time snapshot and can't disturb the
+  run or the file. What you should *not* do is start a second *writing* run
+  (another `oans -dr`, or `-R`) on the same hashfile at the same time; the
+  single-writer design assumes one writer. Note the systemd timer won't start a
+  second `oans@<name>.service` while one is active, but a manual `oans` run is
+  invisible to that — so avoid kicking off a manual dedupe when the timer might
+  fire on the same hashfile.

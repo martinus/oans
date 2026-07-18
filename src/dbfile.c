@@ -25,7 +25,8 @@
 
 static struct dbhandle *gdb = NULL;
 
-static sqlite3 *__dbfile_open_handle(char *filename, bool force_create);
+static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
+				     bool readonly);
 
 static GMutex io_mutex; /* Locks db writes */
 
@@ -420,11 +421,24 @@ static int dbfile_set_modes(sqlite3 *db)
  */
 static bool hashfile_rebuilt;
 
-static int dbfile_prepare(sqlite3 *db)
+static int dbfile_prepare(sqlite3 *db, bool readonly)
 {
 	struct dbfile_config cfg;
 	int ret;
 	char dbpath[PATH_MAX + 1];
+
+	/*
+	 * Read-only open (report modes: --stats/--history/--json/-L): verify the
+	 * file is an oans hashfile but issue no writes at all - no table/index
+	 * DDL, no config sync, no recreate-on-mismatch. This is what makes those
+	 * commands safe to run while another oans is deduping: they never contend
+	 * for the WAL write lock (and never clobber a foreign file).
+	 */
+	if (readonly) {
+		if (dbfile_get_config(db, &cfg))
+			return -1;
+		return dbfile_check(db, &cfg);
+	}
 
 	ret = create_tables(db);
 	if (ret) {
@@ -479,8 +493,8 @@ static int dbfile_prepare(sqlite3 *db)
 			return ret;
 		}
 
-		db = __dbfile_open_handle(dbpath, false);
-		return dbfile_prepare(db);
+		db = __dbfile_open_handle(dbpath, false, false);
+		return dbfile_prepare(db, false);
 	}
 
 	/* May store the default config, if fields were missing
@@ -499,7 +513,8 @@ static int dbfile_prepare(sqlite3 *db)
 #define MEMDB_FILENAME		"file::memory:?cache=shared"
 #define OPEN_FLAGS		(SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOMUTEX|SQLITE_OPEN_URI)
 #define OPEN_FLAGS_CREATE	(OPEN_FLAGS|SQLITE_OPEN_CREATE)
-static sqlite3 *__dbfile_open_handle(char *filename, bool force_create)
+static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
+				     bool readonly)
 {
 	int ret;
 	sqlite3 *db;
@@ -514,10 +529,11 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create)
 	else
 		ret = sqlite3_open_v2(filename, &db, OPEN_FLAGS, NULL);
 
-	if (ret == SQLITE_CANTOPEN && !force_create) {
+	/* A read-only report must not conjure a hashfile that isn't there. */
+	if (ret == SQLITE_CANTOPEN && !force_create && !readonly) {
 		vprintf("Cannot open an existing hashfile, retrying in create mode\n");
 		sqlite3_close(db);
-		return __dbfile_open_handle(filename, true);
+		return __dbfile_open_handle(filename, true, false);
 	}
 
 	if (ret) {
@@ -532,7 +548,7 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create)
 		return NULL;
 	}
 
-	ret = dbfile_prepare(db);
+	ret = dbfile_prepare(db, readonly);
 	if (ret) {
 		sqlite3_close(db);
 		return NULL;
@@ -549,10 +565,10 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create)
 	}											\
 } while (0)
 
-struct dbhandle *dbfile_open_handle(char *filename)
+static struct dbhandle *open_handle(char *filename, bool readonly)
 {
 	struct dbhandle *result = calloc(1, sizeof(struct dbhandle));
-	result->db = __dbfile_open_handle(filename, false);
+	result->db = __dbfile_open_handle(filename, false, readonly);
 
 	if (!result->db)
 		goto err;
@@ -730,6 +746,22 @@ struct dbhandle *dbfile_open_handle(char *filename)
 err:
 	dbfile_close_handle(result);
 	return NULL;
+}
+
+struct dbhandle *dbfile_open_handle(char *filename)
+{
+	return open_handle(filename, false);
+}
+
+/*
+ * Open a hashfile for a read-only report. Issues no writes, so it is safe to
+ * run concurrently with a deduping oans (no WAL write-lock contention) and
+ * never modifies or recreates the file. Returns NULL if the file is missing or
+ * is not an oans hashfile.
+ */
+struct dbhandle *dbfile_open_handle_ro(char *filename)
+{
+	return open_handle(filename, true);
 }
 
 void dbfile_close_handle(struct dbhandle *db)

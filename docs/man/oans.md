@@ -420,6 +420,12 @@ duplication it records - run:
 # NOTES
 Deduplication is currently only supported by the `btrfs` and `xfs` filesystem.
 
+The report modes (`--stats`, `--history`, `--json`, `-L`) open the hashfile
+read-only, so they are safe to run against a hashfile that another oans process
+is actively scanning or deduping; they show a consistent snapshot and never
+write to it. Running two *writing* invocations (e.g. two `-d` runs, or `-R`) on
+the same hashfile at once is not supported and may corrupt it.
+
 The oans project page can be found on [github](https://github.com/martinus/oans).
 oans is a fork of [duperemove](https://github.com/markfasheh/duperemove).
 
