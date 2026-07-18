@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <pwd.h>
 
 #include "csum.h"
 #include "filerec.h"
@@ -73,6 +74,20 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 	if (stat(dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
 		eprintf("Error: cannot open hashfile \"%s\": \"%s\" is not a "
 			"directory.\n", filename, dir);
+		return;
+	}
+	/*
+	 * The file exists but we can't open it: almost always permissions -
+	 * e.g. a hashfile written by a root run (owned root:root, mode 0600)
+	 * being read by a normal user. oans opens hashfiles read/write.
+	 */
+	if (stat(filename, &st) == 0 && access(filename, R_OK | W_OK) != 0) {
+		struct passwd *pw = getpwuid(st.st_uid);
+
+		eprintf("Error: cannot open hashfile \"%s\": permission denied.\n"
+			"       It is owned by %s; run oans as that user "
+			"(e.g. with sudo).\n", filename,
+			pw ? pw->pw_name : "another user");
 		return;
 	}
 	eprintf("Error opening hashfile \"%s\": %s\n", filename,
