@@ -96,7 +96,6 @@ uninstall:
 # Optional: the systemd@ template units for scheduled dedupe (see
 # systemd/README.md). Not part of `install` so it never assumes systemd.
 # ExecStart is rewritten to the real install path ($(BINDIR)/oans).
-.PHONY: install-systemd
 install-systemd:
 	install -d $(DESTDIR)$(UNITDIR)
 	sed 's|/usr/bin/oans|$(BINDIR)/oans|' systemd/oans@.service \
