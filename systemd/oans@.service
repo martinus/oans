@@ -1,0 +1,32 @@
+# oans deduplication for one hashfile "job".
+#
+# The instance name %i selects the hashfile /var/cache/oans/%i.hash. Set that
+# hashfile up once with a normal run naming the paths to dedupe, then enable the
+# matching timer - see systemd/README.md. Because the hashfile is
+# self-describing, this unit needs no arguments beyond it: `oans --hashfile=FILE`
+# replays the options, paths and excludes of that first run.
+#
+# Example: `systemctl start oans@media` deduplicates using
+# /var/cache/oans/media.hash.
+
+[Unit]
+Description=oans deduplication (%i)
+Documentation=man:oans(8) https://github.com/martinus/oans
+# Nothing to do until the hashfile has been set up (skip cleanly, don't fail).
+ConditionPathExists=/var/cache/oans/%i.hash
+
+[Service]
+Type=oneshot
+# Background maintenance: yield CPU and disk to everything interactive.
+Nice=19
+IOSchedulingClass=idle
+# Manage /var/cache/oans (created 0755, owned by this unit's user - root).
+CacheDirectory=oans
+# Replays the stored scan (self-describing hashfile); --quiet keeps the journal
+# to a short summary. Runs as root so it can read and re-extent the configured
+# tree wherever it lives.
+ExecStart=/usr/bin/oans --quiet --hashfile=/var/cache/oans/%i.hash
+# Deduplication only ever rewrites extent sharing via the byte-verified
+# FIDEDUPERANGE ioctl, so an interrupted run is safe; allow a clean stop.
+TimeoutStopSec=30
+NoNewPrivileges=true

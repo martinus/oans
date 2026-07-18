@@ -1,0 +1,16 @@
+# Periodic trigger for oans@%i.service. Enable one per hashfile "job", e.g.
+# `systemctl enable --now oans@media.timer`. See systemd/README.md.
+
+[Unit]
+Description=Weekly oans deduplication (%i)
+Documentation=man:oans(8) https://github.com/martinus/oans
+
+[Timer]
+OnCalendar=weekly
+# Catch up on the next boot if the machine was off when it was due.
+Persistent=true
+# Spread the load a little so several jobs don't all fire at once.
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

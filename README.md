@@ -99,6 +99,9 @@ and filesystem.
   excludes, so `oans --hashfile=FILE` with no arguments replays the last run —
   a cron job need only name the hashfile. If the stored paths have all vanished
   (e.g. an unmounted drive) it refuses rather than pruning the hashfile.
+- **systemd timer templates** for set-and-forget scheduled dedupe: set a job up
+  once, `systemctl enable --now oans@<name>.timer`, and it re-deduplicates that
+  tree weekly. See [`systemd/`](systemd/README.md).
 
 ### Testing
 
@@ -131,11 +134,12 @@ reclaimed space, compare `compsize` **Disk Usage** before and after a run;
 ```sh
 make            # build oans
 make check      # C unit tests + Python integration suite
-sudo make install   # installs oans + a duperemove compat symlink
+sudo make install           # installs oans + a duperemove compat symlink
+sudo make install-systemd   # optional: the oans@ timer/service templates
 ```
 
 Sources live under `src/`; man page sources under `docs/man/`; the integration
-suite under `tests/`.
+suite under `tests/`; the systemd units under `systemd/`.
 
 ## Usage
 

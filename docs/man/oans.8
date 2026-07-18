@@ -332,6 +332,22 @@ metrics for a dashboard:
 oans \-\-history \-\-hashfile=foo.hash
 oans \-\-json \-\-hashfile=foo.hash | jq .reclaimed_total_bytes
 .EE
+.SS Scheduled deduplication
+Because a hashfile is self\-describing, a scheduled run only needs to
+name it.
+oans ships systemd template units (\f[CR]oans\[at].service\f[R] /
+\f[CR]oans\[at].timer\f[R], installed by
+\f[CR]make install\-systemd\f[R]) for exactly this.
+Set a job up once, then enable its timer:
+.IP
+.EX
+oans \-dr \-\-hashfile=/var/cache/oans/media.hash /srv/media
+systemctl enable \-\-now oans\[at]media.timer
+.EE
+.PP
+The timer re\-deduplicates \f[CR]/srv/media\f[R] weekly, hashing only
+what changed.
+See \f[CR]systemd/README.md\f[R] in the source tree for the full guide.
 .SH FAQ
 .SS Is oans safe for my data?
 Yes.

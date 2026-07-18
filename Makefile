@@ -54,6 +54,7 @@ PREFIX  ?= /usr/local
 BINDIR  = $(PREFIX)/bin
 MANDIR  = $(PREFIX)/share/man/man8
 ZSHDIR  = $(PREFIX)/share/zsh/site-functions
+UNITDIR ?= $(PREFIX)/lib/systemd/system
 
 all: oans
 
@@ -92,6 +93,19 @@ uninstall:
 	rm -f $(DESTDIR)$(MANDIR)/oans.8 $(DESTDIR)$(MANDIR)/duperemove.8
 	rm -f $(DESTDIR)$(ZSHDIR)/_oans
 
+# Optional: the systemd@ template units for scheduled dedupe (see
+# systemd/README.md). Not part of `install` so it never assumes systemd.
+# ExecStart is rewritten to the real install path ($(BINDIR)/oans).
+.PHONY: install-systemd
+install-systemd:
+	install -d $(DESTDIR)$(UNITDIR)
+	sed 's|/usr/bin/oans|$(BINDIR)/oans|' systemd/oans@.service \
+		> $(DESTDIR)$(UNITDIR)/oans@.service
+	install -m 0644 systemd/oans@.timer $(DESTDIR)$(UNITDIR)/oans@.timer
+
+uninstall-systemd:
+	rm -f $(DESTDIR)$(UNITDIR)/oans@.service $(DESTDIR)$(UNITDIR)/oans@.timer
+
 # The man page is committed, so building and installing never need pandoc;
 # `make doc` regenerates it from the markdown source (for maintainers).
 .PHONY: doc
@@ -101,7 +115,8 @@ doc:
 DIST         = oans-$(VERSION)
 DIST_TARBALL = $(VERSION).tar.gz
 DIST_SOURCES = $(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
-	README.md docs/man/oans.md $(MANPAGE) $(COMPLETION)
+	README.md docs/man/oans.md $(MANPAGE) $(COMPLETION) \
+	systemd/oans@.service systemd/oans@.timer systemd/README.md
 
 # Source tarball with the resolved version embedded, so tarball builds (no
 # .git) still report it. --parents keeps the src/, docs/, completion/ layout.
