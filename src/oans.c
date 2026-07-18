@@ -46,6 +46,8 @@
 #include "file_scan.h"
 #include "find_dupes.h"
 #include "run_dedupe.h"
+#include "storage.h"
+#include "autotune.h"
 
 #include "opt.h"
 
@@ -57,6 +59,7 @@ static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
 static unsigned int history_only_opt = 0;
 static unsigned int json_only_opt = 0;
+static unsigned int autotune_opt = 0;
 static int opt_no_color = 0;
 
 /* User-supplied --exclude patterns, captured for the self-describing hashfile
@@ -64,9 +67,6 @@ static int opt_no_color = 0;
 static char **user_excludes;
 static int n_user_excludes;
 struct dbfile_config dbfile_cfg;
-
-/* Upper bound for the auto-detected worker thread count (overridable). */
-#define DEFAULT_MAX_AUTO_THREADS	8
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
@@ -624,6 +624,7 @@ enum {
 	STATS_OPTION,
 	HISTORY_OPTION,
 	JSON_OPTION,
+	AUTOTUNE_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -690,6 +691,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "stats", 0, NULL, STATS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
 		{ "json", 0, NULL, JSON_OPTION },
+		{ "autotune", 0, NULL, AUTOTUNE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -769,6 +771,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case JSON_OPTION:
 			json_only_opt = 1;
 			break;
+		case AUTOTUNE_OPTION:
+			autotune_opt = 1;
+			break;
 		case QUIET_OPTION:
 		case 'q':
 			quiet = 1;
@@ -833,15 +838,24 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	/* -L/-R/--stats/--history/--json are exclusive read-only report modes. */
+	/* -L/-R/--stats/--history/--json are exclusive read-only report modes;
+	 * --autotune is exclusive with them too. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
 				  + history_only_opt + json_only_opt;
 	/* Every report mode but -R takes no file list. */
 	bool nofile_report = report_count && !rm_only_opt;
 
-	if (report_count > 1) {
+	if (report_count + autotune_opt > 1) {
 		eprintf("Error: use only one of '-L', '-R', '--stats', "
-			"'--history', '--json'.\n");
+			"'--history', '--json', '--autotune'.\n");
+		return 1;
+	}
+
+	/* --autotune measures a live tree, so it needs a file list (the hashfile
+	 * is optional - it is only used to persist the result). */
+	if (autotune_opt && numfiles == 0) {
+		eprintf("Error: --autotune needs a file or directory to "
+			"measure against.\n");
 		return 1;
 	}
 
@@ -1163,6 +1177,47 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	free(abs);
 }
 
+/*
+ * Refine the auto-detected io-threads default from the backing storage of the
+ * first scan target. Spinning disks are seek-bound and want fewer concurrent
+ * readers than SSDs; a multi-device btrfs pool scales with its spindle count.
+ * A user-supplied --io-threads is always respected. `--autotune` measures the
+ * real optimum; this only picks a sensible starting point with no extra I/O.
+ */
+static void auto_tune_io_threads(const char *root)
+{
+	struct storage_profile p = {0};
+
+	if (options.io_threads)		/* explicit --io-threads (0 == auto) */
+		return;
+
+	/* A prior --autotune result stored in the hashfile wins over the guess. */
+	if (dbfile_cfg.autotune_io_threads) {
+		options.io_threads = dbfile_cfg.autotune_io_threads;
+		vprintf("Using autotuned --io-threads=%u from the hashfile "
+			"(override to change, re-run --autotune to update)\n",
+			options.io_threads);
+		return;
+	}
+
+	/*
+	 * Heuristic from the backing storage. storage_recommend_io_threads()
+	 * returns the plain CPU-count default for unknown media, so a failed
+	 * detect (leaving the zeroed profile) still yields a sane value.
+	 */
+	if (root)
+		storage_detect(root, &p);
+	options.io_threads = storage_recommend_io_threads(&p, get_num_cpus());
+
+	if (verbose) {
+		char desc[96];
+
+		storage_describe(&p, desc, sizeof(desc));
+		vprintf("Storage: %s; using --io-threads=%u (override to change)\n",
+			desc, options.io_threads);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	int ret, filelist_idx = 0;
@@ -1178,20 +1233,17 @@ int main(int argc, char **argv)
 
 	init_filerec();
 
-	/* Set the default CPU limits before parsing the user options */
-	options.cpu_threads = options.io_threads = get_num_cpus();
-
 	/*
-	 * The detected core count can be very high (e.g. 64). Dedup is I/O
-	 * bound - reading and checksumming files, then FIDEDUPERANGE ioctls -
-	 * so beyond a handful of threads we mostly add lock contention and a
-	 * wall of progress lines. Cap the auto-detected default; an explicit
-	 * --io-threads / --cpu-threads (parsed below) still overrides it.
+	 * cpu_threads (the block-search pool) has no storage dependency, so
+	 * default it here to the core count, capped: beyond a handful of threads
+	 * we mostly add lock contention and a wall of progress lines. An explicit
+	 * --cpu-threads (parsed below) overrides. io_threads stays 0 (== auto)
+	 * and is resolved from the scan target's storage once the roots are
+	 * known, in auto_tune_io_threads().
 	 */
-	if (options.io_threads > DEFAULT_MAX_AUTO_THREADS)
-		options.io_threads = DEFAULT_MAX_AUTO_THREADS;
-	if (options.cpu_threads > DEFAULT_MAX_AUTO_THREADS)
-		options.cpu_threads = DEFAULT_MAX_AUTO_THREADS;
+	options.cpu_threads = get_num_cpus();
+	if (options.cpu_threads > AUTO_THREADS_CAP)
+		options.cpu_threads = AUTO_THREADS_CAP;
 
 	ret = parse_options(argc, argv, &filelist_idx);
 	if (ret) {
@@ -1220,6 +1272,8 @@ int main(int argc, char **argv)
 		return print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
 		return print_metrics_json(options.hashfile);
+	else if (autotune_opt)
+		return autotune_run(&argv[filelist_idx], argc - filelist_idx);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1267,6 +1321,9 @@ int main(int argc, char **argv)
 		qprintf("Replaying stored scan of %d path%s from the hashfile.\n",
 			numfiles, numfiles == 1 ? "" : "s");
 	}
+
+	/* Pick io-threads to suit the target's storage (unless set explicitly). */
+	auto_tune_io_threads(roots[0]);
 
 	print_header();
 

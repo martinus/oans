@@ -179,6 +179,19 @@ lifetime run-history totals, then exit. Intended for scripting and dashboards
 `reclaimable_logical_bytes` field is a logical upper bound; the real disk space
 freed is smaller on a compressed filesystem. Requires the `--hashfile` option.
 
+**\--autotune** `files/dirs ..`
+  ~ Measure the fastest `--io-threads` for this machine and exit. oans reads
+and hashes a bounded sample of the given tree at several thread counts,
+dropping the page cache between trials (run as root for meaningful cold-read
+numbers on spinning disks), and prints a throughput table with the best value.
+When `--hashfile` is given the winner is stored in that hashfile, so later runs
+against it use that thread count automatically unless you pass an explicit
+`--io-threads`. This is the hardware-measured counterpart to the automatic
+storage heuristic (see `--io-threads`); it is the reliable way to find the
+optimum for a NAS or multi-disk array. The sample bounds can be tuned with the
+`DUPEREMOVE_AUTOTUNE_MAX_FILES`, `DUPEREMOVE_AUTOTUNE_MAX_BYTES` and
+`DUPEREMOVE_AUTOTUNE_ROUNDS` environment variables.
+
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
 standard input if a hyphen (-) is provided. Requires the `--hashfile` option.
@@ -196,9 +209,14 @@ but can prevent deduplication of zeroed files.
 
 **\--io-threads**=`N`
   ~ Use N threads for I/O. This is used by the file hashing and dedupe
-stages. The default is the number of host cpus, capped at 8 - beyond that,
-more threads mostly add filesystem lock contention instead of speed. An
-explicit `N` overrides the cap.
+stages. By default oans inspects the backing storage of the scan target and
+picks a value automatically: the number of host cpus (capped at 8) on
+non-rotational disks (SSD/NVMe) or when the media is unknown; fewer on a
+single spinning disk, which is seek-bound; and roughly two per device on a
+multi-device btrfs pool, still capped at 8. Run `oans -v` to see the
+detected storage and the chosen value. An explicit `N` disables the
+auto-detection and is used verbatim. Use `--autotune` to measure the real
+optimum on your hardware.
 
 **\--cpu-threads**=`N`
   ~ Use N threads for CPU bound tasks. This is used by the duplicate

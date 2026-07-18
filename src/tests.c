@@ -20,6 +20,7 @@
 #include "memstats.c"
 #include "fiemap.c"
 #include "progress.c"
+#include "storage.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -183,6 +184,41 @@ MU_TEST(test_sanitize_ctrl) {
 	mu_check(strcmp(small, "abc") == 0);
 }
 
+MU_TEST(test_storage_recommend_io_threads) {
+	struct storage_profile p;
+
+	/* SSD / non-rotational: keep the full CPU-capped default (cap 8). */
+	p = (struct storage_profile){ .rotational = false,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(storage_recommend_io_threads(&p, 4) == 4);
+	mu_check(storage_recommend_io_threads(&p, 32) == 8);	/* capped */
+
+	/* Unknown media falls back to the same default, never fewer. */
+	p = (struct storage_profile){ .rotational = false,
+		.rotational_known = false, .num_devices = 1 };
+	mu_check(storage_recommend_io_threads(&p, 16) == 8);
+	mu_check(storage_recommend_io_threads(&p, 2) == 2);
+
+	/* Single spinning disk: few concurrent readers (seek-bound), max 4. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(storage_recommend_io_threads(&p, 32) == 4);
+	mu_check(storage_recommend_io_threads(&p, 2) == 2);	/* fewer cores wins */
+
+	/* HDD pool: ~2 readers per spindle, still capped at 8 and by cores. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 2 };
+	mu_check(storage_recommend_io_threads(&p, 32) == 4);
+	p.num_devices = 4;
+	mu_check(storage_recommend_io_threads(&p, 32) == 8);	/* 2*4, capped 8 */
+	mu_check(storage_recommend_io_threads(&p, 6) == 6);	/* cores limit */
+
+	/* Degenerate CPU count still yields at least one thread. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(storage_recommend_io_threads(&p, 0) == 1);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -190,6 +226,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
 	MU_RUN_TEST(test_sanitize_ctrl);
+	MU_RUN_TEST(test_storage_recommend_io_threads);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

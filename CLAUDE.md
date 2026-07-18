@@ -95,6 +95,45 @@ onto the walker threads.**
   (`statx → btrfs_iget → btree reads`); SQLite is <2%, so parallelizing the
   consumer would not help that workload.
 
+## io-threads auto-tuning (storage detection + --autotune)
+
+`--io-threads` sizes three pools (walkers, the csum/read pool, the dedupe
+pool). Its default is no longer a flat `min(nproc, 8)`; two mechanisms refine
+it, both **only when the user didn't pass `--io-threads`** (tracked by
+`options.io_threads_set`), and both resolved on the main thread *after* the
+roots are known (`auto_tune_io_threads()` in `oans.c`, called before
+`print_header`/`scan_files`) — the fs isn't known at the old pre-parse default
+site.
+
+- **`src/storage.{c,h}` — heuristic from device type.** `storage_detect()`
+  reports rotational-ness + device count. btrfs pools have an anonymous
+  `st_dev` with no `/sys/block` entry, so members are enumerated via
+  `BTRFS_IOC_FS_INFO` (`num_devices`, `max_id`) + `BTRFS_IOC_DEV_INFO` (device
+  path → `st_rdev` → `/sys/dev/block/MAJ:MIN/queue/rotational`, with a
+  `../queue` parent fallback for partitions). Single-device fs reads the file's
+  `st_dev` directly. `storage_recommend_io_threads()` is **pure and
+  unit-tested** (`test_storage_recommend_io_threads`): SSD/unknown keep
+  `min(nproc,8)` (the previously-validated path, unchanged); a single HDD gets
+  ≤4; an HDD pool gets ~2 per device, capped at 8. These HDD constants are
+  *educated guesses* — they were never measured on real spinning-disk/RAID
+  hardware. Treat `--autotune` as authoritative.
+- **`src/autotune.{c,h}` — empirical measurement (`--autotune`).** Re-execs
+  `oans` on a bounded sample (fed as a `-` file list, **no hashfile** → pure
+  in-memory read+hash) at each candidate thread count, interleaved across
+  rounds, keeping each candidate's *fastest* run (per the profiling rules:
+  interleave to cancel drift, min-of-N for noise). It drops the page cache
+  between trials (`/proc/sys/vm/drop_caches`, needs root) and the scan's own
+  `POSIX_FADV_DONTNEED` keeps the sample cold for free. Sample/round bounds:
+  `DUPEREMOVE_AUTOTUNE_{MAX_FILES,MAX_BYTES,ROUNDS}`. With `--hashfile` it
+  stores the winner under config key `autotune_io_threads`
+  (`dbfile_{set,get}_config_int`); a later plain run reads it back and it wins
+  over the storage heuristic (but an explicit `--io-threads` still overrides
+  everything). Pinned by `test_autotune.py`.
+- **Measuring on the dev box is misleading:** the sandbox/CI fs is often ext,
+  which `is_fs_supported()` rejects, so autotune trials read 0 bytes and the
+  throughput numbers are pure process-startup noise. The *mechanism* still
+  runs; real numbers need a btrfs/xfs target.
+
 ## dedupe_seq (incremental dedup)
 
 Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
