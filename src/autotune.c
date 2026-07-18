@@ -82,8 +82,10 @@ static void collect_dir(struct sample *s, const char *dir)
 			continue;
 
 		if (S_ISDIR(st.st_mode)) {
-			if (options.recurse_dirs)
-				collect_dir(s, child);
+			/* Always recurse: sampling a tree to measure throughput
+			 * should look inside subdirectories regardless of -r
+			 * (which governs the real run, not this measurement). */
+			collect_dir(s, child);
 		} else if (S_ISREG(st.st_mode)) {
 			if ((uint64_t)st.st_size < options.min_filesize)
 				continue;
@@ -311,15 +313,26 @@ int autotune_run(char **roots, int nroots)
 		for (unsigned int i = 0; i < ncand; i++) {
 			double t;
 
+			/* Each trial reads the whole (cold) sample, so it can
+			 * take a while - report progress as we go. */
+			printf("  round %u/%u  threads %-3u ", r + 1, rounds,
+			       cand[i]);
+			fflush(stdout);
+
 			if (cold)
 				drop_caches();
 			t = run_trial(self, listpath, cand[i]);
-			if (t < 0)
+			if (t < 0) {
+				printf("failed\n");
 				continue;
+			}
+			printf("%-8s %s/s\n", human_duration(t),
+			       human_size((uint64_t)(s.total_bytes / t)));
 			if (best[i] == 0 || t < best[i])
 				best[i] = t;
 		}
 	}
+	printf("\n");
 
 	/* Find the fastest candidate, then print every row in candidate order. */
 	for (unsigned int i = 0; i < ncand; i++)

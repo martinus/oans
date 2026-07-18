@@ -51,19 +51,23 @@ sudo make install-systemd    # installs the oans@ timer/service templates
 ## Step 2 — Autotune the thread count for your disks
 
 Give the job a name and tune into the hashfile the timer will later use
-(`/var/cache/oans/<name>.hash`), so the measured value is reused by every run:
+(`/var/cache/oans/<name>.hash`). Pass the same `-dr` and path you'll dedupe
+with — autotune records them too, so this one command both measures the
+threads **and** sets up the job:
 
 ```sh
 sudo install -d -m 0755 /var/cache/oans
-sudo oans --autotune --hashfile=/var/cache/oans/media.hash /srv/media
+sudo oans --autotune -dr --hashfile=/var/cache/oans/media.hash /srv/media
 ```
 
 Run it **as root** — autotune drops the page cache between trials to get honest
 cold-read numbers, which matters a lot on spinning disks and RAID. It reads only
-a bounded sample (quick, not a full scan), prints a throughput-vs-threads table,
-and stores the winning `--io-threads` value in the hashfile. This is the
-reliable way to size threads for a NAS; without it, oans falls back to a
-storage-type heuristic whose HDD/RAID numbers are only educated guesses.
+a bounded sample (quick relative to a full scan, though on a big cold tree the
+trials still take a few minutes; it prints each one as it goes), then prints a
+throughput-vs-threads table and stores the winning `--io-threads` value plus the
+scan configuration in the hashfile. This is the reliable way to size threads for
+a NAS; without it, oans falls back to a storage-type heuristic whose HDD/RAID
+numbers are only educated guesses.
 
 ## Step 3 — The first run (the slow one)
 
@@ -74,8 +78,7 @@ sudo oans -dr --hashfile=/var/cache/oans/media.hash /srv/media
 This is the expensive pass: it hashes everything and deduplicates. It
 
 - reuses the thread count autotune stored in Step 2,
-- **records its options and paths** in the hashfile (this is what makes the
-  scheduled runs need no arguments), and
+- re-confirms the stored options and paths (already recorded by Step 2), and
 - is safe to interrupt — the kernel does each dedupe atomically and
   byte-verified, so Ctrl+C can only waste work, never corrupt data.
 

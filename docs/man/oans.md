@@ -183,13 +183,17 @@ freed is smaller on a compressed filesystem. Requires the `--hashfile` option.
   ~ Measure the fastest `--io-threads` for this machine and exit. oans reads
 and hashes a bounded sample of the given tree at several thread counts,
 dropping the page cache between trials (run as root for meaningful cold-read
-numbers on spinning disks), and prints a throughput table with the best value.
-When `--hashfile` is given the winner is stored in that hashfile, so later runs
+numbers on spinning disks), printing each trial as it runs and then a
+throughput table with the best value. Directories are always sampled
+recursively (the sample is about the storage, not the `-r` flag). When
+`--hashfile` is given the winner is stored in that hashfile, so later runs
 against it use that thread count automatically unless you pass an explicit
-`--io-threads`. This is the hardware-measured counterpart to the automatic
-storage heuristic (see `--io-threads`); it is the reliable way to find the
-optimum for a NAS or multi-disk array. The sample bounds can be tuned with the
-`DUPEREMOVE_AUTOTUNE_MAX_FILES`, `DUPEREMOVE_AUTOTUNE_MAX_BYTES` and
+`--io-threads`; the scan configuration (paths and any `-d`/`-r`/… you passed)
+is stored too, so autotune doubles as setup — a later bare
+`oans --hashfile=FILE` replays it. This is the hardware-measured counterpart to
+the automatic storage heuristic (see `--io-threads`); it is the reliable way to
+find the optimum for a NAS or multi-disk array. The sample bounds can be tuned
+with the `DUPEREMOVE_AUTOTUNE_MAX_FILES`, `DUPEREMOVE_AUTOTUNE_MAX_BYTES` and
 `DUPEREMOVE_AUTOTUNE_ROUNDS` environment variables.
 
 **-R** `files ..`

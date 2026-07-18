@@ -178,11 +178,16 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 	/*
 	 * The numbers on the right must stay visible: give the path whatever
 	 * width remains and shorten its middle, never the suffix.
+	 *
+	 * When the terminal width is unknown (some SSH ptys report 0 columns),
+	 * fall back to 80 rather than not truncating at all: an untruncated long
+	 * path wraps onto a second physical row, which desyncs the fixed-height
+	 * progress area (the cursor moves up N rows but N+ were drawn) and leaves
+	 * the top lines frozen. 80 never over-estimates a real terminal, so the
+	 * line can't wrap.
 	 */
-	if (w_col == UINT_MAX)
-		avail = INT_MAX;
-	else
-		avail = (int)w_col - (int)strlen(prefix) - (int)strlen(suffix);
+	avail = (int)(w_col == UINT_MAX ? 80 : w_col)
+		- (int)strlen(prefix) - (int)strlen(suffix);
 	/* Never emit raw control bytes from a filename to the terminal (#353). */
 	sanitize_ctrl(tprogress->file_path, clean, sizeof(clean));
 	ellipsize_path(clean, path, sizeof(path), avail);
