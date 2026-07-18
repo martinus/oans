@@ -61,6 +61,15 @@ static GThread *printer = NULL;
 bool tty;
 unsigned int w_col;
 
+/*
+ * Rows the live progress block occupied in the last render. The redraw returns
+ * to the top of the block by moving the cursor up this many rows (a *relative*
+ * move, which stays correct when the terminal scrolls) rather than restoring an
+ * absolute saved position (which a scroll invalidates, leaving stale copies of
+ * the block piling up). 0 means "no block drawn yet - draw fresh here".
+ */
+static unsigned int drawn_lines;
+
 /* Sums of the per-thread stats */
 static uint64_t files_scanned, bytes_scanned;
 
@@ -88,10 +97,22 @@ static struct {
 	_Atomic uint64_t	reclaimed, kern;
 } pdd;
 
-#define s_save_pos() if (tty) printf("\33[s");
-#define s_restore_pos() if (tty) printf("\33[u");
-#define s_clear() if (tty) printf("\33[J");
 #define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
+
+/* Move the cursor to the top-left of the block drawn in the previous render. */
+static void progress_home(void)
+{
+	if (tty && drawn_lines)
+		printf("\33[%uA\r", drawn_lines);
+}
+
+/* Erase from the cursor to the end of the screen (removes any rows a taller
+ * previous render left below the current one). */
+static void progress_wipe(void)
+{
+	if (tty)
+		printf("\33[J");
+}
 
 #define percent(val1, val2) \
 	((val2) ? (double) (val1) / (double) (val2) * 100 : 0.0)
@@ -201,7 +222,8 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 	s_printf("%s\n", buf);
 }
 
-static void print_scan_progress(void)
+/* Returns the number of lines printed (fixed at 3), for the relative redraw. */
+static unsigned int print_scan_progress(void)
 {
 	uint64_t tf = pscan.total_files_count;
 	uint64_t tb = pscan.total_bytes_count;
@@ -218,7 +240,7 @@ static void print_scan_progress(void)
 			 pscan.files_examined);
 		s_printf("\t%" PRIu64 " need hashing\n", tf);
 		s_printf("\tFile listing: in progress\n");
-		return;
+		return 3;
 	}
 
 	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)\n",
@@ -236,9 +258,11 @@ static void print_scan_progress(void)
 	}
 	printf("\n");
 	s_printf("\tFile listing: completed\n");
+	return 3;
 }
 
-static void print_dedupe_progress(void)
+/* Returns the number of lines printed (fixed at 3), for the relative redraw. */
+static unsigned int print_dedupe_progress(void)
 {
 	uint64_t done = pdd.done;
 	uint64_t queued = pdd.queued;
@@ -276,52 +300,46 @@ static void print_dedupe_progress(void)
 		printf(" · ETA ~%s",
 		       human_duration((total - done) / (done / elapsed)));
 	printf("\n");
+	return 3;
 }
 
-static void print_total_progress(void)
+/* Returns the number of lines printed. */
+static unsigned int print_total_progress(void)
 {
-	if (pdd.phase)
-		print_dedupe_progress();
-	else
-		print_scan_progress();
+	return pdd.phase ? print_dedupe_progress() : print_scan_progress();
 }
 
 static void prepare_screen_area(void)
 {
 	/*
-	 * Prepare one empty line for each scan threads
-	 * plus one line for the total.
-	 * This is required to bypass the scrolling and let us
-	 * save/restore the cursor position.
+	 * The relative-redraw model self-manages: the next print_progress()
+	 * draws the block at the current cursor, and later ones move up
+	 * drawn_lines to redraw in place. Just declare "no block drawn yet".
 	 */
-	for (unsigned int i = 0; i < options.io_threads + 3; i++)
-		s_printf("\n");
-
-	/* Go back to the first line */
-	printf("\33[%iA", options.io_threads + 3);
-
-	/*
-	 * Save the cursor position.
-	 * We will restore it every time we print progress.
-	 */
-	s_save_pos()
+	drawn_lines = 0;
 }
 
 static void *print_progress(void)
 {
+	unsigned int lines = 0;
+
 	files_scanned = 0;
 	bytes_scanned = 0;
 	pscan.files_examined = 0;
 
-	s_restore_pos();
+	progress_home();	/* back to the top of the block we drew last time */
 
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
 		print_thread_progress(pscan.threads[i]);
+		lines++;
 		files_scanned += pscan.threads[i]->total_scanned_files;
 		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
 	}
 
-	print_total_progress();
+	lines += print_total_progress();
+
+	progress_wipe();	/* drop any rows a taller previous render left */
+	drawn_lines = lines;
 
 	return NULL;
 }
@@ -398,11 +416,10 @@ void pscan_join(void)
 	/* Show the cursor again */
 	printf("\33[?25h");
 
-	/* Clear the screen from all thread-progress */
-	s_restore_pos();
-	s_clear();
-	s_restore_pos();
-
+	/* Wipe the live block, then leave the final totals in its place. */
+	progress_home();
+	progress_wipe();
+	drawn_lines = 0;
 	print_total_progress();
 
 	pscan_free_threads();
@@ -448,26 +465,16 @@ void pscan_printf(char *fmt, ...)
 	va_start(args, fmt);
 
 	g_mutex_lock(&pscan.mutex);
-	if (tty) {
-		s_restore_pos();
-		s_clear();
-		s_restore_pos();
-	}
+
+	/* Erase the live block, print the message where it sat (it becomes
+	 * scrollback), then redraw the block below it. */
+	progress_home();
+	progress_wipe();
+	drawn_lines = 0;
 
 	vfprintf(stdout, fmt, args);
-
-	if (tty) {
-		s_save_pos();
-		prepare_screen_area();
-	}
 	va_end(args);
 
-	/*
-	 * We reprint the progress immediately to reduce
-	 * the time during which the screen is left empty:
-	 * between the prepare_screen_area() and the progress_thread()'s
-	 * next iteration.
-	 */
 	print_progress();
 	g_mutex_unlock(&pscan.mutex);
 }
@@ -538,12 +545,12 @@ void pdedupe_end(void)
 		g_thread_join(printer);
 		printer = NULL;
 
-		/* Show the cursor again and clear the status area; the caller
+		/* Show the cursor again and wipe the status area; the caller
 		 * prints the final summary. */
 		printf("\33[?25h");
-		s_restore_pos();
-		s_clear();
-		s_restore_pos();
+		progress_home();
+		progress_wipe();
+		drawn_lines = 0;
 		fflush(stdout);
 	}
 	pscan_free_threads();
