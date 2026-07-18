@@ -33,6 +33,7 @@ _duperemove() {
 		'--stats[print a report about the hashfile and exit]'
 		'--history[print the run history recorded in the hashfile and exit]'
 		'--json[print machine-readable hashfile metrics as JSON and exit]'
+		'--autotune[measure the fastest --io-threads for this machine and exit]'
 		'--skip-zeroes[read data blocks and skip any zeroed blocks]'
 		'-b[use the specified block size]:block size: '
 		'--io-threads=[use N threads for IO]:number of thread: '
