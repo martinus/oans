@@ -2,7 +2,7 @@
 
 `oans` (a fork of duperemove) finds duplicate extents and deduplicates them via
 the kernel `FIDEDUPERANGE` ioctl (atomic, byte-verified). Hashes live in a
-SQLite **hashfile** (WAL mode, `synchronous=OFF`, `cache_size=-256000`).
+SQLite **hashfile** (WAL mode, `synchronous=OFF`, `cache_size=-65536` = 64 MB).
 
 All C sources live under `src/` (main program `src/oans.c`); man page sources
 under `docs/man/`. The binary is `oans`; `make install` adds a `duperemove`
@@ -84,6 +84,17 @@ Startup/scan cost has burned us before. The rules:
   measurement bug**, not a discovery. Reconcile before acting.
 
 ## Hashfile / SQLite gotchas
+
+- **`cache_size = -65536` (64 MB per connection), not 256 MB.** The pragma is
+  applied to *every* connection (listing handle, batched writer, and one per
+  walker thread), so on a large hashfile the peak RSS was dominated by these
+  caches (a NAS user hit ~870 MB on a 1.7M-file tree). Measured on the 174k-file
+  `~/git`: dropping 256 MB → 64 MB is **perf-neutral** on both the warm rescan
+  (change-detection is btrfs-metadata-bound, and the OS page cache backs the DB)
+  and the full `-rd` (dedupe-phase group-loading). 16 MB was ~3% slower on the
+  dedupe joins, so 64 MB is the floor that keeps them cached. Don't raise it back
+  to 256 MB without a measured reason. Further memory work (giving the per-walker
+  read handles a tiny cache; `seen_inodes` scales ~50 B/file) is unexplored.
 
 - In WAL mode a connection holds its read snapshot across queries. Wrapping the
   per-file change-detection reads in **one batched read transaction** (refreshed

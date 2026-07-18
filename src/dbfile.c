@@ -369,7 +369,7 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
-	ret = sqlite3_exec(db, "PRAGMA cache_size = -256000", NULL, NULL, NULL);
+	ret = sqlite3_exec(db, "PRAGMA cache_size = -65536", NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret, "configuring database (cache size)");
 		return ret;
