@@ -18,7 +18,7 @@ deduplication ioctl.
 | **oans** **\--hashfile**=*FILE*
 | **oans** {**\--stats** | **\--history** | **\--json** | **-L**} **\--hashfile**=*FILE*
 | **oans** **-R** **\--hashfile**=*FILE* *file*...
-| **oans** **\--autotune** \[**-r**] *file*...
+| **oans** **\--autotune** *file*...
 
 # DESCRIPTION
 
@@ -66,8 +66,8 @@ space reclaimed is printed at the end (see *OUTPUT*).
 **Report and maintenance modes.**
 **\--stats**, **\--history**, **\--json**, **-L**, **-R**, and **\--autotune**
 each inspect or maintain a hashfile and then exit without scanning for dupes.
-The first four open the hashfile **read-only** and are safe to run against a
-hashfile another `oans` is actively using (see *NOTES*).
+The first four open the hashfile **read-only**; see *NOTES* for running them
+alongside an active `oans`.
 
 # OPTIONS
 

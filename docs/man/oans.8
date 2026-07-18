@@ -30,8 +30,7 @@ kernel\(cqs deduplication ioctl.
 .PD 0
 .P
 .PD
-\f[B]oans\f[R] \f[B]\-\-autotune\f[R] [\f[B]\-r\f[R]]
-\f[I]file\f[R]\&...
+\f[B]oans\f[R] \f[B]\-\-autotune\f[R] \f[I]file\f[R]\&...
 .SH DESCRIPTION
 \f[CR]oans\f[R] finds regions of identical data across a set of files
 and, on request, asks the kernel to make them share storage \(em
@@ -88,9 +87,8 @@ A summary of the space reclaimed is printed at the end (see
 \f[B]\-\-history\f[R], \f[B]\-\-json\f[R], \f[B]\-L\f[R], \f[B]\-R\f[R],
 and \f[B]\-\-autotune\f[R] each inspect or maintain a hashfile and then
 exit without scanning for dupes.
-The first four open the hashfile \f[B]read\-only\f[R] and are safe to
-run against a hashfile another \f[CR]oans\f[R] is actively using (see
-\f[I]NOTES\f[R]).
+The first four open the hashfile \f[B]read\-only\f[R]; see
+\f[I]NOTES\f[R] for running them alongside an active \f[CR]oans\f[R].
 .SH OPTIONS
 The non\-option arguments are the \f[I]files\f[R] and
 \f[I]directories\f[R] to scan, or a single hyphen (\f[B]\-\f[R]) to read
