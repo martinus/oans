@@ -23,9 +23,24 @@ findmnt -no FSTYPE /srv/media      # or: stat -f -c %T /srv/media
 
 ## Step 1 — Build and install
 
-There is no binary package yet, so build from source. You need a C toolchain
-(`gcc`, `make`, `pkg-config`) and development headers for glib2, sqlite3,
-libxxhash (≥ 0.8), util-linux (libuuid/libmount/libblkid) and libbsd.
+There is no binary package yet, so build from source. Install the build
+dependencies first:
+
+```sh
+# Fedora / RHEL
+sudo dnf install gcc make pkgconf-pkg-config \
+    glib2-devel sqlite-devel xxhash-devel \
+    libuuid-devel libmount-devel libblkid-devel libbsd-devel
+```
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config \
+    libglib2.0-dev libsqlite3-dev libxxhash-dev \
+    uuid-dev libmount-dev libblkid-dev libbsd-dev
+```
+
+Then build and install:
 
 ```sh
 make

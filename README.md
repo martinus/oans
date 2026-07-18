@@ -125,11 +125,29 @@ reclaimed space, compare `compsize` **Disk Usage** before and after a run;
 ## Requirements & building
 
 - Linux kernel 3.13 or later
-- GNU make, pkg-config
+- GNU make, a C compiler, pkg-config
 - glib2, sqlite3
-- libxxhash 0.8.0 or later (`libxxhash-dev` on Debian)
+- libxxhash 0.8.0 or later
 - util-linux (libuuid, libmount, libblkid)
-- libbsd (`libbsd-dev` on Debian)
+- libbsd
+
+Install the build dependencies:
+
+```sh
+# Fedora / RHEL
+sudo dnf install gcc make pkgconf-pkg-config \
+    glib2-devel sqlite-devel xxhash-devel \
+    libuuid-devel libmount-devel libblkid-devel libbsd-devel
+```
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config \
+    libglib2.0-dev libsqlite3-dev libxxhash-dev \
+    uuid-dev libmount-dev libblkid-dev libbsd-dev
+```
+
+Then build and install:
 
 ```sh
 make            # build oans
