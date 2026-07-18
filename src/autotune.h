@@ -19,9 +19,6 @@
 #ifndef	__AUTOTUNE_H__
 #define	__AUTOTUNE_H__
 
-/* Config-table key holding a persisted autotune result (io-threads). */
-#define AUTOTUNE_CONFIG_KEY	"autotune_io_threads"
-
 /*
  * Run the calibration over `roots` and print a recommendation. If
  * options.hashfile is set, the winning io-threads is stored in that hashfile's

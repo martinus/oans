@@ -88,6 +88,9 @@ struct dbhandle *dbfile_open_handle_thread(struct threads_pool *pool);
 void dbfile_lock(void);
 void dbfile_unlock(void);
 
+/* Config-table key holding a persisted --autotune result (io-threads). */
+#define AUTOTUNE_CONFIG_KEY	"autotune_io_threads"
+
 struct dbfile_config {
 	unsigned int	blocksize;
 	int		major;
@@ -95,18 +98,19 @@ struct dbfile_config {
 	char		hash_type[8];
 	unsigned int	dedupe_seq;
 	uuid_t		fs_uuid;
+	/* Persisted --autotune winner, 0 if never tuned (see AUTOTUNE_CONFIG_KEY). */
+	unsigned int	autotune_io_threads;
 };
 int dbfile_get_config(sqlite3 *db, struct dbfile_config *cfg);
 int __dbfile_sync_config(sqlite3 *db, struct dbfile_config *cfg);
 int dbfile_sync_config(struct dbhandle *db, struct dbfile_config *cfg);
 
 /*
- * Store/read a single integer under `key` in the config key/value table (used
- * for the persisted --autotune result). set returns 0 on success; get returns
- * 1 and sets *val if the key was present, 0 if absent, <0 on error.
+ * Store a single integer under `key` in the config key/value table (used to
+ * persist the --autotune result). Returns 0 on success. The value is read back
+ * as part of struct dbfile_config (see dbfile_get_config).
  */
 int dbfile_set_config_int(struct dbhandle *db, const char *key, int64_t val);
-int dbfile_get_config_int(struct dbhandle *db, const char *key, int64_t *val);
 
 /*
  * Self-describing hashfile: the scan-shaping options plus the roots and

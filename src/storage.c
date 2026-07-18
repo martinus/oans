@@ -28,13 +28,6 @@
 #include "storage.h"
 
 /*
- * The auto-detected walker/reader default never exceeds this, matching the
- * long-standing cap: on btrfs the walk plateaus at ~8 threads on metadata
- * b-tree lock contention regardless of the disk, so more just burns cores.
- */
-#define STORAGE_MAX_AUTO_THREADS	8
-
-/*
  * Read /sys .../queue/rotational for a block device. `dev` is a device node's
  * st_rdev (btrfs member) or a file's st_dev (single-device fs). Returns 0 and
  * sets *rot on success, or a negative errno. Whole disks answer directly;
@@ -143,8 +136,7 @@ int storage_detect(const char *path, struct storage_profile *p)
 unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 					  unsigned int ncpus)
 {
-	unsigned int cap = STORAGE_MAX_AUTO_THREADS;
-	unsigned int base = ncpus < cap ? ncpus : cap;
+	unsigned int base = ncpus < AUTO_THREADS_CAP ? ncpus : AUTO_THREADS_CAP;
 
 	if (base < 1)
 		base = 1;
@@ -161,13 +153,10 @@ unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 	 */
 	if (p->num_devices <= 1)
 		return base < 4 ? base : 4;
-	else {
-		unsigned int want = 2 * p->num_devices;
 
-		if (want > base)
-			want = base;
-		return want < 1 ? 1 : want;
-	}
+	unsigned int want = 2 * p->num_devices;
+
+	return want < base ? want : base;
 }
 
 void storage_describe(const struct storage_profile *p, char *buf, size_t len)

@@ -68,9 +68,6 @@ static char **user_excludes;
 static int n_user_excludes;
 struct dbfile_config dbfile_cfg;
 
-/* Upper bound for the auto-detected worker thread count (overridable). */
-#define DEFAULT_MAX_AUTO_THREADS	8
-
 static void print_file(char *filename, char *ino, char *subvol)
 {
 	if (verbose)
@@ -743,7 +740,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 					"an integer, %s found\n", optarg);
 				return EINVAL;
 			}
-			options.io_threads_set = true;
 			break;
 		case CPU_THREADS_OPTION:
 			options.cpu_threads = strtoul(optarg, NULL, 10);
@@ -752,7 +748,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 					"an integer, %s found\n", optarg);
 				return EINVAL;
 			}
-			options.cpu_threads_set = true;
 			break;
 		case SKIP_ZEROES_OPTION:
 			options.skip_zeroes = true;
@@ -1189,35 +1184,38 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
  * A user-supplied --io-threads is always respected. `--autotune` measures the
  * real optimum; this only picks a sensible starting point with no extra I/O.
  */
-static void auto_tune_io_threads(struct dbhandle *db, const char *root)
+static void auto_tune_io_threads(const char *root)
 {
-	struct storage_profile p;
-	char desc[96];
-	int64_t stored;
-	unsigned int rec;
+	struct storage_profile p = {0};
 
-	if (options.io_threads_set || !root)
+	if (options.io_threads)		/* explicit --io-threads (0 == auto) */
 		return;
 
 	/* A prior --autotune result stored in the hashfile wins over the guess. */
-	if (db && dbfile_get_config_int(db, AUTOTUNE_CONFIG_KEY, &stored) == 1 &&
-	    stored > 0) {
-		options.io_threads = (unsigned int)stored;
+	if (dbfile_cfg.autotune_io_threads) {
+		options.io_threads = dbfile_cfg.autotune_io_threads;
 		vprintf("Using autotuned --io-threads=%u from the hashfile "
 			"(override to change, re-run --autotune to update)\n",
 			options.io_threads);
 		return;
 	}
 
-	if (storage_detect(root, &p) != 0)
-		return;	/* keep the CPU-count default set in main() */
+	/*
+	 * Heuristic from the backing storage. storage_recommend_io_threads()
+	 * returns the plain CPU-count default for unknown media, so a failed
+	 * detect (leaving the zeroed profile) still yields a sane value.
+	 */
+	if (root)
+		storage_detect(root, &p);
+	options.io_threads = storage_recommend_io_threads(&p, get_num_cpus());
 
-	rec = storage_recommend_io_threads(&p, get_num_cpus());
-	options.io_threads = rec;
+	if (verbose) {
+		char desc[96];
 
-	storage_describe(&p, desc, sizeof(desc));
-	vprintf("Storage: %s; using --io-threads=%u (override to change)\n",
-		desc, rec);
+		storage_describe(&p, desc, sizeof(desc));
+		vprintf("Storage: %s; using --io-threads=%u (override to change)\n",
+			desc, options.io_threads);
+	}
 }
 
 int main(int argc, char **argv)
@@ -1235,20 +1233,17 @@ int main(int argc, char **argv)
 
 	init_filerec();
 
-	/* Set the default CPU limits before parsing the user options */
-	options.cpu_threads = options.io_threads = get_num_cpus();
-
 	/*
-	 * The detected core count can be very high (e.g. 64). Dedup is I/O
-	 * bound - reading and checksumming files, then FIDEDUPERANGE ioctls -
-	 * so beyond a handful of threads we mostly add lock contention and a
-	 * wall of progress lines. Cap the auto-detected default; an explicit
-	 * --io-threads / --cpu-threads (parsed below) still overrides it.
+	 * cpu_threads (the block-search pool) has no storage dependency, so
+	 * default it here to the core count, capped: beyond a handful of threads
+	 * we mostly add lock contention and a wall of progress lines. An explicit
+	 * --cpu-threads (parsed below) overrides. io_threads stays 0 (== auto)
+	 * and is resolved from the scan target's storage once the roots are
+	 * known, in auto_tune_io_threads().
 	 */
-	if (options.io_threads > DEFAULT_MAX_AUTO_THREADS)
-		options.io_threads = DEFAULT_MAX_AUTO_THREADS;
-	if (options.cpu_threads > DEFAULT_MAX_AUTO_THREADS)
-		options.cpu_threads = DEFAULT_MAX_AUTO_THREADS;
+	options.cpu_threads = get_num_cpus();
+	if (options.cpu_threads > AUTO_THREADS_CAP)
+		options.cpu_threads = AUTO_THREADS_CAP;
 
 	ret = parse_options(argc, argv, &filelist_idx);
 	if (ret) {
@@ -1328,7 +1323,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	auto_tune_io_threads(db, roots[0]);
+	auto_tune_io_threads(roots[0]);
 
 	print_header();
 

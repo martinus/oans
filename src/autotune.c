@@ -147,30 +147,23 @@ static double ts_diff(struct timespec a, struct timespec b)
 	       (double)(b.tv_nsec - a.tv_nsec) / 1e9;
 }
 
-static bool can_drop_caches(void)
+/*
+ * Flush and drop the page cache so the next trial reads cold. Returns whether
+ * it actually dropped (needs root); when it can't, callers skip it entirely
+ * rather than paying a system-wide sync() that drops nothing.
+ */
+static bool drop_caches(void)
 {
 	int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
+	ssize_t w;
 
 	if (fd < 0)
 		return false;
+	sync();
+	w = write(fd, "3\n", 2);	/* best effort */
+	(void)w;
 	close(fd);
 	return true;
-}
-
-static void drop_caches(void)
-{
-	int fd;
-
-	sync();
-	fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
-	if (fd < 0)
-		return;
-	{
-		ssize_t w = write(fd, "3\n", 2);	/* best effort */
-
-		(void)w;
-	}
-	close(fd);
 }
 
 /*
@@ -257,6 +250,7 @@ int autotune_run(char **roots, int nroots)
 	ssize_t self_len;
 	unsigned int best_k = 0;
 	double best_time = 0;
+	bool cold;
 	int listfd, ret = 0;
 
 	self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
@@ -303,7 +297,9 @@ int autotune_run(char **roots, int nroots)
 	best = calloc(ncand, sizeof(*best));
 	abort_on(!best);
 
-	if (can_drop_caches())
+	/* Probe once (this also primes a cold cache before the first trial). */
+	cold = drop_caches();
+	if (cold)
 		printf("Dropping page cache between trials (cold reads).\n");
 	else
 		printf("Note: cannot drop page cache (run as root for cold-read "
@@ -315,7 +311,8 @@ int autotune_run(char **roots, int nroots)
 		for (unsigned int i = 0; i < ncand; i++) {
 			double t;
 
-			drop_caches();
+			if (cold)
+				drop_caches();
 			t = run_trial(self, listpath, cand[i]);
 			if (t < 0)
 				continue;
@@ -324,22 +321,21 @@ int autotune_run(char **roots, int nroots)
 		}
 	}
 
+	/* Find the fastest candidate, then print every row in candidate order. */
+	for (unsigned int i = 0; i < ncand; i++)
+		if (best[i] != 0 && (best_time == 0 || best[i] < best_time)) {
+			best_time = best[i];
+			best_k = cand[i];
+		}
+
 	printf("  %-9s %-10s %s\n", "threads", "time", "throughput");
 	for (unsigned int i = 0; i < ncand; i++) {
+		char tp[40];
+
 		if (best[i] == 0) {
 			printf("  %-9u %-10s %s\n", cand[i], "failed", "-");
 			continue;
 		}
-		if (best_time == 0 || best[i] < best_time) {
-			best_time = best[i];
-			best_k = cand[i];
-		}
-	}
-	for (unsigned int i = 0; i < ncand; i++) {
-		char tp[40];
-
-		if (best[i] == 0)
-			continue;
 		snprintf(tp, sizeof(tp), "%s/s",
 			 human_size((uint64_t)(s.total_bytes / best[i])));
 		printf("  %-9u %-10s %-12s%s\n", cand[i],

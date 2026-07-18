@@ -1335,6 +1335,12 @@ static int __dbfile_get_config(sqlite3 *db, struct dbfile_config *cfg)
 	if (ret)
 		goto out;
 
+	/* Optional; stays 0 (dbfile_config_defaults) when --autotune never ran. */
+	ret = get_config_int(stmt, AUTOTUNE_CONFIG_KEY,
+			     (int *)&cfg->autotune_io_threads);
+	if (ret)
+		goto out;
+
 	ret = get_config_text(stmt, "fs_uuid", uuid, 36);
 	if (ret)
 		goto out;
@@ -1370,37 +1376,6 @@ int dbfile_set_config_int(struct dbhandle *db, const char *key, int64_t val)
 	if (ret)
 		perror_sqlite(ret, "dbfile_set_config_int");
 	return ret;
-}
-
-int dbfile_get_config_int(struct dbhandle *db, const char *key, int64_t *val)
-{
-	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
-	int ret, found = 0;
-
-	ret = sqlite3_prepare_v2(db->db,
-				 "select keyval from config where keyname=?1;",
-				 -1, &stmt, NULL);
-	if (ret) {
-		perror_sqlite(ret, "preparing statement");
-		return -1;
-	}
-
-	ret = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
-	if (ret) {
-		perror_sqlite(ret, "dbfile_get_config_int (bind)");
-		return -1;
-	}
-
-	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		*val = sqlite3_column_int64(stmt, 0);
-		found = 1;
-	}
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "dbfile_get_config_int (step)");
-		return -1;
-	}
-
-	return found;
 }
 
 /* Returns 0 on error, and the inserted rowid on success */

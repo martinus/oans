@@ -21,6 +21,15 @@
 
 #include <stdbool.h>
 
+/*
+ * Upper bound for any auto-detected worker-thread count. On btrfs the walk
+ * plateaus at ~8 threads on metadata b-tree lock contention regardless of the
+ * disk, so more just burns cores. Both the io-threads recommendation and the
+ * cpu-threads default are capped here; an explicit --io-threads/--cpu-threads
+ * overrides it.
+ */
+#define AUTO_THREADS_CAP	8
+
 struct storage_profile {
 	/*
 	 * True if any backing device is a spinning disk. Conservative: on a
