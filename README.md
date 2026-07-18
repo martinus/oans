@@ -1,222 +1,149 @@
 # oans
 
-> **A friendly fork of [markfasheh/duperemove](https://github.com/markfasheh/duperemove).**
-> All of the original design and code is the work of **Mark Fasheh** and the
-> upstream contributors (SUSE, Oracle, and many others). This fork adds a set of
-> performance, correctness, and usability improvements on top of that
-> foundation, and is renamed **oans** (Austrian dialect for "one") to avoid
-> confusion with the upstream project. The improvements were developed with the
-> help of AI tooling, and every change was reviewed, tested, and benchmarked on
-> real btrfs data before landing. Huge thanks to the upstream authors — none of
-> this exists without their work.
->
-> The `oans` binary installs a `duperemove` compatibility symlink, so existing
-> scripts and habits keep working.
+**Fast, safe, set-and-forget deduplication for btrfs and XFS.**
 
-oans is a simple tool for finding duplicated extents and submitting them for
-deduplication. Given a list of files it hashes their contents on an extent
-basis and compares those hashes, finding and categorizing extents that match.
-With the `-d` option it submits matching extents to the kernel for
-deduplication via the `FIDEDUPERANGE` ioctl — an atomic, byte-verified
-operation, so a bug can only waste work or miss a dedupe, never corrupt your
-data.
+[![CI](https://github.com/martinus/oans/actions/workflows/ci.yml/badge.svg)](https://github.com/martinus/oans/actions/workflows/ci.yml)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE)
 
-oans can store the hashes it computes in a **hashfile**. Given an existing
-hashfile it only re-hashes files that changed since the last run, so you can
-run it repeatedly on your data as it changes without re-checksumming
-everything. The hashfile is a SQLite database branded with oans's own
-`application_id`, so oans and upstream duperemove will not read each other's
-hashfiles (each rebuilds its own) — but they are just caches, so nothing is
-lost.
+oans finds files and extents with identical content and asks the kernel to
+share their storage. It is a performance-focused fork of
+[duperemove](https://github.com/markfasheh/duperemove) by Mark Fasheh — same
+proven engine, rebuilt for the workflow that actually matters: **re-running
+regularly on a big, mostly-stable tree** (a NAS, a backup target, a build
+server) and getting out of the way.
 
-See [the oans man page](docs/man/oans.md) (`man 8 oans` once installed) for
-the full reference (options, FAQ, and examples). The CLI is a close superset
-of upstream duperemove's: a few new options (`--stats`, `--min-filesize`,
-`--no-color`, `-q`), and a few legacy/testing options removed.
-
----
-
-## What's different in this fork
-
-Everything below is additive: the CLI and behavior stay compatible with
-upstream (the hashfile is oans-branded, see above). The theme is **doing less
-redundant work** and
-**telling you more clearly what happened**.
-
-### Performance
-
-- **Skip already-shared files.** Files whose extents are already shared are
-  detected up front and skipped instead of being re-read and re-compared. This
-  is the big win for the common "re-run periodically on a mostly-stable tree"
-  workflow.
-- **No cross-generation reprocessing.** The dedupe phase processes files in
-  generation passes; a group whose copies span many passes used to be reloaded
-  and re-checked in every pass. It now loads only what's new per pass plus one
-  stable target, so large duplicate groups are handled once. This also fixes an
-  inflated reclaimed-space figure and keeps copies converging onto a single
-  physical extent.
-- **Batched hashfile transactions.** Per-file SQLite read/write transactions
-  are batched on a ~10s cadence, collapsing a lock storm (hundreds of thousands
-  of `F_SETLK` calls on a large rescan down to a few hundred).
-- **Parallel directory walk.** The `opendir`/`readdir`/`statx` walk runs on a
-  pool of walker threads (`--io-threads`), with a default cap tuned to where
-  btrfs metadata contention plateaus.
-- **Compact path-hash index.** Files are looked up in the hashfile by a 64-bit
-  hash of their path (`csum_path`) rather than a full-path string index, for
-  faster path lookups on large trees.
-
-#### Measured
-
-Real numbers, with honest caveats — your mileage depends heavily on your data
-and filesystem.
-
-- **Re-running on an already-deduped tree** (2.07M files, ~230 GiB on btrfs):
-  **~92s vs ~11m for upstream 0.15.2** (~7× faster). This is the best case for
-  the already-shared skip — a cold first run does the real work and the gap is
-  smaller.
-- **Eliminating cross-generation reprocessing** (same tree, our own
-  before/after): **~294s → ~188s (~36%)**, with kernel dedupe traffic cut
-  roughly in half and accurate dedupe accounting.
-- **Batched read transactions**: ~24% faster rescans on a large hashfile.
-
-### Correctness
-
-- **Hardlink safety fix.** `INSERT OR REPLACE` on the inode key could
-  cascade-delete rows for other hardlinks to the same inode and, in a bad
-  batch, silently empty the hashfile while still exiting 0. Guarded, with a
-  regression test.
-- Fixes for a number of upstream issues surfaced along the way.
-
-### Usability
-
-- A **human-readable, colorful summary** (respecting `NO_COLOR` and non-TTY
-  output) instead of a wall of per-extent text.
-- A **live dedupe progress bar** with throughput rate and ETA.
-- **Run history and metrics**: each run's reclaimed space, duration and file
-  count are recorded in the hashfile — `oans --history` shows the timeline and
-  lifetime total, and `oans --json` exports current metrics for a dashboard.
-- A **self-describing hashfile**: each run records its options, paths and
-  excludes, so `oans --hashfile=FILE` with no arguments replays the last run —
-  a cron job need only name the hashfile. If the stored paths have all vanished
-  (e.g. an unmounted drive) it refuses rather than pruning the hashfile.
-- **systemd timer templates** for set-and-forget scheduled dedupe: set a job up
-  once, `systemctl enable --now oans@<name>.timer`, and it re-deduplicates that
-  tree weekly. See [`systemd/`](systemd/README.md).
-
-### Testing
-
-- A **Python `unittest` integration suite** (stdlib only) that drives the built
-  binary against a scratch tree and asserts on the hashfile and on-disk
-  sharing, plus **GitHub Actions CI**.
-
----
-
-## A note on compressed filesystems
-
-If your btrfs uses compression (e.g. zstd), read the `Reclaimed` figure as a
-**logical/uncompressed** amount — the actual disk space you get back is
-smaller, roughly the compression ratio times that number, because dedupe
-operates on logical extents but frees compressed blocks. To see the true
-reclaimed space, compare `compsize` **Disk Usage** before and after a run;
-`Referenced` should stay constant (that's the proof nothing was lost).
-
----
-
-## Requirements & building
-
-- Linux kernel 3.13 or later
-- GNU make, a C compiler, pkg-config
-- glib2, sqlite3
-- libxxhash 0.8.0 or later
-- util-linux (libuuid, libmount, libblkid)
-- libbsd
-
-Install the build dependencies:
-
-```sh
-# Fedora / RHEL
-sudo dnf install gcc make pkgconf-pkg-config \
-    glib2-devel sqlite-devel xxhash-devel \
-    libuuid-devel libmount-devel libblkid-devel libbsd-devel
-```
-
-```sh
-# Debian / Ubuntu
-sudo apt install build-essential pkg-config \
-    libglib2.0-dev libsqlite3-dev libxxhash-dev \
-    uuid-dev libmount-dev libblkid-dev libbsd-dev
-```
-
-Then build and install:
-
-```sh
-make            # build oans
-make check      # C unit tests + Python integration suite
-sudo make install           # installs oans + a duperemove compat symlink
-sudo make install-systemd   # optional: the oans@ timer/service templates
-```
-
-Sources live under `src/`; man page sources under `docs/man/`; the integration
-suite under `tests/`; the systemd units under `systemd/`.
-
-## Usage
-
-oans takes a list of files and directories. A directory scans all regular files
-within it; `-r` recurses. `-d` performs the deduplication (without it, oans
-only reports what it would dedupe).
-
-```sh
-# Dedupe two files:
-oans -dh file1 file2
-
-# Add a directory (its files) to the set:
-oans -dh file1 file2 dir1
-
-# Recurse into dir1 as well:
-oans -dhr file1 file2 dir1/
-
-# Recursively dedupe a tree, reusing a hashfile across runs:
-oans -dr --hashfile=/path/to/hashfile /my/data
-
-# Replay that run later — the hashfile remembers the options and paths:
-oans --hashfile=/path/to/hashfile
-
-# Report what a hashfile holds (files, hashes, duplication):
-oans --stats --hashfile=/path/to/hashfile
-
-# Space reclaimed over time, and machine-readable metrics for a dashboard:
-oans --history --hashfile=/path/to/hashfile
-oans --json --hashfile=/path/to/hashfile
-```
-
-A run ends with a summary like:
-
-```
+```console
+$ sudo oans -dr --hashfile=/var/cache/oans/data.hash /srv/data
+...
 Summary
   Reclaimed      133.1 GiB across 164872 groups
   Elapsed        92.1s
   Already shared 350708 files skipped (no work needed)
 ```
 
-`Reclaimed` is the disk space actually freed (one physical copy kept per
-duplicate group). Piped or under `-q`, oans also prints a stable
-`net change in shared extents` line — a fiemap diagnostic that counts every
-copy as shared, so for pairs it is about twice the reclaimed figure.
+> [!NOTE]
+> Deduplication happens through the kernel's `FIDEDUPERANGE` ioctl, which
+> **byte-compares every range before sharing it**. A bug can waste work or miss
+> a dedupe — it cannot corrupt your data.
 
-For the complete set of options and examples, see the
-[oans man page](docs/man/oans.md).
+## Why oans?
 
-## Credits & license
+| | |
+|---|---|
+| ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* everything already shared. Rescanning a deduped 2M-file / 230 GiB tree: **~92 s with oans vs ~11 min with duperemove 0.15.2** (~7×). |
+| 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
+| ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
+| 📊 **Statistics & history** | `--stats` shows what a hashfile holds and how much is reclaimable; `--history` shows space reclaimed over time; `--json` exports metrics for dashboards. |
+| 🎯 **Honest reporting** | A clean, colorful live progress display (rate + ETA) and a summary that reports the disk space *actually freed* — not an inflated shared-extents figure. |
+| 🔒 **Hardened** | Fixes a data-loss-adjacent upstream bug (hardlinks could silently empty the hashfile), read-only report modes that are safe while a dedupe runs, and an integration suite CI runs against a real btrfs. |
+| 🤝 **Drop-in compatible** | The CLI is a close superset of duperemove's, and `make install` provides a `duperemove` compatibility symlink. |
 
-Original author: **Mark Fasheh** and the upstream duperemove contributors.
-Upstream project: <https://github.com/markfasheh/duperemove>.
+## Quick start
 
-Licensed under the **GNU General Public License, version 2** — see
-[`LICENSE`](LICENSE). This fork remains GPLv2, same as upstream.
+<details>
+<summary><b>Install build dependencies</b> (Fedora, Debian/Ubuntu)</summary>
+
+```sh
+# Fedora / RHEL
+sudo dnf install gcc make pkgconf-pkg-config \
+    glib2-devel sqlite-devel xxhash-devel \
+    libuuid-devel libmount-devel libblkid-devel libbsd-devel
+
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config \
+    libglib2.0-dev libsqlite3-dev libxxhash-dev \
+    uuid-dev libmount-dev libblkid-dev libbsd-dev
+```
+
+Requires Linux 3.13+ with a btrfs or XFS filesystem.
+
+</details>
+
+```sh
+make && sudo make install
+```
+
+```sh
+# 1. First run: hash the tree and deduplicate it (-r recurse, -d dedupe)
+sudo oans -dr --hashfile=/var/cache/oans/data.hash /srv/data
+
+# 2. Every run after that: only changed files are re-hashed,
+#    already-shared files are skipped. No arguments needed.
+sudo oans --hashfile=/var/cache/oans/data.hash
+
+# 3. Optional: make it automatic (weekly, idle-priority)
+sudo make install-systemd
+sudo systemctl enable --now oans@data.timer
+```
+
+📖 **Setting this up on a NAS or home server?** Follow the
+**[NAS quick-start guide](docs/nas-quickstart.md)** — a complete walkthrough
+from first scan to scheduled, monitored dedupe (including `--autotune` to pick
+the fastest I/O settings for your disks).
+
+## Watching it work
+
+```sh
+oans --stats   --hashfile=data.hash   # files, hashes, duplication, reclaimable space
+oans --history --hashfile=data.hash   # reclaimed space per run + lifetime total
+oans --json    --hashfile=data.hash   # machine-readable metrics for a dashboard
+```
+
+These are read-only and safe to run while a scan or dedupe is in progress.
+So is Ctrl+C, by the way: hashes are committed every ~10 s, and a restart
+resumes where it left off.
+
+> [!TIP]
+> On compressed btrfs (e.g. zstd), `Reclaimed` is a **logical** figure — the
+> real disk space freed is smaller by roughly your compression ratio, because
+> dedupe shares logical extents but disk holds compressed blocks. Compare
+> `compsize` *Disk Usage* before/after for ground truth; *Referenced* staying
+> constant is the proof nothing was lost.
+
+## What the fork changes, measured
+
+Benchmarked on real btrfs data (2.07M files, ~230 GiB); your mileage depends
+on your data and filesystem.
+
+| Change | Effect |
+|---|---|
+| Skip already-shared files up front | Warm re-run **~11 min → ~92 s** vs upstream (best case; cold first runs gain less) |
+| No cross-generation reprocessing of duplicate groups | Dedupe phase **~294 s → ~188 s (~36 %)**, kernel dedupe traffic halved, accurate accounting |
+| Batched SQLite transactions (~10 s cadence) | **~24 % faster rescans**; hundreds of thousands of file-lock syscalls collapsed to a few hundred |
+| Parallel directory walk (`--io-threads`) | Faster listing on large trees, capped where btrfs metadata contention plateaus |
+| Compact 64-bit path-hash index | Smaller hashfile, faster path lookups |
+| Skip post-dedupe extent measurement on interactive runs | An open + 2 `FIEMAP` ioctls saved per group member |
+
+Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.md)** (`man 8 oans` once installed).
+
+## Relationship to duperemove
+
+oans (Austrian dialect for *"one"* — as in one copy) builds on
+[duperemove](https://github.com/markfasheh/duperemove); all of the original
+design and code is the work of **Mark Fasheh** and the upstream contributors,
+and none of this exists without them. The fork's improvements were developed
+with the help of AI tooling; every change was reviewed, tested, and benchmarked
+on real btrfs data before landing.
+
+Differences to know about:
+
+- **Hashfiles are not interchangeable.** oans brands its hashfile with its own
+  SQLite `application_id`; oans and duperemove will each rebuild rather than
+  read the other's. Hashfiles are only caches, so nothing is lost.
+- **CLI**: a few additions (`--stats`, `--history`, `--json`, `--autotune`,
+  `--min-filesize`, `--no-color`, `-q`), a few legacy/testing options removed.
+- Scripts that expect the `duperemove` binary keep working via the installed
+  compatibility symlink, including the stable
+  `net change in shared extents` output line.
 
 ## Links
 
-- [NAS quick start](docs/nas-quickstart.md) — set up scheduled dedupe on a NAS/server
-- [oans man page](docs/man/oans.md) — full reference
-- [Upstream duperemove](https://github.com/markfasheh/duperemove) — the original project
-- [Upstream wiki](https://github.com/markfasheh/duperemove/wiki) — design & performance notes
+- 🚀 [NAS quick-start](docs/nas-quickstart.md) — scheduled dedupe on a NAS/server, step by step
+- 📖 [Man page](docs/man/oans.md) — full option reference, FAQ, examples
+- ⏰ [systemd templates](systemd/README.md) — the `oans@` service/timer units
+- 🧪 [Test suite](tests/) — Python integration tests (stdlib-only) run by [CI](.github/workflows/ci.yml)
+- ⬆️ [Upstream duperemove](https://github.com/markfasheh/duperemove) and its [wiki](https://github.com/markfasheh/duperemove/wiki)
+
+## License
+
+[GPL-2.0](LICENSE), same as upstream.
