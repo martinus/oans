@@ -1,16 +1,17 @@
 """Whole-file dedupe should target the least-fragmented copy, so the other
 copies don't inherit a bad on-disk layout (and the dedupe stays cheap).
 
-Requires a reflink-capable filesystem.
+Requires btrfs: the setup builds a fragmented file by overwriting alternate
+blocks in place, which only splits into many extents under copy-on-write.
 """
 
 import os
-from harness import DuperemoveTest, requires_reflink, fiemap_extents
+from harness import DuperemoveTest, requires_btrfs, fiemap_extents
 
 MiB = 1 << 20
 
 
-@requires_reflink
+@requires_btrfs
 class LeastFragmentedTargetTest(DuperemoveTest):
     def _fragment(self, rel, content):
         """Write content, then rewrite alternate 4K blocks in place (COW) so the

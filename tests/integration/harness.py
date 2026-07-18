@@ -144,6 +144,26 @@ requires_reflink = unittest.skipUnless(
 
 
 # --------------------------------------------------------------------------
+# Filesystem type probe
+# --------------------------------------------------------------------------
+
+def scratch_fstype(directory=TEST_ROOT):
+    """Filesystem type of the scratch dir, per `stat -f` (e.g. 'btrfs', 'xfs')."""
+    os.makedirs(directory, exist_ok=True)
+    return subprocess.run(["stat", "-f", "-c", "%T", directory],
+                          capture_output=True, text=True).stdout.strip()
+
+
+# btrfs is copy-on-write, so an in-place overwrite of alternate blocks splits a
+# file into many physical extents. xfs (even with reflink) overwrites in place
+# and stays one extent, so tests that need to *build* a fragmented file can only
+# run on btrfs. (btrfs is reflink-capable, so this implies @requires_reflink.)
+BTRFS = scratch_fstype() == "btrfs"
+requires_btrfs = unittest.skipUnless(
+    BTRFS, "test needs btrfs (copy-on-write fragmentation)")
+
+
+# --------------------------------------------------------------------------
 # Base test case
 # --------------------------------------------------------------------------
 
