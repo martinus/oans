@@ -112,6 +112,13 @@ void pscan_examined(void)
 	pscan.files_examined++;	/* listing is single-threaded; plain ++ is fine */
 }
 
+/* Files that needed (re)hashing this run - the work actually done, and unlike
+ * files_examined it is not periodically cleared by the progress renderer. */
+uint64_t pscan_files_scanned(void)
+{
+	return pscan.total_files_count;
+}
+
 #define BUF_LEN 10*1024
 /*
  * Fit `path` into at most `cols` columns by replacing its middle with a

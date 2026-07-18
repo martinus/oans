@@ -48,6 +48,7 @@ void pscan_set_progress(uint64_t added_files, uint64_t added_bytes);
 
 /* Count one file visited by the listing walk (scanned or skipped as up-to-date). */
 void pscan_examined(void);
+uint64_t pscan_files_scanned(void);
 
 /* Used by each scan threads to grab its own struct pscan_thread */
 struct pscan_thread *pscan_register_thread(pid_t tid);

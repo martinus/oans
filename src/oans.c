@@ -26,6 +26,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include <glib.h>
@@ -54,6 +55,8 @@ static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
+static unsigned int history_only_opt = 0;
+static unsigned int json_only_opt = 0;
 static int opt_no_color = 0;
 
 /* User-supplied --exclude patterns, captured for the self-describing hashfile
@@ -135,13 +138,71 @@ static char *scan_config_options_str(const struct scan_config *sc)
 	return g_string_free(s, FALSE);		/* hand the buffer to the caller */
 }
 
+struct dup_group { uint64_t size, count, waste; char *path; };
+
+/*
+ * One pass over the files table grouped by (digest, size): the whole-file
+ * duplicate totals - groups, files in them, and reclaimable logical bytes.
+ * When top != NULL it also fills the top `top_cap` groups by reclaimable bytes
+ * (example path = the group's shortest filename: min() over a fixed-width
+ * length prefix, substr() strips it) and sets *ntop. Callers wanting only the
+ * totals pass top = NULL. Shared by --stats and --json.
+ */
+static void compute_dup_summary(sqlite3 *sq, uint64_t *groups, uint64_t *dupfiles,
+				uint64_t *reclaim, struct dup_group *top,
+				int top_cap, int *ntop)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
+	/* The example-path column and ordering are only needed for the top-N. */
+	const char *sql = top ?
+		"select size, count(*) c, (count(*)-1)*size w, "
+		"substr(min(printf('%010d', length(filename)) || filename), 11) "
+		"from files where digest is not null group by digest, size "
+		"having c > 1 order by w desc, size desc" :
+		"select size, count(*) c, (count(*)-1)*size w from files "
+		"where digest is not null group by digest, size having c > 1";
+
+	*groups = *dupfiles = *reclaim = 0;
+	if (ntop)
+		*ntop = 0;
+	if (sqlite3_prepare_v2(sq, sql, -1, &s, NULL) != SQLITE_OK)
+		return;
+	while (sqlite3_step(s) == SQLITE_ROW) {
+		uint64_t c = sqlite3_column_int64(s, 1);
+		uint64_t w = sqlite3_column_int64(s, 2);
+
+		(*groups)++;
+		*dupfiles += c;
+		*reclaim += w;
+		if (top && *ntop < top_cap) {
+			const char *fn = (const char *)sqlite3_column_text(s, 3);
+
+			top[*ntop].size = sqlite3_column_int64(s, 0);
+			top[*ntop].count = c;
+			top[*ntop].waste = w;
+			top[*ntop].path = fn ? strdup(fn) : NULL;
+			(*ntop)++;
+		}
+	}
+}
+
+/* Format a unix timestamp as local time with strftime(3). */
+static void fmt_localtime(int64_t ts, const char *fmt, char *buf, size_t n)
+{
+	time_t t = (time_t)ts;
+	struct tm tm;
+
+	localtime_r(&t, &tm);
+	strftime(buf, n, fmt, &tm);
+}
+
 static int print_hashfile_stats(char *filename)
 {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 	struct dbfile_config cfg;
 	struct dbfile_stats st = {0};
 	struct stat sb;
-	struct topgrp { uint64_t size, count, waste; char *path; } top[10];
+	struct dup_group top[10];
 	char uuid_str[37] = "";
 	char htype[9] = "", b1[16], b2[16];
 	int k, ntop = 0, i;
@@ -273,43 +334,7 @@ static int print_hashfile_stats(char *filename)
 
 	/* --- whole-file duplicates: ONE group-by feeds every figure below --- */
 	t0 = g_get_monotonic_time() / 1e6;
-	{
-		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *s = NULL;
-
-		/*
-		 * A single pass over the files table yields every duplicate group
-		 * (digest, size); we accumulate the totals and keep the top 10 by
-		 * reclaimable bytes - far cheaper than one scan per figure. The
-		 * example path is the group's shortest (ties alphabetical), usually
-		 * the canonical least-nested copy: min() over a fixed-width length
-		 * prefix picks it, substr() strips the prefix.
-		 */
-		if (sqlite3_prepare_v2(sq,
-			"select size, count(*) c, "
-			"substr(min(printf('%010d', length(filename)) || filename), 11), "
-			"(count(*)-1)*size w "
-			"from files where digest is not null "
-			"group by digest, size having c > 1 "
-			"order by w desc, size desc", -1, &s, NULL) == SQLITE_OK) {
-			while (sqlite3_step(s) == SQLITE_ROW) {
-				uint64_t c = sqlite3_column_int64(s, 1);
-				uint64_t w = sqlite3_column_int64(s, 3);
-
-				groups++;
-				dupfiles += c;
-				reclaim += w;
-				if (ntop < 10) {
-					const char *fn = (const char *)sqlite3_column_text(s, 2);
-
-					top[ntop].size = sqlite3_column_int64(s, 0);
-					top[ntop].count = c;
-					top[ntop].waste = w;
-					top[ntop].path = fn ? strdup(fn) : NULL;
-					ntop++;
-				}
-			}
-		}
-	}
+	compute_dup_summary(sq, &groups, &dupfiles, &reclaim, top, 10, &ntop);
 	t_analysis = g_get_monotonic_time() / 1e6 - t0;
 
 	printf("\n%s%swhole-file duplicates%s\n", col_bold, col_blue, col_reset);
@@ -339,6 +364,116 @@ static int print_hashfile_stats(char *filename)
 	printf("  %sdup analysis%s    %s   %s(the group-by over %"PRIu64" files)%s\n",
 	       col_dim, col_reset, fmt_dur(b2, sizeof(b2), t_analysis),
 	       col_dim, hashed, col_reset);
+	return 0;
+}
+
+/* Print s as a JSON string literal (quotes + minimal escaping). */
+static void print_json_str(const char *s)
+{
+	putchar('"');
+	for (; *s; s++) {
+		unsigned char c = (unsigned char)*s;
+
+		if (c == '"' || c == '\\')
+			printf("\\%c", c);
+		else if (c < 0x20)
+			printf("\\u%04x", c);
+		else
+			putchar(c);
+	}
+	putchar('"');
+}
+
+static int print_hashfile_history(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	struct run_summary sum;
+	char since[32];
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	if (dbfile_get_run_summary(db, &sum))
+		return -1;
+
+	printf("%s%soans history%s  %s\n", col_bold, col_blue, col_reset, filename);
+	if (sum.runs == 0) {
+		printf("  %sno runs recorded yet%s\n", col_dim, col_reset);
+		return 0;
+	}
+
+	fmt_localtime(sum.first_ts, "%Y-%m-%d", since, sizeof(since));
+	printf("  %ssince%s        %s  %s(%"PRIu64" run%s)%s\n", col_dim, col_reset,
+	       since, col_dim, sum.runs, sum.runs == 1 ? "" : "s", col_reset);
+	printf("  %sreclaimed%s    %s%s%s total\n", col_dim, col_reset, col_green,
+	       human_size(sum.total_reclaimed), col_reset);
+	printf("  %sfiles seen%s   %"PRIu64" %s(cumulative)%s\n", col_dim, col_reset,
+	       sum.total_files, col_dim, col_reset);
+
+	printf("\n  %srecent%s   %sdate · reclaimed · elapsed · files · mode%s\n",
+	       col_dim, col_reset, col_dim, col_reset);
+	if (sqlite3_prepare_v2(db->db,
+		"select ts, reclaimed, duration_ms, files_scanned, deduped "
+		"from run_history order by ts desc limit 20", -1, &stmt, NULL) == SQLITE_OK) {
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			char when[32];
+
+			fmt_localtime(sqlite3_column_int64(stmt, 0), "%Y-%m-%d %H:%M",
+				      when, sizeof(when));
+			printf("    %s  %10s  %7.1fs  %9"PRIu64"  %s\n", when,
+			       human_size(sqlite3_column_int64(stmt, 1)),
+			       sqlite3_column_int64(stmt, 2) / 1000.0,
+			       (uint64_t)sqlite3_column_int64(stmt, 3),
+			       sqlite3_column_int(stmt, 4) ? "dedupe" : "scan");
+		}
+	}
+	return 0;
+}
+
+static int print_metrics_json(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	struct dbfile_config cfg;
+	struct dbfile_stats st = {0};
+	struct run_summary sum;
+	uint64_t logical, hashed, groups, dupfiles, reclaimable;
+	sqlite3 *sq;
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+	sq = db->db;
+	if (dbfile_get_config(sq, &cfg) || dbfile_get_run_summary(db, &sum))
+		return -1;
+	dbfile_get_stats(db, &st);
+
+	logical = dbfile_query_u64(sq, "select ifnull(sum(size),0) from files");
+	hashed = dbfile_query_u64(sq, "select count(*) from files where digest is not null");
+	compute_dup_summary(sq, &groups, &dupfiles, &reclaimable, NULL, 0, NULL);
+
+	printf("{\n  \"hashfile\": ");
+	print_json_str(filename);
+	printf(",\n");
+	printf("  \"format\": \"%d.%d\",\n", cfg.major, cfg.minor);
+	printf("  \"block_size\": %u,\n", cfg.blocksize);
+	printf("  \"files_tracked\": %"PRIu64",\n", st.num_files);
+	printf("  \"files_hashed\": %"PRIu64",\n", hashed);
+	printf("  \"extent_hashes\": %"PRIu64",\n", st.num_e_hashes);
+	printf("  \"block_hashes\": %"PRIu64",\n", st.num_b_hashes);
+	printf("  \"logical_bytes\": %"PRIu64",\n", logical);
+	printf("  \"dup_groups\": %"PRIu64",\n", groups);
+	printf("  \"dup_files\": %"PRIu64",\n", dupfiles);
+	/* Logical upper bound; real disk freed is smaller on compressed fs. */
+	printf("  \"reclaimable_logical_bytes\": %"PRIu64",\n", reclaimable);
+	printf("  \"runs\": %"PRIu64",\n", sum.runs);
+	printf("  \"reclaimed_total_bytes\": %"PRIu64",\n", sum.total_reclaimed);
+	printf("  \"last_run_ts\": %"PRId64"\n", sum.last_ts);
+	printf("}\n");
 	return 0;
 }
 
@@ -487,6 +622,8 @@ enum {
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
 	STATS_OPTION,
+	HISTORY_OPTION,
+	JSON_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -551,6 +688,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
 		{ "stats", 0, NULL, STATS_OPTION },
+		{ "history", 0, NULL, HISTORY_OPTION },
+		{ "json", 0, NULL, JSON_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -624,6 +763,12 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case STATS_OPTION:
 			stats_only_opt = 1;
 			break;
+		case HISTORY_OPTION:
+			history_only_opt = 1;
+			break;
+		case JSON_OPTION:
+			json_only_opt = 1;
+			break;
 		case QUIET_OPTION:
 		case 'q':
 			quiet = 1;
@@ -688,20 +833,26 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	if (list_only_opt + rm_only_opt + stats_only_opt > 1) {
-		eprintf("Error: use only one of '-L', '-R', '--stats'.\n");
+	/* -L/-R/--stats/--history/--json are exclusive read-only report modes. */
+	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
+				  + history_only_opt + json_only_opt;
+	/* Every report mode but -R takes no file list. */
+	bool nofile_report = report_count && !rm_only_opt;
+
+	if (report_count > 1) {
+		eprintf("Error: use only one of '-L', '-R', '--stats', "
+			"'--history', '--json'.\n");
 		return 1;
 	}
 
-	if (list_only_opt || rm_only_opt || stats_only_opt) {
+	if (report_count) {
 		if (!options.hashfile) {
-			eprintf("Error: --hashfile= option is required "
-				"with '-L', '-R' or '--stats'.\n");
+			eprintf("Error: --hashfile= option is required with "
+				"'-L', '-R', '--stats', '--history' or '--json'.\n");
 			return 1;
 		}
-
-		if ((list_only_opt || stats_only_opt) && numfiles) {
-			eprintf("Error: -L/--stats do not take "
+		if (nofile_report && numfiles) {
+			eprintf("Error: -L/--stats/--history/--json do not take "
 				"a file list argument\n");
 			return 1;
 		}
@@ -712,8 +863,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	 * scan config stored in the hashfile. Without a hashfile there is nothing
 	 * to replay, so a file list is still required.
 	 */
-	if (!(list_only_opt || stats_only_opt)
-			&& numfiles == 0 && !options.hashfile) {
+	if (!nofile_report && numfiles == 0 && !options.hashfile) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
 	}
@@ -875,7 +1025,8 @@ static void process_duplicates(struct dbhandle *db)
 		extents_search_free();
 }
 
-static int scan_files(char **roots, int nroots, struct dbhandle *db)
+static int scan_files(char **roots, int nroots, struct dbhandle *db,
+		      uint64_t *files_scanned)
 {
 	int ret;
 
@@ -898,6 +1049,13 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db)
 	filescan_free();
 	if (!quiet)
 		pscan_join();
+
+	/*
+	 * Latch the per-run file count here, while the scan owns the progress
+	 * counters: the dedupe phase reuses them, so a later read would be 0.
+	 */
+	if (files_scanned)
+		*files_scanned = pscan_files_scanned();
 
 	if (ret)
 		return ret;
@@ -1011,6 +1169,7 @@ int main(int argc, char **argv)
 	int numfiles;
 	char **roots;
 	bool replaying = false;
+	uint64_t files_scanned = 0;
 	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
@@ -1057,6 +1216,10 @@ int main(int argc, char **argv)
 		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
 	else if (stats_only_opt)
 		return print_hashfile_stats(options.hashfile);
+	else if (history_only_opt)
+		return print_hashfile_history(options.hashfile);
+	else if (json_only_opt)
+		return print_metrics_json(options.hashfile);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1113,7 +1276,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	ret = scan_files(roots, numfiles, db);
+	ret = scan_files(roots, numfiles, db, &files_scanned);
 	if (ret)
 		goto out;
 
@@ -1140,6 +1303,24 @@ int main(int argc, char **argv)
 		qprintf("Hashfile \"%s\" written\n", options.hashfile);
 
 	process_duplicates(db);
+
+	/* Append this run to the hashfile's history (fuels --history / --json). */
+	if (options.hashfile) {
+		uint64_t groups = 0, reclaimed = 0, kern = 0;
+		struct run_record rec;
+
+		pdedupe_counters(&groups, &reclaimed, &kern);
+		rec = (struct run_record){
+			.ts = time(NULL),
+			.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
+			.files_scanned = files_scanned,
+			.reclaimed = reclaimed,
+			.groups = groups,
+			.kernel_bytes = kern,
+			.deduped = options.run_dedupe,
+		};
+		dbfile_record_run(db, &rec);
+	}
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
 	if (options.hashfile)

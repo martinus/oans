@@ -164,6 +164,21 @@ total logical data tracked, and how much whole-file duplication it records
 (duplicate groups and reclaimable bytes). Requires the `--hashfile` option.
 (Replaces the standalone `hashstats` tool.)
 
+**\--history**
+  ~ Print the run history recorded in the hashfile and exit: how many runs,
+the total space reclaimed over their lifetime, and a timeline of the most
+recent runs (date, reclaimed bytes, elapsed time, files hashed, and whether it
+was a dedupe or scan-only run). Every run appends one row automatically.
+Requires the `--hashfile` option.
+
+**\--json**
+  ~ Print a machine-readable JSON object of the hashfile's current metrics
+(files, hashes, logical bytes, duplicate groups and reclaimable bytes) plus the
+lifetime run-history totals, then exit. Intended for scripting and dashboards
+(e.g. piping to `jq`, Telegraf, or a node\_exporter textfile). The
+`reclaimable_logical_bytes` field is a logical upper bound; the real disk space
+freed is smaller on a compressed filesystem. Requires the `--hashfile` option.
+
 **-R** `files ..`
   ~ Remove file from the db and exit. oans will read the list from
 standard input if a hyphen (-) is provided. Requires the `--hashfile` option.
@@ -266,6 +281,12 @@ recently added to foo (this also becomes the new stored configuration):
 List the files tracked by foo.hash:
 
 	oans -L --hashfile=foo.hash
+
+Show how much space has been reclaimed over time, and export current metrics
+for a dashboard:
+
+	oans --history --hashfile=foo.hash
+	oans --json --hashfile=foo.hash | jq .reclaimed_total_bytes
 
 # FAQ
 

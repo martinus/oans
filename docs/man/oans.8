@@ -178,6 +178,24 @@ bytes).
 Requires the \f[CR]\-\-hashfile\f[R] option.
 (Replaces the standalone \f[CR]hashstats\f[R] tool.)
 .TP
+\f[B]\-\-history\f[R]
+Print the run history recorded in the hashfile and exit: how many runs,
+the total space reclaimed over their lifetime, and a timeline of the
+most recent runs (date, reclaimed bytes, elapsed time, files hashed, and
+whether it was a dedupe or scan\-only run).
+Every run appends one row automatically.
+Requires the \f[CR]\-\-hashfile\f[R] option.
+.TP
+\f[B]\-\-json\f[R]
+Print a machine\-readable JSON object of the hashfile\[cq]s current
+metrics (files, hashes, logical bytes, duplicate groups and reclaimable
+bytes) plus the lifetime run\-history totals, then exit.
+Intended for scripting and dashboards (e.g.\ piping to \f[CR]jq\f[R],
+Telegraf, or a node_exporter textfile).
+The \f[CR]reclaimable_logical_bytes\f[R] field is a logical upper bound;
+the real disk space freed is smaller on a compressed filesystem.
+Requires the \f[CR]\-\-hashfile\f[R] option.
+.TP
 \f[B]\-R\f[R] \f[CR]files ..\f[R]
 Remove file from the db and exit.
 oans will read the list from standard input if a hyphen (\-) is
@@ -305,6 +323,14 @@ List the files tracked by foo.hash:
 .IP
 .EX
 oans \-L \-\-hashfile=foo.hash
+.EE
+.PP
+Show how much space has been reclaimed over time, and export current
+metrics for a dashboard:
+.IP
+.EX
+oans \-\-history \-\-hashfile=foo.hash
+oans \-\-json \-\-hashfile=foo.hash | jq .reclaimed_total_bytes
 .EE
 .SH FAQ
 .SS Is oans safe for my data?

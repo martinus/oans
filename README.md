@@ -92,6 +92,9 @@ and filesystem.
 - A **human-readable, colorful summary** (respecting `NO_COLOR` and non-TTY
   output) instead of a wall of per-extent text.
 - A **live dedupe progress bar** with throughput rate and ETA.
+- **Run history and metrics**: each run's reclaimed space, duration and file
+  count are recorded in the hashfile — `oans --history` shows the timeline and
+  lifetime total, and `oans --json` exports current metrics for a dashboard.
 - A **self-describing hashfile**: each run records its options, paths and
   excludes, so `oans --hashfile=FILE` with no arguments replays the last run —
   a cron job need only name the hashfile. If the stored paths have all vanished
@@ -158,6 +161,10 @@ oans --hashfile=/path/to/hashfile
 
 # Report what a hashfile holds (files, hashes, duplication):
 oans --stats --hashfile=/path/to/hashfile
+
+# Space reclaimed over time, and machine-readable metrics for a dashboard:
+oans --history --hashfile=/path/to/hashfile
+oans --json --hashfile=/path/to/hashfile
 ```
 
 A run ends with a summary like:
