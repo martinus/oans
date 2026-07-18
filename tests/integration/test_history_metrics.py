@@ -76,12 +76,15 @@ class HistoryTest(DuperemoveTest):
 @requires_reflink
 class HistoryReclaimTest(DuperemoveTest):
     def test_lifetime_reclaimed_accumulates_across_runs(self):
-        a, b = self.mkdup("a", "b", 1 << 20)
+        MiB = 1 << 20
+        a, b = self.mkdup("a", "b", MiB)
         self.dm("-rd", self.path("."))          # reclaims one 1 MiB copy
         first = json.loads(self.dm("--json"))["reclaimed_total_bytes"]
-        self.assertGreater(first, 0)
+        # Honest accounting: deduping a pair frees exactly ONE copy, not two.
+        # (The fiemap "net change in shared extents" is 2 MiB; that is not it.)
+        self.assertEqual(MiB, first, "one reclaimed copy for a 1 MiB pair")
 
-        c, e = self.mkdup("c", "e", 1 << 20)     # a second reclaimable pair
+        c, e = self.mkdup("c", "e", MiB)         # a second reclaimable pair
         self.dm("-rd", self.path("."))
         second = json.loads(self.dm("--json"))["reclaimed_total_bytes"]
-        self.assertGreater(second, first)
+        self.assertEqual(2 * MiB, second, "two lifetime pairs = two copies freed")

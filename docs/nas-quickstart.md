@@ -122,7 +122,7 @@ oans --json    --hashfile=/var/cache/oans/media.hash    # metrics for a dashboar
 - **The hashfile is just a cache** (under `/var/cache/oans`). Deleting it only
   forces the next run to re-hash from scratch; it can live on your system SSD,
   separate from the data pool.
-- **Compressed btrfs:** the reported "Deduplicated" figure is *logical* — the
+- **Compressed btrfs:** the reported "Reclaimed" figure is *logical* — the
   real disk space freed is smaller (roughly the compression ratio times that).
   Compare `compsize` before and after for the true reclaimed amount.
 - **First run is slow, later runs are fast:** only changed/new files are

@@ -154,9 +154,8 @@ struct run_record {
 	int64_t		ts;		/* unix seconds */
 	int64_t		duration_ms;
 	uint64_t	files_scanned;
-	uint64_t	reclaimed;	/* bytes: net change in shared extents */
+	uint64_t	reclaimed;	/* bytes: space reclaimed (kernel-deduped) */
 	uint64_t	groups;
-	uint64_t	kernel_bytes;
 	int		deduped;	/* 1 if -d, 0 for a scan-only run */
 };
 int dbfile_record_run(struct dbhandle *db, const struct run_record *r);

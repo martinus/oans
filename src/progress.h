@@ -109,7 +109,7 @@ void pdedupe_set_activity(const char *activity);
 
 /* A group was pushed to / finished by the dedupe pool. */
 void pdedupe_add_queued(uint64_t ngroups);
-void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t kern_bytes);
+void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t net_shared_bytes);
 
 /*
  * Claim a per-thread display line for one unit of work (file scan / dedupe
@@ -121,8 +121,12 @@ void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t kern_bytes);
 struct pscan_thread *pscan_claim_slot(pid_t tid,
 				      enum pscan_thread_status status);
 
-/* Read back the accumulated totals (for the end-of-run summary). */
-void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *kern);
+/*
+ * Read back the accumulated totals (for the end-of-run summary). reclaimed is
+ * the honest disk-freed amount (kernel-deduped bytes); net_shared is the fiemap
+ * "net change in shared extents" diagnostic and may be NULL if not needed.
+ */
+void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *net_shared);
 
 /*
  * Start the "extent search" progress thread

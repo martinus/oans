@@ -1383,17 +1383,16 @@ int main(int argc, char **argv)
 
 	/* Append this run to the hashfile's history (fuels --history / --json). */
 	if (options.hashfile) {
-		uint64_t groups = 0, reclaimed = 0, kern = 0;
+		uint64_t groups = 0, reclaimed = 0;
 		struct run_record rec;
 
-		pdedupe_counters(&groups, &reclaimed, &kern);
+		pdedupe_counters(&groups, &reclaimed, NULL);
 		rec = (struct run_record){
 			.ts = time(NULL),
 			.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
 			.files_scanned = files_scanned,
 			.reclaimed = reclaimed,
 			.groups = groups,
-			.kernel_bytes = kern,
 			.deduped = options.run_dedupe,
 		};
 		dbfile_record_run(db, &rec);

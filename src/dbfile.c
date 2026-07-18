@@ -1173,7 +1173,8 @@ int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
 	sqlite3_bind_int64(stmt, 3, r->files_scanned);
 	sqlite3_bind_int64(stmt, 4, r->reclaimed);
 	sqlite3_bind_int64(stmt, 5, r->groups);
-	sqlite3_bind_int64(stmt, 6, r->kernel_bytes);
+	/* Legacy NOT NULL column, no longer read; mirror reclaimed to satisfy it. */
+	sqlite3_bind_int64(stmt, 6, r->reclaimed);
 	sqlite3_bind_int64(stmt, 7, r->deduped);
 
 	if (sqlite3_step(stmt) != SQLITE_DONE)

@@ -52,6 +52,13 @@ static volatile unsigned long long total_dedupe_passes;
 static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
 static bool whole_file_dedup;
+/*
+ * Whether to measure the fiemap "net change in shared extents". It feeds only
+ * the machine-readable line (non-tty or -q; see dedupe_end), so on an
+ * interactive run the per-group post-dedupe FIEMAP is pure waste. Set once when
+ * the phase starts, from the same condition that governs that line.
+ */
+static bool report_net_shared;
 
 void print_dupes_table(struct results_tree *res, bool whole_file)
 {
@@ -382,10 +389,11 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	}
 
 	/*
-	 * Do this after clean_deduped as we may have removed some
-	 * extents.
+	 * Do this after clean_deduped as we may have removed some extents.
+	 * Skipped unless we'll actually report net_shared (see report_net_shared).
 	 */
-	add_shared_extents(dext, &shared_prev);
+	if (report_net_shared)
+		add_shared_extents(dext, &shared_prev);
 
 	/*
 	 * Prefer the least-fragmented copy as the dedupe target so the others
@@ -601,7 +609,8 @@ close_files:
 	abort_on(ctxt != NULL);
 	abort_on(!RB_EMPTY_ROOT(&open_files.root));
 
-	add_shared_extents_post(dext, &shared_post);
+	if (report_net_shared)
+		add_shared_extents_post(dext, &shared_post);
 
 	/*
 	 * It's entirely possible that some other process is
@@ -706,7 +715,13 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 
 	extent_dedupe_worker(dext, slot, &fiemap_bytes, &kern_bytes);
 
-	pdedupe_group_done(fiemap_bytes, kern_bytes);
+	/*
+	 * Space reclaimed = kernel-deduped bytes (each deduped copy frees its
+	 * length). The fiemap delta counts the surviving copy as newly shared
+	 * too (~2x for pairs), so it is reported only as the "net change in
+	 * shared extents" diagnostic, not as space reclaimed.
+	 */
+	pdedupe_group_done(kern_bytes, fiemap_bytes);
 }
 
 static GThreadPool *dedupe_pool = NULL;
@@ -782,10 +797,10 @@ static int push_extents(struct results_tree *res)
  */
 void dedupe_end(void)
 {
-	uint64_t groups, reclaimed, kern;
+	uint64_t groups, reclaimed, net_shared;
 
 	pdedupe_end();
-	pdedupe_counters(&groups, &reclaimed, &kern);
+	pdedupe_counters(&groups, &reclaimed, &net_shared);
 
 	/* Human summary: skipped by -q. */
 	if (!quiet) {
@@ -793,13 +808,10 @@ void dedupe_end(void)
 			printf("%sNothing to deduplicate.%s\n", col_dim, col_reset);
 		} else {
 			printf("%s%sSummary%s\n", col_bold, col_blue, col_reset);
-			printf("  %sDeduplicated%s   %s%s%s across %lu group%s\n",
+			printf("  %sReclaimed%s      %s%s%s across %lu group%s\n",
 			       col_dim, col_reset, col_green,
 			       human_size(reclaimed), col_reset,
 			       groups, groups == 1 ? "" : "s");
-			if (kern)
-				printf("  %sKernel scanned%s %s\n", col_dim,
-				       col_reset, human_size(kern));
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
@@ -823,7 +835,7 @@ void dedupe_end(void)
 	 */
 	if (!isatty(STDOUT_FILENO) || quiet)
 		printf("Comparison of extent info shows a net change in "
-		       "shared extents of: %s\n", pretty_size(reclaimed));
+		       "shared extents of: %s\n", pretty_size(net_shared));
 }
 
 void dedupe_results(struct results_tree *res, bool whole_file)
@@ -838,6 +850,7 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 	results_tree = res;
 
 	whole_file_dedup = whole_file;
+	report_net_shared = !isatty(STDOUT_FILENO) || quiet;
 
 	/* The pre-dedupe listing is a wall of text; show it only with -v. */
 	if (verbose)

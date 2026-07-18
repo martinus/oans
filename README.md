@@ -53,7 +53,7 @@ redundant work** and
   generation passes; a group whose copies span many passes used to be reloaded
   and re-checked in every pass. It now loads only what's new per pass plus one
   stable target, so large duplicate groups are handled once. This also fixes an
-  inflated "Deduplicated" figure and keeps copies converging onto a single
+  inflated reclaimed-space figure and keeps copies converging onto a single
   physical extent.
 - **Batched hashfile transactions.** Per-file SQLite read/write transactions
   are batched on a ~10s cadence, collapsing a lock storm (hundreds of thousands
@@ -113,7 +113,7 @@ and filesystem.
 
 ## A note on compressed filesystems
 
-If your btrfs uses compression (e.g. zstd), read the `Deduplicated` figure as a
+If your btrfs uses compression (e.g. zstd), read the `Reclaimed` figure as a
 **logical/uncompressed** amount — the actual disk space you get back is
 smaller, roughly the compression ratio times that number, because dedupe
 operates on logical extents but frees compressed blocks. To see the true
@@ -193,11 +193,15 @@ A run ends with a summary like:
 
 ```
 Summary
-  Deduplicated   134.8 GiB across 164872 groups
-  Kernel scanned 994.7 MiB
+  Reclaimed      133.1 GiB across 164872 groups
   Elapsed        92.1s
   Already shared 350708 files skipped (no work needed)
 ```
+
+`Reclaimed` is the disk space actually freed (one physical copy kept per
+duplicate group). Piped or under `-q`, oans also prints a stable
+`net change in shared extents` line — a fiemap diagnostic that counts every
+copy as shared, so for pairs it is about twice the reclaimed figure.
 
 For the complete set of options and examples, see the
 [oans man page](docs/man/oans.md).
