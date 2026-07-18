@@ -311,9 +311,12 @@ still only VACUUM once ≥25% of the file is free.
   on process kill. Only power loss risks the hashfile (due to `synchronous=OFF`).
 - A no-op rescan must net **0** changes and leave row counts identical. Use this
   as a smoke test after any scan-path change.
-- **The "Deduplicated" figure is logical, not disk.** On a compressed btrfs
-  (e.g. `zstd`), dedupe frees *compressed* blocks but the reported number is the
-  *logical* (uncompressed) amount, so real disk reclaimed is ~ratio smaller. To
+- **The "Reclaimed" figure is logical, not disk.** It counts the honest bytes
+  freed (kernel-deduped = one physical copy kept per group), but on a compressed
+  btrfs (e.g. `zstd`) dedupe frees *compressed* blocks while the number is the
+  *logical* (uncompressed) amount, so real disk reclaimed is ~ratio smaller. The
+  piped/`-q` "net change in shared extents" line is a separate fiemap diagnostic
+  that counts the surviving copy as shared too (~2x for pairs). To
   verify actual space freed, compare `compsize` **Disk Usage** before/after (not
   `df`); `Referenced` staying constant proves nothing was lost. `--json`'s
   `reclaimable_logical_bytes` is likewise a logical upper bound.

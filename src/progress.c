@@ -94,7 +94,10 @@ static struct {
 	uint64_t		estimate;	/* fuzzy total, see dbfile */
 	unsigned int		batch, batches;
 	const char		*activity;	/* static string */
-	_Atomic uint64_t	reclaimed, kern;
+	/* reclaimed: honest disk freed (kernel-deduped bytes). net_shared: fiemap
+	 * "net change in shared extents", a diagnostic for the machine-readable
+	 * line only (it counts the surviving copy as shared too, so ~2x for pairs). */
+	_Atomic uint64_t	reclaimed, net_shared;
 } pdd;
 
 #define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
@@ -288,8 +291,7 @@ static unsigned int print_dedupe_progress(void)
 		printf(" · batch %u/%u", pdd.batch, pdd.batches);
 	printf("\n");
 
-	s_printf("\tSpace reclaimed: %s · kernel verified: %s\n",
-		 human_size(pdd.reclaimed), human_size(pdd.kern));
+	s_printf("\tSpace reclaimed: %s\n", human_size(pdd.reclaimed));
 
 	s_printf("\tStatus: %s", pdd.activity ? pdd.activity : "working");
 	if (st)
@@ -515,7 +517,7 @@ void pdedupe_begin(uint64_t estimated_groups, unsigned int batches)
 	pdd.done = 0;
 	pdd.queued = 0;
 	pdd.reclaimed = 0;
-	pdd.kern = 0;
+	pdd.net_shared = 0;
 	pdd.estimate = estimated_groups;
 	pdd.batches = batches;
 	pdd.batch = batches ? 1 : 0;
@@ -572,18 +574,19 @@ void pdedupe_add_queued(uint64_t ngroups)
 	atomic_fetch_add(&pdd.queued, ngroups);
 }
 
-void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t kern_bytes)
+void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t net_shared_bytes)
 {
 	atomic_fetch_add(&pdd.done, 1);
 	atomic_fetch_add(&pdd.reclaimed, reclaimed_bytes);
-	atomic_fetch_add(&pdd.kern, kern_bytes);
+	atomic_fetch_add(&pdd.net_shared, net_shared_bytes);
 }
 
-void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *kern)
+void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *net_shared)
 {
 	*groups = pdd.done;
 	*reclaimed = pdd.reclaimed;
-	*kern = pdd.kern;
+	if (net_shared)
+		*net_shared = pdd.net_shared;
 }
 
 static void *psearch_progress_thread(void * p)
