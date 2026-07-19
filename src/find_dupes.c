@@ -294,6 +294,11 @@ static void search_file_extents(struct filerec *file, struct results_tree *dupe_
 				options.hashfile == NULL ? "(null)" : options.hashfile);
 			return;
 		}
+		/* Up to cpu_threads of these run at once; a smaller per-connection
+		 * cache bounds peak RSS on large hashfiles. The hot index/DB pages
+		 * stay warm in the shared OS page cache, so the joins keep their
+		 * speed. */
+		dbfile_set_cache_kb(db, DB_CACHE_KB_SEARCH);
 	}
 
 	/*

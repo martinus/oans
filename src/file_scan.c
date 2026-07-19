@@ -200,7 +200,15 @@ static void scan_writer_close(void)
 	scan_writer = NULL;
 }
 
-#define READ_BUF_LEN (8*1024*1024) // 8MB
+/*
+ * Per-read-thread streaming buffer (one static __thread buffer per csum thread,
+ * reused across files). Files larger than this are read in successive passes, so
+ * the size only trades read() syscall count against memory: at --io-threads=8
+ * the old 8 MiB cost 64 MiB of resident buffers on large-file trees. 1 MiB
+ * saturates sequential read throughput (the scan is I/O/metadata-bound) while
+ * cutting that to 8 MiB. Measured perf-neutral; see scripts/bench-ram.sh.
+ */
+#define READ_BUF_LEN (1*1024*1024) // 1MB
 
 struct buffer {
 	char *buf;
@@ -889,6 +897,9 @@ int filescan_walk_run(struct dbhandle *db)
 		struct dbhandle *wdb = dbfile_open_handle(options.hashfile);
 
 		abort_on(!wdb);
+		/* Walkers only ever read the fs-uuid config (once, if at all), so
+		 * a full 64 MiB page cache each is pure overhead - shrink it. */
+		dbfile_set_cache_kb(wdb, DB_CACHE_KB_WALKER);
 		threads[i] = g_thread_new("walker", walk_thread, wdb);
 	}
 

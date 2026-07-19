@@ -83,6 +83,19 @@ struct dbhandle *dbfile_open_handle_ro(char *filename);
 void dbfile_close_handle(struct dbhandle *db);
 
 /*
+ * Per-connection SQLite page-cache budgets, in KiB. Every connection defaults
+ * to DB_CACHE_KB_DEFAULT; on a large hashfile that cache fills toward the cap,
+ * so connections that don't run the heavy dedupe joins are given a smaller
+ * budget to bound peak RSS (the search pool alone opens up to cpu_threads of
+ * them). Override a handle's budget with dbfile_set_cache_kb() after opening.
+ */
+#define DB_CACHE_KB_DEFAULT	65536	/* loader / reader / writer: the heavy joins */
+#define DB_CACHE_KB_SEARCH	32768	/* find_dupes search pool (x cpu_threads) */
+#define DB_CACHE_KB_WALKER	 2048	/* walkers only read the fs-uuid config, if that */
+
+void dbfile_set_cache_kb(struct dbhandle *db, unsigned int kb);
+
+/*
  * Open the database (options.hashfile)
  * On success, the handle is registered to be freed when the thread pool is freed
  */

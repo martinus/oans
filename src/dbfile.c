@@ -385,7 +385,10 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
-	ret = sqlite3_exec(db, "PRAGMA cache_size = -65536", NULL, NULL, NULL);
+	char cache_pragma[48];
+	snprintf(cache_pragma, sizeof(cache_pragma),
+		 "PRAGMA cache_size = -%d", DB_CACHE_KB_DEFAULT);
+	ret = sqlite3_exec(db, cache_pragma, NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret, "configuring database (cache size)");
 		return ret;
@@ -766,6 +769,24 @@ err:
 struct dbhandle *dbfile_open_handle(char *filename)
 {
 	return open_handle(filename, false);
+}
+
+/*
+ * Shrink (or grow) a handle's SQLite page-cache budget from the default. Used to
+ * cap peak RSS: the walker and search-pool connections don't run the heavy
+ * dedupe joins, so they don't need the full DB_CACHE_KB_DEFAULT each.
+ */
+void dbfile_set_cache_kb(struct dbhandle *db, unsigned int kb)
+{
+	char pragma[48];
+	int ret;
+
+	if (!db)
+		return;
+	snprintf(pragma, sizeof(pragma), "PRAGMA cache_size = -%u", kb);
+	ret = sqlite3_exec(db->db, pragma, NULL, NULL, NULL);
+	if (ret)
+		perror_sqlite(ret, "adjusting cache size");
 }
 
 /*
