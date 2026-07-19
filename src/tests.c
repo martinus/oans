@@ -101,9 +101,8 @@ MU_TEST(test_seen_inode) {
 	 * match must be exact on both fields: a hash collision that reported a
 	 * distinct inode as "seen" would silently drop a real file.
 	 */
-	seen_inodes = g_hash_table_new_full(ino_key_hash, ino_key_equal,
-					    free, NULL);
-	mu_check(seen_inodes != NULL);
+	seen_inodes_init();
+	mu_check(seen_slots != NULL);
 
 	mu_check(seen_inode(42, 7) == false);
 	mark_inode_seen(42, 7);
@@ -119,8 +118,16 @@ MU_TEST(test_seen_inode) {
 	mu_check(seen_inode(7, 42) == true);
 	mu_check(seen_inode(42, 7) == true);
 
-	g_hash_table_destroy(seen_inodes);
-	seen_inodes = NULL;
+	/* Stress the grow/rehash path (initial capacity is 1024): insert many
+	 * distinct keys, then verify exact membership survives the resizes. */
+	for (uint64_t n = 0; n < 5000; n++)
+		mark_inode_seen(1000 + n, n & 3);
+	for (uint64_t n = 0; n < 5000; n++)
+		mu_check(seen_inode(1000 + n, n & 3) == true);
+	mu_check(seen_inode(1000 + 5000, 0) == false);	/* never inserted */
+	mu_check(seen_inode(999, 0) == false);
+
+	seen_inodes_free();
 }
 
 MU_TEST(test_get_extent) {

@@ -1676,7 +1676,24 @@ int add_exclude_pattern(const char *pattern)
  * have already handled. Touched only from the single __scan_file() consumer
  * (not the walker threads), so it needs no locking.
  */
-static GHashTable *seen_inodes;
+/*
+ * Set of (ino, subvol) pairs already written this scan; a further hardlink to an
+ * inode is skipped so the batched writer never re-stores a pending filerec. A
+ * compact open-addressing set rather than a GHashTable: keys are stored inline
+ * (no per-entry node or malloc), roughly halving the ~50 B/file overhead. Probes
+ * compare the full 128-bit key, so there are no false positives - a hash-only
+ * key could report a distinct inode as "seen" and silently drop a real file.
+ * Single __scan_file() consumer, so no locking.
+ */
+struct ino_key {
+	uint64_t	ino;
+	uint64_t	subvol;
+};
+
+static struct ino_key	*seen_slots;	/* seen_cap entries; occupancy in seen_used */
+static uint64_t		*seen_used;	/* occupied bitmap, 1 bit per slot */
+static size_t		seen_cap;	/* power of two, 0 == uninitialised */
+static size_t		seen_count;
 
 /*
  * Bitset of file ids (rowids) confirmed to exist on disk during this walk, so
@@ -1742,55 +1759,112 @@ int64_t filescan_prune_deleted(struct dbhandle *db)
 	return pruned;
 }
 
-struct ino_key {
-	uint64_t	ino;
-	uint64_t	subvol;
-};
-
-static guint ino_key_hash(gconstpointer p)
+static inline size_t ino_hash(uint64_t ino, uint64_t subvol)
 {
-	const struct ino_key *k = p;
+	/* splitmix64-style mix of both fields into a slot index */
+	uint64_t x = (ino * 0x9E3779B97F4A7C15ULL) ^ (subvol + 0x9E3779B97F4A7C15ULL);
 
-	return g_int64_hash(&k->ino) ^ g_int64_hash(&k->subvol);
+	x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+	x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+	return (size_t)(x ^ (x >> 31));
 }
 
-static gboolean ino_key_equal(gconstpointer a, gconstpointer b)
+static inline bool seen_slot_used(size_t i)
 {
-	const struct ino_key *ka = a, *kb = b;
-
-	return ka->ino == kb->ino && ka->subvol == kb->subvol;
+	return (seen_used[i >> 6] >> (i & 63)) & 1;
 }
 
 static bool seen_inode(uint64_t ino, uint64_t subvol)
 {
-	struct ino_key k = { .ino = ino, .subvol = subvol };
+	size_t mask, i;
 
-	return seen_inodes && g_hash_table_contains(seen_inodes, &k);
+	if (!seen_cap)
+		return false;
+	mask = seen_cap - 1;
+	for (i = ino_hash(ino, subvol) & mask; seen_slot_used(i); i = (i + 1) & mask)
+		if (seen_slots[i].ino == ino && seen_slots[i].subvol == subvol)
+			return true;
+	return false;
+}
+
+/* Insert into a table known to have a free slot (caller ensures capacity). */
+static void seen_insert(uint64_t ino, uint64_t subvol)
+{
+	size_t mask = seen_cap - 1;
+	size_t i;
+
+	for (i = ino_hash(ino, subvol) & mask; seen_slot_used(i); i = (i + 1) & mask)
+		if (seen_slots[i].ino == ino && seen_slots[i].subvol == subvol)
+			return;			/* already present */
+	seen_slots[i].ino = ino;
+	seen_slots[i].subvol = subvol;
+	seen_used[i >> 6] |= (uint64_t)1 << (i & 63);
+	seen_count++;
+}
+
+/* Double the table, rehashing; returns false (old table intact) on OOM. */
+static bool seen_grow(void)
+{
+	struct ino_key *oldslots = seen_slots;
+	uint64_t *oldused = seen_used;
+	size_t oldcap = seen_cap, newcap = seen_cap * 2, i;
+	struct ino_key *ns = calloc(newcap, sizeof(*ns));
+	uint64_t *nu = calloc((newcap + 63) / 64, sizeof(*nu));
+
+	if (!ns || !nu) {
+		free(ns);
+		free(nu);
+		return false;
+	}
+	seen_slots = ns;
+	seen_used = nu;
+	seen_cap = newcap;
+	seen_count = 0;
+	for (i = 0; i < oldcap; i++)
+		if ((oldused[i >> 6] >> (i & 63)) & 1)
+			seen_insert(oldslots[i].ino, oldslots[i].subvol);
+	free(oldslots);
+	free(oldused);
+	return true;
 }
 
 static void mark_inode_seen(uint64_t ino, uint64_t subvol)
 {
-	struct ino_key *k;
-
-	if (!seen_inodes)
+	if (!seen_cap)
 		return;
-
-	k = malloc(sizeof(*k));
-	if (!k)	/* On OOM just skip; the worst case is the pre-fix behavior. */
+	/* Grow at ~70% load to keep probes short. If growth OOMs and the table
+	 * would otherwise fill completely, skip the insert (worst case is the
+	 * pre-fix behavior) rather than risk a full-table probe loop. */
+	if ((seen_count + 1) * 10 >= seen_cap * 7 && !seen_grow() &&
+	    seen_count + 1 >= seen_cap)
 		return;
+	seen_insert(ino, subvol);
+}
 
-	k->ino = ino;
-	k->subvol = subvol;
-	g_hash_table_add(seen_inodes, k);
+static void seen_inodes_init(void)
+{
+	seen_cap = 1024;
+	seen_count = 0;
+	seen_slots = calloc(seen_cap, sizeof(*seen_slots));
+	seen_used = calloc((seen_cap + 63) / 64, sizeof(*seen_used));
+	abort_on(!seen_slots || !seen_used);
+}
+
+static void seen_inodes_free(void)
+{
+	free(seen_slots);
+	seen_slots = NULL;
+	free(seen_used);
+	seen_used = NULL;
+	seen_cap = 0;
+	seen_count = 0;
 }
 
 void filescan_init(void)
 {
 	abort_on(scan_pool.pool);
 	abort_on(scan_writer_open());
-	seen_inodes = g_hash_table_new_full(ino_key_hash, ino_key_equal,
-					    free, NULL);
-	abort_on(!seen_inodes);
+	seen_inodes_init();
 	setup_pool(&scan_pool, csum_whole_file, NULL, options.io_threads);
 	abort_on(!scan_pool.pool);
 }
@@ -1803,8 +1877,5 @@ void filescan_free(void)
 	scan_writer_close();
 	subvol_cache_free();
 	verified_dev_free();
-	if (seen_inodes) {
-		g_hash_table_destroy(seen_inodes);
-		seen_inodes = NULL;
-	}
+	seen_inodes_free();
 }
