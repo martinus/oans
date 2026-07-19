@@ -13,8 +13,8 @@
        alt="oans scanning a large tree, deduplicating it, and reporting the space reclaimed">
 </p>
 
-<img src="assets/logo.png" align="right" width="150"
-     alt="oans logo — a hand-drawn bauble full of rainbow ones, drawn by the author's 8-year-old daughter">
+<img src="assets/logo.png" align="left" width="180"
+     alt="The oans logo, designed and drawn by my 8-year-old daughter">
 
 oans finds files and extents with identical content and asks the kernel to
 share their storage. It is a performance-focused fork of
