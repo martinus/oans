@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/logo.png" width="200" alt="oans logo — a hand-drawn bauble with rainbow ones inside">
-</p>
-
 # oans
 
 **Fast, safe, set-and-forget deduplication for btrfs and XFS.**
@@ -16,6 +12,9 @@
   <img src="assets/demo.gif" width="900"
        alt="oans scanning a large tree, deduplicating it, and reporting the space reclaimed">
 </p>
+
+<img src="assets/logo.png" align="right" width="150"
+     alt="oans logo — a hand-drawn bauble full of rainbow ones, drawn by the author's 8-year-old daughter">
 
 oans finds files and extents with identical content and asks the kernel to
 share their storage. It is a performance-focused fork of
@@ -167,6 +166,9 @@ on real btrfs data before landing. By design the tool cannot put your data at
 risk regardless: dedupe is performed by the kernel's `FIDEDUPERANGE` ioctl,
 which byte-compares every range before sharing it (see the note near the top),
 so the worst a bug can do is waste work or miss a dedupe.
+
+The logo — a bauble full of rainbow *ones* — was designed and hand-drawn by my
+8-year-old daughter.
 
 Differences to know about:
 
