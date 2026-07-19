@@ -8,12 +8,14 @@
 # small, a few large), seeded so the mix is reproducible.
 #
 # Generation is parallel and spawn-free: one awk pass plans every path+size, then
-# a pool of python workers each stream /dev/urandom for many files at once (no
+# a pool of gen.py workers fill many files each with pseudo-random bytes (no
 # per-file `head`), and copies are made with a parallel `cp`. Finally the page
 # cache is dropped so the recorded scan reads cold from disk.
 #
 #   usage: setup.sh <work-dir on btrfs or xfs>
 set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEST="${1:?usage: setup.sh <work-dir on btrfs or xfs>}"
 UNIQUE="${DEMO_UNIQUE:-2700}"         # unique files: hashed, never deduped (long scan)
@@ -72,23 +74,11 @@ awk -v n="$DUP_GROUPS" -v dest="$DEST" \
 
 echo "Generating $UNIQUE unique files + $DUP_GROUPS groups ×${COPIES} (mean ${MEAN_KB} KiB) on ${nworkers} workers ..."
 
-# 3) Generate random-content files in parallel. Split the gen list into nworkers
-#    chunks; each worker opens /dev/urandom once and streams bytes for all its
-#    files — no per-file process spawns.
-gen_py='
-import os, sys
-u = os.open("/dev/urandom", os.O_RDONLY)
-for line in open(sys.argv[1]):
-    b, p = line.rstrip("\n").split("\t", 1)
-    n = int(b)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    while n > 0:
-        d = os.read(u, min(n, 1 << 20)); os.write(fd, d); n -= len(d)
-    os.close(fd)
-'
+# 3) Generate the file content in parallel: split the gen list into nworkers
+#    chunks and hand each to a gen.py worker (pseudo-random bytes; see gen.py).
 split -n "l/$nworkers" "$DEST/.jobs_gen" "$DEST/.chunk_gen." 2>/dev/null \
   || cp "$DEST/.jobs_gen" "$DEST/.chunk_gen.aa"
-for ch in "$DEST"/.chunk_gen.*; do python3 -c "$gen_py" "$ch" & done
+for ch in "$DEST"/.chunk_gen.*; do python3 "$here/gen.py" "$ch" & done
 wait
 
 # 4) Make the duplicate copies in parallel. --reflink=never is essential: on
