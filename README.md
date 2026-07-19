@@ -5,6 +5,9 @@
 [![CI](https://github.com/martinus/oans/actions/workflows/ci.yml/badge.svg)](https://github.com/martinus/oans/actions/workflows/ci.yml)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE)
 
+<!-- assets/demo.gif was generated with:
+     DEMO_UNIQUE=9765 DEMO_DUP_GROUPS=273 DEMO_COPIES=4 DEMO_MEAN_KB=1234 DEMO_LOSSY=80 \
+       scripts/demo/record.sh -->
 <p align="center">
   <img src="assets/demo.gif" width="900"
        alt="oans scanning a large tree, deduplicating it, and reporting the space reclaimed">
