@@ -1267,17 +1267,33 @@ void dbfile_maybe_vacuum(struct dbhandle *db)
 	    (total == 0 || freelist * 100 < total * VACUUM_FREE_PCT))
 		return;
 
+	/* Announce without a trailing newline and finish the line with "done"
+	 * afterwards, so the compaction never looks like it is still running once
+	 * it has completed. The progress printer is not running here, so the
+	 * partial line is buffered - flush it before the (possibly slow) VACUUM. */
 	if (hashfile_rebuilt) {
-		qprintf("Compacting the rebuilt hashfile ...\n");
+		qprintf("Compacting the rebuilt hashfile ... ");
 	} else {
-		vprintf("Vacuuming hashfile: %"PRIu64" of %"PRIu64" pages free\n",
+		vprintf("Vacuuming hashfile: %"PRIu64" of %"PRIu64" pages free ... ",
 			freelist, total);
 	}
+	fflush(stdout);
 
 	/* Maintenance only: a failure here must not fail the run. */
 	ret = sqlite3_exec(db->db, "VACUUM", NULL, NULL, NULL);
-	if (ret)
+
+	if (ret) {
+		if (hashfile_rebuilt) {
+			qprintf("\n");
+		} else {
+			vprintf("\n");
+		}
 		perror_sqlite(ret, "vacuuming hashfile");
+	} else if (hashfile_rebuilt) {
+		qprintf("done\n");
+	} else {
+		vprintf("done\n");
+	}
 }
 
 static int get_config_int(sqlite3_stmt *stmt, const char *name, int *val)
