@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/martinus/oans/discussions
+    about: For setup/usage questions, prefer Discussions over an issue.
+  - name: NAS / server quick-start
+    url: https://github.com/martinus/oans/blob/master/docs/nas-quickstart.md
+    about: Step-by-step guide for scheduled, monitored dedupe on a NAS.

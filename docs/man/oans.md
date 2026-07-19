@@ -410,6 +410,12 @@ boundaries, so files with the same content but a different on-disk extent layout
 may not match unless block-level matching is enabled with
 **\--dedupe-options=partial**.
 
+`oans` is offline, batch deduplication: you point it at specific trees and run it
+on demand or on a timer. This differs from `bees`, an always-on daemon that
+deduplicates the whole filesystem continuously, and from inline filesystem
+dedupe such as ZFS, which maintains a permanent in-RAM dedupe table. `oans` keeps
+no such table and imposes no background cost between runs.
+
 # SEE ALSO
 
 `btrfs`(8), `xfs`(8), `filesystems`(5), `ioctl_fideduprange`(2), `compsize`(8)

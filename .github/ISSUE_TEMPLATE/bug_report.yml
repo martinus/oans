@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a problem with oans (crash, wrong result, missed or wasted dedupe)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Dedupe goes through the kernel's byte-verifying
+        `FIDEDUPERANGE` ioctl, so oans cannot corrupt your data — but it can
+        waste work or miss a dedupe, and those are worth fixing.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did oans do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: The exact `oans` invocation (redact paths if you like).
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: oans version
+      description: Output of `oans --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: filesystem
+    attributes:
+      label: Filesystem
+      options:
+        - btrfs
+        - xfs
+        - other / not sure
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`.
+    validations:
+      required: true
+  - type: dropdown
+    id: fresh-hashfile
+    attributes:
+      label: Does it reproduce with a fresh (empty) hashfile?
+      options:
+        - "Yes"
+        - "No"
+        - "Not tested"
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Logs, `--stats` output, or steps to reproduce.

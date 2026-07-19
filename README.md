@@ -63,6 +63,9 @@ Requires Linux 3.13+ with a btrfs or XFS filesystem.
 make && sudo make install
 ```
 
+> **Arch Linux:** `PKGBUILD`s live in [`packaging/aur/`](packaging/aur) (`oans`
+> for releases, `oans-git` for `master`).
+
 ```sh
 # 1. First run: hash the tree and deduplicate it (-r recurse, -d dedupe)
 sudo oans -dr --hashfile=/var/cache/oans/data.hash /srv/data
@@ -103,7 +106,8 @@ resumes where it left off.
 ## What the fork changes, measured
 
 Benchmarked on real btrfs data (2.07M files, ~230 GiB); your mileage depends
-on your data and filesystem.
+on your data and filesystem. The exact tree, commands and comparison binary are
+documented in the **[benchmark methodology](docs/benchmarks.md)**.
 
 | Change | Effect |
 |---|---|
@@ -116,6 +120,24 @@ on your data and filesystem.
 
 Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.md)** (`man 8 oans` once installed).
 
+## How it compares
+
+**vs. [bees](https://github.com/Zygo/bees):** bees is an always-on daemon doing
+continuous, block-level dedupe across the *whole* filesystem. oans is the other
+trade-off — an *offline, batch* tool you point at specific trees and run on a
+schedule (or a systemd timer): no resident daemon, no constant background I/O,
+plus per-run stats, history and honest accounting. Pick bees for always-on
+whole-fs dedupe; pick oans for scheduled, observable, targeted runs.
+
+**vs. ZFS deduplication:** ZFS dedupes inline and keeps a large dedupe table
+permanently in RAM (on the order of 1–5 GiB per TiB of data), and it's hard to
+undo. oans needs no dedupe table and no permanent RAM cost — you run it when you
+want, on the btrfs/XFS you already have.
+
+**vs. upstream duperemove:** the same engine, tuned for *re-running regularly*
+— see [What the fork changes](#what-the-fork-changes-measured) above, and the
+attribution below.
+
 ## Relationship to duperemove
 
 oans (Austrian dialect for *"one"* — as in one copy) builds on
@@ -123,7 +145,10 @@ oans (Austrian dialect for *"one"* — as in one copy) builds on
 design and code is the work of **Mark Fasheh** and the upstream contributors,
 and none of this exists without them. The fork's improvements were developed
 with the help of AI tooling; every change was reviewed, tested, and benchmarked
-on real btrfs data before landing.
+on real btrfs data before landing. By design the tool cannot put your data at
+risk regardless: dedupe is performed by the kernel's `FIDEDUPERANGE` ioctl,
+which byte-compares every range before sharing it (see the note near the top),
+so the worst a bug can do is waste work or miss a dedupe.
 
 Differences to know about:
 

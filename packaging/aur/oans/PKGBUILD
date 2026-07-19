@@ -1,0 +1,25 @@
+# Maintainer: martinus <martin.ankerl@gmail.com>
+pkgname=oans
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork"
+arch=('x86_64')
+url="https://github.com/martinus/oans"
+license=('GPL-2.0-only')
+depends=('glib2' 'sqlite' 'xxhash' 'util-linux-libs' 'libbsd')
+makedepends=('pkgconf')
+provides=('duperemove')
+conflicts=('duperemove')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('257580e6dd3c1099750e7780fbbcd7b9d59b99b6097cd3346c5862caa9483413')
+
+build() {
+  cd "$pkgname-$pkgver"
+  make
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+  make install-systemd DESTDIR="$pkgdir" PREFIX=/usr
+}

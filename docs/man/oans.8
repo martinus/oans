@@ -475,6 +475,15 @@ Two logically identical files are not always deduped: \f[CR]oans\f[R]
 works on extent boundaries, so files with the same content but a
 different on\-disk extent layout may not match unless block\-level
 matching is enabled with \f[B]\-\-dedupe\-options=partial\f[R].
+.PP
+\f[CR]oans\f[R] is offline, batch deduplication: you point it at
+specific trees and run it on demand or on a timer.
+This differs from \f[CR]bees\f[R], an always\-on daemon that
+deduplicates the whole filesystem continuously, and from inline
+filesystem dedupe such as ZFS, which maintains a permanent in\-RAM
+dedupe table.
+\f[CR]oans\f[R] keeps no such table and imposes no background cost
+between runs.
 .SH SEE ALSO
 \f[CR]btrfs\f[R](8), \f[CR]xfs\f[R](8), \f[CR]filesystems\f[R](5),
 \f[CR]ioctl_fideduprange\f[R](2), \f[CR]compsize\f[R](8)

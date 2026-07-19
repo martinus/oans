@@ -1,0 +1,30 @@
+# Maintainer: martinus <martin.ankerl@gmail.com>
+pkgname=oans-git
+pkgver=1.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork (VCS)"
+arch=('x86_64')
+url="https://github.com/martinus/oans"
+license=('GPL-2.0-only')
+depends=('glib2' 'sqlite' 'xxhash' 'util-linux-libs' 'libbsd')
+makedepends=('git' 'pkgconf')
+provides=('oans' 'duperemove')
+conflicts=('oans' 'duperemove')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd oans
+  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+build() {
+  cd oans
+  make
+}
+
+package() {
+  cd oans
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+  make install-systemd DESTDIR="$pkgdir" PREFIX=/usr
+}
