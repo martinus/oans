@@ -38,6 +38,21 @@ struct file_dedupe_range {
 
 #endif // FIDEDUPERANGE
 
+/*
+ * Fetch a filesystem's UUID directly from an open fd (Linux 6.4+). Unlike a
+ * libblkid device probe this needs no root and no populated blkid cache, so it
+ * is the preferred way to identify an XFS filesystem. Defined here for build
+ * hosts whose kernel headers predate it (the release tarball builds on an older
+ * distro); the runtime kernel returns ENOTTY when it is unsupported.
+ */
+#ifndef FS_IOC_GETFSUUID
+struct fsuuid2 {
+	__u8	len;
+	__u8	uuid[16];
+};
+#define FS_IOC_GETFSUUID	_IOR(0x15, 0, struct fsuuid2)
+#endif // FS_IOC_GETFSUUID
+
 #endif
 
 

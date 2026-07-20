@@ -7,6 +7,10 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scratch_fs: [btrfs, xfs]
     steps:
       - uses: actions/checkout@v4
 
@@ -17,7 +21,7 @@ jobs:
             build-essential pkg-config \
             libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
             uuid-dev libbsd-dev libxxhash-dev \
-            btrfs-progs
+            btrfs-progs xfsprogs
 
       - name: Build
         run: make
@@ -26,20 +30,25 @@ jobs:
         run: make test
 
       # Dedupe integration tests need a reflink-capable filesystem, which the
-      # runner's ext4 root is not. Back a small btrfs with a loopback image and
-      # point the suite's scratch dir at it. Without this the dedupe tests would
-      # skip (the harness detects the lack of reflink) but everything else runs.
-      - name: Set up a scratch btrfs
+      # runner's ext4 root is not. Back a small btrfs/XFS with a loopback image
+      # and point the suite's scratch dir at it. The XFS leg runs unprivileged,
+      # so it also proves the unprivileged FS_IOC_GETFSUUID path (Linux 6.4+);
+      # the harness auto-skips the few btrfs-only (fragmentation) tests on XFS.
+      - name: Set up a scratch ${{ matrix.scratch_fs }}
         run: |
-          sudo modprobe btrfs || true
-          IMG="$RUNNER_TEMP/duperemove-scratch.img"
+          sudo modprobe ${{ matrix.scratch_fs }} || true
+          IMG="$RUNNER_TEMP/oans-scratch.img"
           truncate -s 2G "$IMG"
-          mkfs.btrfs -q "$IMG"
-          sudo mkdir -p /mnt/duperemove-scratch
-          sudo mount -o loop "$IMG" /mnt/duperemove-scratch
-          sudo chmod 1777 /mnt/duperemove-scratch
+          if [ "${{ matrix.scratch_fs }}" = btrfs ]; then
+            mkfs.btrfs -q "$IMG"
+          else
+            mkfs.xfs -q -m reflink=1 "$IMG"
+          fi
+          sudo mkdir -p /mnt/oans-scratch
+          sudo mount -o loop "$IMG" /mnt/oans-scratch
+          sudo chmod 1777 /mnt/oans-scratch
 
       - name: Integration tests
         run: make integration
         env:
-          DUPEREMOVE_TEST_DIR: /mnt/duperemove-scratch
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch

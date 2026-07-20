@@ -459,6 +459,14 @@ units (see \f[I]Scheduled deduplication\f[R]).
 .SH NOTES
 Deduplication is supported only on \f[B]btrfs\f[R] and \f[B]xfs\f[R].
 .PP
+On \f[B]xfs\f[R], \f[CR]oans\f[R] identifies the filesystem by its UUID.
+This works unprivileged on Linux 6.4 and newer; on older kernels the
+UUID lookup needs root, so run \f[CR]oans\f[R] with \f[B]sudo\f[R] there
+(a scheduled root job is unaffected).
+If the filesystem cannot be identified, \f[CR]oans\f[R] now stops with an
+error instead of silently reporting nothing to do.
+\f[B]btrfs\f[R] is unaffected.
+.PP
 The read\-only report modes (\f[B]\-\-stats\f[R], \f[B]\-\-history\f[R],
 \f[B]\-\-json\f[R], \f[B]\-L\f[R]) open the hashfile read\-only and are
 safe to run while another \f[CR]oans\f[R] process is scanning or

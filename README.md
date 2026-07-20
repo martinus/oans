@@ -73,7 +73,9 @@ sudo apt install build-essential pkg-config \
     uuid-dev libmount-dev libblkid-dev libbsd-dev
 ```
 
-Requires Linux 3.13+ with a btrfs or XFS filesystem.
+Requires Linux 3.13+ with a btrfs or XFS filesystem. On XFS, filesystem
+identification is unprivileged on Linux 6.4+; on older kernels run oans as root
+(a scheduled root job is unaffected).
 
 </details>
 

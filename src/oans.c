@@ -1060,6 +1060,19 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	if (!ret)
 		ret = filescan_walk_run(db);
 
+	/*
+	 * Nothing could be locked onto a supported filesystem, so the walk saw
+	 * no files. Fail loudly rather than printing a misleading "Nothing to
+	 * deduplicate" and exiting 0. The most common cause is XFS on a kernel
+	 * older than 6.4 scanned without root (its UUID needs libblkid).
+	 */
+	if (!ret && filescan_seed_failed()) {
+		eprintf("Error: could not determine the filesystem for any given "
+			"path. Deduplication needs btrfs or XFS; for XFS on a "
+			"kernel older than 6.4, run oans as root.\n");
+		ret = 1;
+	}
+
 	pscan_finish_listing();
 	filescan_free();
 	if (!quiet)

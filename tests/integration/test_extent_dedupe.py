@@ -8,16 +8,20 @@ only a hint for the "already deduped" check, and the kernel byte-verifies every
 dedupe, so a wrong hint changes neither data nor sharing. This guards the path
 against crashes/errors and against sharing/data regressions.)
 
-Requires a reflink-capable filesystem.
+Requires btrfs: the setup relies on an fsync-forced extent boundary between the
+head and the shared tail so the tail is its own extent the extent pass can
+match. That boundary only forms under copy-on-write; XFS overwrites in place and
+keeps the file as one extent, so it cannot reproduce the partially-shared layout
+(genuine whole-file and naturally-aligned dedupe still works on XFS).
 """
 
 import os
-from harness import DuperemoveTest, requires_reflink
+from harness import DuperemoveTest, requires_btrfs
 
 MiB = 1 << 20
 
 
-@requires_reflink
+@requires_btrfs
 class ExtentDedupeTest(DuperemoveTest):
     def _mkfile(self, rel, head, tail):
         """head, an fsync to force an extent boundary, then the shared tail."""

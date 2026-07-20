@@ -49,6 +49,7 @@
 #include "filerec.h"
 #include "hash-tree.h"
 #include "btrfs-util.h"
+#include "ioctl.h"
 #include "debug.h"
 #include "file_scan.h"
 #include "dbfile.h"
@@ -267,6 +268,28 @@ struct locked_fs {
 };
 struct locked_fs locked_fs = {0,};
 
+/*
+ * Set when a seeded root (parent_checked == false) is rejected because it could
+ * not be locked onto a supported filesystem: its UUID could not be read (e.g.
+ * XFS on a pre-6.4 kernel run without root) or it lives on a different fs than
+ * the one already locked. Together with a zero seed count this turns an
+ * otherwise silent "Nothing to deduplicate" no-op into a hard error.
+ */
+static bool seed_fs_lock_failed;
+static unsigned int nr_roots_seeded;
+
+/*
+ * Reject a path in check_file(). On a top-level seed (not a child discovered
+ * mid-walk) also record that it could not be locked onto a supported fs, so
+ * scan_files() can fail loudly instead of silently reporting nothing to do.
+ */
+static bool seed_reject(bool parent_checked)
+{
+	if (!parent_checked)
+		seed_fs_lock_failed = true;
+	return false;
+}
+
 static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 {
 	hashes->extents_count = ctxt->fiemap->fm_mapped_extents;
@@ -483,8 +506,21 @@ int get_uuid(char *path, uuid_t *uuid)
 	} else {
 		const char *fs_source;
 		char *first_device;
+		struct fsuuid2 fsuuid = {0,};
 
 		dprintf("get_uuid: %s do not live on btrfs\n", path);
+
+		/*
+		 * Preferred path: ask the filesystem for its UUID directly
+		 * (Linux 6.4+). This is unprivileged and works on XFS without
+		 * root, unlike the libblkid device probe below. Older kernels
+		 * return ENOTTY, so fall through to mountinfo + libblkid.
+		 */
+		if (ioctl(fd, FS_IOC_GETFSUUID, &fsuuid) == 0 &&
+		    fsuuid.len == sizeof(uuid_t)) {
+			uuid_copy(*uuid, fsuuid.uuid);
+			return 0;
+		}
 
 		ret = statx(0, path, 0, STATX_BASIC_STATS, &st);
 		if (ret) {
@@ -614,7 +650,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		dprintf("Empty hashfile, locking on the current file\n");
 		ret = get_uuid(path, &locked_fs.uuid);
 		if (ret)
-			return false;
+			return seed_reject(parent_checked);
 
 		locked_fs.dev = stx_to_dev(st);
 		locked_fs.is_btrfs = is_btrfs(path);
@@ -633,7 +669,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	if (locked_fs.dev == 0) {
 		ret = get_uuid(path, &uuid);
 		if (ret)
-			return false;
+			return seed_reject(parent_checked);
 
 		if (uuid_compare(uuid, locked_fs.uuid) != 0) {
 			eprintf("%s lives on fs ", path);
@@ -641,7 +677,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 			eprintf(" will we are locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
 			eprintf(".\n");
-			return false;
+			return seed_reject(parent_checked);
 		}
 
 		locked_fs.dev = stx_to_dev(st);
@@ -676,6 +712,16 @@ void fs_get_locked_uuid(uuid_t *uuid)
 {
 	if (uuid)
 		uuid_copy(*uuid, locked_fs.uuid);
+}
+
+/*
+ * True when no root could be seeded because none could be locked onto a
+ * supported filesystem. The caller uses this to fail loudly instead of
+ * reporting a silent, successful "nothing to do".
+ */
+bool filescan_seed_failed(void)
+{
+	return seed_fs_lock_failed && nr_roots_seeded == 0;
 }
 
 static int get_dirent_type(struct dirent *entry, int fd, const char *path)
@@ -879,6 +925,8 @@ void filescan_walk_begin(void)
 	walk_dirq = g_async_queue_new();
 	walk_fileq = g_async_queue_new();
 	walk_dir_pending = 1;	/* seeding token; released by filescan_walk_run() */
+	seed_fs_lock_failed = false;
+	nr_roots_seeded = 0;
 }
 
 /*
@@ -1150,6 +1198,7 @@ int scan_file(char *in_path, struct dbhandle *db)
 		fileq_push(path, &st);
 	else
 		dirq_push(strdup(path));
+	nr_roots_seeded++;
 	return 0;
 }
 

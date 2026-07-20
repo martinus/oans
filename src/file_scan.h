@@ -2,6 +2,7 @@
 #define	__FILE_SCAN_H__
 
 #include <sys/types.h>
+#include <stdbool.h>
 #include <uuid/uuid.h>
 
 #include "dbfile.h"
@@ -36,6 +37,14 @@ int filescan_walk_run(struct dbhandle *db);
 int64_t filescan_prune_deleted(struct dbhandle *db);
 
 void fs_get_locked_uuid(uuid_t *uuid);
+
+/*
+ * True after filescan_walk_run() when no root could be seeded because none
+ * could be locked onto a supported filesystem (e.g. XFS whose UUID could not
+ * be read without root on an old kernel). Lets the caller fail loudly instead
+ * of reporting a silent, successful no-op.
+ */
+bool filescan_seed_failed(void);
 
 /* For dbfile.c */
 struct block_csum {

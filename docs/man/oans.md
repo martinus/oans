@@ -395,6 +395,12 @@ check the *Not deduped* line, or run with **-v**, to detect them.
 
 Deduplication is supported only on **btrfs** and **xfs**.
 
+On **xfs**, `oans` identifies the filesystem by its UUID. This works unprivileged
+on Linux 6.4 and newer; on older kernels the UUID lookup needs root, so run
+`oans` with **sudo** there (a scheduled root job is unaffected). If the
+filesystem cannot be identified, `oans` now stops with an error instead of
+silently reporting nothing to do. **btrfs** is unaffected.
+
 The read-only report modes (**\--stats**, **\--history**, **\--json**, **-L**)
 open the hashfile read-only and are safe to run while another `oans` process is
 scanning or deduping the same hashfile: they show a consistent snapshot and
