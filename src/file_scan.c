@@ -278,6 +278,18 @@ struct locked_fs locked_fs = {0,};
 static bool seed_fs_lock_failed;
 static unsigned int nr_roots_seeded;
 
+/*
+ * Reject a path in check_file(). On a top-level seed (not a child discovered
+ * mid-walk) also record that it could not be locked onto a supported fs, so
+ * scan_files() can fail loudly instead of silently reporting nothing to do.
+ */
+static bool seed_reject(bool parent_checked)
+{
+	if (!parent_checked)
+		seed_fs_lock_failed = true;
+	return false;
+}
+
 static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 {
 	hashes->extents_count = ctxt->fiemap->fm_mapped_extents;
@@ -506,7 +518,7 @@ int get_uuid(char *path, uuid_t *uuid)
 		 */
 		if (ioctl(fd, FS_IOC_GETFSUUID, &fsuuid) == 0 &&
 		    fsuuid.len == sizeof(uuid_t)) {
-			memcpy(*uuid, fsuuid.uuid, sizeof(uuid_t));
+			uuid_copy(*uuid, fsuuid.uuid);
 			return 0;
 		}
 
@@ -637,11 +649,8 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	if (uuid_is_null(locked_fs.uuid)) {
 		dprintf("Empty hashfile, locking on the current file\n");
 		ret = get_uuid(path, &locked_fs.uuid);
-		if (ret) {
-			if (!parent_checked)
-				seed_fs_lock_failed = true;
-			return false;
-		}
+		if (ret)
+			return seed_reject(parent_checked);
 
 		locked_fs.dev = stx_to_dev(st);
 		locked_fs.is_btrfs = is_btrfs(path);
@@ -659,11 +668,8 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	 */
 	if (locked_fs.dev == 0) {
 		ret = get_uuid(path, &uuid);
-		if (ret) {
-			if (!parent_checked)
-				seed_fs_lock_failed = true;
-			return false;
-		}
+		if (ret)
+			return seed_reject(parent_checked);
 
 		if (uuid_compare(uuid, locked_fs.uuid) != 0) {
 			eprintf("%s lives on fs ", path);
@@ -671,9 +677,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 			eprintf(" will we are locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
 			eprintf(".\n");
-			if (!parent_checked)
-				seed_fs_lock_failed = true;
-			return false;
+			return seed_reject(parent_checked);
 		}
 
 		locked_fs.dev = stx_to_dev(st);
