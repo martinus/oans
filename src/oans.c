@@ -340,11 +340,12 @@ static int print_hashfile_stats(char *filename)
 	printf("\n%s%swhole-file duplicates%s\n", col_bold, col_blue, col_reset);
 	printf("  %sgroups%s          %"PRIu64"\n", col_dim, col_reset, groups);
 	printf("  %sfiles in groups%s %"PRIu64"\n", col_dim, col_reset, dupfiles);
-	printf("  %sreclaimable%s     %s%s%s   %s(%.1f%% of tracked data)%s\n",
+	printf("  %sduplicated%s      %s%s%s   %s(%.1f%% of tracked data; logical - already"
+	       " freed if deduped, see --history)%s\n",
 	       col_dim, col_reset, col_green, human_size(reclaim), col_reset,
 	       col_dim, logical ? 100.0 * reclaim / logical : 0.0, col_reset);
 	if (ntop)
-		printf("  %stop groups%s      %ssize x copies · reclaimable · example%s\n",
+		printf("  %stop groups%s      %ssize x copies · duplicated · example%s\n",
 		       col_dim, col_reset, col_dim, col_reset);
 	for (i = 0; i < ntop; i++) {
 		char szb[48], wb[32];

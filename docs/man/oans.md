@@ -184,9 +184,11 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **\--stats**
   ~ Print a summary of the hashfile and exit: its format and identity, the
     stored scan configuration a bare replay would use, how many files and hashes
-    it holds, the total logical data tracked, the whole-file duplication it
-    records (duplicate groups and reclaimable bytes), and how much a compaction
-    would reclaim. Requires **\--hashfile**.
+    it holds, the total logical data tracked, and the whole-file duplication it
+    records (duplicate groups and their logical duplicate volume). That volume is
+    a logical figure — it is already shared on disk if you have run a dedupe, so
+    check **\--history** for bytes actually freed and `compsize`(8) for on-disk
+    usage. Requires **\--hashfile**.
 
 **\--history**
   ~ Print the run history recorded in the hashfile and exit: the number of runs,

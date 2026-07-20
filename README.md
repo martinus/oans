@@ -45,7 +45,7 @@ Summary
 | ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* everything already shared. Rescanning a deduped 2M-file / 230 GiB tree: **~92 s with oans vs ~11 min with duperemove 0.15.2** (~7×). |
 | 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
 | ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
-| 📊 **Statistics & history** | `--stats` shows what a hashfile holds and how much is reclaimable; `--history` shows space reclaimed over time; `--json` exports metrics for dashboards. |
+| 📊 **Statistics & history** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards. |
 | 🎯 **Honest reporting** | A clean, colorful live progress display (rate + ETA) and a summary that reports the disk space *actually freed* — not an inflated shared-extents figure. |
 | 🔒 **Hardened** | Fixes a data-loss-adjacent upstream bug (hardlinks could silently empty the hashfile), read-only report modes that are safe while a dedupe runs, and an integration suite CI runs against a real btrfs. |
 | 🤝 **Drop-in compatible** | The CLI is a close superset of duperemove's, and `make install` provides a `duperemove` compatibility symlink. |
@@ -105,7 +105,7 @@ the fastest I/O settings for your disks).
 ## Watching it work
 
 ```sh
-oans --stats   --hashfile=data.hash   # files, hashes, duplication, reclaimable space
+oans --stats   --hashfile=data.hash   # files, hashes, logical duplication (freed if deduped)
 oans --history --hashfile=data.hash   # reclaimed space per run + lifetime total
 oans --json    --hashfile=data.hash   # machine-readable metrics for a dashboard
 ```

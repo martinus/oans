@@ -228,9 +228,12 @@ Default is the host CPU count capped at \f[B]8\f[R]; an explicit
 \f[B]\-\-stats\f[R]
 Print a summary of the hashfile and exit: its format and identity, the
 stored scan configuration a bare replay would use, how many files and
-hashes it holds, the total logical data tracked, the whole\-file
-duplication it records (duplicate groups and reclaimable bytes), and how
-much a compaction would reclaim.
+hashes it holds, the total logical data tracked, and the whole\-file
+duplication it records (duplicate groups and their logical duplicate
+volume).
+That volume is a logical figure \- it is already shared on disk if you
+have run a dedupe, so check \f[B]\-\-history\f[R] for bytes actually
+freed and \f[CR]compsize\f[R](8) for on\-disk usage.
 Requires \f[B]\-\-hashfile\f[R].
 .TP
 \f[B]\-\-history\f[R]
