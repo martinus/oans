@@ -165,6 +165,13 @@ MU_TEST(test_get_extent) {
 	cur = 2;
 	mu_check(get_extent(fm, 8192, &cur) == &fm->fm_extents[1]);
 
+	/* Cursor already on the answer while loff sits in the hole just before
+	 * it (the sparse scan resuming after a skipped hole): must resolve to
+	 * that same extent, so the O(1) resume holds instead of rescanning. */
+	cur = 1;
+	mu_check(get_extent(fm, 4096, &cur) == &fm->fm_extents[1]);
+	mu_check(cur == 1);
+
 	free(fm);
 }
 

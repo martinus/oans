@@ -50,10 +50,13 @@ unsigned int fiemap_count_extents(int fd, uint64_t start,
  * `index` is an optional in/out resume cursor. Extents are sorted by logical
  * offset, so a caller that queries monotonically increasing offsets (the scan
  * of one file) can pass the previous result's index to avoid rescanning from 0
- * every call, turning an O(extents^2) walk into O(extents). We only trust the
- * hint when the extent it points at starts at or before loff; otherwise the
- * real target could be before it, so we fall back to a full scan. Either way
- * the answer is identical to scanning from 0.
+ * every call, turning an O(extents^2) walk into O(extents). Starting at the
+ * hint is safe whenever the previous extent ends at or before loff (so no
+ * earlier extent could be the answer); that also covers loff landing in the
+ * hole just before the pointed extent - the case where the scan resumes right
+ * after skipping a hole. A stale hint pointing past loff fails the test and
+ * falls back to a full scan. Either way the answer is identical to scanning
+ * from 0.
  */
 struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 				 unsigned int *index)
@@ -63,7 +66,9 @@ struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 	unsigned int start = 0;
 
 	if (index && *index < fiemap->fm_mapped_extents &&
-	    fiemap->fm_extents[*index].fe_logical <= loff)
+	    (*index == 0 ||
+	     fiemap->fm_extents[*index - 1].fe_logical +
+	     fiemap->fm_extents[*index - 1].fe_length <= loff))
 		start = *index;
 
 	for (unsigned int i = start; i < fiemap->fm_mapped_extents; i++) {

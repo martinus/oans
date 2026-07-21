@@ -1284,7 +1284,19 @@ static inline bool is_block_ignored(struct fiemap *fiemap, size_t off)
  * boundaries - and therefore block hashes - stay identical to a plain read; a
  * block that only partially overlaps a hole is still read (its hole bytes come
  * back as zeroes) and hashed normally.
- *
+ */
+
+/*
+ * True if the block [off, off + blocksize) maps no data: `e`, the result of
+ * get_extent(fiemap, off, ...), is either NULL (off is past the last extent, a
+ * trailing hole) or a mapped extent that starts beyond this block.
+ */
+static inline bool block_is_hole(const struct fiemap_extent *e, size_t off)
+{
+	return !e || e->fe_logical >= off + blocksize;
+}
+
+/*
  * If the block at ctxt->off is entirely a hole, return the length of the
  * block-aligned run of all-hole blocks starting there; otherwise 0.
  */
@@ -1294,7 +1306,7 @@ static size_t hole_run_at(struct scan_ctxt *ctxt)
 					     &ctxt->extent_cursor);
 	size_t next_data;
 
-	if (e && e->fe_logical < ctxt->off + blocksize)
+	if (!block_is_hole(e, ctxt->off))
 		return 0;			/* block holds some data */
 
 	next_data = e ? e->fe_logical : ctxt->filesize;
@@ -1316,7 +1328,7 @@ static size_t next_hole_block(struct scan_ctxt *ctxt, size_t from)
 	for (;;) {
 		struct fiemap_extent *e = get_extent(ctxt->fiemap, b, &cur);
 
-		if (!e || e->fe_logical >= b + blocksize)
+		if (block_is_hole(e, b))
 			return b;		/* block [b, b+blocksize) is all hole */
 
 		/* Skip past this extent's data, up to the next block boundary. */
@@ -1515,6 +1527,15 @@ static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 		ctxt->read_cap = next_hole_block(ctxt, ctxt->off);
 
 	size_t pos = ctxt->off + buffer->dl_len;
+
+	/*
+	 * The scan loop skips all-hole blocks before calling us, so off's block
+	 * holds data and the cap sits past off and past anything we already
+	 * buffered. If that contract were ever broken the unsigned clamp below
+	 * would underflow and read across a hole, so pin it.
+	 */
+	assert(pos <= ctxt->read_cap);
+
 	size_t want = buffer->size - buffer->dl_len;
 	if (want > ctxt->read_cap - pos)
 		want = ctxt->read_cap - pos;
@@ -1649,6 +1670,9 @@ static void csum_whole_file(struct file_to_scan *file)
 		 * (the whole point is not to touch them), fold a cheap
 		 * (offset, length) descriptor so two files with identical data
 		 * but different sparse layout still produce different digests.
+		 * (Preallocated UNWRITTEN/INLINE extents deliberately keep the
+		 * older faked-zeroes path in fill_buffer instead; unifying the
+		 * two would change preallocated files' digests for no gain here.)
 		 */
 		size_t hole = hole_run_at(&ctxt);
 		if (hole) {
