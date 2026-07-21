@@ -35,7 +35,18 @@ struct options {
 	unsigned int batch_size;
 	char *hashfile;
 	uint64_t min_filesize;	/* skip regular files smaller than this */
+	/*
+	 * Target mapped bytes per chunk for intra-file parallel hashing (#88).
+	 * 0 disables chunking; CHUNK_SIZE_AUTO until auto_tune_scan_params()
+	 * resolves it from the scan target's storage (off on a single spinning
+	 * disk, CHUNK_SIZE_DEFAULT on SSD/NVMe or a multi-device pool). A value
+	 * set via --chunksize is used verbatim.
+	 */
+	uint64_t chunk_size;
 };
+
+#define CHUNK_SIZE_AUTO		UINT64_MAX
+#define CHUNK_SIZE_DEFAULT	(1ULL << 30)	/* 1 GiB, per the #88 spike */
 
 extern struct options options;
 

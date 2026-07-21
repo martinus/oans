@@ -1069,17 +1069,6 @@ static void merge_and_store(struct scan_job *job);
 static void free_job(struct scan_job *job);
 
 /*
- * Target mapped bytes per chunk, or 0 to disable chunking. For now this is
- * env-driven; the device-aware default and a --chunksize option come next.
- */
-static size_t chunk_target_bytes(void)
-{
-	const char *e = getenv("DUPEREMOVE_CHUNK_BYTES");
-
-	return e ? strtoull(e, NULL, 10) : 0;
-}
-
-/*
  * Split [0, filesize) into chunks of ~target mapped bytes, cutting only on
  * blocksize-aligned extent ends so blocks and extents stay whole (and holes,
  * costing no mapped bytes, are never a chunk on their own - this composes with
@@ -1187,12 +1176,14 @@ static int schedule_chunked(char *path, int64_t fileid, size_t filesize,
  */
 static int try_schedule_chunked(const char *path, int64_t fileid, size_t filesize)
 {
-	size_t target = chunk_target_bytes();
+	size_t target = options.chunk_size;
 	size_t *bounds = NULL;
 	struct fiemap *fm;
 	unsigned int nch;
 	int cfd;
 
+	/* auto_tune_scan_params resolves the sentinel to 0 (off) or a size. */
+	assert(target != CHUNK_SIZE_AUTO);
 	if (!target || filesize < 2 * target)
 		return -1;
 

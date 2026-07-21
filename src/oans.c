@@ -626,6 +626,7 @@ enum {
 	HISTORY_OPTION,
 	JSON_OPTION,
 	AUTOTUNE_OPTION,
+	CHUNKSIZE_OPTION,
 };
 
 static int add_one_stdin_file(char *path, void *db)
@@ -682,6 +683,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "hashfile", 1, NULL, HASHFILE_OPTION },
 		{ "io-threads", 1, NULL, IO_THREADS_OPTION },
 		{ "cpu-threads", 1, NULL, CPU_THREADS_OPTION },
+		{ "chunksize", 1, NULL, CHUNKSIZE_OPTION },
 		{ "skip-zeroes", 0, NULL, SKIP_ZEROES_OPTION },
 		{ "dedupe-options", 1, NULL, DEDUPE_OPTS_OPTION },
 		{ "quiet", 0, NULL, QUIET_OPTION },
@@ -741,6 +743,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 					"an integer, %s found\n", optarg);
 				return EINVAL;
 			}
+			break;
+		case CHUNKSIZE_OPTION:
+			/* Explicit target mapped bytes per chunk; 0 turns
+			 * intra-file chunking off. */
+			options.chunk_size = parse_size(optarg);
 			break;
 		case CPU_THREADS_OPTION:
 			options.cpu_threads = strtoul(optarg, NULL, 10);
@@ -1192,43 +1199,57 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 }
 
 /*
- * Refine the auto-detected io-threads default from the backing storage of the
- * first scan target. Spinning disks are seek-bound and want fewer concurrent
- * readers than SSDs; a multi-device btrfs pool scales with its spindle count.
- * A user-supplied --io-threads is always respected. `--autotune` measures the
- * real optimum; this only picks a sensible starting point with no extra I/O.
+ * Resolve the storage-dependent scan knobs - --io-threads and --chunksize
+ * (#88) - from the backing storage of the first scan target, with one shared
+ * storage_detect(). Spinning disks are seek-bound and want fewer concurrent
+ * readers than SSDs and no intra-file chunking; a multi-device pool scales with
+ * its spindle count. Values the user set explicitly are always respected;
+ * `--autotune` measures the real io-threads optimum. No extra I/O beyond the
+ * one detection.
  */
-static void auto_tune_io_threads(const char *root)
+static void auto_tune_scan_params(const char *root)
 {
 	struct storage_profile p = {0};
+	bool need_detect = !options.io_threads ||
+			   options.chunk_size == CHUNK_SIZE_AUTO;
 
-	if (options.io_threads)		/* explicit --io-threads (0 == auto) */
-		return;
+	/*
+	 * Detect once and share the profile between the two auto-tuned knobs.
+	 * storage_detect() leaves a sane zeroed profile on failure.
+	 */
+	if (root && need_detect)
+		storage_detect(root, &p);
 
-	/* A prior --autotune result stored in the hashfile wins over the guess. */
-	if (dbfile_cfg.autotune_io_threads) {
-		options.io_threads = dbfile_cfg.autotune_io_threads;
-		vprintf("Using autotuned --io-threads=%u from the hashfile "
-			"(override to change, re-run --autotune to update)\n",
-			options.io_threads);
-		return;
+	/* io-threads: explicit wins, then a stored --autotune result, then the
+	 * storage heuristic (CPU-count default for unknown media). */
+	if (!options.io_threads) {
+		if (dbfile_cfg.autotune_io_threads) {
+			options.io_threads = dbfile_cfg.autotune_io_threads;
+			vprintf("Using autotuned --io-threads=%u from the hashfile "
+				"(override to change, re-run --autotune to update)\n",
+				options.io_threads);
+		} else {
+			options.io_threads =
+				storage_recommend_io_threads(&p, get_num_cpus());
+		}
 	}
 
 	/*
-	 * Heuristic from the backing storage. storage_recommend_io_threads()
-	 * returns the plain CPU-count default for unknown media, so a failed
-	 * detect (leaving the zeroed profile) still yields a sane value.
+	 * chunk size (#88): auto-enable intra-file chunking only where concurrent
+	 * reads raise throughput (see storage_benefits_from_concurrency). An
+	 * explicit --chunksize (including 0 = off) is respected.
 	 */
-	if (root)
-		storage_detect(root, &p);
-	options.io_threads = storage_recommend_io_threads(&p, get_num_cpus());
+	if (options.chunk_size == CHUNK_SIZE_AUTO)
+		options.chunk_size = storage_benefits_from_concurrency(&p)
+			? CHUNK_SIZE_DEFAULT : 0;
 
-	if (verbose) {
+	if (verbose && need_detect) {
 		char desc[96];
 
 		storage_describe(&p, desc, sizeof(desc));
-		vprintf("Storage: %s; using --io-threads=%u (override to change)\n",
-			desc, options.io_threads);
+		vprintf("Storage: %s; --io-threads=%u, chunking %s\n", desc,
+			options.io_threads,
+			options.chunk_size ? "on" : "off");
 	}
 }
 
@@ -1356,8 +1377,8 @@ int main(int argc, char **argv)
 			numfiles, numfiles == 1 ? "" : "s");
 	}
 
-	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	auto_tune_io_threads(roots[0]);
+	/* Pick io-threads and chunking to suit the target's storage. */
+	auto_tune_scan_params(roots[0]);
 
 	print_header();
 

@@ -179,6 +179,19 @@ directory scans the regular files directly inside it; add **-r** to recurse.
   ~ Number of threads for the CPU-bound duplicate-extent-finding stage. Default
     is the host CPU count capped at **8**; an explicit *N* overrides the cap.
 
+**\--chunksize**=*SIZE*
+  ~ Split a large file into chunks of about *SIZE* mapped bytes and hash them in
+    parallel across the I/O threads, so a scan dominated by one very large file
+    still uses more than one thread. Chunk boundaries fall on extent ends, so
+    only the mapped bytes are counted (holes cost nothing) and the result -
+    every file, block and extent digest - is identical to an unchunked scan.
+    By default `oans` decides from the backing storage: chunking is enabled with
+    a **1G** target on SSD/NVMe and multi-device pools, where concurrent reads
+    raise throughput, and left off on a single spinning disk, where they only
+    add seeks. Pass *SIZE* to set the target explicitly, or **\--chunksize=0** to
+    turn chunking off. Only files at least twice the target are ever split. Run
+    with **-v** to see whether chunking was enabled.
+
 ## Reporting and maintenance (each exits after running)
 
 **\--stats**

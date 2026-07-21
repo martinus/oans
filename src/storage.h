@@ -59,6 +59,13 @@ int storage_detect(const char *path, struct storage_profile *p);
 unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 					  unsigned int ncpus);
 
+/*
+ * Whether concurrent reads to a single file raise throughput on this media
+ * (true for SSD/NVMe, multi-device pools and unknown media; false for a single
+ * spinning disk). Gates intra-file chunking (#88). Pure, unit-tested.
+ */
+bool storage_benefits_from_concurrency(const struct storage_profile *p);
+
 /* One-line human summary, e.g. "btrfs pool of 4 devices, rotational (HDD)". */
 void storage_describe(const struct storage_profile *p, char *buf, size_t len);
 

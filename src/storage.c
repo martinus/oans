@@ -159,6 +159,17 @@ unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 	return want < base ? want : base;
 }
 
+bool storage_benefits_from_concurrency(const struct storage_profile *p)
+{
+	/*
+	 * Concurrent reads to one file raise throughput only where the media
+	 * isn't seek-bound: SSD/NVMe, a multi-device pool (independent spindles),
+	 * or unknown media (assume SSD-like, as the io-threads heuristic does). A
+	 * single spinning disk just thrashes its heads.
+	 */
+	return !p->rotational_known || !p->rotational || p->num_devices > 1;
+}
+
 void storage_describe(const struct storage_profile *p, char *buf, size_t len)
 {
 	const char *disk = !p->rotational_known ? "unknown media" :

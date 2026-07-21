@@ -24,4 +24,5 @@ struct options options = {
 	.dedupe_same_file = true,
 	.batch_size = 1024,
 	.min_filesize = 1,	/* default: only skip empty files */
+	.chunk_size = CHUNK_SIZE_AUTO,
 };
