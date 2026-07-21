@@ -63,6 +63,43 @@ class SparseTest(DuperemoveTest):
         self.assertShared(a, b, "identical trailing-hole files dedupe")
         self.assertEqual(before, open(a, "rb").read(), "data intact after dedupe")
 
+    def test_large_hole_only_file(self):
+        # A big fully-sparse file (issue #87: `truncate -s 1T`) maps no extents,
+        # so it must record no extents and hash no blocks, yet still be digested.
+        # Before the hole-skip it read and hashed every zero byte (ETA minutes).
+        p = self.write("tree/hole", b"")
+        os.truncate(p, 8 * 1024 * 1024 * 1024)  # 8 GiB, entirely a hole
+        self.scan(self.path("tree"))
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"), "hole-only file recorded")
+        self.assertEqual(0, self.hf_count("extents"), "no extents stored for a hole")
+        self.assertEqual(
+            0, self.hf_scalar("select count(*) from files where digest is null"),
+            "hole-only file still digested")
+
+    def test_interior_hole_layout_distinct_digest(self):
+        # Same data blocks, same size, different hole placement. Skipping hole
+        # bytes must not collapse these to one digest: the file checksum folds
+        # each hole's (offset, length) so layout still matters (issue #87).
+        block = 131072
+        A, B = os.urandom(65536), os.urandom(65536)
+
+        p = self.path("tree/p")            # A . . B  (holes in the middle/tail)
+        with open(p, "wb") as f:
+            f.write(A); f.seek(3 * block); f.write(B)
+        os.truncate(p, 4 * block)
+
+        q = self.path("tree/q")            # A B . .  (holes at the tail)
+        with open(q, "wb") as f:
+            f.write(A); f.seek(block); f.write(B)
+        os.truncate(q, 4 * block)
+
+        self.scan(self.path("tree"))
+        self.assertDmOk()
+        dp = self.hf_scalar("select quote(digest) from files where filename like '%/p'")
+        dq = self.hf_scalar("select quote(digest) from files where filename like '%/q'")
+        self.assertNotEqual(dp, dq, "different sparse layout -> different digest")
+
     def test_unaligned_sizes(self):
         self.mkrand("tree/a", 131072 + 1)
         self.mkrand("tree/b", 262144 + 4095)

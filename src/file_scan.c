@@ -249,6 +249,7 @@ struct scan_ctxt {
 	int fd;
 	size_t filesize;
 	size_t off; /* file offset of the last processed bytes */
+	size_t read_cap; /* offset of the next all-hole block: reads stop here (see fill_buffer) */
 	struct fiemap *fiemap;
 	unsigned int extent_cursor; /* resume hint for get_extent() in process_extents */
 	struct running_checksum *file_csum;
@@ -295,7 +296,21 @@ static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 	hashes->extents_count = ctxt->fiemap->fm_mapped_extents;
 	hashes->extents = calloc(hashes->extents_count, sizeof(struct extent_csum));
 
-	hashes->blocks_count = ctxt->filesize / blocksize + 1;
+	/*
+	 * Size the block array from the bytes that are actually mapped, not
+	 * from filesize: a large sparse file (e.g. `truncate -s 1T`) maps few
+	 * or no extents, so sizing by filesize would eagerly allocate hundreds
+	 * of MB of block records we will never fill. Holes are skipped in the
+	 * scan loop, so they contribute no block hashes. add_block_hash()
+	 * grows the array if this estimate is ever short.
+	 */
+	size_t mapped = 0;
+	for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++)
+		mapped += ctxt->fiemap->fm_extents[i].fe_length;
+	if (mapped > ctxt->filesize)
+		mapped = ctxt->filesize;
+
+	hashes->blocks_count = mapped / blocksize + 1;
 	hashes->blocks = calloc(hashes->blocks_count, sizeof(struct block_csum));
 
 	return hashes->extents && hashes->blocks;
@@ -1260,6 +1275,58 @@ static inline bool is_block_ignored(struct fiemap *fiemap, size_t off)
 	return is_area_ignored(fiemap, off, blocksize);
 }
 
+/*
+ * Holes (unmapped regions) are not reported by FIEMAP, so get_extent() returns
+ * the next mapped extent for an offset inside a hole, or NULL past the last
+ * extent (a trailing hole). Reading and hashing a large hole (e.g. the 1 TiB of
+ * zeroes behind `truncate -s 1T`) is pure waste, so we skip whole blocks that
+ * are entirely holes. We work in blocks, aligned to the file start, so block
+ * boundaries - and therefore block hashes - stay identical to a plain read; a
+ * block that only partially overlaps a hole is still read (its hole bytes come
+ * back as zeroes) and hashed normally.
+ *
+ * If the block at ctxt->off is entirely a hole, return the length of the
+ * block-aligned run of all-hole blocks starting there; otherwise 0.
+ */
+static size_t hole_run_at(struct scan_ctxt *ctxt)
+{
+	struct fiemap_extent *e = get_extent(ctxt->fiemap, ctxt->off,
+					     &ctxt->extent_cursor);
+	size_t next_data;
+
+	if (e && e->fe_logical < ctxt->off + blocksize)
+		return 0;			/* block holds some data */
+
+	next_data = e ? e->fe_logical : ctxt->filesize;
+	/* Stop at the block that first contains data (floor to block size). */
+	return (next_data / blocksize) * blocksize - ctxt->off;
+}
+
+/*
+ * First block-aligned offset at or after `from` whose block is entirely a hole
+ * (or filesize if none before EOF). fill_buffer() caps reads here so a buffer
+ * never pulls in a full hole-block; sub-block hole tails before it are still
+ * read (as zeroes) so blocks stay aligned to the file start.
+ */
+static size_t next_hole_block(struct scan_ctxt *ctxt, size_t from)
+{
+	unsigned int cur = ctxt->extent_cursor;
+	size_t b = from;
+
+	for (;;) {
+		struct fiemap_extent *e = get_extent(ctxt->fiemap, b, &cur);
+
+		if (!e || e->fe_logical >= b + blocksize)
+			return b;		/* block [b, b+blocksize) is all hole */
+
+		/* Skip past this extent's data, up to the next block boundary. */
+		b = e->fe_logical + e->fe_length;
+		b = ((b + blocksize - 1) / blocksize) * blocksize;
+		if (b >= ctxt->filesize)
+			return ctxt->filesize;
+	}
+}
+
 static int process_block(char *buf, unsigned int bsize,
 		size_t file_off, struct hashes *hashes)
 {
@@ -1437,18 +1504,40 @@ static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 
 	buffer->faked = false;
 
-	ret = pread(ctxt->fd, buffer->buf + buffer->dl_len,
-		buffer->size - buffer->dl_len, ctxt->off + buffer->dl_len);
-	if (ret > 0)
+	/*
+	 * The scan loop skips whole-hole blocks before calling us, so the block
+	 * at ctxt->off holds data. Cache the offset of the next all-hole block
+	 * and cap the read there, so the buffer never reads a full hole-block
+	 * (which would hash its zeroes and defeat the skip). read_cap is
+	 * recomputed once per run, when off catches up to the previous cap.
+	 */
+	if (ctxt->off >= ctxt->read_cap)
+		ctxt->read_cap = next_hole_block(ctxt, ctxt->off);
+
+	size_t pos = ctxt->off + buffer->dl_len;
+	size_t want = buffer->size - buffer->dl_len;
+	if (want > ctxt->read_cap - pos)
+		want = ctxt->read_cap - pos;
+
+	if (want > 0) {
+		ret = pread(ctxt->fd, buffer->buf + buffer->dl_len, want, pos);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return 0; /* file shrank since we stat()ed it */
 		buffer->dl_len += ret;
+		pos += ret;
+	}
 
 	/* We must never overflow */
 	assert(buffer->dl_offset + buffer->dl_len <= buffer->size);
 
-	if (ret < 0)
-		return ret;
-
-	if (ret == 0 || ctxt->off + buffer->dl_len == ctxt->filesize) /* EOF */
+	/*
+	 * Real EOF, or just the end of this mapped run: in the latter case a
+	 * hole follows and the scan loop will skip it, so hand back what we have
+	 * (dl_len > 0) rather than signalling EOF.
+	 */
+	if (pos >= ctxt->filesize)
 		return 0;
 	return buffer->dl_len;
 }
@@ -1553,6 +1642,24 @@ static void csum_whole_file(struct file_to_scan *file)
 		 * more than that amount of bytes
 		 */
 		ssize_t bytes_processed = 0;
+
+		/*
+		 * Skip runs of all-hole blocks without reading or hashing them.
+		 * Rather than fold the hole's zero bytes into the file checksum
+		 * (the whole point is not to touch them), fold a cheap
+		 * (offset, length) descriptor so two files with identical data
+		 * but different sparse layout still produce different digests.
+		 */
+		size_t hole = hole_run_at(&ctxt);
+		if (hole) {
+			uint64_t desc[2] = { ctxt.off, hole };
+			add_to_running_checksum(ctxt.file_csum,
+						(unsigned char *)desc, sizeof(desc));
+			ctxt.off += hole;
+			tprogress->file_scanned_bytes += hole;
+			tprogress->total_scanned_bytes += hole;
+			continue;
+		}
 
 		ret = fill_buffer(&ctxt, &buffer);
 		if (ret < 0) {
