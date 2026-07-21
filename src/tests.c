@@ -233,14 +233,116 @@ MU_TEST(test_storage_recommend_io_threads) {
 	mu_check(storage_recommend_io_threads(&p, 0) == 1);
 }
 
+/* Build a fiemap of `n` extents of `len` bytes each, laid end to end. */
+static struct fiemap *make_contig_fiemap(unsigned int n, size_t len)
+{
+	struct fiemap *fm = calloc(1, sizeof(*fm) + n * sizeof(struct fiemap_extent));
+
+	fm->fm_mapped_extents = n;
+	for (unsigned int i = 0; i < n; i++) {
+		fm->fm_extents[i].fe_logical = (uint64_t)i * len;
+		fm->fm_extents[i].fe_length = len;
+	}
+	return fm;
+}
+
+MU_TEST(test_plan_chunks) {
+	size_t *bounds = NULL;
+	struct fiemap *fm;
+
+	blocksize = 4096;
+	const size_t ext = 10 * blocksize;	/* one extent, blocksize-aligned */
+	const size_t fsize = 6 * ext;
+
+	fm = make_contig_fiemap(6, ext);	/* 6 gap-free extents */
+
+	/* target = one extent: cut at every interior extent end -> 6 chunks. */
+	mu_check(plan_chunks(fm, fsize, ext, 8, &bounds) == 6);
+	for (unsigned int i = 0; i <= 6; i++)
+		mu_check(bounds[i] == i * ext);
+	free(bounds);
+
+	/* target = two extents: cut every second extent end -> 3 chunks. */
+	mu_check(plan_chunks(fm, fsize, 2 * ext, 8, &bounds) == 3);
+	for (unsigned int i = 0; i <= 3; i++)
+		mu_check(bounds[i] == i * 2 * ext);
+	free(bounds);
+
+	/* max_chunks caps the split; the last chunk absorbs the remainder. */
+	mu_check(plan_chunks(fm, fsize, ext, 3, &bounds) == 3);
+	mu_check(bounds[0] == 0 && bounds[3] == fsize);
+	free(bounds);
+
+	/* Too small to yield two chunks, and chunking-off, both decline. */
+	mu_check(plan_chunks(fm, fsize, fsize, 8, &bounds) == 1);
+	mu_check(plan_chunks(fm, fsize, 0, 8, &bounds) == 1);
+	free(fm);
+
+	/* A single extent offers no interior cut point. */
+	fm = make_contig_fiemap(1, fsize);
+	mu_check(plan_chunks(fm, fsize, 2 * ext, 8, &bounds) == 1);
+	free(fm);
+
+	/* Extents whose ends are NOT blocksize-aligned are never cut (a cut there
+	 * would straddle a block), so no chunking. */
+	fm = make_contig_fiemap(6, 40000);	/* 40000 % 4096 != 0 */
+	mu_check(plan_chunks(fm, 6 * 40000, 40000, 8, &bounds) == 1);
+	free(fm);
+
+	/*
+	 * Holes cost no mapped bytes, so they compose with the #87 hole-skip:
+	 * three 1-extent islands separated by holes, and a trailing hole out to
+	 * filesize. Cuts land on extent ends (never inside a hole), a hole never
+	 * becomes its own chunk, and the last chunk runs to filesize past the
+	 * final extent.
+	 */
+	fm = make_contig_fiemap(3, ext);
+	fm->fm_extents[1].fe_logical = 2 * ext;	/* hole between extent 0 and 1 */
+	fm->fm_extents[2].fe_logical = 4 * ext;	/* hole between extent 1 and 2 */
+	mu_check(plan_chunks(fm, fsize, ext, 8, &bounds) == 4);
+	mu_check(bounds[0] == 0 &&
+		 bounds[1] == ext &&		/* extent 0 end, not the hole at 2*ext */
+		 bounds[2] == 3 * ext &&	/* extent 1 end */
+		 bounds[3] == 5 * ext &&	/* extent 2 end */
+		 bounds[4] == fsize);		/* trailing hole absorbed */
+	free(bounds);
+	free(fm);
+}
+
+MU_TEST(test_storage_benefits_from_concurrency) {
+	struct storage_profile p;
+
+	/* SSD / non-rotational: concurrent reads help. */
+	p = (struct storage_profile){ .rotational = false,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(storage_benefits_from_concurrency(&p));
+
+	/* Single spinning disk: they only add seeks. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(!storage_benefits_from_concurrency(&p));
+
+	/* Multi-device pool, even rotational: independent spindles help. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 4 };
+	mu_check(storage_benefits_from_concurrency(&p));
+
+	/* Unknown media: assume SSD-like, as the io-threads heuristic does. */
+	p = (struct storage_profile){ .rotational = false,
+		.rotational_known = false, .num_devices = 1 };
+	mu_check(storage_benefits_from_concurrency(&p));
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
 	MU_RUN_TEST(test_is_file_renamed);
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
+	MU_RUN_TEST(test_plan_chunks);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_storage_recommend_io_threads);
+	MU_RUN_TEST(test_storage_benefits_from_concurrency);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
