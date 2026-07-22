@@ -68,12 +68,22 @@ void pscan_run(void);
 void pscan_join(void);
 
 /*
- * Reset file tracking data
- * This is used by the csum_whole_file(): regardless of its outcome,
- * the thread is set as idle, total_scanned_files is incremented and
- * total_scanned_bytes is fed up to the file size (in case it shrank)
+ * Per-work-item reset for the churning dedupe pool: finish the current file's
+ * accounting (total_scanned_files++, total_scanned_bytes fed up to the file
+ * size in case it shrank) and park the slot idle. Equivalent to
+ * pscan_finish_file() followed by pscan_slot_idle(); persistent csum workers
+ * use those two directly instead so they don't flash idle between files.
  */
 void pscan_reset_thread(struct pscan_thread **progress);
+
+/*
+ * For a persistently-held slot (one kept by a long-lived worker across many
+ * files, rather than re-claimed per file): pscan_finish_file() does the per-file
+ * byte/count accounting without going idle, so no "idle" flashes between files;
+ * pscan_slot_idle() parks the slot when the worker finally runs out of work.
+ */
+void pscan_finish_file(struct pscan_thread **progress);
+void pscan_slot_idle(struct pscan_thread *slot);
 
 bool is_progress_printer_running(void);
 

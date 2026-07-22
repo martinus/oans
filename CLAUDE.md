@@ -131,6 +131,13 @@ the one consumer, lock-free. Walkers only read `locked_fs` (set before they
 spawn) and mutex-guarded `verified_devs`. **Don't move per-file DB state onto the
 walkers.**
 
+- **`DUPEREMOVE_SCAN_STATS=1`** prints one scan diagnostic to stderr at end of
+  scan: csum-queue `pops`/`empty-waits` (worker starvation) and write-lock
+  `acquisitions`/`contended`/`lock-wait` (total thread-seconds + avg µs per
+  contended wait). Use it to tell producer-starvation from write-lock
+  contention. In-memory (no `--hashfile`) shows ~3 `dbfile_lock()`/file — the
+  per-file change-detection *read* serializes too (shared-cache in-memory has no
+  WAL); `--hashfile` shows ~2 with lock-free WAL-snapshot reads.
 - **Walker count plateaus at ~8 on btrfs — don't raise the cap.** Cold 149k-file
   `~/git`: 1→2→4 scaled (15→9.9→7.8s), 8 was the knee (7.3s), 16/32 gave no wall
   gain while `sys` exploded (16→23→46s). It's btrfs metadata b-tree lock
@@ -200,6 +207,21 @@ are known (`auto_tune_io_threads()` in `oans.c`).
   query isn't the bottleneck and the preload adds ~1s.
 - **statx-relative-to-dir-fd** gave ~5-8% less scan *CPU* but **zero wall**
   change; PR closed.
+- **Scan write-lock (`io_mutex`) contention is a red herring — don't do the
+  single-writer refactor.** `DUPEREMOVE_SCAN_STATS` on warm 173k-file `~/git`:
+  contended% rises with `--io-threads` (2.3→4.8→9.9→16.4% at 4/8/16/32) but wall
+  is flat past ~16 (12.21→12.22s) and total lock-wait stays ≤3.7 *thread*-seconds
+  (<1% of runtime) — the lock is off the critical path (piling threads onto it
+  just makes them wait, unchanged completion). The ~16% (and users' ~20%+ on
+  bigger trees) is scary as a *ratio* but negligible as *time*; each wait is tens
+  of µs, spread across the pool. On-disk `--hashfile` waits are ~2× longer per
+  collision than in-memory (WAL disk I/O in the critical section), still absorbed.
+- **"Idle" csum threads in the live UI are not starvation.** `empty-waits` is ~0
+  (8 = the 8-worker startup ramp) across whole scans: the single `__scan_file`
+  producer keeps the queue full. So batching worker dispatch/commits buys
+  nothing. (The *display* idle-flicker is a separate, cosmetic thing — csum
+  workers are persistent, so they hold one progress slot for life rather than
+  re-claiming per file.)
 - **A savings preview / dry-run isn't worth building.** Real reclaimed disk can't
   be predicted without doing the dedupe (compression, extent alignment, the
   kernel declining, snapshot/external refcounts), and dedupe is already safe and

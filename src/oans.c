@@ -1040,6 +1040,37 @@ static void process_duplicates(struct dbhandle *db)
 		extents_search_free();
 }
 
+/*
+ * Print the scan contention diagnostics gathered this run, gated on
+ * DUPEREMOVE_SCAN_STATS so a benchmark run can ask for the hard numbers without
+ * the timing distortion of full -v output. empty_waits/pops says how often the
+ * csum workers starved for the single producer; contended/total says how often
+ * a writer had to block on the WAL write lock. Starvation-dominated means the
+ * serial producer is the limiter; lock-dominated means the write lock is.
+ */
+static void report_scan_stats(void)
+{
+	uint64_t pops, empty_waits, lock_total, lock_contended, lock_wait_ns;
+
+	if (!getenv("DUPEREMOVE_SCAN_STATS"))
+		return;
+
+	filescan_get_workq_stats(&pops, &empty_waits);
+	dbfile_get_lock_stats(&lock_total, &lock_contended, &lock_wait_ns);
+
+	fprintf(stderr,
+		"scan-stats: csum-queue pops=%" PRIu64 " empty-waits=%" PRIu64
+		" (%.1f%% starved); write-lock acquisitions=%" PRIu64
+		" contended=%" PRIu64 " (%.1f%%); lock-wait total=%.2fs"
+		" avg=%.1fus\n",
+		pops, empty_waits,
+		pops ? 100.0 * empty_waits / pops : 0.0,
+		lock_total, lock_contended,
+		lock_total ? 100.0 * lock_contended / lock_total : 0.0,
+		lock_wait_ns / 1e9,
+		lock_contended ? lock_wait_ns / 1e3 / lock_contended : 0.0);
+}
+
 static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		      uint64_t *files_scanned)
 {
@@ -1084,6 +1115,8 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	 */
 	if (files_scanned)
 		*files_scanned = pscan_files_scanned();
+
+	report_scan_stats();
 
 	if (ret)
 		return ret;

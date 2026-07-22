@@ -7,7 +7,9 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stddef.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -30,6 +32,27 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly);
 
 static GMutex io_mutex; /* Locks db writes */
+
+/*
+ * Diagnostic counters for the write lock (DUPEREMOVE_SCAN_STATS). total counts
+ * every dbfile_lock(); contended counts the acquisitions that could not be
+ * taken uncontended (a worker/producer had to block behind another writer);
+ * wait_ns sums the nanoseconds those contended acquisitions spent blocked. The
+ * contended:total ratio says how *often* threads collide, but only wait_ns says
+ * whether it *costs* anything: divided by contended it gives the average stall
+ * (nanoseconds are harmless, tens of microseconds are not), and as a sum it is
+ * the total thread-time lost to the lock across the scan.
+ */
+static _Atomic uint64_t iolock_total, iolock_contended, iolock_wait_ns;
+
+/* Monotonic nanoseconds, for timing contended lock waits. */
+static uint64_t mono_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 #if (SQLITE_VERSION_NUMBER < 3007015)
 #define	perror_sqlite(_err, _why)					\
@@ -101,7 +124,30 @@ struct dbhandle *dbfile_get_handle(void)
 
 void dbfile_lock(void)
 {
-	g_mutex_lock(&io_mutex);
+	atomic_fetch_add_explicit(&iolock_total, 1, memory_order_relaxed);
+	/*
+	 * trylock first so we can tell contended acquisitions apart from
+	 * uncontended ones: if it fails the lock was held, so this caller
+	 * blocks (and we count it, timing the wait) before taking it for real.
+	 * The clock reads are only on the already-slow contended path, so they
+	 * do not weigh on the uncontended hot path.
+	 */
+	if (!g_mutex_trylock(&io_mutex)) {
+		uint64_t t0 = mono_ns();
+
+		g_mutex_lock(&io_mutex);
+		atomic_fetch_add_explicit(&iolock_contended, 1, memory_order_relaxed);
+		atomic_fetch_add_explicit(&iolock_wait_ns, mono_ns() - t0,
+					  memory_order_relaxed);
+	}
+}
+
+void dbfile_get_lock_stats(uint64_t *total, uint64_t *contended,
+			   uint64_t *wait_ns)
+{
+	*total = atomic_load_explicit(&iolock_total, memory_order_relaxed);
+	*contended = atomic_load_explicit(&iolock_contended, memory_order_relaxed);
+	*wait_ns = atomic_load_explicit(&iolock_wait_ns, memory_order_relaxed);
 }
 
 void dbfile_unlock(void)

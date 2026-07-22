@@ -79,4 +79,11 @@ int add_exclude_pattern(const char *pattern);
 void filescan_init(void);
 void filescan_free(void);
 
+/*
+ * Diagnostic csum-queue counters (DUPEREMOVE_SCAN_STATS): files dequeued by
+ * workers and how many of those dequeues had to block on an empty queue
+ * (workers starved by the single-threaded producer).
+ */
+void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits);
+
 #endif	/* __FILE_SCAN_H__ */

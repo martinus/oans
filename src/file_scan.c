@@ -41,6 +41,7 @@
 #include <libmount/libmount.h>
 #include <sys/sysmacros.h>
 #include <uuid/uuid.h>
+#include <stdatomic.h>
 #include <bsd/sys/queue.h>
 
 #include <glib.h>
@@ -77,7 +78,8 @@ static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 static void mark_file_seen(int64_t id);
 struct buffer;
-static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer);
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
+			    struct pscan_thread *tprogress);
 
 /*
  * Scan work queue — approximate longest-processing-time-first (LPT) dispatch.
@@ -144,6 +146,16 @@ struct scan_workq {
 	bool draining;			/* no more pushes; drain, then workers exit */
 };
 static struct scan_workq scan_workq;
+
+/*
+ * Diagnostic counters for the csum work queue (DUPEREMOVE_SCAN_STATS). pops
+ * counts every file a worker dequeued; empty_waits counts the pops that found
+ * the queue empty and had to block for the single __scan_file() consumer to
+ * feed them. A high empty_waits:pops ratio means the workers are starved by the
+ * serial producer (batching their commits would not help); a low one means
+ * they are kept busy and any stalls are elsewhere (e.g. the write lock).
+ */
+static _Atomic uint64_t scan_pop_total, scan_pop_empty_waits;
 
 static void scan_workq_push(struct file_to_scan *file);
 static void scan_workq_start(unsigned int nworkers);
@@ -1658,10 +1670,13 @@ static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
 {
 	struct file_to_scan *file;
 	unsigned b;
+	bool waited = false;
 
 	g_mutex_lock(&q->lock);
-	while (q->occupied == 0 && !q->draining)
+	while (q->occupied == 0 && !q->draining) {
+		waited = true;		/* starved: no work, blocking on the producer */
 		g_cond_wait(&q->cond, &q->lock);
+	}
 	if (q->occupied == 0) {
 		g_mutex_unlock(&q->lock);
 		return NULL;		/* draining and empty: worker exits */
@@ -1674,6 +1689,11 @@ static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
 		q->occupied &= ~(1ULL << b);
 	}
 	g_mutex_unlock(&q->lock);
+
+	atomic_fetch_add_explicit(&scan_pop_total, 1, memory_order_relaxed);
+	if (waited)
+		atomic_fetch_add_explicit(&scan_pop_empty_waits, 1,
+					  memory_order_relaxed);
 	return file;
 }
 
@@ -1684,10 +1704,26 @@ static gpointer scan_worker(gpointer arg)
 	/* One read buffer per worker, allocated on first use and reused across
 	 * files; owned here so it is freed when the worker exits. */
 	struct buffer buffer = {0,};
+	/*
+	 * These csum workers are persistent (one per --io-threads, alive for the
+	 * whole scan - not a churning glib pool), so each holds a single progress
+	 * slot for its lifetime and rolls it from file to file. That avoids the
+	 * per-file claim/release that made the display flash "idle" in the
+	 * microsecond gap between small files even though the queue was never
+	 * actually empty (see pscan_finish_file). Claimed lazily on the first file
+	 * with a non-idle status so a still-unclaimed slot is never reused by a
+	 * sibling worker; a worker that gets no files never shows a phantom line.
+	 */
+	struct pscan_thread *slot = NULL;
 
-	while ((file = scan_workq_pop(q)))
-		csum_whole_file(file, &buffer);
+	while ((file = scan_workq_pop(q))) {
+		if (!slot)
+			slot = pscan_claim_slot(gettid(), thread_scanning);
+		csum_whole_file(file, &buffer, slot);
+	}
 
+	if (slot)
+		pscan_slot_idle(slot);	/* out of work: park it idle */
 	free(buffer.buf);
 	return NULL;
 }
@@ -1727,7 +1763,8 @@ static void scan_workq_drain(void)
 	/* All buckets are empty now (workers drained them); nothing to free. */
 }
 
-static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
+			    struct pscan_thread *tprogress)
 {
 	int ret = 0;
 
@@ -1741,8 +1778,20 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
 	 */
 	struct dbhandle *db = scan_writer;
 
+	/*
+	 * The worker owns tprogress across files; roll its per-file accounting
+	 * (bytes/count) on every exit path but leave it claimed and non-idle.
+	 * Point the new file's fields in before any early return, so the cleanup
+	 * always reconciles this file and never re-counts the previous one.
+	 */
+	abort_on(!tprogress);
+	tprogress->status = thread_scanning;
+	tprogress->file_scanned_bytes = 0;
+	tprogress->file_total_bytes = file->filesize;
+	strncpy(tprogress->file_path, file->path, PATH_MAX);
+	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
+
 	/* Dummy variables used to trigger the cleanup code */
-	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = NULL;
 	_cleanup_(freep) char *path = file->path;
 	_cleanup_(freep) struct file_to_scan *clean_file = file;
 
@@ -1770,14 +1819,6 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
 		eprintf("csum_whole_file: unable to connect to the database\n");
 		return;
 	}
-
-	/* Claimed per file, not per thread: see pscan_claim_slot(). */
-	tprogress = pscan_claim_slot(gettid(), thread_scanning);
-	abort_on(!tprogress);
-
-	tprogress->file_scanned_bytes = 0;
-	tprogress->file_total_bytes = file->filesize;
-	strncpy(tprogress->file_path, file->path, PATH_MAX);
 
 	ctxt.filesize = file->filesize;
 	ctxt.file_csum = start_running_checksum();
@@ -2205,6 +2246,13 @@ static void seen_inodes_free(void)
 	seen_used = NULL;
 	seen_cap = 0;
 	seen_count = 0;
+}
+
+void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
+{
+	*pops = atomic_load_explicit(&scan_pop_total, memory_order_relaxed);
+	*empty_waits = atomic_load_explicit(&scan_pop_empty_waits,
+					    memory_order_relaxed);
 }
 
 void filescan_init(void)
