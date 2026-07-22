@@ -246,18 +246,40 @@ static unsigned int print_scan_progress(void)
 		return 3;
 	}
 
-	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)\n",
+	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)",
 	      files_scanned, tf, tf ? (double)files_scanned / tf * 100 : 100.0);
+	if (files_scanned && elapsed > 1.0)
+		printf(" · %.0f files/s", files_scanned / elapsed);
+	printf("\n");
+
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)",
 	      human_size(bytes_scanned), human_size(tb),
 	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
 	if (bytes_scanned && elapsed > 1.0) {
-		double rate = bytes_scanned / elapsed;
+		double brate = bytes_scanned / elapsed;
+		double eta = 0.0;
 
-		printf(" · %s/s", human_size((uint64_t)rate));
+		printf(" · %s/s", human_size((uint64_t)brate));
+
+		/*
+		 * Both bytes and files must reach 100%, and which one dominates
+		 * the time left flips during a scan: big files first
+		 * (byte-bound), then a long tail of tiny files (file-count
+		 * bound). A pure byte ETA collapses to a few seconds during that
+		 * tail while hundreds of thousands of small files still remain,
+		 * so take the larger of the byte- and file-rate estimates.
+		 */
 		if (bytes_scanned < tb)
-			printf(" · ETA ~%s",
-			       human_duration((tb - bytes_scanned) / rate));
+			eta = (tb - bytes_scanned) / brate;
+		if (files_scanned && files_scanned < tf) {
+			double feta = (tf - files_scanned) /
+				       (files_scanned / elapsed);
+
+			if (feta > eta)
+				eta = feta;
+		}
+		if (eta > 0.0)
+			printf(" · ETA ~%s", human_duration(eta));
 	}
 	printf("\n");
 	s_printf("\tFile listing: completed\n");

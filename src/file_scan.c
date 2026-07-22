@@ -41,6 +41,7 @@
 #include <libmount/libmount.h>
 #include <sys/sysmacros.h>
 #include <uuid/uuid.h>
+#include <stdatomic.h>
 #include <bsd/sys/queue.h>
 
 #include <glib.h>
@@ -144,6 +145,16 @@ struct scan_workq {
 	bool draining;			/* no more pushes; drain, then workers exit */
 };
 static struct scan_workq scan_workq;
+
+/*
+ * Diagnostic counters for the csum work queue (DUPEREMOVE_SCAN_STATS). pops
+ * counts every file a worker dequeued; empty_waits counts the pops that found
+ * the queue empty and had to block for the single __scan_file() consumer to
+ * feed them. A high empty_waits:pops ratio means the workers are starved by the
+ * serial producer (batching their commits would not help); a low one means
+ * they are kept busy and any stalls are elsewhere (e.g. the write lock).
+ */
+static _Atomic uint64_t scan_pop_total, scan_pop_empty_waits;
 
 static void scan_workq_push(struct file_to_scan *file);
 static void scan_workq_start(unsigned int nworkers);
@@ -1658,10 +1669,13 @@ static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
 {
 	struct file_to_scan *file;
 	unsigned b;
+	bool waited = false;
 
 	g_mutex_lock(&q->lock);
-	while (q->occupied == 0 && !q->draining)
+	while (q->occupied == 0 && !q->draining) {
+		waited = true;		/* starved: no work, blocking on the producer */
 		g_cond_wait(&q->cond, &q->lock);
+	}
 	if (q->occupied == 0) {
 		g_mutex_unlock(&q->lock);
 		return NULL;		/* draining and empty: worker exits */
@@ -1674,6 +1688,11 @@ static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
 		q->occupied &= ~(1ULL << b);
 	}
 	g_mutex_unlock(&q->lock);
+
+	atomic_fetch_add_explicit(&scan_pop_total, 1, memory_order_relaxed);
+	if (waited)
+		atomic_fetch_add_explicit(&scan_pop_empty_waits, 1,
+					  memory_order_relaxed);
 	return file;
 }
 
@@ -2205,6 +2224,13 @@ static void seen_inodes_free(void)
 	seen_used = NULL;
 	seen_cap = 0;
 	seen_count = 0;
+}
+
+void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
+{
+	*pops = atomic_load_explicit(&scan_pop_total, memory_order_relaxed);
+	*empty_waits = atomic_load_explicit(&scan_pop_empty_waits,
+					    memory_order_relaxed);
 }
 
 void filescan_init(void)

@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -30,6 +31,15 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly);
 
 static GMutex io_mutex; /* Locks db writes */
+
+/*
+ * Diagnostic counters for the write lock (DUPEREMOVE_SCAN_STATS). total counts
+ * every dbfile_lock(); contended counts the acquisitions that could not be
+ * taken uncontended (a worker/producer had to block behind another writer). A
+ * high contended:total ratio means the single WAL writer lock is the scan's
+ * limiter; a low one means the workers are starved elsewhere, not lock-bound.
+ */
+static _Atomic uint64_t iolock_total, iolock_contended;
 
 #if (SQLITE_VERSION_NUMBER < 3007015)
 #define	perror_sqlite(_err, _why)					\
@@ -101,7 +111,22 @@ struct dbhandle *dbfile_get_handle(void)
 
 void dbfile_lock(void)
 {
-	g_mutex_lock(&io_mutex);
+	atomic_fetch_add_explicit(&iolock_total, 1, memory_order_relaxed);
+	/*
+	 * trylock first so we can tell contended acquisitions apart from
+	 * uncontended ones: if it fails the lock was held, so this caller
+	 * blocks (and we count it) before taking it for real.
+	 */
+	if (!g_mutex_trylock(&io_mutex)) {
+		atomic_fetch_add_explicit(&iolock_contended, 1, memory_order_relaxed);
+		g_mutex_lock(&io_mutex);
+	}
+}
+
+void dbfile_get_lock_stats(uint64_t *total, uint64_t *contended)
+{
+	*total = atomic_load_explicit(&iolock_total, memory_order_relaxed);
+	*contended = atomic_load_explicit(&iolock_contended, memory_order_relaxed);
 }
 
 void dbfile_unlock(void)

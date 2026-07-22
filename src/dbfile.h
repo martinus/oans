@@ -104,6 +104,12 @@ struct dbhandle *dbfile_open_handle_thread(struct threads_pool *pool);
 void dbfile_lock(void);
 void dbfile_unlock(void);
 
+/*
+ * Diagnostic write-lock counters (DUPEREMOVE_SCAN_STATS): total acquisitions
+ * and how many of those had to block behind another writer.
+ */
+void dbfile_get_lock_stats(uint64_t *total, uint64_t *contended);
+
 /* Config-table key holding a persisted --autotune result (io-threads). */
 #define AUTOTUNE_CONFIG_KEY	"autotune_io_threads"
 
