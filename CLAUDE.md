@@ -82,6 +82,22 @@ in `tests/`; no shell tests.
 - **`scripts/perf-profile.sh`** runs an oans command under `perf` and prints the
   self/leaf + caller/stack views, `perf stat`, and a syscall summary, e.g.
   `scripts/perf-profile.sh --cold -- -dr --hashfile=/tmp/prof.db ~/git`.
+- **Synthetic-tree A/B harnesses — don't hand-roll `head -c /dev/urandom` loops.**
+  Both reuse `scripts/demo/setup.sh` + `scripts/demo/gen.py` (parallel,
+  reproducible, distinct/incompressible files; exponential size mix via the
+  `DEMO_*` env vars; `DEMO_DUP_GROUPS=0` isolates the hash phase — setup.sh
+  tolerates 0).
+  - **`scripts/bench-scan.sh <dir> <oansA> <oansB> [mixed|bigfile] [rounds]
+    [io-threads]`** interleaves two binaries (fresh hashfile per run) and prints
+    mean/min/max wall + user CPU — the tool for scan scheduling / hashing changes.
+    The `bigfile` profile at `io-threads=2` reproduces the largest-file-first
+    idle-tail win (a big file hashed last stalls the other threads).
+  - **`scripts/bench-ram.sh`** does single-binary peak-RSS + wall (buffer/cache
+    budget tuning).
+  - Both need **btrfs/xfs, not tmpfs**. No root on the dev box → `drop_caches` is
+    unavailable, so they run **warm** (cache primed before timing); a lone cold
+    first run is an outlier, not a datapoint. A scan needs **`-r`** or only
+    top-level files are hashed.
 - **Never trust `strace -c`** — its interception overhead inflates the
   most-called syscall. It once reported `statx` at 66% (really ~7%) and hid the
   real hotspot (per-file SQLite WAL locking). Use `perf record -g --call-graph

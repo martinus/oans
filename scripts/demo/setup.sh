@@ -68,9 +68,9 @@ awk -v uniq="$UNIQUE" -v groups="$DUP_GROUPS" -v copies="$COPIES" \
 
 # 2) Pre-create the directories the workers write into (spawn-free via xargs).
 awk -v n="$(( (UNIQUE + 299) / 300 ))" -v dest="$DEST" \
-  'BEGIN { for (i = 0; i < n; i++) printf "%s/tree/data/set_%03d\0", dest, i }' | xargs -0 mkdir -p
+  'BEGIN { for (i = 0; i < n; i++) printf "%s/tree/data/set_%03d\0", dest, i }' | xargs -0 -r mkdir -p
 awk -v n="$DUP_GROUPS" -v dest="$DEST" \
-  'BEGIN { for (g = 1; g <= n; g++) printf "%s/tree/dup/group_%03d\0", dest, g }' | xargs -0 mkdir -p
+  'BEGIN { for (g = 1; g <= n; g++) printf "%s/tree/dup/group_%03d\0", dest, g }' | xargs -0 -r mkdir -p
 
 echo "Generating $UNIQUE unique files + $DUP_GROUPS groups ×${COPIES} (mean ${MEAN_KB} KiB) on ${nworkers} workers ..."
 
