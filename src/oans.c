@@ -1098,9 +1098,9 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	 * older than 6.4 scanned without root (its UUID needs libblkid).
 	 */
 	if (!ret && filescan_seed_failed()) {
-		eprintf("Error: could not determine the filesystem for any given "
-			"path. Deduplication needs btrfs or XFS; for XFS on a "
-			"kernel older than 6.4, run oans as root.\n");
+		eprintf("Error: none of the given paths are on a filesystem oans "
+			"can deduplicate. Deduplication needs btrfs or XFS; for "
+			"XFS on a kernel older than 6.4, run oans as root.\n");
 		ret = 1;
 	}
 

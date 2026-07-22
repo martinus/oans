@@ -757,16 +757,30 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	/* hashfile was empty. We lock on the file. */
 	if (uuid_is_null(locked_fs.uuid)) {
 		dprintf("Empty hashfile, locking on the current file\n");
-		ret = get_uuid(path, &locked_fs.uuid);
+		ret = get_uuid(path, &uuid);
 		if (ret)
 			return seed_reject(parent_checked);
 
+		/*
+		 * We identified the filesystem, but if it is not one oans can
+		 * deduplicate (btrfs or XFS) refuse this root now with a clear
+		 * message. Walking it anyway would hash every file only to have
+		 * each FIEMAP/FIDEDUPERANGE fail with confusing per-file errors
+		 * and still exit 0 ("Nothing to deduplicate"). Rejecting via
+		 * seed_reject() means a run whose roots are *all* unsupported
+		 * fails loudly (filescan_seed_failed()); a mix still scans the
+		 * supported roots. Commit locked_fs only once supported, so a
+		 * rejected root does not pollute the lock for later roots.
+		 */
+		if (!is_fs_supported(path)) {
+			eprintf("Skipping %s: its filesystem is not btrfs or XFS, "
+				"which oans needs to deduplicate.\n", path);
+			return seed_reject(parent_checked);
+		}
+
+		uuid_copy(locked_fs.uuid, uuid);
 		locked_fs.dev = stx_to_dev(st);
 		locked_fs.is_btrfs = is_btrfs(path);
-
-		if (!is_fs_supported(path))
-			eprintf("Warn: filesystem for %s is not known to "
-				"support deduplication.\n", path);
 
 		return true;
 	}
