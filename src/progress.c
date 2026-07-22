@@ -74,6 +74,55 @@ static unsigned int drawn_lines;
 static uint64_t files_scanned, bytes_scanned;
 
 /*
+ * ETA by weighted progress. Hashing a file costs roughly k*bytes + d: a
+ * per-byte rate plus a fixed per-file overhead (open, fiemap, the DB write).
+ * Rather than fit k and d - which is ill-conditioned while only big files have
+ * been hashed, and blows the ETA up to hours on a cold scan when the per-file
+ * overhead spikes under I/O contention - we fix the *ratio* d/k as a constant
+ * file weight (in byte-equivalents) and let the elapsed time supply the scale.
+ *
+ * Each file counts as `weight` bytes of work, so total work = bytes +
+ * weight*files is known from the listing up front (no warm-up, no discovery of
+ * the small-file tail mid-scan). The remaining fraction is extrapolated by the
+ * time already spent, which measures the true speed empirically - parallelism,
+ * cache state and device all fold into elapsed/done. A wrong weight only
+ * reweights files vs bytes and is self-limiting (too large and it degrades to a
+ * plain file-rate ETA; it cannot run away), so a fixed value per storage class
+ * is robust where fitting d was not.
+ */
+#define ETA_FILE_WEIGHT_SSD	(32u << 10)	/* 32 KiB: ~ measured d/k on flash */
+#define ETA_FILE_WEIGHT_HDD	(1u << 20)	/* 1 MiB: seek-bound rotational disks */
+static uint64_t eta_file_weight = ETA_FILE_WEIGHT_SSD;
+
+void pscan_set_storage_rotational(bool rotational)
+{
+	eta_file_weight = rotational ? ETA_FILE_WEIGHT_HDD : ETA_FILE_WEIGHT_SSD;
+}
+
+uint64_t pscan_eta_file_weight(void)
+{
+	return eta_file_weight;
+}
+
+/*
+ * Seconds left, or -1 if nothing measurable yet. weight is the per-file work in
+ * byte-equivalents. Pure, unit-tested (see tests.c).
+ */
+static double scan_eta_seconds(uint64_t done_bytes, uint64_t done_files,
+			       uint64_t total_bytes, uint64_t total_files,
+			       uint64_t weight, double elapsed)
+{
+	double done = (double)done_bytes + (double)weight * done_files;
+	double total = (double)total_bytes + (double)weight * total_files;
+
+	if (done <= 0.0)
+		return -1.0;
+	if (total <= done)
+		return 0.0;
+	return elapsed * (total - done) / done;
+}
+
+/*
  * Used to track the status of our search extents from blocks
  */
 static _Atomic uint64_t search_total, search_processed;
@@ -246,7 +295,7 @@ static unsigned int print_scan_progress(void)
 		return 3;
 	}
 
-	/* Files/s, reused by the file-rate ETA below; 0 until we have a second. */
+	/* Files/s for the display line; 0 until we have a second of data. */
 	double frate = (files_scanned && elapsed > 1.0) ? files_scanned / elapsed : 0.0;
 
 	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)",
@@ -260,26 +309,10 @@ static unsigned int print_scan_progress(void)
 	      tb ? (double)bytes_scanned / tb * 100 : 100.0);
 	if (bytes_scanned && elapsed > 1.0) {
 		double brate = bytes_scanned / elapsed;
-		double eta = 0.0;
+		double eta = scan_eta_seconds(bytes_scanned, files_scanned,
+					      tb, tf, eta_file_weight, elapsed);
 
 		printf(" · %s/s", human_size((uint64_t)brate));
-
-		/*
-		 * Both bytes and files must reach 100%, and which one dominates
-		 * the time left flips during a scan: big files first
-		 * (byte-bound), then a long tail of tiny files (file-count
-		 * bound). A pure byte ETA collapses to a few seconds during that
-		 * tail while hundreds of thousands of small files still remain,
-		 * so take the larger of the byte- and file-rate estimates.
-		 */
-		if (bytes_scanned < tb)
-			eta = (tb - bytes_scanned) / brate;
-		if (frate > 0.0 && files_scanned < tf) {
-			double feta = (tf - files_scanned) / frate;
-
-			if (feta > eta)
-				eta = feta;
-		}
 		if (eta > 0.0)
 			printf(" · ETA ~%s", human_duration(eta));
 	}

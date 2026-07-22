@@ -43,6 +43,16 @@ struct pscan_global {
 
 void pscan_finish_listing(void);
 
+/*
+ * Set the storage class for the scan ETA's per-file work weight (rotational
+ * disks carry a much larger per-file seek cost). Call before the scan; defaults
+ * to non-rotational.
+ */
+void pscan_set_storage_rotational(bool rotational);
+
+/* The per-file work weight (bytes) currently used by the scan ETA. */
+uint64_t pscan_eta_file_weight(void);
+
 /* Used to increment the global todo list */
 void pscan_set_progress(uint64_t added_files, uint64_t added_bytes);
 

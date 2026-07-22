@@ -157,6 +157,23 @@ static struct scan_workq scan_workq;
  */
 static _Atomic uint64_t scan_pop_total, scan_pop_empty_waits;
 
+/*
+ * Per-file overhead vs byte-proportional hash time (DUPEREMOVE_SCAN_STATS).
+ * Their ratio is the ideal ETA file weight B = (overhead/file)/(hash/byte),
+ * for checking the fixed weight against real storage (see report_scan_stats).
+ */
+static _Atomic uint64_t scan_overhead_ns, scan_hash_ns, scan_hashed_files,
+			scan_hashed_bytes;
+
+void filescan_get_eta_calibration(uint64_t *overhead_ns, uint64_t *hash_ns,
+				  uint64_t *files, uint64_t *bytes)
+{
+	*overhead_ns = atomic_load(&scan_overhead_ns);
+	*hash_ns = atomic_load(&scan_hash_ns);
+	*files = atomic_load(&scan_hashed_files);
+	*bytes = atomic_load(&scan_hashed_bytes);
+}
+
 static void scan_workq_push(struct file_to_scan *file);
 static void scan_workq_start(unsigned int nworkers);
 static void scan_workq_drain(void);
@@ -1848,6 +1865,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	/* Prevent close on fd 0 if, somehow, an error occurs before we open */
 	ctxt.fd = -1;
 
+	uint64_t t_start = mono_ns(), t_hash = 0, t_done = 0;	/* calibration */
+
 	if (!(buffer->buf)) {
 		ret = prepare_buffer(buffer);
 		if (ret) {
@@ -1898,6 +1917,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * loop again until pread returns 0 or
 	 * until we reach the expected EOF, based on the expected filesize
 	 */
+	t_hash = mono_ns();	/* calibration: setup done, read+hash begins */
+
 	while (ctxt.off < ctxt.filesize) {
 		/* In the buffer, how much bytes are processed as blocks
 		 * Extents processing and file processing will not consumme
@@ -1984,6 +2005,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		return;
 	}
 
+	t_done = mono_ns();	/* calibration: read+hash done, finalize/DB follow */
+
 	finish_running_checksum(ctxt.file_csum, file_digest);
 	ctxt.file_csum = NULL;
 
@@ -2049,6 +2072,14 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	}
 
 	dbfile_unlock();
+
+	/* Calibration: overhead is everything but the byte-proportional read+hash
+	 * loop (setup + finalize + DB write). */
+	atomic_fetch_add(&scan_overhead_ns,
+			 (t_hash - t_start) + (mono_ns() - t_done));
+	atomic_fetch_add(&scan_hash_ns, t_done - t_hash);
+	atomic_fetch_add(&scan_hashed_files, 1);
+	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
 }
 
 int add_exclude_pattern(const char *pattern)

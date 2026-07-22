@@ -1051,6 +1051,7 @@ static void process_duplicates(struct dbhandle *db)
 static void report_scan_stats(void)
 {
 	uint64_t pops, empty_waits, lock_total, lock_contended, lock_wait_ns;
+	uint64_t over_ns, hash_ns, cal_files, cal_bytes;
 
 	if (!getenv("DUPEREMOVE_SCAN_STATS"))
 		return;
@@ -1069,6 +1070,26 @@ static void report_scan_stats(void)
 		lock_total ? 100.0 * lock_contended / lock_total : 0.0,
 		lock_wait_ns / 1e9,
 		lock_contended ? lock_wait_ns / 1e3 / lock_contended : 0.0);
+
+	/*
+	 * ETA calibration: the ratio of measured per-file overhead to per-byte
+	 * hash time is the ideal ETA file weight for this storage; compare it to
+	 * the fixed weight actually used (see progress.c). Handy for tuning the
+	 * weight on real hardware - e.g. a NAS/HDD.
+	 */
+	filescan_get_eta_calibration(&over_ns, &hash_ns, &cal_files, &cal_bytes);
+	if (cal_files && hash_ns) {
+		double over_per_file = (double)over_ns / cal_files;
+		double hash_per_byte = (double)hash_ns / cal_bytes;
+
+		fprintf(stderr,
+			"eta-calibration: overhead=%.1fus/file hash=%.2fs/GiB"
+			" -> ideal weight %.0f KiB/file (using %" PRIu64 " KiB)\n",
+			over_per_file / 1e3,
+			hash_per_byte * (double)(1ULL << 30) / 1e9,
+			over_per_file / hash_per_byte / 1024.0,
+			pscan_eta_file_weight() / 1024);
+	}
 }
 
 static int scan_files(char **roots, int nroots, struct dbhandle *db,
@@ -1235,6 +1256,16 @@ static void auto_tune_io_threads(const char *root)
 {
 	struct storage_profile p = {0};
 
+	/*
+	 * Detect the backing storage once: it sizes both the io-threads default
+	 * and the scan-ETA per-file weight. The weight must be set even when
+	 * io-threads is fixed below (an explicit flag, or a stored --autotune
+	 * result), so a NAS/HDD still gets the rotational weight.
+	 */
+	if (root)
+		storage_detect(root, &p);
+	pscan_set_storage_rotational(p.rotational && p.rotational_known);
+
 	if (options.io_threads)		/* explicit --io-threads (0 == auto) */
 		return;
 
@@ -1248,12 +1279,10 @@ static void auto_tune_io_threads(const char *root)
 	}
 
 	/*
-	 * Heuristic from the backing storage. storage_recommend_io_threads()
-	 * returns the plain CPU-count default for unknown media, so a failed
-	 * detect (leaving the zeroed profile) still yields a sane value.
+	 * storage_recommend_io_threads() returns the plain CPU-count default for
+	 * unknown media, so a failed detect (zeroed profile) still yields a sane
+	 * value.
 	 */
-	if (root)
-		storage_detect(root, &p);
 	options.io_threads = storage_recommend_io_threads(&p, get_num_cpus());
 
 	if (verbose) {

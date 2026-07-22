@@ -86,4 +86,12 @@ void filescan_free(void);
  */
 void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits);
 
+/*
+ * Diagnostic ETA-calibration counters (DUPEREMOVE_SCAN_STATS): summed per-file
+ * overhead (setup + finalize + DB write) and read+hash time, with their file
+ * and byte counts. overhead/file over hash/byte is the ideal ETA file weight.
+ */
+void filescan_get_eta_calibration(uint64_t *overhead_ns, uint64_t *hash_ns,
+				  uint64_t *files, uint64_t *bytes);
+
 #endif	/* __FILE_SCAN_H__ */
