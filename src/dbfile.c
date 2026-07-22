@@ -45,15 +45,6 @@ static GMutex io_mutex; /* Locks db writes */
  */
 static _Atomic uint64_t iolock_total, iolock_contended, iolock_wait_ns;
 
-/* Monotonic nanoseconds, for timing contended lock waits. */
-static uint64_t mono_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
 #if (SQLITE_VERSION_NUMBER < 3007015)
 #define	perror_sqlite(_err, _why)					\
 	eprintf("%s(): Database error %d while %s: %s\n",	\

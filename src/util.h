@@ -75,6 +75,9 @@ void color_init(bool disable);
 void start_timer(void);
 double elapsed_seconds(void);
 
+/* Monotonic wall-clock nanoseconds, for ad-hoc interval timing. */
+uint64_t mono_ns(void);
+
 int num_digits(unsigned long long num);
 
 /* Online logical CPU count (at least 1). */

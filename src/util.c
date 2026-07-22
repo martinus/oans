@@ -72,6 +72,14 @@ double elapsed_seconds(void)
 	       (now.tv_nsec - timer_start.tv_nsec) / 1e9;
 }
 
+uint64_t mono_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 /* Compact human-readable duration: "45s", "2m14s", "1h03m". */
 int human_duration_snprintf(double seconds, char *str, size_t str_bytes)
 {

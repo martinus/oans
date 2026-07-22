@@ -283,6 +283,42 @@ MU_TEST(test_scan_workq_priority) {
 	memset(&scan_workq, 0, sizeof(scan_workq));
 }
 
+/* Within eps of expected. */
+static bool near(double got, double want, double eps)
+{
+	double e = got - want;
+	return e < eps && e > -eps;
+}
+
+MU_TEST(test_scan_eta) {
+	const uint64_t GiB = 1ull << 30, W = 1ull << 30;   /* 1 GiB per-file weight */
+
+	/* Weighted progress: work = bytes + W*files, ETA = elapsed*(total-done)/done. */
+
+	/* Nothing scanned yet -> no estimate. */
+	mu_check(scan_eta_seconds(0, 0, 4 * GiB, 0, W, 10.0) < 0.0);
+
+	/* Pure files (weight is what counts): 1 of 4 files done in 10 s -> 30 s left.
+	 * done_work = W, total_work = 4*W, eta = 10*(4-1)/1. */
+	mu_check(near(scan_eta_seconds(0, 1, 0, 4, W, 10.0), 30.0, 1e-6));
+
+	/* Pure bytes: 2 of 8 GiB in 12 s -> 36 s. */
+	mu_check(near(scan_eta_seconds(2 * GiB, 0, 8 * GiB, 0, W, 12.0), 36.0, 1e-6));
+
+	/* Mixed, weight ties them together: done_work = 1 GiB + W*1 = 2 GiB,
+	 * total_work = 1 GiB + W*5 = 6 GiB, eta = 10*(6-2)/2 = 20 s. */
+	mu_check(near(scan_eta_seconds(GiB, 1, GiB, 5, W, 10.0), 20.0, 1e-6));
+
+	/* A larger weight up-weights the remaining files, raising the estimate:
+	 * done_work = 1 GiB + 2 GiB*1 = 3 GiB, total = 1 GiB + 2 GiB*5 = 11 GiB,
+	 * eta = 10*(11-3)/3. */
+	mu_check(near(scan_eta_seconds(GiB, 1, GiB, 5, 2 * GiB, 10.0),
+		      10.0 * 8.0 / 3.0, 1e-6));
+
+	/* Done >= total -> 0, never negative or a fallback signal. */
+	mu_check(near(scan_eta_seconds(4 * GiB, 4, 4 * GiB, 4, W, 10.0), 0.0, 1e-6));
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -293,6 +329,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_storage_recommend_io_threads);
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
+	MU_RUN_TEST(test_scan_eta);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
