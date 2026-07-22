@@ -75,6 +75,15 @@ void pscan_join(void);
  */
 void pscan_reset_thread(struct pscan_thread **progress);
 
+/*
+ * For a persistently-held slot (one kept by a long-lived worker across many
+ * files, rather than re-claimed per file): pscan_finish_file() does the per-file
+ * byte/count accounting without going idle, so no "idle" flashes between files;
+ * pscan_slot_idle() parks the slot when the worker finally runs out of work.
+ */
+void pscan_finish_file(struct pscan_thread **progress);
+void pscan_slot_idle(struct pscan_thread *slot);
+
 bool is_progress_printer_running(void);
 
 /*

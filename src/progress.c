@@ -478,6 +478,43 @@ void pscan_reset_thread(struct pscan_thread **progress)
 	(*progress)->file_path[0] = '\0';
 }
 
+/*
+ * Roll a persistently-held slot from one file to the next: do the per-file
+ * accounting pscan_reset_thread() does (reconcile scanned-vs-total bytes, bump
+ * the file count) but leave the slot claimed and non-idle, so a worker that
+ * hands off directly to its next file never flashes "idle" in the microsecond
+ * gap between them. The status/path stay showing the just-finished file until
+ * the next one overwrites them. _cleanup_ compatible.
+ */
+void pscan_finish_file(struct pscan_thread **progress)
+{
+	uint64_t scanned, total;
+
+	if (!progress || !*progress)
+		return;
+	scanned = (*progress)->file_scanned_bytes;
+	total = (*progress)->file_total_bytes;
+
+	if (scanned < total)
+		(*progress)->total_scanned_bytes += total - scanned;
+	if (scanned > total)
+		(*progress)->total_scanned_bytes -= scanned - total;
+
+	(*progress)->total_scanned_files++;
+}
+
+/*
+ * Park a persistently-held slot as idle once its worker has no more work (drain).
+ * No per-file accounting - pscan_finish_file() already ran for the last file.
+ */
+void pscan_slot_idle(struct pscan_thread *slot)
+{
+	if (!slot)
+		return;
+	slot->status = thread_idle;
+	slot->file_path[0] = '\0';
+}
+
 bool is_progress_printer_running(void)
 {
 	return printer ? true : false;

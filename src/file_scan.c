@@ -78,7 +78,8 @@ static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 static void mark_file_seen(int64_t id);
 struct buffer;
-static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer);
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
+			    struct pscan_thread *tprogress);
 
 /*
  * Scan work queue — approximate longest-processing-time-first (LPT) dispatch.
@@ -1703,10 +1704,26 @@ static gpointer scan_worker(gpointer arg)
 	/* One read buffer per worker, allocated on first use and reused across
 	 * files; owned here so it is freed when the worker exits. */
 	struct buffer buffer = {0,};
+	/*
+	 * These csum workers are persistent (one per --io-threads, alive for the
+	 * whole scan - not a churning glib pool), so each holds a single progress
+	 * slot for its lifetime and rolls it from file to file. That avoids the
+	 * per-file claim/release that made the display flash "idle" in the
+	 * microsecond gap between small files even though the queue was never
+	 * actually empty (see pscan_finish_file). Claimed lazily on the first file
+	 * with a non-idle status so a still-unclaimed slot is never reused by a
+	 * sibling worker; a worker that gets no files never shows a phantom line.
+	 */
+	struct pscan_thread *slot = NULL;
 
-	while ((file = scan_workq_pop(q)))
-		csum_whole_file(file, &buffer);
+	while ((file = scan_workq_pop(q))) {
+		if (!slot)
+			slot = pscan_claim_slot(gettid(), thread_scanning);
+		csum_whole_file(file, &buffer, slot);
+	}
 
+	if (slot)
+		pscan_slot_idle(slot);	/* out of work: park it idle */
 	free(buffer.buf);
 	return NULL;
 }
@@ -1746,7 +1763,8 @@ static void scan_workq_drain(void)
 	/* All buckets are empty now (workers drained them); nothing to free. */
 }
 
-static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
+static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
+			    struct pscan_thread *tprogress)
 {
 	int ret = 0;
 
@@ -1760,8 +1778,20 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
 	 */
 	struct dbhandle *db = scan_writer;
 
+	/*
+	 * The worker owns tprogress across files; roll its per-file accounting
+	 * (bytes/count) on every exit path but leave it claimed and non-idle.
+	 * Point the new file's fields in before any early return, so the cleanup
+	 * always reconciles this file and never re-counts the previous one.
+	 */
+	abort_on(!tprogress);
+	tprogress->status = thread_scanning;
+	tprogress->file_scanned_bytes = 0;
+	tprogress->file_total_bytes = file->filesize;
+	strncpy(tprogress->file_path, file->path, PATH_MAX);
+	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
+
 	/* Dummy variables used to trigger the cleanup code */
-	_cleanup_(pscan_reset_thread) struct pscan_thread *tprogress = NULL;
 	_cleanup_(freep) char *path = file->path;
 	_cleanup_(freep) struct file_to_scan *clean_file = file;
 
@@ -1789,14 +1819,6 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer)
 		eprintf("csum_whole_file: unable to connect to the database\n");
 		return;
 	}
-
-	/* Claimed per file, not per thread: see pscan_claim_slot(). */
-	tprogress = pscan_claim_slot(gettid(), thread_scanning);
-	abort_on(!tprogress);
-
-	tprogress->file_scanned_bytes = 0;
-	tprogress->file_total_bytes = file->filesize;
-	strncpy(tprogress->file_path, file->path, PATH_MAX);
 
 	ctxt.filesize = file->filesize;
 	ctxt.file_csum = start_running_checksum();
