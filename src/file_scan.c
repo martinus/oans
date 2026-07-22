@@ -385,14 +385,28 @@ static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 	 * of MB of block records we will never fill. Holes are skipped in the
 	 * scan loop, so they contribute no block hashes. add_block_hash()
 	 * grows the array if this estimate is ever short.
+	 *
+	 * Count the oans blocks each extent *touches*, not fe_length/blocksize:
+	 * FIEMAP extents are aligned to the filesystem block size (~4K), not to
+	 * oans blocksize (128K by default), so an extent can start and end mid
+	 * block and a partially-overlapped block is still read and hashed. Sum
+	 * (last block touched - first block touched) so the estimate never
+	 * under-counts (which would trip the one-at-a-time realloc growth in
+	 * add_block_hash). Adjacent extents sharing a block can over-count, but
+	 * erring high just wastes a little memory once, the safe bias here.
 	 */
-	size_t mapped = 0;
-	for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++)
-		mapped += ctxt->fiemap->fm_extents[i].fe_length;
-	if (mapped > ctxt->filesize)
-		mapped = ctxt->filesize;
+	size_t mapped_blocks = 0;
+	for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &ctxt->fiemap->fm_extents[i];
+		uint64_t first = e->fe_logical / blocksize;
+		uint64_t last = (e->fe_logical + e->fe_length + blocksize - 1) / blocksize;
+		mapped_blocks += last - first;
+	}
+	size_t max_blocks = ctxt->filesize / blocksize + 1;
+	if (mapped_blocks > max_blocks)
+		mapped_blocks = max_blocks;
 
-	hashes->blocks_count = mapped / blocksize + 1;
+	hashes->blocks_count = mapped_blocks + 1;
 	hashes->blocks = calloc(hashes->blocks_count, sizeof(struct block_csum));
 
 	return hashes->extents && hashes->blocks;
@@ -1373,7 +1387,7 @@ static inline bool block_is_hole(const struct fiemap_extent *e, size_t off)
  * If the block at ctxt->off is entirely a hole, return the length of the
  * block-aligned run of all-hole blocks starting there; otherwise 0.
  */
-static size_t hole_run_at(struct scan_ctxt *ctxt)
+static size_t hole_run_length(struct scan_ctxt *ctxt)
 {
 	struct fiemap_extent *e = get_extent(ctxt->fiemap, ctxt->off,
 					     &ctxt->extent_cursor);
@@ -1870,14 +1884,14 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		 * older faked-zeroes path in fill_buffer instead; unifying the
 		 * two would change preallocated files' digests for no gain here.)
 		 */
-		size_t hole = hole_run_at(&ctxt);
-		if (hole) {
-			uint64_t desc[2] = { ctxt.off, hole };
+		size_t hole_length = hole_run_length(&ctxt);
+		if (hole_length) {
+			uint64_t desc[2] = { ctxt.off, hole_length };
 			add_to_running_checksum(ctxt.file_csum,
 						(unsigned char *)desc, sizeof(desc));
-			ctxt.off += hole;
-			tprogress->file_scanned_bytes += hole;
-			tprogress->total_scanned_bytes += hole;
+			ctxt.off += hole_length;
+			tprogress->file_scanned_bytes += hole_length;
+			tprogress->total_scanned_bytes += hole_length;
 			continue;
 		}
 
