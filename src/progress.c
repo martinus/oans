@@ -216,6 +216,16 @@ static void ellipsize_path(const char *path, char *out, size_t out_len,
 	snprintf(out, out_len, "%.*s…%s", head, path, path + len - tail);
 }
 
+/* Short label per status (thread_idle is rendered separately below). Indexed
+ * by the enum, so the order is irrelevant and adding a state is a one-liner. */
+static const char *const status_label[] = {
+	[thread_mapping]	= "mapping:",
+	[thread_scanning]	= "hashing:",
+	[thread_waiting_lock]	= "wait lock:",
+	[thread_committing]	= "commit:",
+	[thread_deduping]	= "deduping:",
+};
+
 static void print_thread_progress(struct pscan_thread *tprogress)
 {
 	char buf[BUF_LEN];
@@ -223,30 +233,30 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 	char clean[PATH_MAX + 1];
 	int avail;
 
+	/* The only thing that varies is the suffix: a byte percentage while
+	 * hashing/deduping, else a size (no bytes processed yet to show a %). */
 	switch (tprogress->status) {
 	case thread_idle:
 		s_printf("[%u] idle\n", tprogress->tid);
 		return;
 	case thread_scanning:
 	case thread_deduping:
-		snprintf(prefix, sizeof(prefix), "[%u] %-20s", tprogress->tid,
-			 tprogress->status == thread_scanning ?
-			 "checksumming:" : "deduping:");
 		snprintf(suffix, sizeof(suffix), ": %s/%s (%05.2f%%)",
 			 human_size(tprogress->file_scanned_bytes),
 			 human_size(tprogress->file_total_bytes),
 			 percent(tprogress->file_scanned_bytes,
 				 tprogress->file_total_bytes));
 		break;
+	case thread_mapping:
 	case thread_waiting_lock:
 	case thread_committing:
-		snprintf(prefix, sizeof(prefix), "[%u] %-20s", tprogress->tid,
-			 tprogress->status == thread_waiting_lock ?
-			 "waiting for lock:" : "committing:");
 		snprintf(suffix, sizeof(suffix), " (size: %s)",
 			 human_size(tprogress->file_total_bytes));
 		break;
 	}
+
+	snprintf(prefix, sizeof(prefix), "[%u] %-11s", tprogress->tid,
+		 status_label[tprogress->status]);
 
 	/*
 	 * The numbers on the right must stay visible: give the path whatever
