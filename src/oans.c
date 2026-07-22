@@ -1050,22 +1050,25 @@ static void process_duplicates(struct dbhandle *db)
  */
 static void report_scan_stats(void)
 {
-	uint64_t pops, empty_waits, lock_total, lock_contended;
+	uint64_t pops, empty_waits, lock_total, lock_contended, lock_wait_ns;
 
 	if (!getenv("DUPEREMOVE_SCAN_STATS"))
 		return;
 
 	filescan_get_workq_stats(&pops, &empty_waits);
-	dbfile_get_lock_stats(&lock_total, &lock_contended);
+	dbfile_get_lock_stats(&lock_total, &lock_contended, &lock_wait_ns);
 
 	fprintf(stderr,
 		"scan-stats: csum-queue pops=%" PRIu64 " empty-waits=%" PRIu64
 		" (%.1f%% starved); write-lock acquisitions=%" PRIu64
-		" contended=%" PRIu64 " (%.1f%%)\n",
+		" contended=%" PRIu64 " (%.1f%%); lock-wait total=%.2fs"
+		" avg=%.1fus\n",
 		pops, empty_waits,
 		pops ? 100.0 * empty_waits / pops : 0.0,
 		lock_total, lock_contended,
-		lock_total ? 100.0 * lock_contended / lock_total : 0.0);
+		lock_total ? 100.0 * lock_contended / lock_total : 0.0,
+		lock_wait_ns / 1e9,
+		lock_contended ? lock_wait_ns / 1e3 / lock_contended : 0.0);
 }
 
 static int scan_files(char **roots, int nroots, struct dbhandle *db,
