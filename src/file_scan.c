@@ -390,10 +390,10 @@ static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 	 * FIEMAP extents are aligned to the filesystem block size (~4K), not to
 	 * oans blocksize (128K by default), so an extent can start and end mid
 	 * block and a partially-overlapped block is still read and hashed. Sum
-	 * (last block touched - first block touched) so the estimate never
-	 * under-counts (which would trip the one-at-a-time realloc growth in
-	 * add_block_hash). Adjacent extents sharing a block can over-count, but
-	 * erring high just wastes a little memory once, the safe bias here.
+	 * (last block touched - first block touched) so the estimate is a tight
+	 * upper bound and add_block_hash() rarely has to grow it. Adjacent extents
+	 * sharing a block can over-count, but erring high just wastes a little
+	 * memory once, the safe bias here.
 	 */
 	size_t mapped_blocks = 0;
 	for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++) {
@@ -1310,19 +1310,40 @@ static inline int is_block_zeroed(void *buf)
 	return buf && ((int*)buf)[0] == 0 && !memcmp(buf, buf + 1, blocksize - 1);
 }
 
+/*
+ * Ensure *arr can hold at least `index + 1` elements of `elem_size`. The
+ * counts in allocate_hashes() are estimates; when one falls short we grow
+ * geometrically (double) rather than by one element at a time, so a run of
+ * short estimates costs O(log n) reallocs instead of O(n) reallocs / O(n^2)
+ * copying on a fragmented file.
+ */
+static int ensure_hash_capacity(void **arr, unsigned int *count,
+				unsigned int index, size_t elem_size)
+{
+	void *retp;
+	unsigned int newcount;
+
+	if (index < *count)
+		return 0;
+
+	newcount = *count ? *count * 2 : 4;
+	retp = realloc(*arr, elem_size * newcount);
+	if (!retp)
+		return -ENOMEM;
+	*arr = retp;
+	*count = newcount;
+	return 0;
+}
+
 static int add_block_hash(struct hashes *hashes,
 			  uint64_t loff, unsigned char *digest)
 {
-	struct block_csum *retp;
-
-	if (hashes->blocks_index + 1 > hashes->blocks_count) {
-		/* Somehow, we did not allocate enough memory */
-		hashes->blocks_count++;
-		retp = realloc(hashes->blocks, sizeof(struct block_csum) * hashes->blocks_count);
-		if (!retp)
-			return -ENOMEM;
-		hashes->blocks = retp;
-	}
+	int ret = ensure_hash_capacity((void **)&hashes->blocks,
+				       &hashes->blocks_count,
+				       hashes->blocks_index,
+				       sizeof(struct block_csum));
+	if (ret)
+		return ret;
 
 	hashes->blocks[hashes->blocks_index].loff = loff;
 	memcpy(hashes->blocks[hashes->blocks_index].digest, digest, DIGEST_LEN);
@@ -1468,16 +1489,12 @@ static ssize_t process_blocks(struct scan_ctxt *ctxt, struct buffer *buffer,
 
 static int store_extent(struct scan_ctxt *ctxt, struct hashes *hashes, struct fiemap_extent *extent)
 {
-	struct extent_csum *retp;
-
-	if (hashes->extents_index + 1 > hashes->extents_count) {
-		/* Somehow, we did not allocate enough memory */
-		hashes->extents_count++;
-		retp = realloc(hashes->extents, sizeof(struct extent_csum) * hashes->extents_count);
-		if (!retp)
-			return -ENOMEM;
-		hashes->extents = retp;
-	}
+	int ret = ensure_hash_capacity((void **)&hashes->extents,
+				       &hashes->extents_count,
+				       hashes->extents_index,
+				       sizeof(struct extent_csum));
+	if (ret)
+		return ret;
 
 	if (extent->fe_flags & FIEMAP_SKIP_FLAGS) {
 		hashes->extents[hashes->extents_index].len = 0;
