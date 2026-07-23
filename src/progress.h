@@ -45,6 +45,16 @@ struct pscan_global {
 void pscan_finish_listing(void);
 
 /*
+ * Enable machine-readable progress: the progress thread streams newline-delimited
+ * JSON to stderr (~1/s) instead of drawing the ANSI block, on a tty or not.
+ * stdout is left untouched. Call once before pscan_run().
+ */
+void progress_set_json(bool on);
+
+/* Emit the terminal {"event":"done", ...} line (no-op unless JSON is enabled). */
+void pscan_json_done(uint64_t files_scanned, uint64_t groups, uint64_t reclaimed);
+
+/*
  * Set the storage class for the scan ETA's per-file work weight (rotational
  * disks carry a much larger per-file seek cost). Call before the scan; defaults
  * to non-rotational.

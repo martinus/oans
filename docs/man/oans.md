@@ -243,6 +243,28 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     favor of the progress bar, and show the detected storage / chosen thread
     count.
 
+**\--progress=json**
+
+  ~ Stream machine-readable progress instead of the interactive display, for
+    monitoring scheduled or non-interactive runs. One newline-delimited JSON
+    object is written to **standard error** per phase (and about once a second),
+    ending with a `{"event":"done", ...}` line; standard output is unchanged (so
+    the `net change in shared extents` line and the human summary still appear
+    there). Works whether or not standard output is a terminal.
+
+    Each line is a self-contained object. During scanning:
+    `{"phase":"scanning","elapsed_sec":2.1,"files_examined":48120,"files_to_hash":12340}`;
+    during hashing: `"phase":"hashing"` with `files`, `files_total`, `bytes`,
+    `bytes_total`, and, once measurable, `bytes_per_sec` and `eta_sec`; during
+    dedupe: `"phase":"dedupe"` with `groups`, `groups_total`, `reclaimed_bytes`,
+    the current `activity`, and `eta_sec`. The final line is
+    `{"event":"done","elapsed_sec":...,"files_scanned":...,"groups_deduped":...,"reclaimed_bytes":...}`.
+    Fields that are not yet known (an ETA, a rate) are omitted; a consumer
+    reading a line at a time can ignore any line that is not valid JSON.
+
+    Combine with **-q** to silence the human stdout too, e.g.
+    `oans -qd --progress=json --hashfile=FILE /srv/data 2>progress.jsonl`.
+
 **\--no-color**
   ~ Disable colored output. Color is also disabled automatically when standard
     output is not a terminal or when the `NO_COLOR` environment variable is set.
