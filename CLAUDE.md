@@ -91,22 +91,31 @@ in `tests/`; no shell tests.
 - **`scripts/perf-profile.sh`** runs an oans command under `perf` and prints the
   self/leaf + caller/stack views, `perf stat`, and a syscall summary, e.g.
   `scripts/perf-profile.sh --cold -- -dr --hashfile=/tmp/prof.db ~/git`.
-- **Synthetic-tree A/B harnesses — don't hand-roll `head -c /dev/urandom` loops.**
-  Both reuse `scripts/demo/setup.sh` + `scripts/demo/gen.py` (parallel,
-  reproducible, distinct/incompressible files; exponential size mix via the
-  `DEMO_*` env vars; `DEMO_DUP_GROUPS=0` isolates the hash phase — setup.sh
-  tolerates 0).
-  - **`scripts/bench-scan.sh <dir> <oansA> <oansB> [mixed|bigfile] [rounds]
-    [io-threads]`** interleaves two binaries (fresh hashfile per run) and prints
-    mean/min/max wall + user CPU — the tool for scan scheduling / hashing changes.
-    The `bigfile` profile at `io-threads=2` reproduces the largest-file-first
-    idle-tail win (a big file hashed last stalls the other threads).
-  - **`scripts/bench-ram.sh`** does single-binary peak-RSS + wall (buffer/cache
-    budget tuning).
-  - Both need **btrfs/xfs, not tmpfs**. No root on the dev box → `drop_caches` is
-    unavailable, so they run **warm** (cache primed before timing); a lone cold
-    first run is an outlier, not a datapoint. A scan needs **`-r`** or only
-    top-level files are hashed.
+- **`scripts/bench.py` is THE benchmark harness — don't reinvent it or add new
+  bench-*.sh.** One Python tool that generates reproducible trees (reusing
+  `scripts/demo/gen.py`), runs a matrix of *binaries × io-threads × walk-threads ×
+  env-variants* over declarative workload **profiles**, cold or warm, interleaved
+  across rounds, and prints wall/user/sys (+`--rss` peak RSS) as
+  median/mean/min/max. It subsumes the old `bench-scan.sh`, `bench-scan-cold.sh`
+  and `bench-ram.sh` (all removed). `scripts/demo/*` stays — that's the GIF, not
+  benchmarking. `median` is the headline column (robust to the cold/swap
+  outliers a `drop_caches` box throws).
+  - Profiles live in the `PROFILES` dict — add a key, nothing else changes:
+    `realistic` (default; ~65k files + dup groups → hashing + find_dupes, the
+    everyday regression check), `mixed` (pure hashing, bandwidth-bound), `bigfile`
+    (one huge file → largest-first idle-tail; pair with `--io-threads 2`), `many`
+    (~250k tiny dup-heavy → find_dupes pool + walk), `big` (few large → read
+    buffers; pair with `--rss`), and `git` (an *existing* real tree, default
+    `~/git`, via `--external`). Synthetic sizes target ~10 s cold on NVMe.
+  - Examples: `scripts/bench.py -p mixed --bin base=/tmp/oans-master --bin new=./oans`
+    (A/B two builds); `scripts/bench.py -p git --walk-threads 4,8,16,32` (thread
+    sweep); `scripts/bench.py -p git --variant a: --variant b:DUPEREMOVE_FOO=1`
+    (env-gated code experiment). It confirms a reflink fs and needs **btrfs/xfs,
+    not tmpfs**; a scan uses **`-rq`** (so only `-r`, non-destructive, repeatable).
+  - **Cold runs work now:** the dev box enables `sudo tee /proc/sys/vm/drop_caches`
+    via sudoers, so `bench.py` drops the page cache (metadata + data) before every
+    timed run (default; `--warm` opts out). Plain `sudo -n true` still needs a
+    password — only the `drop_caches` tee is passwordless.
 - **Never trust `strace -c`** — its interception overhead inflates the
   most-called syscall. It once reported `statx` at 66% (really ~7%) and hid the
   real hotspot (per-file SQLite WAL locking). Use `perf record -g --call-graph
@@ -167,6 +176,19 @@ walkers.**
   `~/git`: 1→2→4 scaled (15→9.9→7.8s), 8 was the knee (7.3s), 16/32 gave no wall
   gain while `sys` exploded (16→23→46s). It's btrfs metadata b-tree lock
   contention (`btrfs_search_slot`/`_raw_spin_lock`), not I/O.
+  - **Decoupling walkers from the hashing pool doesn't help either** (re-checked
+    2026-07 with `DUPEREMOVE_WALK_THREADS`, which overrides *only* `walk_nthreads`,
+    leaving the csum/dedupe pools at `--io-threads`). Cold `bench.py` walker sweep
+    with io-threads pinned at 8: on `~/git` (media-mix) walk={4,8,16,32} gave
+    medians 14.35/14.48/14.52/14.58 s, and on `many` (250k tiny files, the most
+    walk-bound case) 8.33/8.01/7.88/8.01 s — flat, `sys` creeping up with more
+    walkers. Verified real, not a no-op: the same harness's io-threads control
+    swept 1→2→8 = 38.0/20.7/7.9 s, and thread counts + hash output were checked
+    (`DUPEREMOVE_WALK_THREADS=32` → 32 live `walker` threads; each run stored
+    250k extents). So **don't decouple or double the walkers**: they only feed the
+    single `__scan_file` consumer, so past ~4 they're never the bottleneck — the
+    csum pool (`--io-threads`) is. `DUPEREMOVE_WALK_THREADS` exists solely as a
+    `bench.py --walk-threads` experiment hook; default (unset) is unchanged.
 - Cold-walk cost is fundamental btrfs metadata I/O (`statx→btrfs_iget→btree`);
   SQLite is <2%, so parallelizing the consumer wouldn't help.
 
@@ -223,6 +245,17 @@ are known (`auto_tune_io_threads()` in `oans.c`).
 
 ## Measured dead-ends — don't re-attempt without new evidence
 
+- **Separating the walk from hashing into two sequential phases is not worth it.**
+  Prototyped (`DUPEREMOVE_SEPARATE_PHASES`: finish the whole parallel walk, then hash
+  strictly largest-first with the full file list known — true global LPT + exact
+  up-front byte total) and cold-benchmarked vs the current pipeline. Byte-identical
+  hash output. `mixed`/`bigfile` (incl. io-threads=2, the idle-tail case):
+  **identical** — those are disk-bandwidth-bound (6 GB cold = 2.7 s wall but only
+  0.5 s user CPU), so read *order* can't change makespan. Cold `~/git`: pipelined
+  was ~3% *faster* on the median (14.1 vs 14.5 s) because hashing overlaps the cold
+  metadata walk — separation throws that overlap away for nothing. The one real win
+  (exact ETA from a known total) is a UX gain that doesn't need serialization (the
+  walk already counts files incrementally). Reverted.
 - **Warm rescan is single-consumer pipeline-latency-bound**, not CPU/query. A
   no-op rescan of ~174k files is ~2s wall / ~0.9s CPU, invariant to
   `--io-threads` (1..16); the serial consumer (`__scan_file` queue handoff +

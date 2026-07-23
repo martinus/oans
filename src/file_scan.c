@@ -306,7 +306,7 @@ static void scan_writer_close(void)
  * the size only trades read() syscall count against memory: at --io-threads=8
  * the old 8 MiB cost 64 MiB of resident buffers on large-file trees. 1 MiB
  * saturates sequential read throughput (the scan is I/O/metadata-bound) while
- * cutting that to 8 MiB. Measured perf-neutral; see scripts/bench-ram.sh.
+ * cutting that to 8 MiB. Measured perf-neutral; see scripts/bench.py (--rss).
  */
 #define READ_BUF_LEN (1*1024*1024) // 1MB
 
@@ -1061,7 +1061,21 @@ static gpointer walk_thread(gpointer arg)
 /* Set up the walk queues. Call before seeding roots via scan_file(). */
 void filescan_walk_begin(void)
 {
+	const char *walk_override;
+
 	walk_nthreads = options.io_threads ? options.io_threads : 1;
+	/*
+	 * Experiment (DUPEREMOVE_WALK_THREADS): decouple the walker count from the
+	 * csum/dedupe pools so a walker sweep can test whether extra directory-
+	 * walk concurrency (deeper block-layer I/O queue) speeds the cold btrfs
+	 * metadata walk, without also inflating the hashing pool.
+	 */
+	walk_override = getenv("DUPEREMOVE_WALK_THREADS");
+	if (walk_override) {
+		unsigned long n = strtoul(walk_override, NULL, 10);
+		if (n >= 1)
+			walk_nthreads = (unsigned int)n;
+	}
 	walk_dirq = g_async_queue_new();
 	walk_fileq = g_async_queue_new();
 	walk_dir_pending = 1;	/* seeding token; released by filescan_walk_run() */
