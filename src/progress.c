@@ -153,6 +153,18 @@ static double scan_eta_seconds(uint64_t done_bytes, uint64_t done_files,
 }
 
 /*
+ * Dedupe ETA: linear extrapolation from the rate so far, once enough groups are
+ * done for it to be stable. -1 until measurable. Shared by the live bar and the
+ * JSON stream so they never diverge.
+ */
+static double dedupe_eta_seconds(uint64_t done, uint64_t total, double elapsed)
+{
+	if (done > 20 && elapsed > 2.0 && done < total)
+		return (double)(total - done) / (done / elapsed);
+	return -1.0;
+}
+
+/*
  * Used to track the status of our search extents from blocks
  */
 static _Atomic uint64_t search_total, search_processed;
@@ -509,8 +521,7 @@ static unsigned int print_bar_line(void)
 			/* No group count yet (still analyzing): bounce the bar. */
 			indet = true;
 		}
-		if (done > 20 && elapsed > 2.0 && done < total)
-			eta = (total - done) / (done / elapsed);
+		eta = dedupe_eta_seconds(done, total, elapsed);
 	} else if (!pscan.listing_completed) {
 		/* Hashing total not known until the listing finishes. */
 		indet = true;
@@ -653,12 +664,21 @@ static void prepare_screen_area(void)
 	drawn_lines = 0;
 }
 
+/* Refresh the per-run scanned totals from the live slots. Caller holds mutex. */
+static void sum_scanned(void)
+{
+	files_scanned = bytes_scanned = 0;
+	for (unsigned int i = 0; i < pscan.thread_count; i++) {
+		files_scanned += pscan.threads[i]->total_scanned_files;
+		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
+	}
+}
+
 static void *print_progress(void)
 {
 	unsigned int lines = 0;
 
-	files_scanned = 0;
-	bytes_scanned = 0;
+	sum_scanned();
 
 	progress_home();	/* back to the top of the block we drew last time */
 
@@ -666,8 +686,6 @@ static void *print_progress(void)
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
 		print_thread_progress(pscan.threads[i], i + 1);
 		lines++;
-		files_scanned += pscan.threads[i]->total_scanned_files;
-		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
 	}
 
 	/* One blank spacer line between the workers and the stage indicator. */
@@ -682,22 +700,35 @@ static void *print_progress(void)
 	return NULL;
 }
 
+/* The live edge for the JSON stream: scanning and hashing overlap, so the
+ * hashing tick begins once the listing is complete; dedupe once it starts. */
+enum jphase { JP_SCAN, JP_HASH, JP_DEDUPE };
+
+static enum jphase json_phase(void)
+{
+	return pdd.phase ? JP_DEDUPE :
+	       (pscan.listing_completed ? JP_HASH : JP_SCAN);
+}
+
 /*
- * One newline-delimited JSON progress object on stderr, reflecting the current
- * phase. Numbers are raw (bytes, file/group counts); *_sec fields are seconds.
- * Fields that are not yet measurable (ETA, rate) are simply omitted. Consumers
- * read a line at a time and can ignore any line that is not valid JSON (e.g. an
- * interleaved error). See docs/man/oans.md.
+ * One newline-delimited JSON progress object on stderr for the given phase.
+ * Numbers are raw (bytes, file/group counts); *_sec fields are seconds. Fields
+ * that are not yet measurable (ETA, rate) are simply omitted. Consumers read a
+ * line at a time and can ignore any line that is not valid JSON (e.g. an
+ * interleaved error). files_scanned/bytes_scanned are the per-run sums the
+ * caller refreshed this tick. See docs/man/oans.md.
  */
-static void emit_json_progress(void)
+static void emit_json_progress(enum jphase phase)
 {
 	double elapsed = elapsed_seconds();
 
-	if (pdd.phase) {
+	switch (phase) {
+	case JP_DEDUPE: {
 		uint64_t done = pdd.done, queued = pdd.queued;
 		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		uint64_t st = search_total, sd = search_processed;
 		double de = (g_get_monotonic_time() - pdd.start_us) / 1e6;
+		double eta = dedupe_eta_seconds(done, total, de);
 
 		fprintf(stderr, "{\"phase\":\"dedupe\",\"elapsed_sec\":%.2f,"
 			"\"groups\":%" PRIu64 ",\"groups_total\":%" PRIu64 ","
@@ -708,18 +739,16 @@ static void emit_json_progress(void)
 		if (st)
 			fprintf(stderr, ",\"search_files\":%" PRIu64 ","
 				"\"search_files_total\":%" PRIu64, sd, st);
-		if (done > 20 && de > 2.0 && done < total)
-			fprintf(stderr, ",\"eta_sec\":%.1f",
-				(double)(total - done) / (done / de));
-		fprintf(stderr, "}\n");
-	} else if (!pscan.listing_completed) {
+		if (eta > 0.0)
+			fprintf(stderr, ",\"eta_sec\":%.1f", eta);
+		break;
+	}
+	case JP_SCAN:
 		fprintf(stderr, "{\"phase\":\"scanning\",\"elapsed_sec\":%.2f,"
-			"\"files_examined\":%" PRIu64 ",\"files_to_hash\":%" PRIu64
-			"}\n", elapsed, pscan.files_examined,
-			pscan.total_files_count);
-	} else {
-		/* files_scanned / bytes_scanned are the per-run sums, refreshed by
-		 * the caller each tick (they also drive the loop's exit test). */
+			"\"files_examined\":%" PRIu64 ",\"files_to_hash\":%" PRIu64,
+			elapsed, pscan.files_examined, pscan.total_files_count);
+		break;
+	case JP_HASH: {
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 
 		fprintf(stderr, "{\"phase\":\"hashing\",\"elapsed_sec\":%.2f,"
@@ -735,8 +764,10 @@ static void emit_json_progress(void)
 			if (eta > 0.0)
 				fprintf(stderr, ",\"eta_sec\":%.1f", eta);
 		}
-		fprintf(stderr, "}\n");
+		break;
 	}
+	}
+	fprintf(stderr, "}\n");
 	fflush(stderr);
 }
 
@@ -756,28 +787,23 @@ static void *pscan_progress_thread(void * p)
 {
 	struct winsize w;
 	gint64 json_last = 0;	/* monotonic us of the last JSON emit */
-	int json_last_phase = -1;
+	enum jphase json_last_phase = -1;
 
 	do {
 		if (progress_json) {
 			gint64 now = g_get_monotonic_time();
-			int phase = pdd.phase ? 2 :
-				    (pscan.listing_completed ? 1 : 0);
+			enum jphase phase = json_phase();
 
 			/* Refresh the per-run sums every tick so the loop's exit test
 			 * stays responsive (~100ms). Emit ~1/s, but always right away
 			 * on a phase change so every phase is reported even on a fast
 			 * run. */
 			g_mutex_lock(&pscan.mutex);
-			files_scanned = bytes_scanned = 0;
-			for (unsigned int i = 0; i < pscan.thread_count; i++) {
-				files_scanned += pscan.threads[i]->total_scanned_files;
-				bytes_scanned += pscan.threads[i]->total_scanned_bytes;
-			}
+			sum_scanned();
 			g_mutex_unlock(&pscan.mutex);
 
 			if (phase != json_last_phase || now - json_last >= 1000000) {
-				emit_json_progress();
+				emit_json_progress(phase);
 				json_last = now;
 				json_last_phase = phase;
 			}
@@ -1038,30 +1064,25 @@ void pdedupe_begin(unsigned int batches)
 	stage_set(STAGE_DONE, ST_PENDING);
 	spin_frame = 0;
 
-	/* JSON progress runs regardless of tty/-q/-v; it draws no block. */
-	if (progress_json) {
-		pdd.running = 1;
-		printer = g_thread_new("progress_printer",
-				       pscan_progress_thread, NULL);
+	/*
+	 * JSON progress runs regardless of tty/-q/-v (it draws no block). The
+	 * interactive block only makes sense on a tty; under -v the per-group
+	 * notices would fight the redraws, and -q wants silence. The counters
+	 * above accumulate regardless, for the final summary.
+	 */
+	if (!progress_json && (quiet || verbose || !isatty(STDOUT_FILENO)))
 		return;
+
+	if (!progress_json) {
+		tty = true;
+		printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
+		/*
+		 * Do NOT reset drawn_lines here: the scan left its block in place
+		 * (see pscan_join with continues=true), so the first dedupe render
+		 * redraws over that same block, keeping the worker list continuous.
+		 * When there was no scan block (drawn_lines already 0) it draws fresh.
+		 */
 	}
-
-	/*
-	 * The live area only makes sense on a tty; under -v the per-group
-	 * notices would fight with the redraws, and -q wants silence. The
-	 * counters above accumulate regardless, for the final summary.
-	 */
-	if (quiet || verbose || !isatty(STDOUT_FILENO))
-		return;
-
-	tty = true;
-	printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
-	/*
-	 * Do NOT reset drawn_lines here: the scan left its block in place (see
-	 * pscan_join with continues=true), so the first dedupe render redraws
-	 * over that same block, keeping the worker list continuous. When there
-	 * was no scan block (drawn_lines already 0) this simply draws fresh.
-	 */
 	pdd.running = 1;
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }

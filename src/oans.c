@@ -1179,10 +1179,14 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		      uint64_t *files_scanned)
 {
 	int ret;
+	/* Run the progress thread whenever there's an output to feed - the live
+	 * display (unless -q) or the JSON stream. The run/join calls must gate on
+	 * the same thing, so decide once. */
+	bool want_progress = !quiet || options.progress_json;
 
 	filescan_init();
 	filescan_walk_begin();
-	if (!quiet || options.progress_json)
+	if (want_progress)
 		pscan_run();
 
 	/* Seed the walk with the roots (this only queues them). */
@@ -1210,7 +1214,7 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	filescan_free();
-	if (!quiet || options.progress_json) {
+	if (want_progress) {
 		/*
 		 * A live dedupe phase (the only one that keeps drawing the block)
 		 * runs when deduping on an interactive, non-verbose tty. Tell the
@@ -1535,30 +1539,27 @@ int main(int argc, char **argv)
 	 */
 	process_duplicates(db);
 
-	/* Terminal event for --progress=json (a no-op otherwise); emitted before
-	 * the hashfile-only history record so in-memory runs report it too. */
 	{
-		uint64_t g = 0, r = 0;
-
-		pdedupe_counters(&g, &r, NULL);
-		pscan_json_done(files_scanned, g, r);
-	}
-
-	/* Append this run to the hashfile's history (fuels --history / --json). */
-	if (options.hashfile) {
 		uint64_t groups = 0, reclaimed = 0;
-		struct run_record rec;
 
 		pdedupe_counters(&groups, &reclaimed, NULL);
-		rec = (struct run_record){
-			.ts = time(NULL),
-			.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
-			.files_scanned = files_scanned,
-			.reclaimed = reclaimed,
-			.groups = groups,
-			.deduped = options.run_dedupe,
-		};
-		dbfile_record_run(db, &rec);
+
+		/* Terminal event for --progress=json (a no-op otherwise); before the
+		 * hashfile-only history record so in-memory runs report it too. */
+		pscan_json_done(files_scanned, groups, reclaimed);
+
+		/* Append this run to the hashfile's history (fuels --history/--json). */
+		if (options.hashfile) {
+			struct run_record rec = {
+				.ts = time(NULL),
+				.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
+				.files_scanned = files_scanned,
+				.reclaimed = reclaimed,
+				.groups = groups,
+				.deduped = options.run_dedupe,
+			};
+			dbfile_record_run(db, &rec);
+		}
 	}
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
