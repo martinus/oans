@@ -944,7 +944,11 @@ static void print_header(void)
 #ifdef	DEBUG_BUILD
 	printf("Debug build, performance may be impacted.\n");
 #endif
-	qprintf("%s%sScanning%s files...\n", col_bold, col_cyan, col_reset);
+	/*
+	 * No "Scanning files..." banner: the live stage line (scanning / hashing
+	 * / dedupe / done) is the single source of phase truth now, and a banner
+	 * left above the worker block contradicts that unified view.
+	 */
 }
 
 /* Process the dedupe generations in (seq_lo, seq_hi]. */

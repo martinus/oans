@@ -66,6 +66,7 @@ int human_duration_snprintf(double seconds, char *str, size_t str_bytes);
  */
 extern const char *col_reset, *col_bold, *col_dim;
 extern const char *col_red, *col_green, *col_yellow, *col_blue, *col_cyan;
+extern const char *col_magenta;
 void color_init(bool disable);
 
 /* Monotonic seconds since the process recorded its start (see start_timer). */

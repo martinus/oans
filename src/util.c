@@ -43,6 +43,7 @@
 const char *col_reset = "", *col_bold = "", *col_dim = "";
 const char *col_red = "", *col_green = "", *col_yellow = "";
 const char *col_blue = "", *col_cyan = "";
+const char *col_magenta = "";
 
 void color_init(bool disable)
 {
@@ -51,7 +52,7 @@ void color_init(bool disable)
 
 	col_reset = "\033[0m"; col_bold = "\033[1m"; col_dim = "\033[2m";
 	col_red = "\033[31m"; col_green = "\033[32m"; col_yellow = "\033[33m";
-	col_blue = "\033[34m"; col_cyan = "\033[36m";
+	col_blue = "\033[34m"; col_cyan = "\033[36m"; col_magenta = "\033[35m";
 }
 
 static struct timespec timer_start;
