@@ -535,6 +535,19 @@ static unsigned int print_detail_line(void)
 		uint64_t done = pdd.done, queued = pdd.queued;
 		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		uint64_t sd = search_processed, st = search_total;
+		bool pool_idle = true;
+
+		/*
+		 * The dedupe pool drains between batches while the main thread
+		 * loads / groups the next batch, so every worker slot sits idle for
+		 * a beat. Detect that and surface the current activity, so those
+		 * pauses read as work-in-progress rather than a hang.
+		 */
+		for (unsigned int i = 0; i < pscan.thread_count; i++)
+			if (pscan.threads[i]->status != thread_idle) {
+				pool_idle = false;
+				break;
+			}
 
 		/*
 		 * Before the first group is deduped there is no numeric progress
@@ -558,6 +571,8 @@ static unsigned int print_detail_line(void)
 		if (st)
 			printf(" %s·%s searching extents %" PRIu64 "/%" PRIu64,
 			       col_dim, col_reset, sd, st);
+		else if (pool_idle && pdd.activity)
+			printf(" %s·%s %s", col_dim, col_reset, pdd.activity);
 		printf(" %s·%s reclaimed %s%s%s\n", col_dim, col_reset,
 		       col_green, human_size(pdd.reclaimed), col_reset);
 		return 1;
