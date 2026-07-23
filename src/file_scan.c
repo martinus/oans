@@ -1847,7 +1847,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * always reconciles this file and never re-counts the previous one.
 	 */
 	abort_on(!tprogress);
-	tprogress->status = thread_scanning;
+	tprogress->status = thread_mapping;	/* open + do_fiemap: no bytes yet */
 	tprogress->file_scanned_bytes = 0;
 	tprogress->file_total_bytes = file->filesize;
 	strncpy(tprogress->file_path, file->path, PATH_MAX);
@@ -1918,6 +1918,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * until we reach the expected EOF, based on the expected filesize
 	 */
 	t_hash = mono_ns();	/* calibration: setup done, read+hash begins */
+	tprogress->status = thread_scanning;	/* first byte imminent: show % */
 
 	while (ctxt.off < ctxt.filesize) {
 		/* In the buffer, how much bytes are processed as blocks

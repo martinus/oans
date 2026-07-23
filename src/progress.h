@@ -7,6 +7,7 @@
 
 enum pscan_thread_status {
 	thread_idle,
+	thread_mapping,		/* "mapping:" - setup before the first byte: open + do_fiemap */
 	thread_scanning,
 	thread_waiting_lock,
 	thread_committing,
