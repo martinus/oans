@@ -90,8 +90,9 @@ static uint64_t files_scanned, bytes_scanned;
  * plain file-rate ETA; it cannot run away), so a fixed value per storage class
  * is robust where fitting d was not.
  */
-#define ETA_FILE_WEIGHT_SSD	(32u << 10)	/* 32 KiB: ~ measured d/k on flash */
-#define ETA_FILE_WEIGHT_HDD	(1u << 20)	/* 1 MiB: seek-bound rotational disks */
+#define ETA_FILE_WEIGHT_SSD	(32u << 10)	/* 32 KiB: measured d/k ~30 KiB on flash */
+#define ETA_FILE_WEIGHT_HDD	(256u << 10)	/* 256 KiB: measured d/k ~268 KiB on a
+						 * 4-HDD btrfs RAID (1.7M files, cold) */
 static uint64_t eta_file_weight = ETA_FILE_WEIGHT_SSD;
 
 void pscan_set_storage_rotational(bool rotational)
