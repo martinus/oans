@@ -2026,11 +2026,16 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	ctxt.file_csum = NULL;
 
 	/*
-	 * We've read the whole file once and won't touch it again this scan.
-	 * Drop it from the page cache so hashing a large tree doesn't evict
-	 * everything else and push page allocation into the reclaim slowpath.
+	 * We've read the whole file once. In scan/report-only runs we won't
+	 * touch it again, so drop it from the page cache — hashing a large tree
+	 * shouldn't evict everything else and push page allocation into the
+	 * reclaim slowpath. But when dedupe follows (-d), FIDEDUPERANGE has to
+	 * byte-compare the very data we just hashed; evicting it here forces a
+	 * cold re-read from disk in the dedupe phase (btrfs' in-kernel dedupe
+	 * read path is slow cold: ~30x slower on large files). So keep it warm.
 	 */
-	posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_DONTNEED);
+	if (!options.run_dedupe)
+		posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_DONTNEED);
 
 	/*
 	 * Whether the last extent is inlined is a pure fiemap scan; compute it

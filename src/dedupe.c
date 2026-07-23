@@ -22,6 +22,7 @@
 #include <sys/vfs.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <errno.h>
 
@@ -376,6 +377,47 @@ static void clamp_len_to_ioctl_file(struct dedupe_ctxt *ctxt)
 	ctxt->len = ctxt->orig_len = src_size - ctxt->ioctl_file_off;
 }
 
+/*
+ * Read this round's ranges into the page cache right before the FIDEDUPERANGE
+ * ioctl. The kernel byte-compares the source against every destination in-kernel
+ * before sharing; on btrfs that read path is very slow when the pages are cold
+ * (it doesn't read ahead), so on a tree larger than the page cache - where the
+ * data we hashed has already been evicted by the time dedupe runs - dedupe
+ * crawls (~10x). A plain sequential read primes those pages fast, so the ioctl
+ * compares from RAM.
+ *
+ * It must be a real read: posix_fadvise(WILLNEED) is asynchronous and the ioctl
+ * outruns it (measured ~10x slower, i.e. no better than not prefetching). We
+ * prefetch only the current round (src_length <= DEDUPE_ROUND_LEN per range), so
+ * a duplicated file far larger than RAM is warmed a chunk at a time - the working
+ * set is (1 + dest_count) * <=32 MiB, independent of file size. When the data is
+ * already resident (the common case, since the scan just hashed it) these reads
+ * are cheap page-cache hits.
+ */
+static void prefetch_range(int fd, uint64_t off, uint64_t len)
+{
+	static __thread char buf[1 << 20];
+
+	while (len) {
+		size_t chunk = len < sizeof(buf) ? len : sizeof(buf);
+		ssize_t r = pread(fd, buf, chunk, off);
+
+		if (r <= 0)
+			return;	/* unreadable range: let the ioctl take the cold path */
+		off += r;
+		len -= r;
+	}
+}
+
+static void prefetch_dedupe_round(struct dedupe_ctxt *ctxt,
+				  struct file_dedupe_range *same)
+{
+	prefetch_range(ctxt->ioctl_file->fd, same->src_offset, same->src_length);
+	for (unsigned int i = 0; i < same->dest_count; i++)
+		prefetch_range(same->info[i].dest_fd, same->info[i].dest_offset,
+			       same->src_length);
+}
+
 int dedupe_extents(struct dedupe_ctxt *ctxt)
 {
 	int ret = 0;
@@ -387,6 +429,8 @@ int dedupe_extents(struct dedupe_ctxt *ctxt)
 
 		/* Convert the queued list into an actual request */
 		populate_dedupe_request(ctxt, ctxt->same);
+
+		prefetch_dedupe_round(ctxt, ctxt->same);
 
 retry:
 		ret = ioctl(ctxt->ioctl_file->fd, FIDEDUPERANGE, ctxt->same);
