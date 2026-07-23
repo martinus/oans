@@ -584,7 +584,7 @@ static unsigned int print_detail_line(void)
 		 * visited (reset once at pscan_run); total_files_count is how many
 		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
-		printf("%s%s%s examined %s·%s %s%s%s need hashing\n",
+		printf("%s%s%s files %s·%s %s%s%s need hashing\n",
 		       col_bold, group_u64(pscan.files_examined), col_reset,
 		       col_dim, col_reset,
 		       col_bold, group_u64(pscan.total_files_count), col_reset);
