@@ -658,13 +658,63 @@ static int scan_files_from_cmdline(int numfiles, char **files, struct dbhandle *
 	return 0;
 }
 
+/* One-line synopsis, printed on a usage error (e.g. run with no arguments). */
+static void usage(void)
+{
+	eprintf("Usage: oans [options] <file|dir>...\n"
+		"Try 'oans --help' for more information.\n");
+}
+
+/*
+ * Full help text, printed for -h/--help. Self-contained (the man page is not
+ * consulted, so this works from an uninstalled build); points at 'man 8 oans'
+ * for the complete reference.
+ */
 static void help(void)
 {
-	execlp("man", "man", "8", "oans", NULL);
-	/* Only reached when man(1) or the man page is missing. */
-	printf("Usage: oans [options] -r -d --hashfile=FILE <files/dirs...>\n"
-	       "Finds duplicate extents and (with -d) submits them for dedupe.\n"
-	       "Full reference: 'man 8 oans' or docs/man/oans.md in the source tree.\n");
+	printf(
+"Usage: oans [options] <file|dir>...\n"
+"\n"
+"Find duplicate data across files and, with -d, ask the kernel to make them\n"
+"share storage - reclaiming duplicated space without changing file contents.\n"
+"Works on btrfs and xfs. Pass files/directories to scan, or a single '-' to\n"
+"read the list from standard input.\n"
+"\n"
+"Operation:\n"
+"  -d                          deduplicate: submit matching extents to the kernel\n"
+"  -r                          recurse into subdirectories\n"
+"      --hashfile=FILE         store hashes in FILE (SQLite) for incremental runs;\n"
+"                              a bare 'oans --hashfile=FILE' replays the last run\n"
+"\n"
+"Scan tuning:\n"
+"  -b SIZE                     hashing block size, 4K-1M (default 128K)\n"
+"  -B, --batchsize=N           dedupe every N scanned files (default 1024)\n"
+"  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
+"      --skip-zeroes           detect and skip all-zero blocks\n"
+"      --exclude=PATTERN       exclude matching paths (may be repeated)\n"
+"      --dedupe-options=OPT    [no]same, [no]partial, [no]only_whole_files\n"
+"\n"
+"Threads:\n"
+"      --io-threads=N          threads for the I/O-bound stages (auto by default)\n"
+"      --cpu-threads=N         threads for duplicate-finding (default nproc, cap 8)\n"
+"\n"
+"Reporting and maintenance (require --hashfile; each exits after running):\n"
+"      --stats                 summarize the hashfile\n"
+"      --history               show the run history and lifetime totals\n"
+"      --json                  print hashfile metrics as JSON\n"
+"  -L                          list files tracked in the hashfile\n"
+"  -R <file>...                remove the named paths from the hashfile\n"
+"      --autotune              measure the fastest --io-threads for this machine\n"
+"\n"
+"Other:\n"
+"  -q, --quiet                 print only errors and a one-line summary\n"
+"  -v                          verbose output\n"
+"      --no-color              disable colored output\n"
+"      --debug                 print debug messages (implies -v)\n"
+"      --version               print version and exit\n"
+"  -h, --help                  show this help and exit\n"
+"\n"
+"Full reference: man 8 oans (or docs/man/oans.md in the source tree).\n");
 	exit(0);
 }
 
@@ -697,7 +747,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	};
 
 	if (argc < 2) {
-		help(); /* Never returns */
+		usage();
+		exit(1);
 	}
 
 	while ((c = getopt_long(argc, argv, "b:vdrh?LRqB:m:", long_ops, NULL))
@@ -729,7 +780,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			verbose = 1;
 			break;
 		case 'h':
-			human_readable = 1;
+			help(); /* Never returns */
 			break;
 		case HASHFILE_OPTION:
 			options.hashfile = strdup(optarg);

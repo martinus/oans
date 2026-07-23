@@ -84,7 +84,10 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **-r**
   ~ Recurse into subdirectories of any directory argument.
 
+<!-- Keep the blank line between this term and its `~` body below: without it
+     pandoc >=3.9 collapses this multi-paragraph definition into a single block. -->
 **\--hashfile**=*FILE*
+
   ~ Store hashes in *FILE* (an SQLite database) instead of memory. This is the
     recommended way to run `oans` on anything larger than a handful of files: it
     keeps the memory footprint modest and makes runs **incremental** and
@@ -231,9 +234,6 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 
 ## Output and information
 
-**-h**
-  ~ Print sizes in human-readable units (KiB/MiB/GiB) rather than raw bytes.
-
 **-q**, **\--quiet**
   ~ Quiet: print only errors and a one-line dedupe summary. Suppresses the live
     progress display and the human summary block.
@@ -253,8 +253,9 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **\--version**
   ~ Print the `oans` version and exit.
 
-**\--help**
-  ~ Show this manual page and exit.
+**-h**, **\--help**
+  ~ Print a short usage summary and exit. (For the full reference, read this
+    manual page: **man 8 oans**.)
 
 # OUTPUT
 

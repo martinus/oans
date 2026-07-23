@@ -26,9 +26,6 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 
-/* controlled by user options, turns pretty print on if true. */
-extern int human_readable;
-
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 /*
@@ -44,7 +41,7 @@ int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 		_str;							\
 	})
 
-/* Always human-readable (KiB/MiB/...), regardless of the --human option. */
+/* Human-readable size (KiB/MiB/...); pretty_size prints raw bytes. */
 int human_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 #define human_size(size)						\
 	({								\

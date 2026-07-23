@@ -40,8 +40,6 @@
 #include "debug.h"
 #include "util.h"
 
-int human_readable = 0;
-
 const char *col_reset = "", *col_bold = "", *col_dim = "";
 const char *col_red = "", *col_green = "", *col_yellow = "";
 const char *col_blue = "", *col_cyan = "";
@@ -94,7 +92,7 @@ int human_duration_snprintf(double seconds, char *str, size_t str_bytes)
 	return snprintf(str, str_bytes, "%luh%02lum", s / 3600, (s % 3600) / 60);
 }
 
-/* Human-readable size, always (pretty_size_snprintf honors --human; this does not). */
+/* Human-readable size (KiB/MiB/...); pretty_size_snprintf prints raw bytes. */
 int human_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 {
 	static const char * const units[] = { "B", "KiB", "MiB", "GiB",
@@ -168,9 +166,7 @@ uint64_t parse_size(char *s)
 
 int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 {
-	if (!human_readable)
-		return snprintf(str, str_bytes, "%"PRIu64, size);
-	return human_size_snprintf(size, str, str_bytes);
+	return snprintf(str, str_bytes, "%"PRIu64, size);
 }
 
 void print_stack_trace(void)

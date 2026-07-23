@@ -107,9 +107,26 @@ uninstall-systemd:
 
 # The man page is committed, so building and installing never need pandoc;
 # `make doc` regenerates it from the markdown source (for maintainers).
+# Prefer a pandoc on PATH, else the one `make pandoc` drops in .pandoc/.
+PANDOC = $(or $(shell command -v pandoc 2>/dev/null),$(wildcard $(CURDIR)/.pandoc/pandoc))
+
 .PHONY: doc
 doc:
-	pandoc --standalone docs/man/oans.md --to man -o $(MANPAGE)
+	@test -n "$(PANDOC)" || { echo "No pandoc found. Run 'make pandoc' to fetch a prebuilt one, or install it (see CONTRIBUTING.md)."; exit 1; }
+	$(PANDOC) --standalone docs/man/oans.md --to man -o $(MANPAGE)
+
+# Fetch a prebuilt pandoc from PyPI's pypandoc_binary wheel into .pandoc/.
+# Works where GitHub release downloads are blocked but PyPI is reachable (e.g.
+# CI sandboxes). `make doc` then picks it up automatically; nothing to install.
+# Pinned so the fetched pandoc (and thus the .8 it generates) is reproducible
+# rather than drifting to whatever is newest; this wheel carries pandoc 3.9.
+PYPANDOC_VERSION = 1.17
+.PHONY: pandoc
+pandoc:
+	@mkdir -p .pandoc
+	pip download pypandoc_binary==$(PYPANDOC_VERSION) --no-deps -d .pandoc
+	@cd .pandoc && unzip -o -q pypandoc_binary-*.whl && cp -f pypandoc/files/pandoc pandoc && chmod +x pandoc
+	@echo "Fetched $$(.pandoc/pandoc --version | head -1) -> .pandoc/pandoc"
 
 DIST         = oans-$(VERSION)
 DIST_TARBALL = $(VERSION).tar.gz

@@ -285,10 +285,6 @@ Sample bounds are controlled by the \f[CR]DUPEREMOVE_AUTOTUNE_*\f[R]
 variables (see \f[I]ENVIRONMENT\f[R]).
 .SS Output and information
 .TP
-\f[B]\-h\f[R]
-Print sizes in human\-readable units (KiB/MiB/GiB) rather than raw
-bytes.
-.TP
 \f[B]\-q\f[R], \f[B]\-\-quiet\f[R]
 Quiet: print only errors and a one\-line dedupe summary.
 Suppresses the live progress display and the human summary block.
@@ -309,8 +305,9 @@ Print debug messages; implies \f[B]\-v\f[R].
 \f[B]\-\-version\f[R]
 Print the \f[CR]oans\f[R] version and exit.
 .TP
-\f[B]\-\-help\f[R]
-Show this manual page and exit.
+\f[B]\-h\f[R], \f[B]\-\-help\f[R]
+Print a short usage summary and exit.
+(For the full reference, read this manual page: \f[B]man 8 oans\f[R].)
 .SH OUTPUT
 A dedupe run ends with a summary such as:
 .IP

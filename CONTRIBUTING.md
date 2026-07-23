@@ -44,7 +44,8 @@ scripts/verify.sh   # build + make check + a valgrind scan/dedupe/replay smoke
   trusting numbers. See [`docs/benchmarks.md`](docs/benchmarks.md).
 - Add or update tests for behavior changes; keep the suite green.
 - If you touch the man page, edit `docs/man/oans.md` and run `make doc` to
-  regenerate `oans.8` (needs `pandoc`).
+  regenerate `oans.8` (needs `pandoc`). No pandoc installed? `make pandoc`
+  fetches a prebuilt one into `.pandoc/` from PyPI, and `make doc` picks it up.
 - New code should read like the code around it — match the existing style.
 
 ## License

@@ -10,3 +10,4 @@ test
 .itest-scratch/
 __pycache__/
 version
+.pandoc/
