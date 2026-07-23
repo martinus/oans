@@ -484,6 +484,9 @@ static unsigned int print_bar_line(void)
 			pct = (unsigned int)(100.0 * done / total);
 			if (pct > 99)
 				pct = 99;
+		} else {
+			/* No group count yet (still analyzing): bounce the bar. */
+			indet = true;
 		}
 		if (done > 20 && elapsed > 2.0 && done < total)
 			eta = (total - done) / (done / elapsed);
@@ -507,9 +510,7 @@ static unsigned int print_bar_line(void)
 		fputs("\033[K", stdout);
 	printf("%s%-*s%s  ", acc, STAGE_PREFIX_W, stage_name[cs], col_reset);
 	render_bar(frac, indet, acc);
-	if (indet) {
-		printf("  %sscanning…%s", col_dim, col_reset);
-	} else {
+	if (!indet) {
 		printf("  %s%u%%%s", col_bold, pct, col_reset);
 		if (eta > 0.0)
 			printf("  %s·%s ETA ~%s", col_dim, col_reset,
@@ -534,6 +535,20 @@ static unsigned int print_detail_line(void)
 		uint64_t done = pdd.done, queued = pdd.queued;
 		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		uint64_t sd = search_processed, st = search_total;
+
+		/*
+		 * Before the first group is deduped there is no numeric progress
+		 * yet - show what the phase is doing (analyzing duplicates, loading
+		 * identical files, ...) here under the bar instead of "0 / ~0".
+		 */
+		if (done == 0 && pdd.activity) {
+			printf("%s", pdd.activity);
+			if (st)
+				printf(" %s·%s %" PRIu64 "/%" PRIu64 " files",
+				       col_dim, col_reset, sd, st);
+			putchar('\n');
+			return 1;
+		}
 
 		printf("%s%" PRIu64 "%s / ~%" PRIu64 " groups",
 		       col_bold, done, col_reset, total);
@@ -927,6 +942,11 @@ void pdedupe_set_batch(unsigned int cur)
 void pdedupe_set_activity(const char *activity)
 {
 	pdd.activity = activity;
+}
+
+void pdedupe_set_estimate(uint64_t estimated_groups)
+{
+	pdd.estimate = estimated_groups;
 }
 
 void pdedupe_add_queued(uint64_t ngroups)

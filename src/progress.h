@@ -129,6 +129,14 @@ void pscan_printf(char *fmt, ...);
 void pdedupe_begin(uint64_t estimated_groups, unsigned int batches);
 void pdedupe_end(void);
 
+/*
+ * Update the fuzzy group-count estimate after pdedupe_begin(). Lets the phase
+ * start (and its live block) before the potentially-slow count runs, so the
+ * count happens with the dedupe status ("analyzing duplicates") live under the
+ * bar rather than as a stale message printed beforehand.
+ */
+void pdedupe_set_estimate(uint64_t estimated_groups);
+
 /* Starting duplicate-batch cur (1-based) of the batches passed to begin. */
 void pdedupe_set_batch(unsigned int cur);
 

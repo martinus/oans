@@ -1079,14 +1079,14 @@ static void process_duplicates(struct dbhandle *db)
 		unsigned long long total;
 
 		/*
-		 * Counting the dup groups can take a moment on a big hashfile and
-		 * happens before the dedupe block starts drawing, so announce it
-		 * (routed above the scan block when it is still on screen).
+		 * Start the dedupe live block first (group count not known yet),
+		 * then run the count - which can take a moment on a big hashfile -
+		 * with the dedupe stage spinning and "analyzing duplicates" showing
+		 * on the status line under the bar, instead of a stale line above.
 		 */
-		if (!quiet && isatty(STDOUT_FILENO))
-			gap_status("Analyzing duplicates…\n");
+		pdedupe_begin(0, passes);
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
-		pdedupe_begin(total, passes);
+		pdedupe_set_estimate(total);
 	}
 
 	for (unsigned int i = first_seq; i < max; i += stride) {
