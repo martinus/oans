@@ -339,3 +339,25 @@ void debug_print_uuid(uuid_t uuid)
 	uuid_unparse(uuid, buf);
 	eprintf("%s", buf);
 }
+
+void sanitize_ctrl(const char *in, char *out, size_t out_sz)
+{
+	const unsigned char *p = (const unsigned char *)in;
+	size_t o = 0;
+
+	if (out_sz == 0)
+		return;
+
+	while (*p && o + 1 < out_sz) {
+		if (*p < 0x20 || *p == 0x7f) {
+			out[o++] = '?';
+			p++;
+		} else if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
+			out[o++] = '?';
+			p += 2;
+		} else {
+			out[o++] = *p++;
+		}
+	}
+	out[o] = '\0';
+}

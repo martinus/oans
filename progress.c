@@ -13,6 +13,7 @@
  */
 #include <sys/ioctl.h>
 #include <stdatomic.h>
+#include <inttypes.h>
 
 #include "debug.h"
 #include "opt.h"
@@ -90,6 +91,10 @@ void pscan_set_progress(uint64_t added_files, uint64_t added_bytes)
 static void print_thread_progress(struct pscan_thread *tprogress)
 {
 	char buf[BUF_LEN];
+	char clean[PATH_MAX + 1];
+
+	/* Never emit raw control bytes from a filename to the terminal (#353). */
+	sanitize_ctrl(tprogress->file_path, clean, sizeof(clean));
 
 	switch (tprogress->status) {
 	case thread_idle:
@@ -99,7 +104,7 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s: %s/%s (%05.2f%%)",
 			tprogress->tid,
 			"checksumming:",
-			tprogress->file_path,
+			clean,
 			pretty_size(tprogress->file_scanned_bytes),
 			pretty_size(tprogress->file_total_bytes),
 			percent(tprogress->file_scanned_bytes, tprogress->file_total_bytes));
@@ -108,14 +113,14 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
 			tprogress->tid,
 			"waiting for lock:",
-			tprogress->file_path,
+			clean,
 			pretty_size(tprogress->file_total_bytes));
 		break;
 	case thread_committing:
 		snprintf(buf, BUF_LEN, "[%u] %-20s%s (size: %s)",
 			tprogress->tid,
 			"committing:",
-			tprogress->file_path,
+			clean,
 			pretty_size(tprogress->file_total_bytes));
 		break;
 	}
@@ -126,7 +131,7 @@ static void print_thread_progress(struct pscan_thread *tprogress)
 
 static void print_total_progress(void)
 {
-	s_printf("\tFiles scanned: %lu/%lu (%05.2f%%)\n",
+	s_printf("\tFiles scanned: %" PRIu64 "/%" PRIu64 " (%05.2f%%)\n",
 	      files_scanned, pscan.total_files_count,
 	      (double)files_scanned / (double)pscan.total_files_count * 100);
 	s_printf("\tBytes scanned: %s/%s (%05.2f%%)\n",
@@ -320,7 +325,9 @@ static void *psearch_progress_thread(void * p)
 		int pos;
 		int width = 40;
 
-		pos = (float) search_processed / search_total * width;
+		/* Guard the empty-search case so pos is 0, not NaN (#348). */
+		pos = search_total ?
+			(float) search_processed / search_total * width : 0;
 
 		/* Only update our status every width% */
 		if (pos > last_pos) {

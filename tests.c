@@ -92,10 +92,34 @@ MU_TEST(test_is_file_renamed) {
 	mu_check(is_file_renamed(exec_path, new_path) == false);
 }
 
+MU_TEST(test_sanitize_ctrl) {
+	char out[64];
+
+	/* Plain ASCII and legitimate multi-byte UTF-8 pass through unchanged. */
+	sanitize_ctrl("plain.txt", out, sizeof(out));
+	mu_check(strcmp(out, "plain.txt") == 0);
+	sanitize_ctrl("café-Β.txt", out, sizeof(out));   /* é=C3A9, Β=CE92 */
+	mu_check(strcmp(out, "café-Β.txt") == 0);
+
+	/* C0 control and DEL become '?'. */
+	sanitize_ctrl("a\tb\nc\x7f", out, sizeof(out));
+	mu_check(strcmp(out, "a?b?c?") == 0);
+
+	/* C1 control U+009F (UTF-8 C2 9F) becomes a single '?' (#353). */
+	sanitize_ctrl("Te\xc2\x9ft", out, sizeof(out));
+	mu_check(strcmp(out, "Te?t") == 0);
+
+	/* Truncation stays NUL-terminated and within bounds. */
+	char small[4];
+	sanitize_ctrl("abcdef", small, sizeof(small));
+	mu_check(strcmp(small, "abc") == 0);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
 	MU_RUN_TEST(test_is_file_renamed);
+	MU_RUN_TEST(test_sanitize_ctrl);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

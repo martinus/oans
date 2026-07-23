@@ -80,4 +80,12 @@ static inline void closefd(int *fd)
 
 void debug_print_uuid(uuid_t uuid);
 
+/*
+ * Copy `in` to `out` (up to out_sz bytes, always NUL-terminated), replacing
+ * terminal control characters with '?': C0 controls (< 0x20), DEL (0x7f), and
+ * the two-byte UTF-8 encodings of the C1 controls (U+0080..U+009F). Some
+ * terminals act on these when a filename is printed verbatim (#353).
+ */
+void sanitize_ctrl(const char *in, char *out, size_t out_sz);
+
 #endif	/* __UTIL_H__ */

@@ -83,9 +83,14 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 		printf("\n");
 		printf("Start\t\tFilename\n");
 		list_for_each_entry(extent, &dext->de_extents, e_list) {
+			char clean[PATH_MAX + 1];
+
+			/* Keep control bytes in a filename from reaching the
+			 * terminal in the default (non-quiet) listing (#353). */
+			sanitize_ctrl(extent->e_file->filename, clean,
+				      sizeof(clean));
 			printf("%s\t\"%s\"\n",
-			       pretty_size(extent->e_loff),
-			       extent->e_file->filename);
+			       pretty_size(extent->e_loff), clean);
 		}
 
 		node = rb_next(node);
