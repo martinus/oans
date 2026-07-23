@@ -203,8 +203,9 @@ void pscan_examined(void)
 	pscan.files_examined++;	/* listing is single-threaded; plain ++ is fine */
 }
 
-/* Files that needed (re)hashing this run - the work actually done, and unlike
- * files_examined it is not periodically cleared by the progress renderer. */
+/* Files that needed (re)hashing this run - the work actually done. Distinct
+ * from files_examined, which counts every file the walk visited (including
+ * those already up to date). */
 uint64_t pscan_files_scanned(void)
 {
 	return pscan.total_files_count;
@@ -549,9 +550,9 @@ static unsigned int print_detail_line(void)
 
 	if (!pscan.listing_completed) {
 		/*
-		 * files_examined is a transient the renderer clears each frame
-		 * (it shows the walk is live); total_files_count is the running
-		 * count needing (re)hashing.
+		 * files_examined is the cumulative count of files the walk has
+		 * visited (reset once at pscan_run); total_files_count is how many
+		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
 		printf("%s%" PRIu64 "%s examined %s·%s %s%" PRIu64 "%s need hashing\n",
 		       col_bold, pscan.files_examined, col_reset,
@@ -619,9 +620,6 @@ static void *print_progress(void)
 	lines++;
 
 	lines += print_total_progress();
-
-	/* Transient: cleared each frame after the detail line consumed it. */
-	pscan.files_examined = 0;
 
 	progress_wipe();	/* drop any rows a taller previous render left */
 	drawn_lines = lines;
@@ -691,6 +689,7 @@ void pscan_run(void)
 	stage_set(STAGE_DEDUPE, ST_PENDING);
 	stage_set(STAGE_DONE, ST_PENDING);
 	spin_frame = 0;
+	pscan.files_examined = 0;	/* cumulative walk count, climbs to the total */
 
 	if (tty) {
 		/* hide the cursor */

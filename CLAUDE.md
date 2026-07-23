@@ -233,8 +233,9 @@ are known (`auto_tune_io_threads()` in `oans.c`).
   human timeline + lifetime totals (`dbfile_get_run_summary`); `--json` = a flat
   metrics object for jq/Telegraf. Gotcha: take the per-run file count from
   `pscan_files_scanned()` (out-param) **inside `scan_files`** — the dedupe phase
-  reuses the progress counters and `pscan.files_examined` is cleared ~10×/s by
-  the renderer. Pinned by `test_history_metrics.py`.
+  reuses the progress counters, so a later read is 0. (Not `files_examined`,
+  which counts every file the walk *visited*, up-to-date ones included, not just
+  those hashed.) Pinned by `test_history_metrics.py`.
 - **Report modes** `-L`/`-R`/`--stats`/`--history`/`--json`/`--autotune` are
   mutually exclusive (one `report_count` check in `parse_options`): `--stats` =
   hashfile report, `-L` lists files, `-R` removes paths.
