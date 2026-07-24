@@ -1,0 +1,17 @@
+# LeakSanitizer suppressions for oans (ASAN builds: make SANITIZE=address...).
+#
+# These are library-level residue, NOT leaks in oans code - the ASAN analogue
+# of tests/valgrind.supp. Point LSAN at this file with
+#   LSAN_OPTIONS=suppressions=tests/lsan.supp
+# (the Makefile's sanitizer run does this automatically).
+#
+# GLib caches idle worker threads from its thread pools (oans's walker/dedupe
+# pools and the progress thread) rather than joining them all at exit, so the
+# per-thread bookkeeping and TLS GLib allocates for them can still be live when
+# LSAN scans at exit. oans frees its pools (g_thread_pool_free with wait=TRUE);
+# the residue is GLib/glibc internal and not ours. A `leak:` line matches when
+# the substring appears anywhere in the leak's stack (module or function).
+leak:libglib-2.0
+leak:g_thread_proxy
+leak:g_private_get
+leak:g_thread_self

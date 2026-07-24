@@ -31,6 +31,26 @@ ifdef DEBUG
 	# We link the system libsqlite3, so SQLITE_* build defines don't apply here.
 	DEBUG_FLAGS = -ggdb3 -fsanitize=address -fno-omit-frame-pointer -O0 \
 		-DDEBUG_BUILD -fsanitize-address-use-after-scope
+else ifdef SANITIZE
+	# Sanitizer build, e.g. `make SANITIZE=address,undefined CC=clang`. The
+	# flags land in CFLAGS, which the link rules also use, so -fsanitize
+	# instruments and links in one shot. -fno-sanitize-recover=all makes UBSAN
+	# *abort* on a finding (it only logs by default) so the test suites catch
+	# it; ASAN aborts already. -O1 keeps stacks readable while staying fast
+	# enough for the integration suite. No release hardening here: FORTIFY's
+	# interceptors clash with ASAN's and only warn under these options.
+	DEBUG_FLAGS = -ggdb3 -O1 -fno-omit-frame-pointer \
+		-fsanitize=$(SANITIZE) -fno-sanitize-recover=all \
+		-DSANITIZER_BUILD
+	# Env for running the instrumented `./test` and `./oans`: abort on any
+	# finding (so a suite fails on it), print UBSAN stacks, and point
+	# LeakSanitizer at the suppressions for GLib's cached idle-thread residue
+	# (the same library false positive tests/valgrind.supp filters). Prepended
+	# by the `test`/`integration` rules; empty (a no-op) in a non-sanitized build.
+	SANITIZE_RUN = \
+		ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1 \
+		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+		LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp
 else
 	# Release hardening (needs optimization, hence not in the debug build).
 	# Override with HARDENING= to disable.
@@ -81,13 +101,13 @@ oans: $(OBJECTS)
 .PHONY: test
 test:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o $@ $(LIBRARY_FLAGS)
-	./test
+	$(SANITIZE_RUN) ./test
 
 # End-to-end suite (Python stdlib unittest). Dedupe cases need a reflink fs;
 # override the scratch dir with DUPEREMOVE_TEST_DIR=/path.
 .PHONY: integration
 integration: oans
-	DUPEREMOVE=./oans python3 tests/run.py
+	$(SANITIZE_RUN) DUPEREMOVE=./oans python3 tests/run.py
 
 # Same end-to-end suite, but every oans invocation runs under valgrind memcheck
 # (via tests/valgrind-wrap.sh). Findings go to per-pid logs; a non-empty log

@@ -95,3 +95,59 @@ jobs:
         run: make integration-valgrind
         env:
           DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
+
+  # Clang AddressSanitizer and UndefinedBehaviorSanitizer builds. These run the
+  # same unit + integration suites but compiled with -fsanitize; the Makefile's
+  # SANITIZE=... path also disables release hardening and exports the ASAN/UBSAN/
+  # LSAN run options that make any finding abort the process (so a suite fails on
+  # it). ASAN and UBSAN are separate legs for a clean per-sanitizer signal.
+  # Complements valgrind: ASAN's LeakSanitizer and use-after-scope plus UBSAN's
+  # integer/alignment/UB checks catch classes memcheck doesn't. Like valgrind,
+  # one filesystem is enough (the checks are fs-independent), so btrfs only.
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: [address, undefined]
+    env:
+      CC: clang
+      SANITIZE: ${{ matrix.sanitize }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libclang-rt-dev pkg-config \
+            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
+            uuid-dev libbsd-dev libxxhash-dev \
+            btrfs-progs
+
+      # Newer runners default vm.mmap_rnd_bits to 32, which clang's ASAN shadow
+      # mapping can't accommodate ("Shadow memory range interleaves..."). 28 is
+      # the value ASAN expects. Harmless for the UBSAN leg.
+      - name: Widen ASLR entropy for ASAN
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build (${{ matrix.sanitize }})
+        run: make
+
+      - name: Unit tests (${{ matrix.sanitize }})
+        run: make test
+
+      - name: Set up a scratch btrfs
+        run: |
+          sudo modprobe btrfs || true
+          IMG="$RUNNER_TEMP/oans-scratch.img"
+          truncate -s 2G "$IMG"
+          mkfs.btrfs -q "$IMG"
+          sudo mkdir -p /mnt/oans-scratch
+          sudo mount -o loop "$IMG" /mnt/oans-scratch
+          sudo chmod 1777 /mnt/oans-scratch
+
+      - name: Integration tests (${{ matrix.sanitize }})
+        run: make integration
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
