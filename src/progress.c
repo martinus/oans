@@ -590,6 +590,22 @@ static unsigned int print_bar_line(void)
 }
 
 /*
+ * Append " · <throughput>/s" to the detail line once >1 s of data has been
+ * hashed (below that the rate is too noisy to be useful). Hashing overlaps the
+ * listing walk, so both the scanning and hashing lines show this same live
+ * rate from one definition. bytes_scanned is the file-scope per-run sum.
+ */
+static void print_hash_rate(void)
+{
+	double elapsed = elapsed_seconds();
+
+	if (bytes_scanned && elapsed > 1.0) {
+		detail_sep();
+		printf("%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
+	}
+}
+
+/*
  * One line of concrete numbers for the current stage. Indented to line up under
  * the bar (the stage-name prefix + its two spaces) and with no leading word -
  * the stage line above already names the phase.
@@ -659,23 +675,21 @@ static unsigned int print_detail_line(void)
 		printf("%s%s%s files", col_bold,
 		       group_u64(pscan.files_examined), col_reset);
 		detail_sep();
-		printf("%s%s%s need hashing\n", col_bold,
+		printf("%s%s%s need hashing", col_bold,
 		       group_u64(pscan.total_files_count), col_reset);
+		print_hash_rate();	/* hashing overlaps the walk */
+		putchar('\n');
 		return 1;
 	}
 
 	{
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
-		double elapsed = elapsed_seconds();
 
 		printf("%s%s%s / %s files", col_bold,
 		       group_u64(files_scanned), col_reset, group_u64(tf));
 		detail_sep();
 		printf("%s / %s", human_size(bytes_scanned), human_size(tb));
-		if (bytes_scanned && elapsed > 1.0) {
-			detail_sep();
-			printf("%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
-		}
+		print_hash_rate();
 		putchar('\n');
 		return 1;
 	}

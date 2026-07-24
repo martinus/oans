@@ -205,7 +205,8 @@ work continues.
 One line, current stage's concrete numbers, coloured per §7 (numbers stand out
 from labels). Reuses today's strings, minus the `\t`-prefixed multi-line blocks:
 
-- **scanning** (before listing done): `Scanning: 48,120 files found · 12,340 need hashing`
+- **scanning** (before listing done): `48,120 files · 12,340 need hashing · 210 MiB/s`
+  (the throughput appears once hashing, which overlaps the walk, has moved >1 s of data)
 - **hashing**: `Hashing 12,340 / 20,000 files · 6.1 GiB / 9.8 GiB · 210 MiB/s`
 - **dedupe**: `Deduping 512 / ~1,900 groups · batch 2/5 · reclaimed 3.4 GiB`
   - while the per-pass block-level extent search runs, it appends here so the work
