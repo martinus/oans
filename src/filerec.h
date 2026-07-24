@@ -32,6 +32,14 @@ extern unsigned int dedupe_seq; /* This is incremented on every dedupe pass */
 struct filerec {
 	int		fd;			/* file descriptor */
 	unsigned int	fd_refs;			/* fd refcount */
+	/*
+	 * Lifetime refcount, distinct from fd_refs. In the streaming dedupe
+	 * phase a filerec can be referenced by more than one in-flight batch
+	 * (e.g. a cross-window anchor); each batch that loads it holds one ref
+	 * and drops it at batch completion. All get/put happen on the single
+	 * producer thread, so this needs no lock. filerec_new() starts at 0.
+	 */
+	unsigned int	refs;
 
 	char	*filename;		/* path to file */
 	int64_t fileid;
@@ -50,6 +58,13 @@ void free_all_filerecs(void);
 struct filerec *filerec_new(const char *filename, int64_t fileid,
 			    uint64_t size);
 struct filerec *filerec_find(int64_t fileid);
+
+/*
+ * Lifetime refcount (see struct filerec::refs). filerec_put() frees the filerec
+ * when its count reaches zero. Producer-thread only; not thread-safe by design.
+ */
+void filerec_get(struct filerec *file);
+void filerec_put(struct filerec *file);
 
 int filerec_open(struct filerec *file, bool quiet);
 void filerec_close(struct filerec *file);

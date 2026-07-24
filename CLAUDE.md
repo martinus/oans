@@ -303,6 +303,49 @@ per-pass target drift (a group spanning passes used to converge to one cluster
 *per pass* instead of a single extent). Exercise with `DUPEREMOVE_FILES_PER_PASS`
 (`test_cross_pass.py`); don't reintroduce loading all `dedupe_seq <= ?2` members.
 
+## Streaming dedupe pipeline (Stage 2)
+
+The dedupe phase (`-d`) runs **one persistent thread pool** for the whole phase;
+the main thread is a **bounded producer** that loads generation batch *i+1* while
+batch *i* dedupes. No pool drain between batches or between the whole-file and
+extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
+`dedupe_begin_batch`/`dedupe_push`/`dedupe_seal_batch`) driven by
+`stream_duplicates()` in `oans.c`. The report path (no `-d`) stays sequential
+(`report_duplicates()`).
+
+- **At most `DEDUPE_MAX_INFLIGHT` (2) batches in flight** — the RAM double
+  buffer. `dedupe_await_slot()` blocks the producer until a slot frees.
+- **Generation-ordered watermark.** Batches are reaped strictly in FIFO
+  (generation) order; `dedupe_seq` only advances to a batch's `seq_hi` once that
+  batch *and all earlier ones* are complete (`dedupe_advance_seq` callback, under
+  `dbfile_lock`). This preserves the **Ctrl+C invariant**: on kill, `dedupe_seq`
+  reflects only fully-processed generations. Empty windows still advance it.
+- **Filerec lifetime = batch-held refs (NOT per-extent).** `struct filerec.refs`
+  is a lifetime count separate from `fd_refs`. Each batch holds one ref per
+  filerec it loaded (taken in `push_results`, released in `free_batch` at reap).
+  **All get/put/new/find happen on the single producer thread**, so the filerec
+  registry (`filerec_by_fileid` tree / `filerec_head`) needs **no lock** and
+  workers never touch it — they only read `filerec` fields and mutate their
+  batch's own results tree (under the global `mutex`). A cross-window anchor is
+  referenced by two in-flight batches; each holds a ref, so it survives until
+  both reap. **Never free filerecs while a batch referencing them is live**
+  (`free_all_filerecs()` is teardown-only now; it's gone from between batches).
+  This is a deliberate, safer alternative to the plan's per-extent/worker-release
+  refcount — same lifetime guarantee, far less lock surface.
+- **Producer DB handle.** The producer loads on a **separate read connection**
+  (`dbfile_open_handle`) so it doesn't share a sqlite handle with the workers
+  writing on the global handle (WAL: readers don't block the writer). The
+  in-memory shared-cache db (no `--hashfile`) has no WAL, so there the producer
+  reuses the global handle and serializes loads with `dbfile_lock()` (`inmem`).
+- **Order-independence (Stage 2.1).** `GET_DUPLICATE_EXTENTS` excludes whole-file
+  dup members *statically* (the `filedup` CTE) instead of relying on the
+  whole-file pass having deleted their extent rows first — the prerequisite for
+  loading both passes without a barrier. As a bonus the two per-batch results
+  trees reference **disjoint** filerec sets. Pinned by
+  `test_extent_order_independent.py`; streaming by `test_streaming_dedupe.py`.
+- **Valgrind is the gate** (`make integration-valgrind`): this is the UAF-prone
+  area (see the "Valgrind" section / PR #105). Run it before any PR here.
+
 ## Dedupe progress is byte-weighted (not group-counted)
 
 The dedupe bar tracks the kernel **byte-verify volume**, not a fuzzy group

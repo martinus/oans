@@ -220,6 +220,18 @@ static void filerec_free(struct filerec *file)
 	}
 }
 
+void filerec_get(struct filerec *file)
+{
+	file->refs++;
+}
+
+void filerec_put(struct filerec *file)
+{
+	abort_on(file->refs == 0);
+	if (--file->refs == 0)
+		filerec_free(file);
+}
+
 void free_all_filerecs(void)
 {
 	struct filerec *file, *tmp;

@@ -962,9 +962,12 @@ static void print_header(void)
 	 */
 }
 
-/* Process the dedupe generations in (seq_lo, seq_hi]. */
-static void __process_duplicates(struct dbhandle *db, unsigned int seq_lo,
-				 unsigned int seq_hi)
+/*
+ * Report-only path (no -d): load the dupe groups for generations (seq_lo,
+ * seq_hi] and print them. The dedupe path uses the streaming pipeline below.
+ */
+static void report_duplicates(struct dbhandle *db, unsigned int seq_lo,
+			      unsigned int seq_hi)
 {
 	int ret;
 	struct results_tree res;
@@ -974,25 +977,17 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq_lo,
 	init_hash_tree(&dups_tree);
 
 	vprintf("Loading identical files...\n");
-	pdedupe_set_activity("loading identical files");
 	ret = dbfile_load_same_files(db, &res, seq_lo, seq_hi);
 	if (ret)
 		goto out;
 
-	if (options.run_dedupe)
-		dedupe_results(&res, true);
-	else
-		print_dupes_table(&res, true);
-
-	/* Reset the results_tree before loading extents or blocks */
+	print_dupes_table(&res, true);
 	free_results_tree(&res);
 
 	if (!options.only_whole_files) {
 		init_results_tree(&res);
 
 		vprintf("Loading duplicated hashes...\n");
-		pdedupe_set_activity("loading duplicate extents");
-
 		ret = dbfile_load_extent_hashes(db, &res, seq_lo, seq_hi);
 		if (ret)
 			goto out;
@@ -1009,15 +1004,112 @@ static void __process_duplicates(struct dbhandle *db, unsigned int seq_lo,
 				goto out;
 		}
 
-		if (options.run_dedupe)
-			dedupe_results(&res, false);
-		else
-			print_dupes_table(&res, false);
+		print_dupes_table(&res, false);
 	}
 
 out:
 	free_results_tree(&res);
 	free_hash_tree(&dups_tree);
+}
+
+/*
+ * The streaming dedupe producer uses a separate read connection so its per-batch
+ * loads don't share a sqlite handle with the workers writing on the global
+ * handle. In WAL (hashfile) mode readers don't block the writer; the in-memory
+ * shared-cache db has no WAL, so there we reuse the global handle and serialize
+ * loads with dbfile_lock() (worker writes take the same lock).
+ */
+static struct dbhandle *g_dedupe_write_db;	/* global handle, for the watermark */
+
+/* Reaped-batch callback (producer thread): advance the durable dedupe_seq once a
+ * batch and all earlier generations are done. Serialized against worker writes
+ * on the shared write handle via dbfile_lock(). */
+static void dedupe_advance_seq(unsigned int seq_hi)
+{
+	dedupe_seq = seq_hi;
+	dbfile_cfg.dedupe_seq = dedupe_seq;
+	dbfile_cfg.blocksize = blocksize;
+	dbfile_lock();
+	dbfile_sync_config(g_dedupe_write_db, &dbfile_cfg);
+	dbfile_unlock();
+}
+
+/* Load one generation window's groups into a batch and submit them. */
+static void stream_load_batch(struct dbhandle *pdb, bool inmem,
+			      struct dedupe_batch *batch,
+			      unsigned int seq_lo, unsigned int seq_hi)
+{
+	pdedupe_set_activity("loading identical files");
+	if (inmem)
+		dbfile_lock();
+	dbfile_load_same_files(pdb, dedupe_batch_files(batch), seq_lo, seq_hi);
+	if (inmem)
+		dbfile_unlock();
+	dedupe_push(batch, true);
+
+	if (options.only_whole_files)
+		return;
+
+	pdedupe_set_activity("loading duplicate extents");
+	if (inmem)
+		dbfile_lock();
+	dbfile_load_extent_hashes(pdb, dedupe_batch_extents(batch),
+				  seq_lo, seq_hi);
+	if (inmem)
+		dbfile_unlock();
+
+	if (options.do_block_hash) {
+		struct hash_tree dups_tree;
+
+		init_hash_tree(&dups_tree);
+		if (inmem)
+			dbfile_lock();
+		dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
+		if (inmem)
+			dbfile_unlock();
+		find_additional_dedupe(dedupe_batch_extents(batch));
+		free_hash_tree(&dups_tree);
+	}
+	dedupe_push(batch, false);
+}
+
+/*
+ * Streaming dedupe: one persistent pool for the whole phase; the main thread is
+ * a bounded producer that loads batch i+1 while batch i dedupes (at most two
+ * batches in flight), so the pool never drains between generations or between
+ * the whole-file and extent passes. dedupe_seq advances in generation order as
+ * batches complete (see dedupe_advance_seq), preserving the Ctrl+C invariant.
+ */
+static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
+			      unsigned int max, unsigned int stride)
+{
+	bool inmem = !options.hashfile;
+	struct dbhandle *pdb = inmem ? db : dbfile_open_handle(options.hashfile);
+	unsigned int pass = 0;
+
+	if (!pdb) {
+		eprintf("Unable to open a read handle for the dedupe phase\n");
+		return;
+	}
+
+	g_dedupe_write_db = dbfile_get_handle();
+	dedupe_phase_begin(dedupe_advance_seq);
+
+	for (unsigned int i = first_seq; i < max; i += stride) {
+		unsigned int hi = i + stride < max ? i + stride : max;
+		struct dedupe_batch *batch;
+
+		dedupe_await_slot();		/* bound to 2 batches in flight */
+		pdedupe_set_batch(++pass);
+		batch = dedupe_begin_batch(hi);
+		stream_load_batch(pdb, inmem, batch, i, hi);
+		dedupe_seal_batch(batch);
+	}
+
+	dedupe_phase_end();
+
+	if (!inmem)
+		dbfile_close_handle(pdb);
 }
 
 /*
@@ -1035,7 +1127,7 @@ static void process_duplicates(struct dbhandle *db)
 	unsigned int max = get_max_dedupe_seq(db);
 	unsigned int first_seq = dedupe_seq;	/* bumped inside the loop */
 	unsigned int files_per_pass = DEDUPE_FILES_PER_PASS;
-	unsigned int stride, passes, pass = 0;
+	unsigned int stride, passes;
 	/* Tests force many small passes to exercise the cross-generation path. */
 	const char *env = getenv("DUPEREMOVE_FILES_PER_PASS");
 	int env_val = env ? atoi(env) : 0;
@@ -1100,32 +1192,24 @@ static void process_duplicates(struct dbhandle *db)
 						options.only_whole_files));
 	}
 
-	for (unsigned int i = first_seq; i < max; i += stride) {
-		unsigned int hi = i + stride < max ? i + stride : max;
-
-		if (options.run_dedupe)
-			pdedupe_set_batch(++pass);
-
-		/* Drop all filerecs from the previous iteration. Needed filerecs will be
-		 * recreated by __process_duplicates()
+	if (options.run_dedupe) {
+		/*
+		 * Streaming producer: it owns the per-batch loads, advances
+		 * dedupe_seq as batches complete (in generation order), and
+		 * prints the summary. Filerecs are held per batch and released
+		 * at batch completion - no free_all_filerecs() between batches.
 		 */
-		free_all_filerecs();
-		__process_duplicates(db, i, hi);
+		stream_duplicates(db, first_seq, max, stride);
+	} else {
+		for (unsigned int i = first_seq; i < max; i += stride) {
+			unsigned int hi = i + stride < max ? i + stride : max;
 
-		if (options.run_dedupe) {
-			/*
-			 * Bump dedupe_seq, this effectively marks the files
-			 * in our hashfile as having been through dedupe.
-			 */
-			dedupe_seq = hi;
-			dbfile_cfg.dedupe_seq = dedupe_seq;
-			dbfile_cfg.blocksize = blocksize;
-			dbfile_sync_config(db, &dbfile_cfg);
+			/* Report path is sequential; drop the previous window's
+			 * filerecs, which report_duplicates() recreates. */
+			free_all_filerecs();
+			report_duplicates(db, i, hi);
 		}
 	}
-
-	if (options.run_dedupe)
-		dedupe_end();
 
 	if (options.do_block_hash)
 		extents_search_free();

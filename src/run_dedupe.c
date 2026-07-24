@@ -47,18 +47,58 @@
 
 static GMutex mutex;
 static GMutex console_mutex;
-static struct results_tree *results_tree;
 static volatile unsigned long long total_dedupe_passes;
 static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
-static bool whole_file_dedup;
 /*
  * Whether to measure the fiemap "net change in shared extents". It feeds only
- * the machine-readable line (non-tty or -q; see dedupe_end), so on an
+ * the machine-readable line (non-tty or -q; see dedupe_phase_end), so on an
  * interactive run the per-group post-dedupe FIEMAP is pure waste. Set once when
  * the phase starts, from the same condition that governs that line.
  */
 static bool report_net_shared;
+
+/*
+ * Streaming dedupe pipeline (Stage 2). One thread pool serves the whole phase;
+ * the main thread is a bounded producer that loads batch i+1 while batch i
+ * dedupes, so the pool never drains between generation batches or between the
+ * whole-file and extent passes.
+ *
+ * A batch owns its two results trees (whole-file + extent; disjoint filerec
+ * sets thanks to the static whole-file exclusion in GET_DUPLICATE_EXTENTS) and
+ * holds one lifetime ref on every filerec it loaded, released at completion.
+ * The producer admits at most DEDUPE_MAX_INFLIGHT batches (RAM double buffer)
+ * and reaps them strictly in generation order, so the durable dedupe_seq
+ * watermark only advances past a generation once that batch and all earlier
+ * ones are done - preserving the Ctrl+C invariant.
+ */
+#define DEDUPE_MAX_INFLIGHT	2
+
+struct dedupe_batch {
+	struct results_tree	res_files;	/* whole-file groups */
+	struct results_tree	res_extents;	/* extent groups */
+	GPtrArray		*held;		/* filerecs to put at completion */
+	unsigned int		seq_hi;		/* generation watermark on completion */
+	_Atomic int		outstanding;	/* work items not yet finished */
+	bool			fully_pushed;	/* producer has pushed every item */
+	struct list_head	list;		/* in-flight FIFO, generation order */
+};
+
+/* One unit of pool work: dedupe this group, then account against its batch. */
+struct dedupe_work_item {
+	struct dupe_extents	*dext;
+	struct dedupe_batch	*batch;
+	bool			whole_file;
+};
+
+static GThreadPool	*dedupe_pool;
+static GMutex		producer_mutex;	/* guards the in-flight list + counts */
+static GCond		producer_cond;	/* producer waits; workers/seal signal */
+static struct list_head	inflight_batches = LIST_HEAD_INIT(inflight_batches);
+static unsigned int	inflight_count;
+/* Called on the producer thread when a batch (and all earlier ones) complete,
+ * to advance the durable dedupe_seq. Provided by the caller of the phase. */
+static void		(*batch_complete_cb)(unsigned int seq_hi);
 
 void print_dupes_table(struct results_tree *res, bool whole_file)
 {
@@ -219,7 +259,8 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
  * Removes extents which it believes have already been deduped. We err
  * on the side of more deduping here.
  */
-static void clean_deduped(struct dupe_extents **ret_dext)
+static void clean_deduped(struct dupe_extents **ret_dext,
+			  struct results_tree *res)
 {
 	int left;
 	int extents_kept = 0;
@@ -281,8 +322,7 @@ static void clean_deduped(struct dupe_extents **ret_dext)
 					extent_plen(inner_extent));
 
 				g_mutex_lock(&mutex);
-				left = remove_extent(results_tree,
-						     inner_extent);
+				left = remove_extent(res, inner_extent);
 				g_mutex_unlock(&mutex);
 				if (left == 0) {
 					*ret_dext = dext = NULL;
@@ -365,7 +405,8 @@ static void group_tick(void *arg, uint64_t bytes)
 
 #define	DEDUPE_EXTENTS_CLEANED	(-1)
 static int dedupe_extent_list(struct dupe_extents *dext,
-			      struct group_progress *gp,
+			      struct group_progress *gp, bool whole_file_dedup,
+			      struct results_tree *res,
 			      uint64_t *fiemap_bytes, uint64_t *kern_bytes,
 			      unsigned long long passno)
 {
@@ -404,7 +445,7 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	 * goes below 2. If that happens, we return a special value so
 	 * the caller knows not to reference dext any more.
 	 */
-	clean_deduped(&dext);
+	clean_deduped(&dext, res);
 	if (!dext) {
 		vprintf("[%p] Skipping - extents are already deduped.\n",
 		       g_thread_self());
@@ -666,7 +707,8 @@ out:
 }
 
 static int extent_dedupe_worker(struct dupe_extents *dext,
-				struct group_progress *gp,
+				struct group_progress *gp, bool whole_file_dedup,
+				struct results_tree *res,
 				uint64_t *fiemap_bytes, uint64_t *kern_bytes)
 {
 	int ret;
@@ -676,7 +718,8 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	struct pscan_thread *slot = gp->slot;
 	struct dbhandle *db = dbfile_get_handle();
 
-	ret = dedupe_extent_list(dext, gp, fiemap_bytes, kern_bytes, passno);
+	ret = dedupe_extent_list(dext, gp, whole_file_dedup, res, fiemap_bytes,
+				 kern_bytes, passno);
 	if (ret) {
 		if (ret == DEDUPE_EXTENTS_CLEANED)
 			return 0;
@@ -716,18 +759,32 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 
 	if (!list_empty(&dext->de_extents)) {
 		g_mutex_lock(&mutex);
-		dupe_extents_free(dext, results_tree);
+		dupe_extents_free(dext, res);
 		g_mutex_unlock(&mutex);
 	}
 
 	return 0;
 }
 
+/* Signal the producer when a batch has no work left to run. Caller must hold
+ * producer_mutex. A batch is complete only once every item finished AND the
+ * producer finished pushing (so an all-fast batch isn't reaped early). */
+static void batch_maybe_complete_locked(struct dedupe_batch *batch)
+{
+	if (batch->outstanding == 0 && batch->fully_pushed)
+		g_cond_signal(&producer_cond);
+}
+
 static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 {
 	uint64_t fiemap_bytes = 0ULL;
 	uint64_t kern_bytes = 0ULL;
-	struct dupe_extents *dext = priv;
+	struct dedupe_work_item *item = priv;
+	struct dupe_extents *dext = item->dext;
+	struct dedupe_batch *batch = item->batch;
+	bool whole_file = item->whole_file;
+	struct results_tree *res = whole_file ? &batch->res_files
+					      : &batch->res_extents;
 	_cleanup_(pscan_reset_thread) struct pscan_thread *slot =
 				pscan_claim_slot(gettid(), thread_deduping);
 	struct group_progress gp = { .slot = slot, .ticked = 0 };
@@ -738,6 +795,8 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	 */
 	uint64_t w0 = dext_work(dext);
 
+	free(item);	/* the item is consumed; dext/batch captured above */
+
 	/*
 	 * Seed the display line from the group before any work: first member
 	 * as the (provisional) target path, and the data the kernel has to
@@ -746,7 +805,8 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	 */
 	slot_show_group(slot, dext);
 
-	extent_dedupe_worker(dext, &gp, &fiemap_bytes, &kern_bytes);
+	extent_dedupe_worker(dext, &gp, whole_file, res, &fiemap_bytes,
+			     &kern_bytes);
 
 	/*
 	 * Settle up the byte bar: credit whatever work never reached the kernel
@@ -766,9 +826,13 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	 * shared extents" diagnostic, not as space reclaimed.
 	 */
 	pdedupe_group_done(kern_bytes, fiemap_bytes);
-}
 
-static GThreadPool *dedupe_pool = NULL;
+	/* Last one out of this batch wakes the producer to reap it. */
+	g_mutex_lock(&producer_mutex);
+	batch->outstanding--;
+	batch_maybe_complete_locked(batch);
+	g_mutex_unlock(&producer_mutex);
+}
 
 /*
  * The kernel byte-verifies group length times (copies - 1), so that product
@@ -787,24 +851,33 @@ static int cmp_dext_work(const void *pa, const void *pb)
 	return wa > wb ? -1 : wa < wb ? 1 : 0;
 }
 
-/* Errors from this function are fatal. */
-static int push_extents(struct results_tree *res)
+/*
+ * Hold one lifetime ref on every filerec this tree references (released when the
+ * batch is reaped), then LPT-sort the groups and push one work item each. The
+ * tree is stable here: this runs on the producer thread before any of this
+ * batch's items can be dequeued. Errors are fatal.
+ */
+static void push_results(struct dedupe_batch *batch, struct results_tree *res,
+			 bool whole_file)
 {
 	struct rb_node *node;
 	struct dupe_extents *dext;
+	struct extent *extent;
 	_cleanup_(freep) struct dupe_extents **sorted = NULL;
 	unsigned int nr = 0, i;
 	GError *err = NULL;
 
-	/*
-	 * Nothing is pushed until the array is complete, so no worker owns any
-	 * group yet and the tree is stable while we collect and sort.
-	 */
-	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
-	if (!sorted) {
-		eprintf("Out of memory while sorting dupe groups.\n");
-		return 1;
+	for (node = rb_first(&res->root); node; node = rb_next(node)) {
+		dext = rb_entry(node, struct dupe_extents, de_node);
+		list_for_each_entry(extent, &dext->de_extents, e_list) {
+			filerec_get(extent->e_file);
+			g_ptr_array_add(batch->held, extent->e_file);
+		}
 	}
+
+	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
+	if (!sorted)
+		abort_on(1);	/* OOM: the whole program is out of memory */
 
 	for (node = rb_first(&res->root); node; node = rb_next(node)) {
 		dext = rb_entry(node, struct dupe_extents, de_node);
@@ -822,31 +895,193 @@ static int push_extents(struct results_tree *res)
 	qsort(sorted, nr, sizeof(*sorted), cmp_dext_work);
 
 	for (i = 0; i < nr; i++) {
-		struct dupe_extents *d = sorted[i];
+		struct dedupe_work_item *item = malloc(sizeof(*item));
 
-		g_thread_pool_push(dedupe_pool, d, &err);
+		abort_on(!item);	/* OOM */
+		item->dext = sorted[i];
+		item->batch = batch;
+		item->whole_file = whole_file;
+
+		/*
+		 * Reserve the slot before the push so a fast worker can't drive
+		 * outstanding to 0 (and race completion) before its item is
+		 * counted. Completion is still gated on fully_pushed, so the
+		 * count only matters once the producer has sealed the batch.
+		 */
+		atomic_fetch_add(&batch->outstanding, 1);
+		g_thread_pool_push(dedupe_pool, item, &err);
 		if (err) {
-			eprintf("Fatal error while deduping: %s\n",
-				err->message);
+			eprintf("Fatal error while deduping: %s\n", err->message);
 			g_error_free(err);
-			return 1;
+			abort_on(1);
 		}
 		pdedupe_add_queued(1);
 		/* Byte analog of add_queued: lets the renderer clamp the total
 		 * up for block-hash-discovered groups not in the upfront sum. */
-		pdedupe_add_pushed_work(dext_work(d));
+		pdedupe_add_pushed_work(dext_work(sorted[i]));
 	}
-	return 0;
+}
+
+struct results_tree *dedupe_batch_files(struct dedupe_batch *b)
+{
+	return &b->res_files;
+}
+
+struct results_tree *dedupe_batch_extents(struct dedupe_batch *b)
+{
+	return &b->res_extents;
+}
+
+struct dedupe_batch *dedupe_begin_batch(unsigned int seq_hi)
+{
+	struct dedupe_batch *b = calloc(1, sizeof(*b));
+
+	abort_on(!b);	/* OOM */
+	init_results_tree(&b->res_files);
+	init_results_tree(&b->res_extents);
+	b->held = g_ptr_array_new();
+	b->seq_hi = seq_hi;
+	b->outstanding = 0;
+	b->fully_pushed = false;
+	INIT_LIST_HEAD(&b->list);
+	return b;
+}
+
+void dedupe_push(struct dedupe_batch *b, bool whole_file)
+{
+	struct results_tree *res = whole_file ? &b->res_files : &b->res_extents;
+
+	pdedupe_set_activity(whole_file ? "deduplicating identical files"
+					: "deduplicating duplicate extents");
+
+	/* The pre-dedupe listing is a wall of text; show it only with -v. */
+	if (verbose)
+		print_dupes_table(res, whole_file);
+
+	if (RB_EMPTY_ROOT(&res->root))
+		return;
+
+	total_dedupe_passes += res->num_dupes;
+	leading_spaces = num_digits(total_dedupe_passes);
+
+	push_results(b, res, whole_file);
+}
+
+/* Reap a completed batch (producer thread): advance the durable watermark, then
+ * free its results trees and drop its filerec refs. */
+static void free_batch(struct dedupe_batch *b)
+{
+	unsigned int i;
+
+	if (batch_complete_cb)
+		batch_complete_cb(b->seq_hi);
+
+	free_results_tree(&b->res_files);
+	free_results_tree(&b->res_extents);
+	for (i = 0; i < b->held->len; i++)
+		filerec_put(g_ptr_array_index(b->held, i));
+	g_ptr_array_free(b->held, TRUE);
+	free(b);
 }
 
 /*
- * Close the dedupe phase (the live status is started by pdedupe_begin() and
- * fed from the workers; see progress.c) and print one aggregated summary
- * spanning every dedupe_results() call.
+ * Reap completed batches from the front of the in-flight FIFO, in generation
+ * order, advancing dedupe_seq only as far as a fully-completed prefix. Called
+ * with producer_mutex held; drops it around the per-batch teardown (which does
+ * DB I/O) and re-takes it. Producer thread only.
  */
-void dedupe_end(void)
+static void reap_ready_locked(void)
+{
+	while (!list_empty(&inflight_batches)) {
+		struct dedupe_batch *b = list_first_entry(&inflight_batches,
+							  struct dedupe_batch,
+							  list);
+
+		if (b->outstanding != 0 || !b->fully_pushed)
+			break;	/* front not done; FIFO order => stop here */
+
+		list_del(&b->list);
+		inflight_count--;
+		g_mutex_unlock(&producer_mutex);
+		free_batch(b);
+		g_mutex_lock(&producer_mutex);
+	}
+}
+
+/* Block the producer until an in-flight slot is free (the RAM double buffer),
+ * reaping completed batches while it waits. */
+void dedupe_await_slot(void)
+{
+	g_mutex_lock(&producer_mutex);
+	reap_ready_locked();
+	while (inflight_count >= DEDUPE_MAX_INFLIGHT) {
+		g_cond_wait(&producer_cond, &producer_mutex);
+		reap_ready_locked();
+	}
+	g_mutex_unlock(&producer_mutex);
+}
+
+/* Finish a batch: mark it fully pushed, enqueue it in generation order, and
+ * reap it (and any earlier ready batch) if it is already complete. */
+void dedupe_seal_batch(struct dedupe_batch *b)
+{
+	g_mutex_lock(&producer_mutex);
+	b->fully_pushed = true;
+	list_add_tail(&b->list, &inflight_batches);
+	inflight_count++;
+	reap_ready_locked();
+	g_mutex_unlock(&producer_mutex);
+}
+
+/*
+ * Open the streaming dedupe phase: one pool for the whole phase. on_complete is
+ * invoked (producer thread) as each batch is reaped, in generation order, to
+ * advance the durable dedupe_seq watermark.
+ */
+void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
+{
+	GError *err = NULL;
+
+	batch_complete_cb = on_complete;
+	report_net_shared = !isatty(STDOUT_FILENO) || quiet;
+	curr_dedupe_pass = 0;
+	total_dedupe_passes = 0;
+	inflight_count = 0;
+	INIT_LIST_HEAD(&inflight_batches);
+
+	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
+
+	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, NULL,
+					options.io_threads, TRUE, &err);
+	if (err) {
+		eprintf("Unable to create dedupe thread pool: %s\n",
+			err->message);
+		g_error_free(err);
+		dedupe_pool = NULL;
+	}
+}
+
+/*
+ * Close the dedupe phase: drain every in-flight batch (reaping in generation
+ * order so the watermark lands on the last completed generation), tear down the
+ * pool, then print one aggregated summary spanning the whole phase.
+ */
+void dedupe_phase_end(void)
 {
 	uint64_t groups, reclaimed, net_shared;
+
+	g_mutex_lock(&producer_mutex);
+	while (inflight_count > 0) {
+		reap_ready_locked();
+		if (inflight_count > 0)
+			g_cond_wait(&producer_cond, &producer_mutex);
+	}
+	g_mutex_unlock(&producer_mutex);
+
+	if (dedupe_pool) {
+		g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for exit */
+		dedupe_pool = NULL;
+	}
 
 	pdedupe_end();
 	pdedupe_counters(&groups, &reclaimed, &net_shared);
@@ -885,48 +1120,4 @@ void dedupe_end(void)
 	if (!isatty(STDOUT_FILENO) || quiet)
 		printf("Comparison of extent info shows a net change in "
 		       "shared extents of: %s\n", pretty_size(net_shared));
-}
-
-void dedupe_results(struct results_tree *res, bool whole_file)
-{
-	GError *err = NULL;
-
-	/*
-	 * dedupe_results() could be called multiple times, so we reset that bit
-	 * to its initial value every time
-	 */
-	curr_dedupe_pass = 0;
-	results_tree = res;
-
-	whole_file_dedup = whole_file;
-	report_net_shared = !isatty(STDOUT_FILENO) || quiet;
-
-	/* The pre-dedupe listing is a wall of text; show it only with -v. */
-	if (verbose)
-		print_dupes_table(res, whole_file);
-
-	if (RB_EMPTY_ROOT(&res->root))
-		return;
-
-	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
-
-	pdedupe_set_activity(whole_file ? "deduplicating identical files"
-					: "deduplicating duplicate extents");
-
-	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, NULL,
-					options.io_threads, TRUE, &err);
-	if (err) {
-		eprintf("Unable to create dedupe thread pool: %s\n",
-			err->message);
-		g_error_free(err);
-		return;
-	}
-
-	total_dedupe_passes = res->num_dupes;
-	leading_spaces = num_digits(total_dedupe_passes);
-
-	/* On failure push_extents() has already reported the error. */
-	push_extents(res);
-
-	g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for all work */
 }
