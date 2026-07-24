@@ -823,6 +823,23 @@ static int push_extents(struct results_tree *res)
 
 	for (i = 0; i < nr; i++) {
 		struct dupe_extents *d = sorted[i];
+		/*
+		 * The group's byte work, captured BEFORE the push: the moment
+		 * the group is in the pool a worker owns it and can free it
+		 * (an already-shared group is cleaned and freed in
+		 * microseconds), so d must not be dereferenced after
+		 * g_thread_pool_push(). Reading it afterwards once fed
+		 * len * (0 - 1) from a freed dext into the pushed-work total,
+		 * blowing the progress denominator up to ~2^59 (a frozen bar
+		 * and a multi-thousand-year ETA).
+		 */
+		uint64_t w0 = dext_work(d);
+
+		/* A single group can't verify a pebibyte; a value this big is
+		 * a corrupt dext, not work. (The freed-dext read this guards
+		 * against fed len * (0 - 1): 128 MiB * (2^32 - 1) ~= 2^59, so
+		 * the cap must sit well below that.) */
+		abort_on(w0 > 1ULL << 50);
 
 		g_thread_pool_push(dedupe_pool, d, &err);
 		if (err) {
@@ -834,7 +851,7 @@ static int push_extents(struct results_tree *res)
 		pdedupe_add_queued(1);
 		/* Byte analog of add_queued: lets the renderer clamp the total
 		 * up for block-hash-discovered groups not in the upfront sum. */
-		pdedupe_add_pushed_work(dext_work(d));
+		pdedupe_add_pushed_work(w0);
 	}
 	return 0;
 }
