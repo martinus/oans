@@ -256,8 +256,13 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     `{"phase":"scanning","elapsed_sec":2.1,"files_examined":48120,"files_to_hash":12340}`;
     during hashing: `"phase":"hashing"` with `files`, `files_total`, `bytes`,
     `bytes_total`, and, once measurable, `bytes_per_sec` and `eta_sec`; during
-    dedupe: `"phase":"dedupe"` with `groups`, `groups_total`, `reclaimed_bytes`,
-    the current `activity`, and `eta_sec`. The final line is
+    dedupe: `"phase":"dedupe"` with `groups`, `groups_total`, `work_done_bytes`,
+    `work_total_bytes`, `reclaimed_bytes`, the current `activity`, and `eta_sec`.
+    `work_total_bytes` is the total kernel byte-verify volume the phase will do
+    (computed exactly up front) and `work_done_bytes` counts up to it; these
+    drive the smooth dedupe progress bar and are emitted raw (never clamped
+    backwards), so `work_done_bytes` is non-decreasing and reaches
+    `work_total_bytes` on the last dedupe line. The final line is
     `{"event":"done","elapsed_sec":...,"files_scanned":...,"groups_deduped":...,"reclaimed_bytes":...}`.
     Fields that are not yet known (an ETA, a rate) are omitted; a consumer
     reading a line at a time can ignore any line that is not valid JSON.

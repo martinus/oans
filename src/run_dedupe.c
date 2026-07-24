@@ -337,13 +337,35 @@ static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext
 	strncpy(slot->file_path,
 		list_first_entry(&dext->de_extents, struct extent,
 				 e_list)->e_file->filename, PATH_MAX);
-	slot->file_total_bytes = dext->de_len * (dext->de_num_dupes - 1);
+	slot->file_total_bytes = dext_work(dext);
 	slot->file_scanned_bytes = 0;
+}
+
+/*
+ * Per-group byte-progress accounting. Every credit path - real ioctl rounds and
+ * the already-shared skip - goes through group_tick(), which moves the per-thread
+ * status line, records how much this group has credited so far (`ticked`), and
+ * feeds the global byte bar. dedupe_worker() then settles up any shortfall
+ * against W0 for the paths that never reach the kernel (clean_deduped, changed
+ * since scan, ENOENT, ...), so each group credits exactly W0 by the time it ends.
+ */
+struct group_progress {
+	struct pscan_thread	*slot;
+	uint64_t		ticked;	/* bytes credited globally for this group */
+};
+
+static void group_tick(void *arg, uint64_t bytes)
+{
+	struct group_progress *gp = arg;
+
+	gp->slot->file_scanned_bytes += bytes;	/* per-thread status line */
+	gp->ticked += bytes;
+	pdedupe_add_work_done(bytes);		/* the main bar */
 }
 
 #define	DEDUPE_EXTENTS_CLEANED	(-1)
 static int dedupe_extent_list(struct dupe_extents *dext,
-			      struct pscan_thread *slot,
+			      struct group_progress *gp,
 			      uint64_t *fiemap_bytes, uint64_t *kern_bytes,
 			      unsigned long long passno)
 {
@@ -353,6 +375,7 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	uint64_t shared_prev, shared_post;
 	struct extent *extent;
 	struct dedupe_ctxt *ctxt = NULL;
+	struct pscan_thread *slot = gp->slot;
 	uint64_t len = dext->de_len;
 	/* Target's extent map, fetched once and reused to skip already-shared
 	 * destinations (see the shared-check below). */
@@ -507,8 +530,10 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 				ret = ENOMEM;
 				goto out;
 			}
-			/* Tick the status line as ioctl rounds complete. */
-			ctxt->progress = &slot->file_scanned_bytes;
+			/* Tick the status line + global byte bar as ioctl
+			 * rounds complete. */
+			ctxt->progress_fn = group_tick;
+			ctxt->progress_arg = gp;
 
 			/*
 			 * If we just picked the target, it got added
@@ -537,7 +562,7 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 					     extent->e_file->fd, extent->e_loff,
 					     len)) {
 			atomic_fetch_add(&dedupe_dest_already_shared, 1);
-			slot->file_scanned_bytes += len;
+			group_tick(gp, len);	/* skipped, but credit its work */
 			vprintf("[%p] %s already shares the target's extents; "
 				"skipping.\n", g_thread_self(),
 				extent->e_file->filename);
@@ -641,16 +666,17 @@ out:
 }
 
 static int extent_dedupe_worker(struct dupe_extents *dext,
-				struct pscan_thread *slot,
+				struct group_progress *gp,
 				uint64_t *fiemap_bytes, uint64_t *kern_bytes)
 {
 	int ret;
 	unsigned long long passno = __atomic_add_fetch(&curr_dedupe_pass, 1, __ATOMIC_SEQ_CST);
 
 	struct extent *extent;
+	struct pscan_thread *slot = gp->slot;
 	struct dbhandle *db = dbfile_get_handle();
 
-	ret = dedupe_extent_list(dext, slot, fiemap_bytes, kern_bytes, passno);
+	ret = dedupe_extent_list(dext, gp, fiemap_bytes, kern_bytes, passno);
 	if (ret) {
 		if (ret == DEDUPE_EXTENTS_CLEANED)
 			return 0;
@@ -704,6 +730,13 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	struct dupe_extents *dext = priv;
 	_cleanup_(pscan_reset_thread) struct pscan_thread *slot =
 				pscan_claim_slot(gettid(), thread_deduping);
+	struct group_progress gp = { .slot = slot, .ticked = 0 };
+	/*
+	 * The group's total byte work, captured BEFORE any dedupe: the worker
+	 * can free dext (dupe_extents_free), so de_len/de_num_dupes must not be
+	 * read afterwards.
+	 */
+	uint64_t w0 = dext_work(dext);
 
 	/*
 	 * Seed the display line from the group before any work: first member
@@ -713,7 +746,18 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	 */
 	slot_show_group(slot, dext);
 
-	extent_dedupe_worker(dext, slot, &fiemap_bytes, &kern_bytes);
+	extent_dedupe_worker(dext, &gp, &fiemap_bytes, &kern_bytes);
+
+	/*
+	 * Settle up the byte bar: credit whatever work never reached the kernel
+	 * (clean_deduped removals, changed-since-scan, ENOENT/EINVAL failures,
+	 * the DEDUPE_EXTENTS_CLEANED early return) in one lump, so every group
+	 * credits exactly W0. Over-ticking (ioctl retries, clamped lengths) is
+	 * possible and harmless - the 99% cap, monotone clamp and exact upfront
+	 * total absorb it.
+	 */
+	if (gp.ticked < w0)
+		pdedupe_add_work_done(w0 - gp.ticked);
 
 	/*
 	 * Space reclaimed = kernel-deduped bytes (each deduped copy frees its
@@ -737,8 +781,8 @@ static int cmp_dext_work(const void *pa, const void *pb)
 {
 	const struct dupe_extents *a = *(const struct dupe_extents **)pa;
 	const struct dupe_extents *b = *(const struct dupe_extents **)pb;
-	uint64_t wa = a->de_len * (a->de_num_dupes - 1);
-	uint64_t wb = b->de_len * (b->de_num_dupes - 1);
+	uint64_t wa = dext_work(a);
+	uint64_t wb = dext_work(b);
 
 	return wa > wb ? -1 : wa < wb ? 1 : 0;
 }
@@ -778,7 +822,9 @@ static int push_extents(struct results_tree *res)
 	qsort(sorted, nr, sizeof(*sorted), cmp_dext_work);
 
 	for (i = 0; i < nr; i++) {
-		g_thread_pool_push(dedupe_pool, sorted[i], &err);
+		struct dupe_extents *d = sorted[i];
+
+		g_thread_pool_push(dedupe_pool, d, &err);
 		if (err) {
 			eprintf("Fatal error while deduping: %s\n",
 				err->message);
@@ -786,6 +832,9 @@ static int push_extents(struct results_tree *res)
 			return 1;
 		}
 		pdedupe_add_queued(1);
+		/* Byte analog of add_queued: lets the renderer clamp the total
+		 * up for block-hash-discovered groups not in the upfront sum. */
+		pdedupe_add_pushed_work(dext_work(d));
 	}
 	return 0;
 }

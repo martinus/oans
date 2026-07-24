@@ -1090,6 +1090,14 @@ static void process_duplicates(struct dbhandle *db)
 		pdedupe_set_activity("analyzing duplicates");
 		total = dbfile_count_dupe_groups(db, options.only_whole_files);
 		pdedupe_set_estimate(total);
+		/*
+		 * Exact byte total for the smooth progress bar. Uses first_seq
+		 * (the phase-start dedupe_seq) as the "old" watermark so it
+		 * matches exactly what the per-pass loaders hand the workers,
+		 * regardless of how the generations get split across passes.
+		 */
+		pdedupe_set_work_total(dbfile_count_dupe_bytes(db, first_seq,
+						options.only_whole_files));
 	}
 
 	for (unsigned int i = first_seq; i < max; i += stride) {

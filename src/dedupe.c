@@ -452,8 +452,8 @@ retry:
 
 		process_dedupes(ctxt, ctxt->same);
 
-		if (ctxt->progress)
-			*ctxt->progress += round;
+		if (ctxt->progress_fn)
+			ctxt->progress_fn(ctxt->progress_arg, round);
 
 		/*
 		 * Guard against an infinite loop (upstream #396/#407): if a full

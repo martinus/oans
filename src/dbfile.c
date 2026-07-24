@@ -2143,6 +2143,77 @@ uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only)
 	return files > extents ? files : extents;
 }
 
+/* Like dbfile_query_u64 but binds a single uint64 into ?1 first. */
+static uint64_t dbfile_query_u64_arg(sqlite3 *db, const char *sql, uint64_t arg)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	uint64_t v = 0;
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+	    sqlite3_bind_int64(stmt, 1, arg) == SQLITE_OK &&
+	    sqlite3_step(stmt) == SQLITE_ROW)
+		v = sqlite3_column_int64(stmt, 0);
+	return v;
+}
+
+uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
+				 bool whole_file_only)
+{
+	uint64_t files, extents;
+
+	/*
+	 * Whole-file work. Mirrors GET_DUPLICATE_FILES: a group with an
+	 * already-deduped member (old_cnt > 0) dedupes all its new members
+	 * against that anchor (new_cnt copies); a group with only new members
+	 * promotes one to target and dedupes the rest (new_cnt - 1). Summing
+	 * per-group over the whole hashfile is exact regardless of how the
+	 * generations get split into passes: across passes the first new member
+	 * becomes the anchor and every later one dedupes against it.
+	 */
+	files = dbfile_query_u64_arg(db->db,
+		"select coalesce(sum(size * (case when old_cnt > 0 then new_cnt "
+		"                                 else new_cnt - 1 end)), 0) "
+		"from ( "
+		"  select size, "
+		"         sum(dedupe_seq >  ?1) as new_cnt, "
+		"         sum(dedupe_seq <= ?1) as old_cnt "
+		"  from files "
+		"  where digest is not null and not (flags & 1) "
+		"  group by digest, size "
+		"  having count(*) > 1 and new_cnt > 0)", seq_lo);
+	if (whole_file_only)
+		return files;
+
+	/*
+	 * Extent work, excluding extents whose file is a whole-file dup-group
+	 * member: the whole-file pass deletes those extent rows
+	 * (dbfile_remove_extent_hashes) before the extent loader runs in the
+	 * same pass, so counting them would double-count. This exclusion is
+	 * what makes the total exact where the group-count estimate could only
+	 * be max()-fudged.
+	 */
+	extents = dbfile_query_u64_arg(db->db,
+		"with filedup(id) as ( "
+		"  select id from files "
+		"  where digest is not null and not (flags & 1) "
+		"    and (digest, size) in ( "
+		"      select digest, size from files "
+		"      where digest is not null and not (flags & 1) "
+		"      group by digest, size having count(*) > 1)) "
+		"select coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
+		"                                else new_cnt - 1 end)), 0) "
+		"from ( "
+		"  select e.len as len, "
+		"         sum(f.dedupe_seq >  ?1) as new_cnt, "
+		"         sum(f.dedupe_seq <= ?1) as old_cnt "
+		"  from extents e join files f on e.fileid = f.id "
+		"  where not exists (select 1 from filedup fd "
+		"                    where fd.id = e.fileid) "
+		"  group by e.digest, e.len "
+		"  having count(*) > 1 and new_cnt > 0)", seq_lo);
+	return files + extents;
+}
+
 /*
  * Remove entries from the files table that were listed but never csummed, i.e.
  * whose digest is still NULL. This happens when a previous run was interrupted

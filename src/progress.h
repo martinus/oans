@@ -154,6 +154,19 @@ void pdedupe_add_queued(uint64_t ngroups);
 void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t net_shared_bytes);
 
 /*
+ * Byte-weighted progress for the dedupe bar. The total is the kernel byte-verify
+ * volume the phase will do (de_len*(de_num_dupes-1) per group), computed exactly
+ * up front by SQL (pdedupe_set_work_total) and ticked as ioctl rounds complete
+ * (pdedupe_add_work_done), with a settle-up lump for skipped work. Groups that
+ * the block-hash search discovers mid-phase are not in the upfront total; each is
+ * added via pdedupe_add_pushed_work at push time and the renderer clamps the
+ * total up to that running sum.
+ */
+void pdedupe_set_work_total(uint64_t bytes);
+void pdedupe_add_work_done(uint64_t bytes);
+void pdedupe_add_pushed_work(uint64_t bytes);
+
+/*
  * Claim a per-thread display line for one unit of work (file scan / dedupe
  * group) and mark it with `status`; fill in file_path / file_total_bytes /
  * file_scanned_bytes afterwards. Release it with pscan_reset_thread(). Claim

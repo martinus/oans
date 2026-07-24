@@ -52,11 +52,15 @@ struct dedupe_ctxt {
 	struct list_head	completed;
 
 	/*
-	 * Optional live progress counter: when set, dedupe_extents() adds the
-	 * bytes deduped after every ioctl round, so a status display can show
-	 * movement inside large requests instead of one jump at the end.
+	 * Optional live progress callback: when set, dedupe_extents() reports
+	 * the bytes deduped after every ioctl round, so a status display can
+	 * show movement inside large requests instead of one jump at the end.
+	 * A callback (rather than a bare counter) keeps dedupe.c free of the
+	 * progress.h layering: run_dedupe.c both ticks its per-thread status
+	 * line and credits the global byte bar from the same callback.
 	 */
-	uint64_t		*progress;
+	void			(*progress_fn)(void *arg, uint64_t bytes);
+	void			*progress_arg;
 
 	struct file_dedupe_range *same;
 };

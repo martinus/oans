@@ -313,8 +313,15 @@ during hashing: \f[CR]\[dq]phase\[dq]:\[dq]hashing\[dq]\f[R] with
 \f[CR]bytes_total\f[R], and, once measurable, \f[CR]bytes_per_sec\f[R]
 and \f[CR]eta_sec\f[R]; during dedupe:
 \f[CR]\[dq]phase\[dq]:\[dq]dedupe\[dq]\f[R] with \f[CR]groups\f[R],
-\f[CR]groups_total\f[R], \f[CR]reclaimed_bytes\f[R], the current
+\f[CR]groups_total\f[R], \f[CR]work_done_bytes\f[R],
+\f[CR]work_total_bytes\f[R], \f[CR]reclaimed_bytes\f[R], the current
 \f[CR]activity\f[R], and \f[CR]eta_sec\f[R].
+\f[CR]work_total_bytes\f[R] is the total kernel byte\-verify volume the
+phase will do (computed exactly up front) and \f[CR]work_done_bytes\f[R]
+counts up to it; these drive the smooth dedupe progress bar and are
+emitted raw (never clamped backwards), so \f[CR]work_done_bytes\f[R] is
+non\-decreasing and reaches \f[CR]work_total_bytes\f[R] on the last
+dedupe line.
 The final line is
 \f[CR]{\[dq]event\[dq]:\[dq]done\[dq],\[dq]elapsed_sec\[dq]:...,\[dq]files_scanned\[dq]:...,\[dq]groups_deduped\[dq]:...,\[dq]reclaimed_bytes\[dq]:...}\f[R].
 Fields that are not yet known (an ETA, a rate) are omitted; a consumer

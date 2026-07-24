@@ -183,6 +183,17 @@ static struct {
 	_Atomic uint64_t	done;		/* groups finished */
 	_Atomic uint64_t	queued;		/* groups pushed to the pool */
 	uint64_t		estimate;	/* fuzzy total, see dbfile */
+	/*
+	 * Byte-weighted progress: the kernel byte-verify volume the phase will
+	 * do. work_total_bytes is the exact upfront SQL sum (grow-only, clamped
+	 * up by pushed_bytes if block-hash search discovers extra work);
+	 * work_done_bytes is ticked by the workers; shown_pct is the printer
+	 * thread's monotone display clamp so the bar never renders backwards.
+	 */
+	_Atomic uint64_t	work_done_bytes;
+	_Atomic uint64_t	work_total_bytes;
+	_Atomic uint64_t	pushed_bytes;	/* sum of W0 pushed so far */
+	uint64_t		shown_pct;	/* printer thread only */
 	unsigned int		batch, batches;
 	const char		*activity;	/* static string */
 	/* reclaimed: honest disk freed (kernel-deduped bytes). net_shared: fiemap
@@ -190,6 +201,18 @@ static struct {
 	 * line only (it counts the surviving copy as shared too, so ~2x for pairs). */
 	_Atomic uint64_t	reclaimed, net_shared;
 } pdd;
+
+/*
+ * The byte total to render against: the exact upfront sum, clamped up to the
+ * work actually pushed (the byte analog of max(estimate, queued)). With an
+ * exact upfront total this only rises for block-hash-discovered groups.
+ */
+static uint64_t work_total_clamped(void)
+{
+	uint64_t total = pdd.work_total_bytes, pushed = pdd.pushed_bytes;
+
+	return pushed > total ? pushed : total;
+}
 
 #define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
 
@@ -507,21 +530,30 @@ static unsigned int print_bar_line(void)
 	unsigned int pct = 0;
 
 	if (pdd.phase) {
-		uint64_t done = pdd.done, queued = pdd.queued;
-		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		double elapsed = (g_get_monotonic_time() - pdd.start_us) / 1e6;
+		uint64_t wdone = pdd.work_done_bytes;
+		uint64_t wtotal = work_total_clamped();
 
-		/* Fuzzy total: cap at 99% while the phase is still running. */
-		if (total) {
-			frac = (double)done / total;
-			pct = (unsigned int)(100.0 * done / total);
+		if (wtotal) {
+			/* Byte-weighted bar: cap at 99% while still running. */
+			frac = (double)wdone / wtotal;
+			pct = (unsigned int)(100.0 * wdone / wtotal);
 			if (pct > 99)
 				pct = 99;
+			/* Monotone clamp (printer thread only): never step back. */
+			if (pct < pdd.shown_pct)
+				pct = pdd.shown_pct;
+			else
+				pdd.shown_pct = pct;
+			if (frac < (double)pct / 100.0)
+				frac = (double)pct / 100.0;
+			eta = dedupe_eta_seconds(wdone, wtotal, elapsed);
 		} else {
-			/* No group count yet (still analyzing): bounce the bar. */
+			/* No work known yet (still analyzing), or the only groups
+			 * are zero-length: bounce the bar. The fuzzy group count
+			 * still feeds the detail line and JSON, not the bar. */
 			indet = true;
 		}
-		eta = dedupe_eta_seconds(done, total, elapsed);
 	} else if (!pscan.listing_completed) {
 		/* Hashing total not known until the listing finishes. */
 		indet = true;
@@ -727,13 +759,20 @@ static void emit_json_progress(enum jphase phase)
 		uint64_t done = pdd.done, queued = pdd.queued;
 		uint64_t total = pdd.estimate > queued ? pdd.estimate : queued;
 		uint64_t st = search_total, sd = search_processed;
+		uint64_t wdone = pdd.work_done_bytes;
+		uint64_t wtotal = work_total_clamped();
 		double de = (g_get_monotonic_time() - pdd.start_us) / 1e6;
-		double eta = dedupe_eta_seconds(done, total, de);
+		/* Machine consumers get the byte-weighted ETA when available. */
+		double eta = wtotal ? dedupe_eta_seconds(wdone, wtotal, de)
+				    : dedupe_eta_seconds(done, total, de);
 
+		/* Raw values (no monotone clamp): consumers want truth. */
 		fprintf(stderr, "{\"phase\":\"dedupe\",\"elapsed_sec\":%.2f,"
 			"\"groups\":%" PRIu64 ",\"groups_total\":%" PRIu64 ","
+			"\"work_done_bytes\":%" PRIu64 ","
+			"\"work_total_bytes\":%" PRIu64 ","
 			"\"reclaimed_bytes\":%" PRIu64, elapsed, done, total,
-			(uint64_t)pdd.reclaimed);
+			wdone, wtotal, (uint64_t)pdd.reclaimed);
 		if (pdd.activity)
 			fprintf(stderr, ",\"activity\":\"%s\"", pdd.activity);
 		if (st)
@@ -1051,6 +1090,10 @@ void pdedupe_begin(unsigned int batches)
 	pdd.reclaimed = 0;
 	pdd.net_shared = 0;
 	pdd.estimate = 0;		/* set later via pdedupe_set_estimate() */
+	pdd.work_done_bytes = 0;
+	pdd.work_total_bytes = 0;	/* set later via pdedupe_set_work_total() */
+	pdd.pushed_bytes = 0;
+	pdd.shown_pct = 0;
 	pdd.batches = batches;
 	pdd.batch = batches ? 1 : 0;
 	pdd.activity = "analyzing duplicates";
@@ -1110,6 +1153,17 @@ void pdedupe_end(void)
 			fflush(stdout);
 		}
 	}
+
+	/*
+	 * Emit one last dedupe record with the settled totals. The ~1/s printer
+	 * cadence otherwise leaves the final JSONL record showing mid-phase
+	 * progress on a fast run, so machine consumers would never see
+	 * work_done_bytes reach work_total_bytes. Done after the printer joins
+	 * (single writer to stderr) but before pdd.phase clears.
+	 */
+	if (progress_json)
+		emit_json_progress(JP_DEDUPE);
+
 	pscan_free_threads();
 	pdd.phase = false;
 }
@@ -1132,6 +1186,27 @@ void pdedupe_set_estimate(uint64_t estimated_groups)
 void pdedupe_add_queued(uint64_t ngroups)
 {
 	atomic_fetch_add(&pdd.queued, ngroups);
+}
+
+void pdedupe_set_work_total(uint64_t bytes)
+{
+	pdd.work_total_bytes = bytes;
+}
+
+void pdedupe_add_work_done(uint64_t bytes)
+{
+	atomic_fetch_add(&pdd.work_done_bytes, bytes);
+}
+
+/*
+ * A group of W0 = de_len*(de_num_dupes-1) bytes was pushed to the pool. Track
+ * the running sum so the renderer can clamp the total up (total = max(upfront,
+ * pushed)) - the byte analog of the old max(estimate, queued). With an exact
+ * upfront total this only engages for block-hash-discovered work.
+ */
+void pdedupe_add_pushed_work(uint64_t bytes)
+{
+	atomic_fetch_add(&pdd.pushed_bytes, bytes);
 }
 
 void pdedupe_group_done(uint64_t reclaimed_bytes, uint64_t net_shared_bytes)

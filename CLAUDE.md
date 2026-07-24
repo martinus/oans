@@ -303,6 +303,33 @@ per-pass target drift (a group spanning passes used to converge to one cluster
 *per pass* instead of a single extent). Exercise with `DUPEREMOVE_FILES_PER_PASS`
 (`test_cross_pass.py`); don't reintroduce loading all `dedupe_seq <= ?2` members.
 
+## Dedupe progress is byte-weighted (not group-counted)
+
+The dedupe bar tracks the kernel **byte-verify volume**, not a fuzzy group
+count, so it moves smoothly 0→100% (like hashing) even through one giant group.
+
+- **Work of a group = `de_len * (de_num_dupes - 1)`** — the bytes the kernel
+  byte-compares, same figure `cmp_dext_work()` sorts by. The exact phase total
+  is summed up front by `dbfile_count_dupe_bytes()` (whole-file + extent, minus
+  extents owned by whole-file dup members, since the whole-file pass deletes
+  those rows first). Passed `seq_lo = first_seq`, so it matches what the
+  per-pass loaders hand the workers regardless of how generations split — the
+  sum is batch-invariant (`test_progress_bytes.py::…_stable_across_passes`).
+- **Settlement contract:** every group credits *exactly* `W0` bytes to
+  `work_done_bytes` by the time its worker returns — ticked smoothly per ≤32 MiB
+  ioctl round (via `ctxt->progress_fn`), plus a settle-up lump in
+  `dedupe_worker()` for whatever was skipped (clean_deduped, already-shared,
+  changed-since-scan, ENOENT/EINVAL, the DEDUPE_EXTENTS_CLEANED early return).
+  **Don't try to credit each skip path exactly** — capture `w0` before the work
+  (the worker can free `dext`) and settle the shortfall once. Over-ticking is
+  fine: the 99% cap + monotone display clamp + exact upfront total absorb it.
+- Block-hash-discovered groups (`--dedupe-options=partial`, off by default)
+  aren't in the upfront total; each is added via `pdedupe_add_pushed_work()` at
+  push time and the renderer clamps `total = max(upfront, pushed)`.
+- `--progress=json` emits `work_done_bytes`/`work_total_bytes` **raw** (no
+  monotone clamp — machine consumers want truth); `pdedupe_end()` emits one
+  final dedupe record so the last line shows the settled `done == total`.
+
 ## Valgrind
 
 `verify.sh` runs the smoke. Manual, with the suppressions file (filters the one

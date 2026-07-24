@@ -49,6 +49,18 @@ struct dupe_extents {
 	bool			de_anchored;
 };
 
+/*
+ * Bytes the kernel byte-verifies for a group: its length times the copies to
+ * dedupe against the target. The single definition of a group's "work" - the
+ * largest-first sort key, the per-thread status total, the byte-progress
+ * settlement target, and (restated in SQL) the upfront progress total all use
+ * it, so they must agree.
+ */
+static inline uint64_t dext_work(const struct dupe_extents *d)
+{
+	return d->de_len * (d->de_num_dupes - 1);
+}
+
 struct extent {
 	struct dupe_extents	*e_parent;
 

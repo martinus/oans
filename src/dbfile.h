@@ -293,6 +293,17 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db);
  * duplicate-extent groups across the whole hashfile.
  */
 uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only);
+
+/*
+ * Exact pending dedupe work in bytes for generations > seq_lo, matching what the
+ * loaders (GET_DUPLICATE_FILES / GET_DUPLICATE_EXTENTS) will hand to the workers:
+ * de_len * (de_num_dupes - 1) summed over every group. The extent part excludes
+ * extents owned by whole-file dup-group members, since the whole-file pass
+ * deletes those rows before the extent loader runs. Unless whole_file_only, the
+ * result is the sum of both parts. Used for the byte-weighted dedupe progress bar.
+ */
+uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
+				 bool whole_file_only);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
 int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t));
 
