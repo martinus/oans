@@ -23,8 +23,10 @@
 #include "rbtree.h"
 #include "results-tree.h"
 
-SLIST_HEAD(filerec_list, filerec);
-extern struct filerec_list filerec_head;
+/* Doubly-linked (kernel list_head) so an individual filerec can be removed in
+ * O(1): the streaming dedupe phase frees filerecs per batch, in load order, not
+ * head-first, so a singly-linked list's O(n) removal made teardown O(n^2). */
+extern struct list_head filerec_head;
 
 extern unsigned long long num_filerecs;
 extern unsigned int dedupe_seq; /* This is incremented on every dedupe pass */
@@ -49,7 +51,7 @@ struct filerec {
 	uint64_t		size;
 	struct rb_root		block_tree;	/* root for hash blocks tree */
 
-	SLIST_ENTRY(filerec)	rec_list;	/* all filerecs */
+	struct list_head	rec_list;	/* all filerecs */
 };
 
 void init_filerec(void);
