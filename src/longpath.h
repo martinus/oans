@@ -8,10 +8,9 @@
  * argument within PATH_MAX. These helpers encapsulate that walk; see issue
  * #117 (follow-up to #108/#115).
  *
- * Callers on the hot per-file path gate on strlen(path) > PATH_MAX before
- * calling, so ordinary-length files keep taking the plain open()/stat() code
- * path; the helpers themselves also take that fast path internally, so they are
- * always safe to call directly.
+ * Each helper takes the plain open()/stat()/opendir() fast path internally when
+ * the path fits, so ordinary-length paths cost nothing extra and callers never
+ * need to gate on length themselves.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -26,6 +25,7 @@
 #ifndef	__LONGPATH_H__
 #define	__LONGPATH_H__
 
+#include <dirent.h>
 #include <sys/stat.h>
 
 /*
@@ -38,11 +38,19 @@
  */
 int longpath_open(const char *abspath, int flags);
 
+/* Like opendir(abspath), tolerating strlen(abspath) > PATH_MAX. NULL/errno on
+ * failure. For in-range paths this is exactly opendir(abspath). */
+DIR *longpath_opendir(const char *abspath);
+
 /*
  * Like stat(abspath, st), but tolerates strlen(abspath) > PATH_MAX (opens the
  * parent directory via the same ancestor walk, then fstatat(dirfd, basename)).
  * Follows symlinks like stat(). Returns 0 on success or -1 with errno set.
  */
 int longpath_stat(const char *abspath, struct stat *st);
+
+/* Like lstat(abspath, st) (does not follow a final symlink), tolerating
+ * strlen(abspath) > PATH_MAX. Returns 0 on success or -1 with errno set. */
+int longpath_lstat(const char *abspath, struct stat *st);
 
 #endif	/* __LONGPATH_H__ */

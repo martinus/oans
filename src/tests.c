@@ -439,7 +439,7 @@ MU_TEST(test_longpath) {
 	int levels = 0;
 	int savedcwd = open(".", O_PATH | O_CLOEXEC);
 	struct stat st;
-	int fd, dfd, bfd, n;
+	int fd, bfd, n;
 	char buf[128] = { 0 };
 	ssize_t r;
 	DIR *d;
@@ -466,14 +466,15 @@ MU_TEST(test_longpath) {
 	mu_check(r == (ssize_t)strlen(contents));
 	mu_check(strcmp(buf, contents) == 0);
 
-	/* 2. stat the deep file. */
+	/* 2. stat + lstat the deep file. */
 	mu_check(longpath_stat(leaf, &st) == 0);
 	mu_check((size_t)st.st_size == strlen(contents));
+	memset(&st, 0, sizeof(st));
+	mu_check(longpath_lstat(leaf, &st) == 0);
+	mu_check((size_t)st.st_size == strlen(contents));
 
-	/* 3. open the deep directory (O_DIRECTORY) and list it. */
-	dfd = longpath_open(absdir, O_RDONLY | O_DIRECTORY);
-	mu_check(dfd >= 0);
-	d = fdopendir(dfd);
+	/* 3. opendir the deep directory and list it. */
+	d = longpath_opendir(absdir);
 	mu_check(d != NULL);
 	while ((de = readdir(d))) {
 		if (strcmp(de->d_name, victim) == 0) {

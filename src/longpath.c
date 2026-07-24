@@ -12,8 +12,10 @@
  */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -27,19 +29,25 @@
  */
 #define LONGPATH_MAXLEN	(PATH_MAX - 1)
 
+/* Close fd without disturbing errno (so a preceding failure's errno survives). */
+static void close_keep_errno(int fd)
+{
+	int err = errno;
+
+	close(fd);
+	errno = err;
+}
+
 /*
  * Open the directory named by the range [begin, end) (an absolute path prefix,
  * possibly longer than PATH_MAX), returning an O_PATH directory fd suitable as
- * a dirfd for openat()/fstatat(). Walks from "/" one chunk at a time, where a
- * chunk is the longest run of '/'-separated components whose joined length is
- * <= LONGPATH_MAXLEN (a single component is bounded by NAME_MAX, so a chunk
- * always fits). Symlinks in the prefix are followed, matching open()/stat().
- * Returns -1 with errno set on failure.
+ * a dirfd for openat()/fstatat()/fdopendir(). Walks from "/" one component at a
+ * time (each is bounded by NAME_MAX, well within a single syscall argument).
+ * Symlinks in the prefix are followed, matching open()/stat(). Returns -1 with
+ * errno set on failure.
  */
 static int open_ancestor(const char *begin, const char *end)
 {
-	char chunk[PATH_MAX + 1];
-	size_t clen = 0;
 	const char *p = begin;
 	int dfd;
 
@@ -48,8 +56,10 @@ static int open_ancestor(const char *begin, const char *end)
 		return -1;
 
 	while (p < end) {
+		char comp[NAME_MAX + 1];
 		const char *start;
 		size_t complen;
+		int next;
 
 		while (p < end && *p == '/')
 			p++;
@@ -61,43 +71,18 @@ static int open_ancestor(const char *begin, const char *end)
 		complen = p - start;
 
 		/* A lone component this long can never be opened. */
-		if (complen > LONGPATH_MAXLEN) {
-			close(dfd);
+		if (complen > NAME_MAX) {
+			close_keep_errno(dfd);
 			errno = ENAMETOOLONG;
 			return -1;
 		}
+		memcpy(comp, start, complen);
+		comp[complen] = '\0';
 
-		/* Flush the accumulated chunk if this component won't fit. */
-		if (clen != 0 && clen + 1 + complen > LONGPATH_MAXLEN) {
-			int next = openat(dfd, chunk,
-					  O_PATH | O_DIRECTORY | O_CLOEXEC);
-			int err = errno;
-
-			close(dfd);
-			if (next < 0) {
-				errno = err;
-				return -1;
-			}
-			dfd = next;
-			clen = 0;
-		}
-
-		if (clen != 0)
-			chunk[clen++] = '/';
-		memcpy(chunk + clen, start, complen);
-		clen += complen;
-		chunk[clen] = '\0';
-	}
-
-	if (clen != 0) {
-		int next = openat(dfd, chunk, O_PATH | O_DIRECTORY | O_CLOEXEC);
-		int err = errno;
-
-		close(dfd);
-		if (next < 0) {
-			errno = err;
+		next = openat(dfd, comp, O_PATH | O_DIRECTORY | O_CLOEXEC);
+		close_keep_errno(dfd);
+		if (next < 0)
 			return -1;
-		}
 		dfd = next;
 	}
 
@@ -105,19 +90,16 @@ static int open_ancestor(const char *begin, const char *end)
 }
 
 /*
- * Split abspath into its directory prefix and final component, open the prefix
- * via open_ancestor(), and hand the resulting dirfd to `act` (openat/fstatat).
- * Shared by longpath_open() and longpath_stat(). Returns act()'s result, or -1
- * (errno set) if the prefix could not be opened. Only reached for paths that
- * are absolute and longer than PATH_MAX.
+ * Open the parent directory of abspath (absolute, possibly longer than
+ * PATH_MAX) via open_ancestor() and set *base_out to its final component, so a
+ * caller can reach the leaf with a single openat()/fstatat()/fdopendir(). Only
+ * called for over-PATH_MAX absolute paths. Returns the parent dir fd, or -1
+ * with errno set.
  */
-static int with_parent_dirfd(const char *abspath,
-			     int (*act)(int dirfd, const char *base, void *arg),
-			     void *arg)
+static int open_parent_dir(const char *abspath, const char **base_out)
 {
 	const char *slash = strrchr(abspath, '/');
 	const char *base = slash ? slash + 1 : NULL;
-	int dfd, ret, err;
 
 	/* No slash at all, or a trailing slash (no final component): there is
 	 * no basename we can reach relative to a parent dirfd. */
@@ -125,52 +107,83 @@ static int with_parent_dirfd(const char *abspath,
 		errno = ENOTDIR;
 		return -1;
 	}
-
-	dfd = open_ancestor(abspath, slash);
-	if (dfd < 0)
-		return -1;
-
-	ret = act(dfd, base, arg);
-	err = errno;
-	close(dfd);
-	if (ret < 0)
-		errno = err;
-	return ret;
+	*base_out = base;
+	return open_ancestor(abspath, slash);
 }
 
-static int act_open(int dirfd, const char *base, void *arg)
+/* True when abspath can be handled by a single plain syscall (fits, or is a
+ * relative path we cannot anchor a walk on - let the syscall report the error). */
+static bool fits_one_syscall(const char *abspath)
 {
-	int flags = *(int *)arg;
-
-	return openat(dirfd, base, flags);
-}
-
-static int act_stat(int dirfd, const char *base, void *arg)
-{
-	return fstatat(dirfd, base, (struct stat *)arg, 0);
+	return strlen(abspath) <= LONGPATH_MAXLEN || abspath[0] != '/';
 }
 
 int longpath_open(const char *abspath, int flags)
 {
-	/* Fast path: fits in a single syscall argument. */
-	if (strlen(abspath) <= LONGPATH_MAXLEN)
+	const char *base;
+	int dfd, fd;
+
+	if (fits_one_syscall(abspath))
 		return open(abspath, flags);
 
-	/* Only an absolute path can be reached by walking from "/". A relative
-	 * path this long has no anchor; let open() report ENAMETOOLONG. */
-	if (abspath[0] != '/')
-		return open(abspath, flags);
+	dfd = open_parent_dir(abspath, &base);
+	if (dfd < 0)
+		return -1;
+	fd = openat(dfd, base, flags);
+	close_keep_errno(dfd);
+	return fd;
+}
 
-	return with_parent_dirfd(abspath, act_open, &flags);
+DIR *longpath_opendir(const char *abspath)
+{
+	const char *base;
+	int dfd, fd;
+	DIR *dirp;
+
+	if (fits_one_syscall(abspath))
+		return opendir(abspath);
+
+	dfd = open_parent_dir(abspath, &base);
+	if (dfd < 0)
+		return NULL;
+	fd = openat(dfd, base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	close_keep_errno(dfd);
+	if (fd < 0)
+		return NULL;
+	dirp = fdopendir(fd);
+	if (!dirp)
+		close_keep_errno(fd);
+	return dirp;
 }
 
 int longpath_stat(const char *abspath, struct stat *st)
 {
-	if (strlen(abspath) <= LONGPATH_MAXLEN)
+	const char *base;
+	int dfd, ret;
+
+	if (fits_one_syscall(abspath))
 		return stat(abspath, st);
 
-	if (abspath[0] != '/')
-		return stat(abspath, st);
+	dfd = open_parent_dir(abspath, &base);
+	if (dfd < 0)
+		return -1;
+	ret = fstatat(dfd, base, st, 0);
+	close_keep_errno(dfd);
+	return ret;
+}
 
-	return with_parent_dirfd(abspath, act_stat, st);
+int longpath_lstat(const char *abspath, struct stat *st)
+{
+	const char *base;
+	int dfd, ret;
+
+	if (fits_one_syscall(abspath))
+		return lstat(abspath, st);
+
+	dfd = open_parent_dir(abspath, &base);
+	if (dfd < 0)
+		return -1;
+	ret = fstatat(dfd, base, st, AT_SYMLINK_NOFOLLOW);
+	close_keep_errno(dfd);
+	return ret;
 }
