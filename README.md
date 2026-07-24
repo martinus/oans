@@ -149,6 +149,17 @@ documented in the **[benchmark methodology](docs/benchmarks.md)**.
 
 Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.md)** (`man 8 oans` once installed).
 
+> [!NOTE]
+> **On a dataset larger than RAM** — the normal case for a NAS / backup / build
+> tree — oans deduplicates **~11× faster than upstream duperemove** (median
+> **14 s vs 155 s** on an ~11 GiB tree with the page cache capped to 4 GiB),
+> hashes ~1.6× faster, uses less than half the peak RSS, and writes a ~1.8×
+> smaller hashfile — doing byte-for-byte identical dedupe. This is where the
+> dedupe-phase design pays off: when the working set doesn't fit in cache, the
+> kernel's `FIDEDUPERANGE` re-read is slow cold, and oans prefetches it while
+> upstream doesn't. Full methodology, parameters and per-round tables:
+> **[larger-than-RAM benchmark](docs/benchmarks-low-memory.md)**.
+
 ## How it compares
 
 **vs. [bees](https://github.com/Zygo/bees):** bees is an always-on daemon doing
@@ -195,6 +206,7 @@ Differences to know about:
 
 - 🚀 [NAS quick-start](docs/nas-quickstart.md) — scheduled dedupe on a NAS/server, step by step
 - 📖 [Man page](docs/man/oans.md) — full option reference, FAQ, examples
+- 📊 [Benchmark methodology](docs/benchmarks.md) and [larger-than-RAM benchmark](docs/benchmarks-low-memory.md) — how the numbers were measured
 - ⏰ [systemd templates](systemd/README.md) — the `oans@` service/timer units
 - 🧪 [Test suite](tests/) — Python integration tests (stdlib-only) run by [CI](.github/workflows/ci.yml)
 - ⬆️ [Upstream duperemove](https://github.com/markfasheh/duperemove) and its [wiki](https://github.com/markfasheh/duperemove/wiki)
