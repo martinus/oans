@@ -631,6 +631,29 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 	}											\
 } while (0)
 
+/*
+ * True when file F is a member of a whole-file dup group (scanned, same
+ * digest+size, >1 member) - the same membership GET_DUPLICATE_FILES tests.
+ * Whole-file dedupe remaps/removes their extents, so both the extent loader
+ * (GET_DUPLICATE_EXTENTS) and the pending-work byte count
+ * (dbfile_count_dupe_bytes) must exclude them. Defined once so the loader and
+ * the progress total can't silently drift.
+ *
+ * Deliberately a correlated exists probe (via idx_files_digest_size), NOT a
+ * materialized membership set: a "select ... group by digest, size" CTE is a
+ * full-table group-by that a 3.5M-file hashfile pays ~6 s to materialize on
+ * EVERY per-batch extent load, serializing the streaming producer while the
+ * dedupe pool sits idle (measured: 21.7 s -> 0.2 s per batch load). The probe
+ * only touches the rows the enclosing query already examines.
+ *
+ * F is the SQL alias of the `files` row being tested, as a string literal.
+ */
+#define FILEDUP_MEMBER(F)						\
+"(" F ".digest is not null and not (" F ".flags & 1) "			\
+"and exists (select 1 from files fdup "					\
+"	where fdup.digest = " F ".digest and fdup.size = " F ".size "	\
+"	and fdup.id <> " F ".id and not (fdup.flags & 1))) "
+
 static struct dbhandle *open_handle(char *filename, bool readonly)
 {
 	struct dbhandle *result = calloc(1, sizeof(struct dbhandle));
@@ -710,24 +733,37 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * members from an earlier pass), rather than every member. Extent dedupe takes
  * the first list entry as target, so ordering the representative first keeps a
  * stable target across passes (convergence) without a per-group flag.
+ *
+ * Extents whose file is a whole-file dup-group member (FILEDUP_MEMBER) are
+ * excluded *statically*, everywhere `extents` is referenced. The whole-file
+ * pass deletes exactly those rows (dbfile_remove_extent_hashes) for every
+ * member it processes, so the end state is identical to relying on that
+ * deletion having happened first - but the static exclusion means the extent
+ * load no longer depends on the whole-file pass finishing, which is what lets
+ * the two passes pipeline.
  */
 #define GET_DUPLICATE_EXTENTS						\
 "with grp(digest, len) as ( "						\
 "	select extents.digest, len from extents "			\
 "	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
+"	where dedupe_seq <= ?2 "					\
+"	and not " FILEDUP_MEMBER("files")				\
+"	and (extents.digest, len) in ( "				\
 "		select extents.digest, len from extents "		\
 "		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
+"		where dedupe_seq > ?1 and dedupe_seq <= ?2 "		\
+"		and not " FILEDUP_MEMBER("files") ") "			\
 "	group by extents.digest, len having count(*) > 1) "		\
 "select extents.digest, fileid, loff, len, poff from extents "		\
 "join files on fileid = id "						\
-"where (extents.digest, len) in (select digest, len from grp) and ( "	\
+"where not " FILEDUP_MEMBER("files")					\
+"and (extents.digest, len) in (select digest, len from grp) and ( "	\
 "	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
 "	or extents.rowid in ( "						\
 "		select min(e.rowid) from extents e "			\
 "		join files f on e.fileid = f.id "			\
 "		where f.dedupe_seq <= ?1 "				\
+"		and not " FILEDUP_MEMBER("f")				\
 "		and (e.digest, e.len) in (select digest, len from grp) "\
 "		group by e.digest, e.len)) "				\
 "order by (dedupe_seq > ?1), fileid;"
@@ -2193,13 +2229,6 @@ uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
 	 * be max()-fudged.
 	 */
 	extents = dbfile_query_u64_arg(db->db,
-		"with filedup(id) as ( "
-		"  select id from files "
-		"  where digest is not null and not (flags & 1) "
-		"    and (digest, size) in ( "
-		"      select digest, size from files "
-		"      where digest is not null and not (flags & 1) "
-		"      group by digest, size having count(*) > 1)) "
 		"select coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
 		"                                else new_cnt - 1 end)), 0) "
 		"from ( "
@@ -2207,8 +2236,7 @@ uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
 		"         sum(f.dedupe_seq >  ?1) as new_cnt, "
 		"         sum(f.dedupe_seq <= ?1) as old_cnt "
 		"  from extents e join files f on e.fileid = f.id "
-		"  where not exists (select 1 from filedup fd "
-		"                    where fd.id = e.fileid) "
+		"  where not " FILEDUP_MEMBER("f")
 		"  group by e.digest, e.len "
 		"  having count(*) > 1 and new_cnt > 0)", seq_lo);
 	return files + extents;
