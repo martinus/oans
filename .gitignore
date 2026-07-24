@@ -11,4 +11,5 @@ test
 .vglogs/
 __pycache__/
 version
+.version-stamp
 .pandoc/

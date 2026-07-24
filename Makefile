@@ -60,6 +60,19 @@ all: oans
 
 -include $(DEPENDS)
 
+# Rebuild the version-stamped object when the version *string* changes, not only
+# when its source does. A release is just a tag plus a man-page bump, so `make`
+# would otherwise leave the previous VERSTRING baked into src/oans.o and
+# `oans --version` would report the old version on an otherwise-current build.
+# The stamp records $(VERSION) and is rewritten only when it actually changes
+# (the cmp guard), so it never churns the build otherwise. VERSTRING is used
+# only in src/oans.c; if another source uses it, add its object here too.
+.PHONY: force-version
+.version-stamp: force-version
+	@printf '%s\n' '$(VERSION)' | cmp -s - $@ 2>/dev/null || printf '%s\n' '$(VERSION)' > $@
+
+src/oans.o: .version-stamp
+
 # oans is the only program: src/oans.c has main(), the rest is its library.
 oans: $(OBJECTS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBRARY_FLAGS)
@@ -161,4 +174,4 @@ tarball: clean $(DIST_SOURCES)
 	rm -fr "$$tmp"
 
 clean:
-	rm -f $(OBJECTS) $(DEPENDS) oans test test.d $(DIST_TARBALL) *~
+	rm -f $(OBJECTS) $(DEPENDS) oans test test.d $(DIST_TARBALL) .version-stamp *~
