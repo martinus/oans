@@ -574,7 +574,13 @@ static unsigned int print_bar_line(void)
 	render_bar(frac, indet, acc);
 	if (!indet) {
 		printf("  %s%u%%%s", col_bold, pct, col_reset);
-		if (eta > 0.0) {
+		/*
+		 * An ETA beyond a year means the inputs are off (a stalled
+		 * rate sample or a corrupt total), not a real forecast; the
+		 * string is also long enough to wrap the bar line and desync
+		 * the block redraw. Show nothing until it becomes sane.
+		 */
+		if (eta > 0.0 && eta < 365.0 * 86400) {
 			detail_sep();
 			printf("ETA ~%s", human_duration(eta));
 		}

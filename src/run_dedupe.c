@@ -896,6 +896,21 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 
 	for (i = 0; i < nr; i++) {
 		struct dedupe_work_item *item = malloc(sizeof(*item));
+		/*
+		 * The group's byte work, captured BEFORE the push: the moment
+		 * the item is in the pool a worker owns the dext and can free
+		 * it (an already-shared group is cleaned and freed in
+		 * microseconds), so sorted[i] must not be dereferenced after
+		 * g_thread_pool_push(). Reading it afterwards once fed
+		 * len * (0 - 1) from a freed dext into the pushed-work total,
+		 * blowing the progress denominator up to ~2^59 (a frozen bar
+		 * and a multi-thousand-year ETA).
+		 */
+		uint64_t w0 = dext_work(sorted[i]);
+
+		/* A single group can't verify an exbibyte; a value this big is
+		 * a corrupt dext, not work. */
+		abort_on(w0 > 1ULL << 60);
 
 		abort_on(!item);	/* OOM */
 		item->dext = sorted[i];
@@ -918,7 +933,7 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 		pdedupe_add_queued(1);
 		/* Byte analog of add_queued: lets the renderer clamp the total
 		 * up for block-hash-discovered groups not in the upfront sum. */
-		pdedupe_add_pushed_work(dext_work(sorted[i]));
+		pdedupe_add_pushed_work(w0);
 	}
 }
 
