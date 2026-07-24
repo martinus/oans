@@ -21,6 +21,7 @@
 #include "fiemap.c"
 #include "progress.c"
 #include "storage.c"
+#include "longpath.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -348,6 +349,178 @@ MU_TEST(test_group_u64) {
 	mu_check(small[3] == '\0' && strlen(small) <= 3);
 }
 
+/*
+ * longpath: reach a file whose absolute path exceeds PATH_MAX. Builds a chain
+ * of 255-char directories (via incremental chdir, since the leaf's own path is
+ * too long to pass to a syscall) under a /tmp temp dir, then checks that
+ * longpath_open/longpath_stat reach the deep leaf that a plain open/stat could
+ * not. Runs on tmpfs (no reflink needed); best-effort teardown climbs back out.
+ */
+#define LP_COMP_LEN 255
+
+static void lp_fill(char *buf, char c, int n)
+{
+	memset(buf, c, n);
+	buf[n] = '\0';
+}
+
+static int lp_make_deep(char *absdir, size_t abscap, char *base_out,
+			size_t base_cap, int *out_levels, const char *victim,
+			const char *contents)
+{
+	char comp[LP_COMP_LEN + 1];
+	char base[] = "/tmp/oans-longpath-XXXXXX";
+	size_t len = strlen(base);
+	int levels = 0, fd;
+
+	lp_fill(comp, 'd', LP_COMP_LEN);
+
+	if (!mkdtemp(base) || len + 1 > base_cap || len + 1 > abscap)
+		return -1;
+	memcpy(base_out, base, len + 1);
+	if (chdir(base) != 0)
+		return -1;
+	memcpy(absdir, base, len + 1);
+
+	/* Descend until the directory path alone exceeds PATH_MAX, so the walk
+	 * exercises the multi-chunk openat chain (not just one openat). */
+	while (len < (size_t)PATH_MAX + 128) {
+		if (mkdir(comp, 0700) != 0 || chdir(comp) != 0)
+			return -1;
+		if (len + 1 + LP_COMP_LEN + 1 > abscap)
+			return -1;
+		absdir[len++] = '/';
+		memcpy(absdir + len, comp, LP_COMP_LEN + 1);
+		len += LP_COMP_LEN;
+		levels++;
+	}
+
+	fd = open(victim, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	if (write(fd, contents, strlen(contents)) != (ssize_t)strlen(contents)) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	*out_levels = levels;
+	return 0;
+}
+
+static void lp_destroy_deep(int savedcwd, const char *base, const char *victim,
+			    int levels)
+{
+	char comp[LP_COMP_LEN + 1];
+	int i;
+
+	lp_fill(comp, 'd', LP_COMP_LEN);
+
+	/* CWD is the leaf dir: drop the file, then climb + rmdir each level. */
+	unlink(victim);
+	for (i = 0; i < levels; i++) {
+		if (chdir("..") != 0)
+			break;
+		rmdir(comp);
+	}
+	if (savedcwd >= 0 && fchdir(savedcwd) != 0)
+		return;
+	rmdir(base);
+}
+
+MU_TEST(test_longpath) {
+	const char *contents = "over-the-PATH_MAX limit\n";
+	char victim[LP_COMP_LEN + 1];
+	char absdir[20000];
+	char base[64];
+	char leaf[20000];
+	char miss_leaf[20000];
+	char miss_mid[20000];
+	int levels = 0;
+	int savedcwd = open(".", O_PATH | O_CLOEXEC);
+	struct stat st;
+	int fd, dfd, bfd, n;
+	char buf[128] = { 0 };
+	ssize_t r;
+	DIR *d;
+	struct dirent *de;
+	bool found = false;
+
+	lp_fill(victim, 'v', LP_COMP_LEN);
+
+	mu_check(savedcwd >= 0);
+	mu_check(lp_make_deep(absdir, sizeof(absdir), base, sizeof(base),
+			      &levels, victim, contents) == 0);
+	/* The directory itself is past PATH_MAX, forcing the chunked walk. */
+	mu_check(strlen(absdir) > PATH_MAX);
+
+	n = snprintf(leaf, sizeof(leaf), "%s/%s", absdir, victim);
+	mu_check(n > 0 && (size_t)n < sizeof(leaf));
+	mu_check(strlen(leaf) > PATH_MAX);
+
+	/* 1. open + read the deep file. */
+	fd = longpath_open(leaf, O_RDONLY);
+	mu_check(fd >= 0);
+	r = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	mu_check(r == (ssize_t)strlen(contents));
+	mu_check(strcmp(buf, contents) == 0);
+
+	/* 2. stat the deep file. */
+	mu_check(longpath_stat(leaf, &st) == 0);
+	mu_check((size_t)st.st_size == strlen(contents));
+
+	/* 3. open the deep directory (O_DIRECTORY) and list it. */
+	dfd = longpath_open(absdir, O_RDONLY | O_DIRECTORY);
+	mu_check(dfd >= 0);
+	d = fdopendir(dfd);
+	mu_check(d != NULL);
+	while ((de = readdir(d))) {
+		if (strcmp(de->d_name, victim) == 0) {
+			found = true;
+			break;
+		}
+	}
+	closedir(d);
+	mu_check(found);
+
+	/* 4a. missing final component → ENOENT, not ENAMETOOLONG. */
+	{
+		char missname[LP_COMP_LEN + 1];
+
+		lp_fill(missname, 'x', LP_COMP_LEN);
+		snprintf(miss_leaf, sizeof(miss_leaf), "%s/%s", absdir, missname);
+		mu_check(strlen(miss_leaf) > PATH_MAX);
+		errno = 0;
+		mu_check(longpath_open(miss_leaf, O_RDONLY) < 0);
+		mu_check(errno == ENOENT);
+		errno = 0;
+		mu_check(longpath_stat(miss_leaf, &st) < 0);
+		mu_check(errno == ENOENT);
+	}
+
+	/* 4b. missing intermediate directory → ENOENT from the ancestor walk. */
+	{
+		char missdir[LP_COMP_LEN + 1];
+
+		lp_fill(missdir, 'z', LP_COMP_LEN);
+		snprintf(miss_mid, sizeof(miss_mid), "%s/%s/%s", absdir,
+			 missdir, victim);
+		mu_check(strlen(miss_mid) > PATH_MAX);
+		errno = 0;
+		mu_check(longpath_open(miss_mid, O_RDONLY) < 0);
+		mu_check(errno == ENOENT);
+	}
+
+	/* 5. short path: identical to plain open(). */
+	bfd = longpath_open(base, O_RDONLY | O_DIRECTORY);
+	mu_check(bfd >= 0);
+	close(bfd);
+
+	lp_destroy_deep(savedcwd, base, victim, levels);
+	close(savedcwd);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -360,6 +533,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_scan_workq_priority);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
+	MU_RUN_TEST(test_longpath);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
