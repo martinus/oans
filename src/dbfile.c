@@ -25,11 +25,32 @@
 
 #include "dbfile.h"
 #include "opt.h"
+#include "longpath.h"
 
 static struct dbhandle *gdb = NULL;
 
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly);
+
+int file_set_filename(struct file *f, const char *name)
+{
+	char *dup = NULL;
+
+	if (name) {
+		dup = strdup(name);
+		if (!dup)
+			return -1;
+	}
+	free(f->filename);
+	f->filename = dup;
+	return 0;
+}
+
+void file_cleanup(struct file *f)
+{
+	free(f->filename);
+	f->filename = NULL;
+}
 
 static GMutex io_mutex; /* Locks db writes */
 
@@ -2042,7 +2063,10 @@ int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 	dbfile->size = sqlite3_column_int64(stmt, 1);
 
 	buf = (char *)sqlite3_column_text(stmt, 2);
-	strncpy(dbfile->filename, buf, PATH_MAX);
+	if (file_set_filename(dbfile, buf)) {
+		ret = ENOMEM;
+		goto out;
+	}
 
 	dbfile->id = sqlite3_column_int64(stmt, 3);
 
@@ -2307,7 +2331,7 @@ int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 			continue;
 
 		fn = (const char *)sqlite3_column_text(sel, 1);
-		if (!fn || stat(fn, &st) == 0)
+		if (!fn || longpath_stat(fn, &st) == 0)
 			continue;
 		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */
 		if (errno != ENOENT && errno != ENOTDIR)
