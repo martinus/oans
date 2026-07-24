@@ -710,24 +710,46 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * members from an earlier pass), rather than every member. Extent dedupe takes
  * the first list entry as target, so ordering the representative first keeps a
  * stable target across passes (convergence) without a per-group flag.
+ *
+ * Extents whose file is a whole-file dup-group member (`filedup`) are excluded
+ * *statically*, everywhere `extents` is referenced. The whole-file pass deletes
+ * exactly those rows (dbfile_remove_extent_hashes) for every member it
+ * processes, so the end state is identical to relying on that deletion having
+ * happened first - but the static exclusion means the extent load no longer
+ * depends on the whole-file pass finishing, which is what lets the two passes
+ * pipeline. `filedup` mirrors GET_DUPLICATE_FILES' membership test.
  */
 #define GET_DUPLICATE_EXTENTS						\
-"with grp(digest, len) as ( "						\
+"with filedup(id) as ( "						\
+"	select id from files "						\
+"	where digest is not null and not (flags & 1) "			\
+"	and (digest, size) in ( "					\
+"		select digest, size from files "			\
+"		where digest is not null and not (flags & 1) "		\
+"		group by digest, size having count(*) > 1)), "		\
+"grp(digest, len) as ( "						\
 "	select extents.digest, len from extents "			\
 "	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 and (extents.digest, len) in ( "		\
+"	where dedupe_seq <= ?2 "					\
+"	and not exists (select 1 from filedup fd where fd.id = fileid) "	\
+"	and (extents.digest, len) in ( "				\
 "		select extents.digest, len from extents "		\
 "		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
+"		where dedupe_seq > ?1 and dedupe_seq <= ?2 "		\
+"		and not exists (select 1 from filedup fd "		\
+"				where fd.id = fileid)) "		\
 "	group by extents.digest, len having count(*) > 1) "		\
 "select extents.digest, fileid, loff, len, poff from extents "		\
 "join files on fileid = id "						\
-"where (extents.digest, len) in (select digest, len from grp) and ( "	\
+"where not exists (select 1 from filedup fd where fd.id = fileid) "	\
+"and (extents.digest, len) in (select digest, len from grp) and ( "	\
 "	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
 "	or extents.rowid in ( "						\
 "		select min(e.rowid) from extents e "			\
 "		join files f on e.fileid = f.id "			\
 "		where f.dedupe_seq <= ?1 "				\
+"		and not exists (select 1 from filedup fd "		\
+"				where fd.id = e.fileid) "		\
 "		and (e.digest, e.len) in (select digest, len from grp) "\
 "		group by e.digest, e.len)) "				\
 "order by (dedupe_seq > ?1), fileid;"
