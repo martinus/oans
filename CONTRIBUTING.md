@@ -36,6 +36,22 @@ Before opening a PR, run the full pre-flight gate:
 scripts/verify.sh   # build + make check + a valgrind scan/dedupe/replay smoke
 ```
 
+### Sanitizer builds
+
+The suites also run under clang's AddressSanitizer and UndefinedBehaviorSanitizer
+in CI. To reproduce locally (needs `clang` and its `libclang-rt-dev`):
+
+```sh
+make check CC=clang SANITIZE=address,undefined   # build + run both suites, instrumented
+```
+
+`SANITIZE=...` compiles and links with `-fsanitize=<flavor>` (drops release
+hardening), and the `test`/`integration` targets automatically export the
+ASAN/UBSAN/LSAN run options that make any finding abort — so a sanitizer error
+fails the suite. LeakSanitizer's GLib false positives are filtered by
+[`tests/lsan.supp`](tests/lsan.supp) (the ASAN analogue of `tests/valgrind.supp`).
+CI runs ASAN and UBSAN as separate legs; combining them locally as above is fine.
+
 ## Pull requests
 
 - Branch from `master`, keep the change focused, and describe what you measured.
