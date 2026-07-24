@@ -908,9 +908,11 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 		 */
 		uint64_t w0 = dext_work(sorted[i]);
 
-		/* A single group can't verify an exbibyte; a value this big is
-		 * a corrupt dext, not work. */
-		abort_on(w0 > 1ULL << 60);
+		/* A single group can't verify a pebibyte; a value this big is
+		 * a corrupt dext, not work. (The freed-dext read this guards
+		 * against fed len * (0 - 1): 128 MiB * (2^32 - 1) ~= 2^59, so
+		 * the cap must sit well below that.) */
+		abort_on(w0 > 1ULL << 50);
 
 		abort_on(!item);	/* OOM */
 		item->dext = sorted[i];
