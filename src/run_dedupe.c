@@ -1067,10 +1067,15 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	dedupe_pool = g_thread_pool_new((GFunc) dedupe_worker, NULL,
 					options.io_threads, TRUE, &err);
 	if (err) {
+		/*
+		 * Fatal: the phase cannot run without a pool, and limping on
+		 * would push items into a NULL pool - never run, so their
+		 * batches never complete and dedupe_phase_end() waits forever.
+		 */
 		eprintf("Unable to create dedupe thread pool: %s\n",
 			err->message);
 		g_error_free(err);
-		dedupe_pool = NULL;
+		abort_on(1);
 	}
 }
 
