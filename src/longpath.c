@@ -21,12 +21,19 @@
 #include "longpath.h"
 
 /*
+ * The longest pathname the kernel accepts in a single syscall argument. PATH_MAX
+ * counts the terminating NUL, so a usable path is at most PATH_MAX - 1 bytes;
+ * anything longer gets ENAMETOOLONG and must be reached via the openat chain.
+ */
+#define LONGPATH_MAXLEN	(PATH_MAX - 1)
+
+/*
  * Open the directory named by the range [begin, end) (an absolute path prefix,
  * possibly longer than PATH_MAX), returning an O_PATH directory fd suitable as
  * a dirfd for openat()/fstatat(). Walks from "/" one chunk at a time, where a
  * chunk is the longest run of '/'-separated components whose joined length is
- * <= PATH_MAX (a single component is bounded by NAME_MAX, so a chunk always
- * fits). Symlinks in the prefix are followed, matching open()/stat() semantics.
+ * <= LONGPATH_MAXLEN (a single component is bounded by NAME_MAX, so a chunk
+ * always fits). Symlinks in the prefix are followed, matching open()/stat().
  * Returns -1 with errno set on failure.
  */
 static int open_ancestor(const char *begin, const char *end)
@@ -53,15 +60,15 @@ static int open_ancestor(const char *begin, const char *end)
 			p++;
 		complen = p - start;
 
-		/* A lone component over PATH_MAX can never be opened. */
-		if (complen > PATH_MAX) {
+		/* A lone component this long can never be opened. */
+		if (complen > LONGPATH_MAXLEN) {
 			close(dfd);
 			errno = ENAMETOOLONG;
 			return -1;
 		}
 
 		/* Flush the accumulated chunk if this component won't fit. */
-		if (clen != 0 && clen + 1 + complen > PATH_MAX) {
+		if (clen != 0 && clen + 1 + complen > LONGPATH_MAXLEN) {
 			int next = openat(dfd, chunk,
 					  O_PATH | O_DIRECTORY | O_CLOEXEC);
 			int err = errno;
@@ -146,7 +153,7 @@ static int act_stat(int dirfd, const char *base, void *arg)
 int longpath_open(const char *abspath, int flags)
 {
 	/* Fast path: fits in a single syscall argument. */
-	if (strlen(abspath) <= PATH_MAX)
+	if (strlen(abspath) <= LONGPATH_MAXLEN)
 		return open(abspath, flags);
 
 	/* Only an absolute path can be reached by walking from "/". A relative
@@ -159,7 +166,7 @@ int longpath_open(const char *abspath, int flags)
 
 int longpath_stat(const char *abspath, struct stat *st)
 {
-	if (strlen(abspath) <= PATH_MAX)
+	if (strlen(abspath) <= LONGPATH_MAXLEN)
 		return stat(abspath, st);
 
 	if (abspath[0] != '/')

@@ -73,6 +73,34 @@ _FIEMAP_EXTENT_DATA_INLINE = 0x0200
 _NO_PHYS = _FIEMAP_EXTENT_UNKNOWN | _FIEMAP_EXTENT_DELALLOC | _FIEMAP_EXTENT_DATA_INLINE
 
 
+def fiemap_extents_fd(fd):
+    """Like fiemap_extents(), but on an already-open fd. Lets callers reach a
+    file whose absolute path exceeds PATH_MAX (opened via a dir_fd), #117."""
+    # extent_count=0 makes the kernel report only the total extent count
+    # (it never fills more than fm_extent_count, so a single sized guess can
+    # silently truncate). Count first, then fetch exactly that many.
+    buf = bytearray(_FIEMAP_HDR.size)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                          _FIEMAP_FLAG_SYNC, 0, 0, 0)
+    fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+    count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+    if count == 0:
+        return []
+
+    buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                          _FIEMAP_FLAG_SYNC, 0, count, 0)
+    fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+    mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+
+    out = []
+    for i in range(mapped):
+        logical, physical, length, _r0, _r1, flags, *_ = \
+            _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
+        out.append((logical, physical, length, flags))
+    return out
+
+
 def fiemap_extents(path):
     """Return [(logical, physical, length, flags), ...] for path's data extents.
 
@@ -81,37 +109,24 @@ def fiemap_extents(path):
     """
     fd = os.open(path, os.O_RDONLY)
     try:
-        # extent_count=0 makes the kernel report only the total extent count
-        # (it never fills more than fm_extent_count, so a single sized guess can
-        # silently truncate). Count first, then fetch exactly that many.
-        buf = bytearray(_FIEMAP_HDR.size)
-        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                              _FIEMAP_FLAG_SYNC, 0, 0, 0)
-        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
-        count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
-        if count == 0:
-            return []
-
-        buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
-        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                              _FIEMAP_FLAG_SYNC, 0, count, 0)
-        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
-        mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
-
-        out = []
-        for i in range(mapped):
-            logical, physical, length, _r0, _r1, flags, *_ = \
-                _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
-            out.append((logical, physical, length, flags))
-        return out
+        return fiemap_extents_fd(fd)
     finally:
         os.close(fd)
 
 
+def phys_extents_fd(fd):
+    """Set of physical start offsets of an open file's real data extents."""
+    return {phys for _log, phys, _len, flags in fiemap_extents_fd(fd)
+            if not (flags & _NO_PHYS)}
+
+
 def phys_extents(path):
     """Set of physical start offsets of path's real (allocated) data extents."""
-    return {phys for _log, phys, _len, flags in fiemap_extents(path)
-            if not (flags & _NO_PHYS)}
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return phys_extents_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def files_share(a, b):

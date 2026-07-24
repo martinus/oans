@@ -59,6 +59,7 @@
 #include "threads.h"
 #include "fiemap.h"
 #include "progress.h"
+#include "longpath.h"
 
 /* This is not in linux/magic.h */
 #ifndef	XFS_SB_MAGIC
@@ -979,27 +980,62 @@ static void fileq_push(const char *path, struct statx *st)
 }
 
 /* Read one directory: queue subdirs, hand regular files to the consumer. */
+/*
+ * opendir() a directory that may itself have an absolute path longer than
+ * PATH_MAX (#117): fall back to the openat-chain reopen + fdopendir. Ordinary
+ * directories take the plain opendir() fast path.
+ */
+static DIR *opendir_maybe_long(const char *path)
+{
+	int dfd;
+	DIR *dirp;
+
+	/* PATH_MAX counts the NUL, so opendir() accepts at most PATH_MAX - 1. */
+	if (strlen(path) < PATH_MAX)
+		return opendir(path);
+
+	dfd = longpath_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
+		return NULL;
+	dirp = fdopendir(dfd);
+	if (!dirp)
+		close(dfd);
+	return dirp;
+}
+
 static void process_dir(const char *path, struct dbhandle *db)
 {
 	struct dirent *entry;
 	struct statx st;
-	_cleanup_(closedirectory) DIR *dirp = opendir(path);
-	char child[PATH_MAX + 257] = { 0, };
-	size_t dirlen;
+	_cleanup_(closedirectory) DIR *dirp = opendir_maybe_long(path);
+	size_t dirlen = strlen(path);
+	/*
+	 * Full child path. A deep directory prefix can itself exceed PATH_MAX
+	 * (#117), so size the buffer to the prefix plus one component (bounded
+	 * by NAME_MAX) instead of a fixed PATH_MAX. The absolute string is only
+	 * built for exclude matching, queueing and messages; children are
+	 * reached with dir-fd-relative syscalls below.
+	 */
+	_cleanup_(freep) char *child = malloc(dirlen + 1 + NAME_MAX + 1);
 
 	if (dirp == NULL) {
 		eprintf("Error %d: %s while opening directory %s\n",
 			errno, strerror(errno), path);
 		return;
 	}
+	if (child == NULL) {
+		eprintf("Out of memory while scanning directory %s\n", path);
+		return;
+	}
 
 	/* Seed the (constant) directory prefix once; append names below. */
-	dirlen = strlen(path);
 	memcpy(child, path, dirlen);
 	if (dirlen != 1 || path[0] != '/')
 		child[dirlen++] = '/';
 
 	while (true) {
+		size_t namelen;
+
 		errno = 0;
 		entry = readdir(dirp);
 		if (!entry) {
@@ -1019,24 +1055,22 @@ static void process_dir(const char *path, struct dbhandle *db)
 		    !(options.recurse_dirs && entry->d_type == DT_DIR))
 			continue;
 
-		/*
-		 * PATH_MAX bounds the path any syscall (statx/open/dedupe ioctl)
-		 * will accept, so we cannot hash a file we can only name with a
-		 * longer absolute path. Warn instead of silently ignoring it; the
-		 * child buffer is oversized (PATH_MAX + 257) so we can still form
-		 * the full name for the message. See issue #108.
-		 */
-		size_t namelen = strlen(entry->d_name);
-
-		strcpy(child + dirlen, entry->d_name);
-
-		if (dirlen + namelen > PATH_MAX) {
-			eprintf("Skipping \"%s\": absolute path length %zu exceeds PATH_MAX (%d)\n",
-				child, dirlen + namelen, PATH_MAX);
+		/* A component is bounded by NAME_MAX; guard defensively so the
+		 * child buffer can never overflow. */
+		namelen = strlen(entry->d_name);
+		if (namelen > NAME_MAX) {
+			eprintf("Skipping \"%s/%s\": name length %zu exceeds NAME_MAX (%d)\n",
+				path, entry->d_name, namelen, NAME_MAX);
 			continue;
 		}
+		strcpy(child + dirlen, entry->d_name);
 
-		if (statx(0, child, 0, STATX_BASIC_STATS, &st) ||
+		/*
+		 * Stat relative to the open directory fd, not by absolute path:
+		 * the child's absolute path may exceed PATH_MAX, which the
+		 * kernel would reject with ENAMETOOLONG (#117).
+		 */
+		if (statx(dirfd(dirp), entry->d_name, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
 			eprintf("Failed to stat %s: %s\n", child, strerror(errno));
 			continue;
@@ -1148,7 +1182,7 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 {
 	struct stat st;
 
-	if (strlen(path_in_db) == 0 || strcmp(path_in_db, path) == 0)
+	if (!path_in_db || path_in_db[0] == '\0' || strcmp(path_in_db, path) == 0)
 		return false;
 
 	/*
@@ -1167,7 +1201,7 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 {
 	int ret;
-	struct file dbfile = {0,};
+	_cleanup_(file_cleanup) struct file dbfile = {0,};
 	static unsigned int seq = 0, counter = 0;
 	struct file_to_scan *file;
 	int64_t fileid = 0;
@@ -1189,7 +1223,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	if (locked_fs.is_btrfs && !subvol_cache_get(stx_to_dev(st), &dbfile.subvol)) {
 		_cleanup_(closefd) int fd;
-		fd = open(path, O_RDONLY);
+		fd = longpath_open(path, O_RDONLY);
 		if (fd == -1) {
 			eprintf("Error %d: %s while opening file \"%s\". "
 				"Skipping.\n", errno, strerror(errno), path);
@@ -1250,7 +1284,10 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	dbfile.ino = st->stx_ino;
 	dbfile.size = st->stx_size;
-	strncpy(dbfile.filename, path, PATH_MAX);
+	if (file_set_filename(&dbfile, path)) {
+		eprintf("Out of memory storing \"%s\". Skipping.\n", path);
+		return 0;
+	}
 	dbfile.mtime = timestamp_to_nano(st->stx_mtime);
 	dbfile.dedupe_seq = seq;
 
@@ -1876,7 +1913,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	tprogress->status = thread_mapping;	/* open + do_fiemap: no bytes yet */
 	tprogress->file_scanned_bytes = 0;
 	tprogress->file_total_bytes = file->filesize;
-	strncpy(tprogress->file_path, file->path, PATH_MAX);
+	progress_copy_path(tprogress->file_path, sizeof(tprogress->file_path),
+			   file->path);
 	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
 
 	/* Dummy variables used to trigger the cleanup code */
@@ -1915,7 +1953,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (!ctxt.file_csum)
 		return;
 
-	ctxt.fd = open(file->path, O_RDONLY);
+	ctxt.fd = longpath_open(file->path, O_RDONLY);
 	if (ctxt.fd == -1) {
 		eprintf("csum_whole_file: Error %d: %s while opening file \"%s\". "
 			"Skipping.\n", errno, strerror(errno), file->path);

@@ -14,11 +14,34 @@
 #include <sys/ioctl.h>
 #include <stdatomic.h>
 #include <inttypes.h>
+#include <string.h>
 
 #include "debug.h"
 #include "opt.h"
 #include "util.h"
 #include "progress.h"
+
+/*
+ * Copy a file path into a fixed status-line buffer, always NUL-terminated. A
+ * path longer than the buffer (an absolute path over PATH_MAX, #117) is shown
+ * as its tail with a leading '~', since the basename is the useful part; this
+ * is display only, never used to reopen the file.
+ */
+void progress_copy_path(char *dst, size_t cap, const char *src)
+{
+	size_t len;
+
+	if (cap == 0)
+		return;
+	len = strlen(src);
+	if (len < cap) {
+		memcpy(dst, src, len + 1);
+		return;
+	}
+	dst[0] = '~';
+	memcpy(dst + 1, src + (len - (cap - 2)), cap - 2);
+	dst[cap - 1] = '\0';
+}
 
 /*
  * This implements a multi progressbar

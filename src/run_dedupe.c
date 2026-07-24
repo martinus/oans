@@ -374,9 +374,9 @@ static void pick_least_fragmented_target(struct dupe_extents *dext)
  * member) plus the bytes the kernel still has to byte-verify as work total. */
 static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext)
 {
-	strncpy(slot->file_path,
-		list_first_entry(&dext->de_extents, struct extent,
-				 e_list)->e_file->filename, PATH_MAX);
+	progress_copy_path(slot->file_path, sizeof(slot->file_path),
+			   list_first_entry(&dext->de_extents, struct extent,
+					    e_list)->e_file->filename);
 	slot->file_total_bytes = dext_work(dext);
 	slot->file_scanned_bytes = 0;
 }
