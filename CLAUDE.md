@@ -112,6 +112,19 @@ in `tests/`; no shell tests.
     sweep); `scripts/bench.py -p git --variant a: --variant b:DUPEREMOVE_FOO=1`
     (env-gated code experiment). It confirms a reflink fs and needs **btrfs/xfs,
     not tmpfs**; a scan uses **`-rq`** (so only `-r`, non-destructive, repeatable).
+  - **The dedupe phase has its own harness: `scripts/bench-dedupe.py`** — the one
+    sanctioned exception to "no new bench-*", because `bench.py` structurally
+    can't measure dedupe (it only scans `-rq`; dedupe *mutates* the tree, so each
+    round needs a fresh unshared copy, and its cost only shows larger-than-RAM).
+    It builds N `--reflink=never` copies of a source tree, times the hash and
+    hash+dedupe phases cold inside a `MemoryMax`-capped `systemd-run --user
+    --scope`, restores the copies between rounds, and with `--verify` checks
+    byte-identical sharing via `btrfs filesystem du -s`. Reuses `bench.py`'s
+    `drop_caches`/reflink helpers. Canonical A/B (produces `docs/benchmarks.md`'s
+    larger-than-RAM numbers): `scripts/bench-dedupe.py --baseline build:897a222
+    --source ~/git/linux --cap 4G --rounds 10 --verify` (`build:897a222` builds the
+    fork's pure-upstream base in a cached worktree — the only valid duperemove
+    baseline; `../duperemove` and `../dm-backports` already carry fork commits).
   - **Cold runs work now:** the dev box enables `sudo tee /proc/sys/vm/drop_caches`
     via sudoers, so `bench.py` drops the page cache (metadata + data) before every
     timed run (default; `--warm` opts out). Plain `sudo -n true` still needs a
