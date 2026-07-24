@@ -42,7 +42,7 @@ Summary
 
 | Feature | What you get |
 |---|---|
-| ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* everything already shared. Rescanning a deduped 2M-file / 230 GiB tree: **~92 s with oans vs ~11 min with duperemove 0.15.2** (~7×). |
+| ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* already shared — rescanning a deduped 2M-file / 230 GiB tree takes **~92 s vs ~11 min for duperemove 0.15.2** (~7×). And when the tree is **larger than RAM** (the usual NAS/backup case), even a first-run dedupe is **~11× faster** (14 s vs 155 s): oans prefetches the data the kernel re-reads cold — [benchmark](docs/benchmarks-low-memory.md). |
 | 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
 | ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
 | 📊 **Observability** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards; `--progress=json` streams live per-phase progress for monitoring scheduled runs. |
@@ -144,7 +144,7 @@ documented in the **[benchmark methodology](docs/benchmarks.md)**.
 | No cross-generation reprocessing of duplicate groups | Dedupe phase **~294 s → ~188 s (~36 %)**, kernel dedupe traffic halved, accurate accounting |
 | Batched SQLite transactions (~10 s cadence) | **~24 % faster rescans**; hundreds of thousands of file-lock syscalls collapsed to a few hundred |
 | Parallel directory walk (`--io-threads`) | Faster listing on large trees, capped where btrfs metadata contention plateaus |
-| Compact 64-bit path-hash index | Smaller hashfile, faster path lookups |
+| Compact 64-bit path-hash index | Smaller hashfile (**41 vs 73 MiB** on the benchmark tree), faster path lookups |
 | Skip post-dedupe extent measurement on interactive runs | An open + 2 `FIEMAP` ioctls saved per group member |
 
 Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.md)** (`man 8 oans` once installed).
@@ -175,7 +175,9 @@ undo. oans needs no dedupe table and no permanent RAM cost — you run it when y
 want, on the btrfs/XFS you already have.
 
 **vs. upstream duperemove:** the same engine, tuned for *re-running regularly*
-— see [What the fork changes](#what-the-fork-changes-measured) above, and the
+and for trees **larger than RAM** — where its dedupe phase measures
+[~11× faster](docs/benchmarks-low-memory.md). See
+[What the fork changes](#what-the-fork-changes-measured) above, and the
 attribution below.
 
 ## Relationship to duperemove
