@@ -242,21 +242,34 @@ Identical `Exclusive` (0 B — nothing unique left in copy2) and `Set-shared`
 
 ### Reproduce it
 
-The dataset is a stand-in — use any tree you like, as long as the total data is
-larger than the cap. The harness:
+The whole benchmark above is one command — [`scripts/bench-dedupe.py`](../scripts/bench-dedupe.py):
 
-1. Build the tree with two non-reflinked copies of a source directory.
-2. For each round, interleaving the two binaries:
-   - restore the unshared tree (`rm copy2 && sync && cp --reflink=never … && sync`)
-     and remove the hashfile;
-   - `sync; echo 3 > /proc/sys/vm/drop_caches`;
-   - run under a capped scope and record `/usr/bin/time` metrics:
-     ```sh
-     systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-       /usr/bin/time -f '%e %U %S %M %I' \
-       <bin> -dr --hashfile=/path/bench.hash /path/tree
-     ```
-3. Report the median across rounds (robust to the occasional cold-cache spike).
+```sh
+scripts/bench-dedupe.py --baseline build:897a222 --source ~/git/linux \
+    --copies 2 --cap 4G --rounds 10 --verify
+```
+
+`build:897a222` builds the fork's pure-upstream base (duperemove 0.15.2) in a
+cached worktree; pass `--baseline /path/to/duperemove` to use a binary you
+already have, or omit `--baseline` to benchmark oans alone. `--verify` runs the
+byte-identical-sharing check (`btrfs filesystem du -s`). The dataset is a
+stand-in — use any `--source` tree, as long as its `--copies` total is larger
+than `--cap`.
+
+Under the hood, for each round and interleaving the binaries, it:
+
+1. builds `--copies` non-reflinked copies of the source (dedupe reclaims the
+   later copies against `copy0`);
+2. restores the unshared copies (`rm` + `cp --reflink=never`) and removes the
+   hashfile before each dedupe run;
+3. drops the page cache (`sync; echo 3 > /proc/sys/vm/drop_caches`) and runs each
+   binary under a capped scope, recording `/usr/bin/time` metrics:
+   ```sh
+   systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
+     /usr/bin/time -f '%e %U %S %M %I' \
+     <bin> -dr --hashfile=/path/bench.hash /path/tree
+   ```
+4. reports the median across rounds (robust to the occasional cold-cache spike).
 
 ## Caveats worth stating up front
 
