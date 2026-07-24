@@ -980,34 +980,11 @@ static void fileq_push(const char *path, struct statx *st)
 }
 
 /* Read one directory: queue subdirs, hand regular files to the consumer. */
-/*
- * opendir() a directory that may itself have an absolute path longer than
- * PATH_MAX (#117): fall back to the openat-chain reopen + fdopendir. Ordinary
- * directories take the plain opendir() fast path.
- */
-static DIR *opendir_maybe_long(const char *path)
-{
-	int dfd;
-	DIR *dirp;
-
-	/* PATH_MAX counts the NUL, so opendir() accepts at most PATH_MAX - 1. */
-	if (strlen(path) < PATH_MAX)
-		return opendir(path);
-
-	dfd = longpath_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dfd < 0)
-		return NULL;
-	dirp = fdopendir(dfd);
-	if (!dirp)
-		close(dfd);
-	return dirp;
-}
-
 static void process_dir(const char *path, struct dbhandle *db)
 {
 	struct dirent *entry;
 	struct statx st;
-	_cleanup_(closedirectory) DIR *dirp = opendir_maybe_long(path);
+	_cleanup_(closedirectory) DIR *dirp = longpath_opendir(path);
 	size_t dirlen = strlen(path);
 	/*
 	 * Full child path. A deep directory prefix can itself exceed PATH_MAX
@@ -1187,9 +1164,10 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 
 	/*
 	 * Old path and new paths differs. Could be hardlink,
-	 * so we check if the old still exists.
+	 * so we check if the old still exists (tolerating a >PATH_MAX
+	 * stored path, which the scan can now record - #117).
 	 */
-	return lstat(path_in_db, &st);
+	return longpath_lstat(path_in_db, &st);
 }
 
 /*
