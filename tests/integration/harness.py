@@ -183,17 +183,28 @@ requires_btrfs = unittest.skipUnless(
 # Base test case
 # --------------------------------------------------------------------------
 
-def _settle(f):
-    """fsync f so FIEMAP reports real extents rather than delayed allocation.
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
-    The sparse-layout helpers below build a file and hand it straight to a scan
-    that asserts on its extents. Without the fsync those extents may still be
-    unallocated when oans maps the file, and it correctly records none - which
-    surfaced as test_sparse_file_scans failing 4 runs in 12 once the suite
-    started running in parallel and writeback fell further behind.
+
+def _settle_scratch():
+    """syncfs() the scratch filesystem so FIEMAP sees real extents.
+
+    A test builds files and hands them straight to a scan that asserts on their
+    extents. Under delayed allocation those extents may not exist yet when oans
+    maps the file - it correctly records none, and the test reads the shortfall
+    as a scanner bug. Running the suite in parallel pushes writeback far enough
+    behind to lose this routinely: test_sparse_file_scans failed 4 runs in 12,
+    and test_hardlink_pair_does_not_empty_hashfile saw 381 of 401 extents.
+
+    Once per oans invocation, not once per file: fsync()ing each created file
+    costs a journal commit apiece and took the suite from 5.4s to 18s, where one
+    syncfs() of the whole scratch is a single syscall for the same guarantee.
     """
-    f.flush()
-    os.fsync(f.fileno())
+    fd = os.open(TEST_ROOT, os.O_RDONLY)
+    try:
+        _libc.syncfs(fd)
+    finally:
+        os.close(fd)
 
 
 class DuperemoveTest(unittest.TestCase):
@@ -232,6 +243,7 @@ class DuperemoveTest(unittest.TestCase):
         Runs with -q by default (terse output); pass quiet=False to get the
         full human summary block (e.g. to assert on the 'Reclaimed' line).
         """
+        _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
         if quiet:
             cmd.insert(1, "-q")
@@ -399,7 +411,6 @@ class DuperemoveTest(unittest.TestCase):
             f.write(head)
             f.seek(len(head) + hole)
             f.write(tail)
-            _settle(f)
         return p
 
     def make_trailing_hole(self, relpath, data, size):
@@ -408,7 +419,6 @@ class DuperemoveTest(unittest.TestCase):
         with open(p, "wb") as f:
             f.write(data)
             f.truncate(size)
-            _settle(f)
         return p
 
     def reflink(self, src_rel, dst_rel):
