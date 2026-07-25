@@ -229,7 +229,20 @@ class DuperemoveTest(unittest.TestCase):
         return self.dm("-rd", path, *extra)
 
     def assertDmOk(self, msg=None):
-        """Fail if the last run printed any error signature."""
+        """Fail if the last run exited non-zero or printed an error signature.
+
+        The exit code matters as much as the output: a crash (SIGABRT from an
+        abort_on(), SIGSEGV) still prints everything up to the point it died, so
+        an output-only check reads a fatal run as a clean one and the test only
+        fails later -- on some downstream assertion, with a misleading message
+        -- or not at all.
+        """
+        if self.rc != 0:
+            how = (f"killed by signal {-self.rc}" if self.rc < 0
+                   else f"exit status {self.rc}")
+            tail = "\n    ".join(self.out.splitlines()[-15:])
+            self.fail((msg or "oans failed") + f" ({how}):\n    " + tail)
+
         hits = [ln for ln in self.out.splitlines() if _ERROR_RE.search(ln)]
         if hits:
             detail = "\n    ".join(hits)
