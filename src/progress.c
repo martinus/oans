@@ -962,10 +962,19 @@ static void pscan_free_threads(void)
 	pscan.thread_count = 0;
 }
 
-struct pscan_thread *pscan_register_thread(pid_t tid)
+/*
+ * Allocate a fresh slot, already claimed by `tid`, and publish it. status and
+ * owned are set before publication: the moment the slot is in pscan.threads a
+ * concurrent pscan_claim_slot() may look at it, and a slot that is still
+ * idle/unowned there would be handed to a second worker.
+ */
+static struct pscan_thread *pscan_register_thread(pid_t tid,
+						  enum pscan_thread_status status)
 {
 	struct pscan_thread *tprogress = calloc(1, sizeof(struct pscan_thread));
 	tprogress->tid = tid;
+	tprogress->status = status;
+	tprogress->owned = true;
 
 	g_mutex_lock(&pscan.mutex);
 	pscan.threads = realloc(pscan.threads, (pscan.thread_count + 1) *
@@ -1105,21 +1114,41 @@ void pscan_set_file(struct pscan_thread *slot, const char *path,
 }
 
 /*
- * Park a persistently-held slot as idle once its worker has no more work (drain).
- * No per-file accounting - pscan_finish_file() already ran for the last file.
+ * Show a persistently-held slot as idle while its worker waits for more work,
+ * without releasing it: the worker keeps the slot and rolls it into its next
+ * file. Used when the hashing queue starves - the walk is the bottleneck, or
+ * nearly everything is up to date - so the line reads "idle" instead of
+ * freezing on the last file's "commit" for the rest of the run.
+ * No per-file accounting: pscan_finish_file() already ran for the last file.
+ */
+void pscan_slot_wait(struct pscan_thread *slot)
+{
+	if (!slot)
+		return;
+	/* file_path is only written under this mutex (the renderer reads it). */
+	g_mutex_lock(&pscan.mutex);
+	slot->file_path[0] = '\0';
+	slot->status = thread_idle;
+	g_mutex_unlock(&pscan.mutex);
+}
+
+/*
+ * Release a slot: its worker is done with it for good (drain, or the churning
+ * dedupe pool finishing one work item), so another worker may claim it.
  */
 void pscan_slot_idle(struct pscan_thread *slot)
 {
 	if (!slot)
 		return;
 	/*
-	 * Park the slot under the same mutex pscan_claim_slot() scans with, so
-	 * that lock is the handoff edge to whichever worker picks it up next.
+	 * Release the slot under the same mutex pscan_claim_slot() scans with,
+	 * so that lock is the handoff edge to whichever worker picks it up next.
 	 * (Every other slot field is either _Atomic or written under this mutex.)
 	 */
 	g_mutex_lock(&pscan.mutex);
 	slot->file_path[0] = '\0';
 	slot->status = thread_idle;
+	slot->owned = false;
 	g_mutex_unlock(&pscan.mutex);
 }
 
@@ -1171,19 +1200,21 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 
 	g_mutex_lock(&pscan.mutex);
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
-		if (pscan.threads[i]->status == thread_idle) {
+		/* Idle but still owned = a persistent worker waiting for its
+		 * next file; it will be back, so leave that line alone. */
+		if (pscan.threads[i]->status == thread_idle &&
+		    !pscan.threads[i]->owned) {
 			slot = pscan.threads[i];
 			slot->tid = tid;
 			slot->status = status;
+			slot->owned = true;
 			break;
 		}
 	}
 	g_mutex_unlock(&pscan.mutex);
 
-	if (!slot) {
-		slot = pscan_register_thread(tid);
-		slot->status = status;
-	}
+	if (!slot)
+		slot = pscan_register_thread(tid, status);
 	return slot;
 }
 

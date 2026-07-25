@@ -337,16 +337,66 @@ MU_TEST(test_scan_workq_priority) {
 
 	/* Biggest bucket first; within b4, FIFO keeps pos2 before pos4. */
 	struct file_to_scan *f;
-	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 5);	/* b7 */
-	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 2);	/* b4 */
-	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 4);	/* b4 */
-	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 3);	/* b2 */
-	f = scan_workq_pop(&scan_workq); mu_check(f->file_position == 1);	/* b0 */
+	f = scan_workq_pop(&scan_workq, NULL); mu_check(f->file_position == 5);	/* b7 */
+	f = scan_workq_pop(&scan_workq, NULL); mu_check(f->file_position == 2);	/* b4 */
+	f = scan_workq_pop(&scan_workq, NULL); mu_check(f->file_position == 4);	/* b4 */
+	f = scan_workq_pop(&scan_workq, NULL); mu_check(f->file_position == 3);	/* b2 */
+	f = scan_workq_pop(&scan_workq, NULL); mu_check(f->file_position == 1);	/* b0 */
 
 	/* Empty + draining => pop returns NULL (worker would exit). */
 	scan_workq.draining = true;
-	mu_check(scan_workq_pop(&scan_workq) == NULL);
+	mu_check(scan_workq_pop(&scan_workq, NULL) == NULL);
 
+	memset(&scan_workq, 0, sizeof(scan_workq));
+}
+
+struct park_probe {
+	struct pscan_thread	*slot;
+	struct file_to_scan	*got;
+};
+
+static gpointer park_probe_pop(gpointer arg)
+{
+	struct park_probe *probe = arg;
+
+	probe->got = scan_workq_pop(&scan_workq, probe->slot);
+	return NULL;
+}
+
+MU_TEST(test_scan_slot_parks_idle_when_starved) {
+	/*
+	 * A csum worker holds its display slot across files, so whatever status
+	 * the last file left behind ("commit") is what a starved queue would
+	 * keep showing - for the whole rest of a walk-bound run. After
+	 * SCAN_IDLE_PARK_MS with nothing to hash the slot must read "idle"
+	 * instead, while staying owned so no sibling worker takes over its line.
+	 */
+	memset(&scan_workq, 0, sizeof(scan_workq));
+
+	struct file_to_scan file = { .filesize = 4096, .file_position = 1 };
+	struct pscan_thread *slot = pscan_claim_slot(4242, thread_committing);
+	struct park_probe probe = { .slot = slot };
+	GThread *popper = g_thread_new("park", park_probe_pop, &probe);
+
+	g_usleep((SCAN_IDLE_PARK_MS + 250) * 1000);
+	mu_check(slot->status == thread_idle);
+	mu_check(slot->owned);
+
+	/* Owned: a worker claiming now gets a line of its own, not this one. */
+	struct pscan_thread *other = pscan_claim_slot(4243, thread_scanning);
+	mu_check(other != slot);
+
+	/* Work again: the parked worker wakes up on its own slot. */
+	scan_workq_push(&file);
+	g_thread_join(popper);
+	mu_check(probe.got == &file);
+
+	/* Released for good (drain): now it is up for grabs. */
+	pscan_slot_idle(other);
+	pscan_slot_idle(slot);
+	mu_check(pscan_claim_slot(4244, thread_scanning) == slot);
+
+	pscan_free_threads();
 	memset(&scan_workq, 0, sizeof(scan_workq));
 }
 
@@ -634,6 +684,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_storage_recommend_io_threads);
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
+	MU_RUN_TEST(test_scan_slot_parks_idle_when_starved);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
 	MU_RUN_TEST(test_longpath);

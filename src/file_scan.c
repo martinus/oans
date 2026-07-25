@@ -1828,17 +1828,47 @@ static void scan_workq_push(struct file_to_scan *file)
 	g_mutex_unlock(&q->lock);
 }
 
+/*
+ * How long a worker may sit empty-handed before its progress line is parked as
+ * "idle". Longer than a redraw (100ms on a tty), so the sub-millisecond gaps
+ * between two small files never flicker; short enough that a genuinely starved
+ * pool - the walk is the bottleneck, or almost everything is up to date - stops
+ * showing the last file's "commit" within a blink.
+ */
+#define SCAN_IDLE_PARK_MS	250
+
 /* Pop from the largest non-empty bucket, or NULL once drained. Blocks. O(1). */
-static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
+static struct file_to_scan *scan_workq_pop(struct scan_workq *q,
+					   struct pscan_thread *slot)
 {
 	struct file_to_scan *file;
 	unsigned b;
 	bool waited = false;
+	bool parked = false;
 
 	g_mutex_lock(&q->lock);
 	while (q->occupied == 0 && !q->draining) {
 		waited = true;		/* starved: no work, blocking on the producer */
-		g_cond_wait(&q->cond, &q->lock);
+		if (parked) {
+			g_cond_wait(&q->cond, &q->lock);
+			continue;
+		}
+		/*
+		 * First wait of this starvation: bounded, so that a wait which
+		 * turns out to be a long one can be reflected in the display.
+		 * The park itself takes the progress mutex, so drop q->lock for
+		 * it rather than nesting the two locks - the loop re-checks the
+		 * queue anyway.
+		 */
+		if (g_cond_wait_until(&q->cond, &q->lock,
+				      g_get_monotonic_time() +
+				      SCAN_IDLE_PARK_MS * G_TIME_SPAN_MILLISECOND))
+			continue;	/* signalled (or spurious): re-check */
+
+		g_mutex_unlock(&q->lock);
+		pscan_slot_wait(slot);	/* still nothing to do: show idle */
+		parked = true;
+		g_mutex_lock(&q->lock);
 	}
 	if (q->occupied == 0) {
 		g_mutex_unlock(&q->lock);
@@ -1876,10 +1906,13 @@ static gpointer scan_worker(gpointer arg)
 	 * actually empty (see pscan_finish_file). Claimed lazily on the first file
 	 * with a non-idle status so a still-unclaimed slot is never reused by a
 	 * sibling worker; a worker that gets no files never shows a phantom line.
+	 * While the queue starves, scan_workq_pop() shows the slot as idle
+	 * (without giving it up), so a walk-bound run doesn't freeze the line on
+	 * the last file it hashed.
 	 */
 	struct pscan_thread *slot = NULL;
 
-	while ((file = scan_workq_pop(q))) {
+	while ((file = scan_workq_pop(q, slot))) {
 		if (!slot)
 			slot = pscan_claim_slot(gettid(), thread_scanning);
 		csum_whole_file(file, &buffer, slot);

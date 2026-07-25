@@ -40,6 +40,11 @@ struct pscan_thread {
 	 * the renderer reads it every redraw - hence atomic. The idle/claim
 	 * handoff itself is ordered by the mutex, not by this field. */
 	_Atomic enum pscan_thread_status	status;
+
+	/* A worker still owns this slot and will come back to it, so no other
+	 * worker may claim it - even while it sits idle (pscan_slot_wait()).
+	 * Only ever read/written under pscan.mutex. */
+	bool				owned;
 };
 
 struct pscan_global {
@@ -90,9 +95,6 @@ void pscan_set_progress(uint64_t added_files, uint64_t added_bytes);
 void pscan_examined(void);
 uint64_t pscan_files_scanned(void);
 
-/* Used by each scan threads to grab its own struct pscan_thread */
-struct pscan_thread *pscan_register_thread(pid_t tid);
-
 /*
  * Setup the pty and start the progress thread
  * The thread will run until the scan is done, that is:
@@ -123,9 +125,12 @@ void pscan_reset_thread(struct pscan_thread **progress);
  * For a persistently-held slot (one kept by a long-lived worker across many
  * files, rather than re-claimed per file): pscan_finish_file() does the per-file
  * byte/count accounting without going idle, so no "idle" flashes between files;
- * pscan_slot_idle() parks the slot when the worker finally runs out of work.
+ * pscan_slot_wait() shows the slot as idle while its worker waits for more work
+ * but keeps it reserved (the worker comes back to the same line);
+ * pscan_slot_idle() releases it when the worker finally runs out of work.
  */
 void pscan_finish_file(struct pscan_thread **progress);
+void pscan_slot_wait(struct pscan_thread *slot);
 void pscan_slot_idle(struct pscan_thread *slot);
 
 bool is_progress_printer_running(void);
