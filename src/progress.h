@@ -40,6 +40,11 @@ struct pscan_thread {
 	 * the renderer reads it every redraw - hence atomic. The idle/claim
 	 * handoff itself is ordered by the mutex, not by this field. */
 	_Atomic enum pscan_thread_status	status;
+
+	/* Monotonic us at which this slot's worker started waiting for its next
+	 * unit of work, or 0 while it has work. Set by the worker, read by the
+	 * renderer every redraw - hence atomic. See pscan_slot_waiting(). */
+	_Atomic gint64			waiting_since;
 };
 
 struct pscan_global {
@@ -90,9 +95,6 @@ void pscan_set_progress(uint64_t added_files, uint64_t added_bytes);
 void pscan_examined(void);
 uint64_t pscan_files_scanned(void);
 
-/* Used by each scan threads to grab its own struct pscan_thread */
-struct pscan_thread *pscan_register_thread(pid_t tid);
-
 /*
  * Setup the pty and start the progress thread
  * The thread will run until the scan is done, that is:
@@ -127,6 +129,18 @@ void pscan_reset_thread(struct pscan_thread **progress);
  */
 void pscan_finish_file(struct pscan_thread **progress);
 void pscan_slot_idle(struct pscan_thread *slot);
+
+/*
+ * Bracket a persistently-held slot's wait for its next unit of work. Such a
+ * slot keeps showing the last file's status between files, which is right for
+ * the microsecond gap between two small files and a lie once the worker is
+ * starved (the walk is the bottleneck, or nearly everything is up to date).
+ * The worker just publishes when the wait started; the renderer decides when
+ * that has gone on long enough to draw the line as idle instead. One atomic
+ * store (plus a clock read on the `true` side), so it is cheap enough for the
+ * per-file path.
+ */
+void pscan_slot_waiting(struct pscan_thread *slot, bool waiting);
 
 bool is_progress_printer_running(void);
 

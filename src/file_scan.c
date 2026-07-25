@@ -1876,10 +1876,19 @@ static gpointer scan_worker(gpointer arg)
 	 * actually empty (see pscan_finish_file). Claimed lazily on the first file
 	 * with a non-idle status so a still-unclaimed slot is never reused by a
 	 * sibling worker; a worker that gets no files never shows a phantom line.
+	 * The flip side is that between files the line keeps showing the last one's
+	 * status, so bracket the wait for the next file: a wait long enough to
+	 * outlast a couple of redraws is what makes the line read "idle" instead of
+	 * freezing on the last file's "commit" for the rest of a walk-bound run.
 	 */
 	struct pscan_thread *slot = NULL;
 
-	while ((file = scan_workq_pop(q))) {
+	for (;;) {
+		pscan_slot_waiting(slot, true);
+		file = scan_workq_pop(q);
+		pscan_slot_waiting(slot, false);
+		if (!file)
+			break;
 		if (!slot)
 			slot = pscan_claim_slot(gettid(), thread_scanning);
 		csum_whole_file(file, &buffer, slot);

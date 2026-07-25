@@ -350,6 +350,51 @@ MU_TEST(test_scan_workq_priority) {
 	memset(&scan_workq, 0, sizeof(scan_workq));
 }
 
+static gpointer pop_one(gpointer arg)
+{
+	struct file_to_scan **got = arg;
+
+	*got = scan_workq_pop(&scan_workq);
+	return NULL;
+}
+
+MU_TEST(test_starved_worker_line_reads_idle) {
+	/*
+	 * A csum worker holds its display line across files, so the status the
+	 * last file left behind ("commit") is what a starved queue would keep
+	 * showing - for the whole rest of a walk-bound run. The worker publishes
+	 * how long it has been waiting for its next file and the renderer draws
+	 * a long enough wait as idle; a short one (the gap between two small
+	 * files) must still show the file's real status, or the line flickers.
+	 */
+	memset(&scan_workq, 0, sizeof(scan_workq));
+
+	struct file_to_scan file = { .filesize = 4096, .file_position = 1 };
+	struct file_to_scan *got = NULL;
+	struct pscan_thread *slot = pscan_claim_slot(4242, thread_committing);
+
+	/* Waiting on an empty queue: the worker blocks in the pop. */
+	GThread *popper = g_thread_new("pop", pop_one, &got);
+
+	pscan_slot_waiting(slot, true);
+	mu_check(!slot_is_idle(slot));			/* just started waiting */
+	slot->waiting_since -= IDLE_AFTER_US + 1;	/* ... a while ago */
+	mu_check(slot_is_idle(slot));
+
+	/* Still claimed while it waits, so no sibling takes over its line. */
+	mu_check(pscan_claim_slot(4243, thread_scanning) != slot);
+
+	/* Back to work: the line shows the file again, not idle. */
+	scan_workq_push(&file);
+	g_thread_join(popper);
+	pscan_slot_waiting(slot, false);
+	mu_check(got == &file);
+	mu_check(!slot_is_idle(slot));
+
+	pscan_free_threads();
+	memset(&scan_workq, 0, sizeof(scan_workq));
+}
+
 /* Within eps of expected. */
 static bool near(double got, double want, double eps)
 {
@@ -634,6 +679,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_storage_recommend_io_threads);
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
+	MU_RUN_TEST(test_starved_worker_line_reads_idle);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
 	MU_RUN_TEST(test_longpath);

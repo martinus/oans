@@ -383,6 +383,18 @@ static const char *const BAR_SUB[] = {
 /* Worker-line left column: number(3) + gap(2) + status + gap(2) before the path. */
 #define WORKER_LEFT_W	(3 + 2 + STATUS_COL_W + 2)
 
+/* Redraw cadence of the live block: smooth on a tty, sparse into a log. */
+#define REDRAW_MS	100
+#define REDRAW_LOG_MS	1000
+
+/*
+ * How long a worker may wait for its next unit of work before its line reads
+ * "idle" rather than the status the last one left behind. Longer than a redraw,
+ * so the sub-millisecond gaps between two small files never flicker; short
+ * enough that a starved pool stops lying within a blink.
+ */
+#define IDLE_AFTER_US	(2 * REDRAW_MS * G_TIME_SPAN_MILLISECOND)
+
 /* The dim " · " separator between fields on the bar and detail lines. */
 static void detail_sep(void)
 {
@@ -416,6 +428,20 @@ static const char *status_color(enum pscan_thread_status s)
 	return col_reset;
 }
 
+/*
+ * Does this line read as idle? Either the slot is unclaimed, or its worker has
+ * been waiting for work long enough that drawing the last file's status would
+ * be a lie (a persistent csum worker keeps its line across files, so that
+ * status outlives the file - see pscan_slot_waiting).
+ */
+static bool slot_is_idle(struct pscan_thread *t)
+{
+	gint64 since = t->waiting_since;
+
+	return t->status == thread_idle ||
+	       (since && g_get_monotonic_time() - since > IDLE_AFTER_US);
+}
+
 static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 {
 	char buf[BUF_LEN];
@@ -426,9 +452,10 @@ static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 	int avail, termw;
 
 	/* Idle slots are just the dim number and word - nothing on the right. */
-	if (t->status == thread_idle) {
-		s_printf("%s%3u%s  %s%s%s\n",
-			 col_dim, slot, col_reset, wcol, word, col_reset);
+	if (slot_is_idle(t)) {
+		s_printf("%s%3u%s  %s%s%s\n", col_dim, slot, col_reset,
+			 status_color(thread_idle), status_word(thread_idle),
+			 col_reset);
 		return;
 	}
 
@@ -927,7 +954,7 @@ static void *pscan_progress_thread(void * p)
 				json_last = now;
 				json_last_phase = phase;
 			}
-			usleep(100 * 1000);
+			usleep(REDRAW_MS * 1000);
 			continue;
 		}
 
@@ -947,7 +974,7 @@ static void *pscan_progress_thread(void * p)
 		spin_frame++;	/* advance every spinner + the indeterminate bar */
 
 		/* Do not waste too much cpu */
-		usleep(1000 * (tty ? 100 : 1000));
+		usleep(1000 * (tty ? REDRAW_MS : REDRAW_LOG_MS));
 	} while (printer_running);
 
 	return NULL;
@@ -962,10 +989,18 @@ static void pscan_free_threads(void)
 	pscan.thread_count = 0;
 }
 
-struct pscan_thread *pscan_register_thread(pid_t tid)
+/*
+ * Allocate a fresh slot, already claimed by `tid`, and publish it. The status
+ * is set before publication: the moment the slot is in pscan.threads a
+ * concurrent pscan_claim_slot() may look at it, and a still-idle slot there
+ * would be handed to a second worker.
+ */
+static struct pscan_thread *pscan_register_thread(pid_t tid,
+						  enum pscan_thread_status status)
 {
 	struct pscan_thread *tprogress = calloc(1, sizeof(struct pscan_thread));
 	tprogress->tid = tid;
+	tprogress->status = status;
 
 	g_mutex_lock(&pscan.mutex);
 	pscan.threads = realloc(pscan.threads, (pscan.thread_count + 1) *
@@ -1120,7 +1155,16 @@ void pscan_slot_idle(struct pscan_thread *slot)
 	g_mutex_lock(&pscan.mutex);
 	slot->file_path[0] = '\0';
 	slot->status = thread_idle;
+	slot->waiting_since = 0;
 	g_mutex_unlock(&pscan.mutex);
+}
+
+/* See progress.h: the worker publishes the wait, slot_is_idle() judges it. */
+void pscan_slot_waiting(struct pscan_thread *slot, bool waiting)
+{
+	if (!slot)
+		return;
+	slot->waiting_since = waiting ? g_get_monotonic_time() : 0;
 }
 
 bool is_progress_printer_running(void)
@@ -1171,6 +1215,12 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 
 	g_mutex_lock(&pscan.mutex);
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
+		/*
+		 * Only a released slot is free. A persistent worker waiting for
+		 * its next file keeps a non-idle status (that is what
+		 * waiting_since exists to soften, in the renderer only), so its
+		 * line is never handed to a sibling.
+		 */
 		if (pscan.threads[i]->status == thread_idle) {
 			slot = pscan.threads[i];
 			slot->tid = tid;
@@ -1180,10 +1230,8 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 	}
 	g_mutex_unlock(&pscan.mutex);
 
-	if (!slot) {
-		slot = pscan_register_thread(tid);
-		slot->status = status;
-	}
+	if (!slot)
+		slot = pscan_register_thread(tid, status);
 	return slot;
 }
 
