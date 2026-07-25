@@ -57,11 +57,20 @@ done
 
 [ $# -gt 0 ] || die "no duperemove arguments given; put them after '--'. See --help."
 
-# Resolve the binary.
+# Resolve the binary. ./oans first: this repo builds that name, and `make
+# install` puts a `duperemove` compatibility symlink on PATH, so preferring the
+# PATH lookup silently profiles whatever duperemove is installed - which on a
+# dev box is usually *upstream*, not your build. Falling back that far is worth
+# a warning rather than a silent substitution.
 if [ -z "$BINARY" ]; then
-	if [ -x ./duperemove ]; then BINARY=./duperemove
-	elif command -v duperemove >/dev/null 2>&1; then BINARY=$(command -v duperemove)
-	else die "no duperemove binary; build it or pass --binary PATH"
+	if [ -x ./oans ]; then BINARY=./oans
+	elif [ -x ./duperemove ]; then BINARY=./duperemove
+	elif command -v duperemove >/dev/null 2>&1; then
+		BINARY=$(command -v duperemove)
+		echo "perf-profile: warning: no ./oans or ./duperemove in $PWD;" >&2
+		echo "              profiling $BINARY, which is probably NOT your build." >&2
+		echo "              Build first, or pass -b/--binary explicitly." >&2
+	else die "no oans/duperemove binary; build it or pass --binary PATH"
 	fi
 fi
 [ -x "$BINARY" ] || die "not executable: $BINARY"
@@ -83,11 +92,17 @@ drop_caches() {
 	sync
 	if [ "$(id -u)" -eq 0 ]; then
 		echo 3 > /proc/sys/vm/drop_caches
-	elif sudo -n true 2>/dev/null; then
-		echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null
-	else
-		die "--cold needs root or passwordless sudo to drop caches"
+		return
 	fi
+	# Probe the real command, not `sudo -n true`. The useful sudoers rule to
+	# grant here is exactly `tee /proc/sys/vm/drop_caches` and nothing else -
+	# which is what scripts/bench.py relies on - and under such a rule
+	# `sudo -n true` still demands a password. The old probe therefore disabled
+	# --cold on precisely the machines configured to support it.
+	if echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1; then
+		return
+	fi
+	die "--cold needs root, or a passwordless sudoers rule for 'tee /proc/sys/vm/drop_caches'"
 }
 
 run() { "$BINARY" "$@" >/dev/null 2>&1 || true; }

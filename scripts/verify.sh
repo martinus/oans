@@ -37,6 +37,23 @@ if ! command -v valgrind >/dev/null 2>&1; then
 else
 	scratch=$(mktemp -d "${DUPEREMOVE_TEST_DIR:-${TMPDIR:-/tmp}}/verify-smoke.XXXXXX")
 	trap 'rm -rf "$scratch"' EXIT
+
+	# The smoke deduplicates, so the scratch has to be reflink-capable. With
+	# DUPEREMOVE_TEST_DIR unset it lands in /tmp, which is tmpfs on most
+	# distros: oans then correctly refuses the tree and exits 1 - but its
+	# message went to the >/dev/null below, so this script stopped dead with no
+	# output at all and looked like it had simply ended. Check up front instead.
+	fstype=$(stat -f -c %T "$scratch" 2>/dev/null || echo unknown)
+	case "$fstype" in
+	btrfs|xfs) ;;
+	*)
+		echo "verify: scratch '$scratch' is on '$fstype', but the valgrind smoke" >&2
+		echo "        deduplicates and needs btrfs or xfs. Point DUPEREMOVE_TEST_DIR" >&2
+		echo "        at a reflink-capable directory, e.g.:" >&2
+		echo "            DUPEREMOVE_TEST_DIR=\$HOME/.itest-scratch $0" >&2
+		exit 1 ;;
+	esac
+
 	head -c 1048576 /dev/urandom > "$scratch/a"
 	cp "$scratch/a" "$scratch/b"		# a real duplicate for dedupe to act on
 	hf="$scratch/hf.db"
@@ -44,8 +61,19 @@ else
 		valgrind -q --leak-check=full --error-exitcode=42 \
 			--suppressions=tests/valgrind.supp "$@"
 	}
-	vg ./oans -rd --hashfile="$hf" "$scratch" >/dev/null
-	vg ./oans --hashfile="$hf" >/dev/null	# bare replay of the stored config
+	# Keep the output instead of discarding it: on failure it is the only
+	# explanation of what went wrong, and swallowing it is what made the tmpfs
+	# case above so hard to read.
+	smoke() {
+		local out
+		if ! out=$(vg "$@" 2>&1); then
+			echo "$out" >&2
+			echo "verify: valgrind smoke failed: $*" >&2
+			exit 1
+		fi
+	}
+	smoke ./oans -rd --hashfile="$hf" "$scratch"
+	smoke ./oans --hashfile="$hf"		# bare replay of the stored config
 	echo "ok"
 fi
 
