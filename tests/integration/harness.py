@@ -33,7 +33,11 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.abspath(os.path.join(_HERE, "..", ".."))
-DUPEREMOVE = os.environ.get("DUPEREMOVE", os.path.join(REPO_DIR, "oans"))
+# Resolved now, while the cwd is still the repo: `make integration` passes a
+# relative DUPEREMOVE=./oans, and a test that chdir()s (to exercise a relative
+# --exclude, say) would otherwise fail to find the binary.
+DUPEREMOVE = os.path.abspath(
+    os.environ.get("DUPEREMOVE", os.path.join(REPO_DIR, "oans")))
 TEST_ROOT = os.environ.get("DUPEREMOVE_TEST_DIR", os.path.join(REPO_DIR, ".itest-scratch"))
 
 # oans exits 0 even after per-file failures, so we scan its output for
