@@ -47,17 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # apt was 15-37s per job. The cache key pins the runner image and the
-      # package list, so a hit means the same packages on the same image; the
-      # installer then works straight from the cached .debs. See the script.
-      - name: Restore apt cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/apt-deps
         with:
-          path: ~/.apt-archives
-          key: apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-build-${{ hashFiles('.github/apt/build.txt') }}
-
-      - name: Install build dependencies
-        run: .github/scripts/apt-install.sh .github/apt/build.txt
+          leg: build
 
       # Guards the long-path invariant (#117): a syscall taking a scanned
       # file's path silently ENAMETOOLONGs and drops the file, exit 0.
@@ -105,17 +97,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # apt was 15-37s per job. The cache key pins the runner image and the
-      # package list, so a hit means the same packages on the same image; the
-      # installer then works straight from the cached .debs. See the script.
-      - name: Restore apt cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/apt-deps
         with:
-          path: ~/.apt-archives
-          key: apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-valgrind-${{ hashFiles('.github/apt/valgrind.txt') }}
-
-      - name: Install build dependencies
-        run: .github/scripts/apt-install.sh .github/apt/valgrind.txt
+          leg: valgrind
 
       - name: Build
         run: make
@@ -164,17 +148,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # apt was 15-37s per job. The cache key pins the runner image and the
-      # package list, so a hit means the same packages on the same image; the
-      # installer then works straight from the cached .debs. See the script.
-      - name: Restore apt cache
-        uses: actions/cache@v4
+      - uses: ./.github/actions/apt-deps
         with:
-          path: ~/.apt-archives
-          key: apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-sanitizers-${{ hashFiles('.github/apt/sanitizers.txt') }}
-
-      - name: Install build dependencies
-        run: .github/scripts/apt-install.sh .github/apt/sanitizers.txt
+          leg: sanitizers
 
       # Newer runners default vm.mmap_rnd_bits to 32, which clang's ASAN shadow
       # mapping can't accommodate ("Shadow memory range interleaves..."). 28 is

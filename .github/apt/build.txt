@@ -1,15 +1,5 @@
-# Packages for the build-and-test matrix. One per line; blank lines and
-# # comments ignored. The cache key hashes this file, so editing it
-# invalidates the cached .debs - which is the point.
+# Extras for the build-and-test matrix, on top of base.txt. Both compilers,
+# and xfs because that matrix covers both scratch filesystems.
 build-essential
 clang
-pkg-config
-libsqlite3-dev
-libglib2.0-dev
-libblkid-dev
-libmount-dev
-uuid-dev
-libbsd-dev
-libxxhash-dev
-btrfs-progs
 xfsprogs
