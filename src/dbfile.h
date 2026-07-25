@@ -65,7 +65,12 @@ struct dbhandle {
 
 struct file {
 	int64_t		id;
-	char		filename[PATH_MAX + 1];
+	/*
+	 * Heap-owned so a path longer than PATH_MAX round-trips intact (#117).
+	 * Manage only via file_set_filename(); free via file_cleanup() (usable
+	 * as a _cleanup_ handler on a stack `struct file`).
+	 */
+	char		*filename;
 	uint64_t	ino;
 	uint64_t	subvol;
 	size_t		size;
@@ -81,6 +86,15 @@ struct dbhandle *dbfile_open_handle(char *filename);
  * is deduping the same hashfile. NULL if missing or not an oans hashfile. */
 struct dbhandle *dbfile_open_handle_ro(char *filename);
 void dbfile_close_handle(struct dbhandle *db);
+
+/*
+ * Replace f->filename with a heap copy of `name` (freeing the previous one);
+ * `name` may be NULL to clear it. Returns 0, or -1 (errno set) if the copy
+ * failed. file_cleanup() frees f->filename and is meant to be used as a
+ * _cleanup_ handler on a stack `struct file`.
+ */
+int file_set_filename(struct file *f, const char *name);
+void file_cleanup(struct file *f);
 
 /*
  * Per-connection SQLite page-cache budgets, in KiB. Every connection defaults

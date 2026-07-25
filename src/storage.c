@@ -48,6 +48,7 @@ static int read_rotational(dev_t dev, bool *rot)
 		int fd, n;
 
 		snprintf(path, sizeof(path), forms[i], maj, min);
+		/* longpath-ok: a generated /sys path, never a scanned file. */
 		fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd < 0)
 			continue;
@@ -99,6 +100,7 @@ static void detect_btrfs(int fd, struct storage_profile *p)
 			continue;
 		if (di.path[0] == '\0')
 			continue;
+		/* longpath-ok: a device node path from BTRFS_IOC_DEV_INFO. */
 		if (stat((const char *)di.path, &st) != 0 || !S_ISBLK(st.st_mode))
 			continue;
 
@@ -115,9 +117,13 @@ int storage_detect(const char *path, struct storage_profile *p)
 	memset(p, 0, sizeof(*p));
 	p->num_devices = 1;
 
+	/* longpath-ok: a scan root, not a scanned file. NOTE: if the root
+	 * PATH_MAX limit is ever lifted, this function needs an fd and
+	 * fstat()/fstatfs() instead -- see src/longpath.h. */
 	if (stat(path, &st) != 0)
 		return -errno;
 
+		/* longpath-ok: a scan root; see the note above. */
 	if (statfs(path, &sfs) == 0 && sfs.f_type == BTRFS_SUPER_MAGIC) {
 		fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd >= 0) {

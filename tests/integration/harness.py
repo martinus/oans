@@ -73,50 +73,58 @@ _FIEMAP_EXTENT_DATA_INLINE = 0x0200
 _NO_PHYS = _FIEMAP_EXTENT_UNKNOWN | _FIEMAP_EXTENT_DELALLOC | _FIEMAP_EXTENT_DATA_INLINE
 
 
-def fiemap_extents(path):
+def fiemap_extents_fd(fd):
+    """Like fiemap_extents(), but on an already-open fd. Lets callers reach a
+    file whose absolute path exceeds PATH_MAX (opened via a dir_fd), #117."""
+    # extent_count=0 makes the kernel report only the total extent count
+    # (it never fills more than fm_extent_count, so a single sized guess can
+    # silently truncate). Count first, then fetch exactly that many.
+    buf = bytearray(_FIEMAP_HDR.size)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                          _FIEMAP_FLAG_SYNC, 0, 0, 0)
+    fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+    count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+    if count == 0:
+        return []
+
+    buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
+                          _FIEMAP_FLAG_SYNC, 0, count, 0)
+    fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
+    mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
+
+    out = []
+    for i in range(mapped):
+        logical, physical, length, _r0, _r1, flags, *_ = \
+            _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
+        out.append((logical, physical, length, flags))
+    return out
+
+
+def fiemap_extents(path, dir_fd=None):
     """Return [(logical, physical, length, flags), ...] for path's data extents.
 
     Holes are not returned by FIEMAP, so every entry is real data. Uses
-    FIEMAP_FLAG_SYNC so results are stable right after writes.
+    FIEMAP_FLAG_SYNC so results are stable right after writes. Pass dir_fd to
+    reach a file whose absolute path exceeds PATH_MAX (#117) -- the test process
+    cannot name those either.
     """
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDONLY, dir_fd=dir_fd)
     try:
-        # extent_count=0 makes the kernel report only the total extent count
-        # (it never fills more than fm_extent_count, so a single sized guess can
-        # silently truncate). Count first, then fetch exactly that many.
-        buf = bytearray(_FIEMAP_HDR.size)
-        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                              _FIEMAP_FLAG_SYNC, 0, 0, 0)
-        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
-        count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
-        if count == 0:
-            return []
-
-        buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
-        _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                              _FIEMAP_FLAG_SYNC, 0, count, 0)
-        fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
-        mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
-
-        out = []
-        for i in range(mapped):
-            logical, physical, length, _r0, _r1, flags, *_ = \
-                _FIEMAP_EXT.unpack_from(buf, _FIEMAP_HDR.size + i * _FIEMAP_EXT.size)
-            out.append((logical, physical, length, flags))
-        return out
+        return fiemap_extents_fd(fd)
     finally:
         os.close(fd)
 
 
-def phys_extents(path):
+def phys_extents(path, dir_fd=None):
     """Set of physical start offsets of path's real (allocated) data extents."""
-    return {phys for _log, phys, _len, flags in fiemap_extents(path)
+    return {phys for _log, phys, _len, flags in fiemap_extents(path, dir_fd)
             if not (flags & _NO_PHYS)}
 
 
-def files_share(a, b):
+def files_share(a, b, dir_fd=None):
     """True if a and b have at least one physical extent in common (reflinked)."""
-    return bool(phys_extents(a) & phys_extents(b))
+    return bool(phys_extents(a, dir_fd) & phys_extents(b, dir_fd))
 
 
 # --------------------------------------------------------------------------
@@ -289,12 +297,12 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- on-disk sharing ---------------------------------------------------
 
-    def assertShared(self, a, b, msg=None):
-        self.assertTrue(files_share(a, b),
+    def assertShared(self, a, b, msg=None, dir_fd=None):
+        self.assertTrue(files_share(a, b, dir_fd),
                         msg or f"expected {a} and {b} to share storage")
 
-    def assertNotShared(self, a, b, msg=None):
-        self.assertFalse(files_share(a, b),
+    def assertNotShared(self, a, b, msg=None, dir_fd=None):
+        self.assertFalse(files_share(a, b, dir_fd),
                          msg or f"expected {a} and {b} to be independent")
 
     # -- data integrity ----------------------------------------------------

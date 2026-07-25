@@ -26,6 +26,7 @@
 #include "debug.h"
 #include "memstats.h"
 #include "fiemap.h"
+#include "longpath.h"
 
 #include "filerec.h"
 
@@ -251,7 +252,7 @@ int filerec_open(struct filerec *file, bool quiet)
 	if (file->fd_refs == 0) {
 		abort_on(file->fd != -1);
 
-		fd = open(file->filename, O_RDONLY);
+		fd = longpath_open(file->filename, O_RDONLY);
 		if (fd == -1) {
 			ret = errno;
 			if (ret != ENOENT || !quiet)

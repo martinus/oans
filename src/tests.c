@@ -21,6 +21,7 @@
 #include "fiemap.c"
 #include "progress.c"
 #include "storage.c"
+#include "longpath.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -198,6 +199,72 @@ MU_TEST(test_sanitize_ctrl) {
 	mu_check(strcmp(small, "abc") == 0);
 }
 
+MU_TEST(test_progress_copy_path) {
+	char buf[32];
+
+	/* Fits: copied verbatim. */
+	progress_copy_path(buf, sizeof(buf), "abc");
+	mu_check(strcmp(buf, "abc") == 0);
+
+	/* Exactly filling the buffer (len == cap) must still elide. */
+	progress_copy_path(buf, 4, "abcd");
+	mu_check(strlen(buf) < 4);
+
+	/*
+	 * Too long: elided with the renderer's single "…", keeping the real
+	 * head and the basename so both ends stay readable.
+	 */
+	progress_copy_path(buf, sizeof(buf),
+			   "/a/very/long/directory/path/basename.txt");
+	mu_check(strlen(buf) < sizeof(buf));
+	mu_check(strstr(buf, "…") != NULL);
+	mu_check(buf[0] == '/');                       /* real head kept */
+	mu_check(strstr(buf, "name.txt") != NULL);     /* basename kept */
+
+	/* Degenerate caps must stay in bounds and NUL-terminated. */
+	for (size_t cap = 1; cap <= sizeof(buf); cap++) {
+		memset(buf, 'X', sizeof(buf));
+		progress_copy_path(buf, cap, "/some/quite/long/path/name.txt");
+		mu_check(strlen(buf) < cap);
+		mu_check(buf[cap - 1] == '\0' || buf[cap - 1] == 'X');
+	}
+
+	/* cap 0 writes nothing at all. */
+	memset(buf, 'X', sizeof(buf));
+	progress_copy_path(buf, 0, "abcdef");
+	mu_check(buf[0] == 'X');
+}
+
+/*
+ * A path is shortened twice on its way to the screen: once into the worker
+ * slot's fixed buffer, then again to the terminal width. Both stages use
+ * ellipsize_path(), so the drawn line carries exactly one "…" -- not one
+ * marker per stage -- and still shows the real head and the real basename.
+ */
+MU_TEST(test_progress_path_two_stage_render) {
+	char deep[9000];
+	char slot[PATH_MAX + 1];
+	char drawn[PATH_MAX + 4];
+	size_t n = 0;
+	const char *p;
+	int markers = 0;
+
+	n += snprintf(deep + n, sizeof(deep) - n, "/head-marker");
+	while (n < sizeof(deep) - 300)
+		n += snprintf(deep + n, sizeof(deep) - n, "/%0*d", 200, 7);
+	snprintf(deep + n, sizeof(deep) - n, "/basename.txt");
+	mu_check(strlen(deep) > PATH_MAX);
+
+	progress_copy_path(slot, sizeof(slot), deep);
+	ellipsize_path(slot, drawn, sizeof(drawn), 100);
+
+	for (p = drawn; (p = strstr(p, "…")); p += strlen("…"))
+		markers++;
+	mu_check(markers == 1);
+	mu_check(strstr(drawn, "/head-marker") == drawn);
+	mu_check(strstr(drawn, "basename.txt") != NULL);
+}
+
 MU_TEST(test_storage_recommend_io_threads) {
 	struct storage_profile p;
 
@@ -348,6 +415,213 @@ MU_TEST(test_group_u64) {
 	mu_check(small[3] == '\0' && strlen(small) <= 3);
 }
 
+/*
+ * longpath: reach a file whose absolute path exceeds PATH_MAX. Builds a chain
+ * of 255-char directories (via incremental chdir, since the leaf's own path is
+ * too long to pass to a syscall) under a /tmp temp dir, then checks that
+ * longpath_open/longpath_stat reach the deep leaf that a plain open/stat could
+ * not. Runs on tmpfs (no reflink needed); best-effort teardown climbs back out.
+ */
+#define LP_COMP_LEN 255
+/* absdir runs to ~PATH_MAX + 383; a leaf adds at most two more
+ * NAME_MAX components on top of that. */
+#define LP_PATH_BUF	6144
+
+static void lp_fill(char *buf, char c, int n)
+{
+	memset(buf, c, n);
+	buf[n] = '\0';
+}
+
+/*
+ * Build the deep tree. *out_levels counts the directories created so far and is
+ * updated as we descend, so a failure partway still leaves the caller enough
+ * state to tear the tree down (we are chdir'd into it and cannot name it with
+ * an absolute path). base_out is emptied first for the same reason.
+ */
+static int lp_make_deep(char *absdir, size_t abscap, char *base_out,
+			size_t base_cap, int *out_levels, const char *victim,
+			const char *contents)
+{
+	char comp[LP_COMP_LEN + 1];
+	char base[] = "/tmp/oans-longpath-XXXXXX";
+	size_t len = strlen(base);
+	int fd;
+
+	lp_fill(comp, 'd', LP_COMP_LEN);
+	base_out[0] = '\0';
+	*out_levels = 0;
+
+	if (!mkdtemp(base) || len + 1 > base_cap || len + 1 > abscap)
+		return -1;
+	memcpy(base_out, base, len + 1);
+	if (chdir(base) != 0)
+		return -1;
+	memcpy(absdir, base, len + 1);
+
+	/* Descend until the directory path alone exceeds PATH_MAX, so the walk
+	 * exercises the multi-chunk openat chain (not just one openat). */
+	while (len < (size_t)PATH_MAX + 128) {
+		if (mkdir(comp, 0700) != 0 || chdir(comp) != 0)
+			return -1;
+		(*out_levels)++;
+		if (len + 1 + LP_COMP_LEN + 1 > abscap)
+			return -1;
+		absdir[len++] = '/';
+		memcpy(absdir + len, comp, LP_COMP_LEN + 1);
+		len += LP_COMP_LEN;
+	}
+
+	fd = open(victim, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	if (write(fd, contents, strlen(contents)) != (ssize_t)strlen(contents)) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	return 0;
+}
+
+static void lp_destroy_deep(int savedcwd, const char *base, const char *victim,
+			    int levels)
+{
+	char comp[LP_COMP_LEN + 1];
+	int i;
+
+	lp_fill(comp, 'd', LP_COMP_LEN);
+
+	/* CWD is the leaf dir: drop the file, then climb + rmdir each level. */
+	unlink(victim);
+	for (i = 0; i < levels; i++) {
+		if (chdir("..") != 0)
+			break;
+		rmdir(comp);
+	}
+	if (savedcwd >= 0 && fchdir(savedcwd) != 0)
+		return;
+	if (base[0])
+		rmdir(base);
+}
+
+/*
+ * The assertions, split out of test_longpath() below: mu_check() returns from
+ * its enclosing function on failure, so keeping them here means a failure can
+ * never skip the teardown -- which would otherwise strand the process CWD
+ * inside a directory too deep to name and leak the tree under /tmp.
+ */
+static void lp_check_helpers(const char *absdir, const char *base,
+			     const char *victim, const char *contents)
+{
+	char leaf[LP_PATH_BUF];
+	struct stat st;
+	int fd, bfd, n;
+	char buf[128] = { 0 };
+	ssize_t r;
+	DIR *d;
+	struct dirent *de;
+	bool found = false;
+
+	/* The directory itself is past PATH_MAX, forcing the chunked walk. */
+	mu_check(strlen(absdir) > PATH_MAX);
+
+	n = snprintf(leaf, sizeof(leaf), "%s/%s", absdir, victim);
+	mu_check(n > 0 && (size_t)n < sizeof(leaf));
+	mu_check(strlen(leaf) > PATH_MAX);
+
+	/* 1. open + read the deep file. */
+	fd = longpath_open(leaf, O_RDONLY);
+	mu_check(fd >= 0);
+	r = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	mu_check(r == (ssize_t)strlen(contents));
+	mu_check(strcmp(buf, contents) == 0);
+
+	/* 2. stat + lstat the deep file. */
+	mu_check(longpath_stat(leaf, &st) == 0);
+	mu_check((size_t)st.st_size == strlen(contents));
+	memset(&st, 0, sizeof(st));
+	mu_check(longpath_lstat(leaf, &st) == 0);
+	mu_check((size_t)st.st_size == strlen(contents));
+
+	/* 3. opendir the deep directory and list it. */
+	d = longpath_opendir(absdir);
+	mu_check(d != NULL);
+	while ((de = readdir(d))) {
+		if (strcmp(de->d_name, victim) == 0) {
+			found = true;
+			break;
+		}
+	}
+	closedir(d);
+	mu_check(found);
+
+	/* 4a. missing final component → ENOENT, not ENAMETOOLONG. */
+	{
+		char missname[LP_COMP_LEN + 1];
+		char miss_leaf[LP_PATH_BUF];
+
+		lp_fill(missname, 'x', LP_COMP_LEN);
+		snprintf(miss_leaf, sizeof(miss_leaf), "%s/%s", absdir, missname);
+		mu_check(strlen(miss_leaf) > PATH_MAX);
+		errno = 0;
+		mu_check(longpath_open(miss_leaf, O_RDONLY) < 0);
+		mu_check(errno == ENOENT);
+		errno = 0;
+		mu_check(longpath_stat(miss_leaf, &st) < 0);
+		mu_check(errno == ENOENT);
+	}
+
+	/* 4b. missing intermediate directory → ENOENT from the ancestor walk. */
+	{
+		char missdir[LP_COMP_LEN + 1];
+		char miss_mid[LP_PATH_BUF];
+
+		lp_fill(missdir, 'z', LP_COMP_LEN);
+		snprintf(miss_mid, sizeof(miss_mid), "%s/%s/%s", absdir,
+			 missdir, victim);
+		mu_check(strlen(miss_mid) > PATH_MAX);
+		errno = 0;
+		mu_check(longpath_open(miss_mid, O_RDONLY) < 0);
+		mu_check(errno == ENOENT);
+	}
+
+	/* 5. short path: identical to plain open(). */
+	bfd = longpath_open(base, O_RDONLY | O_DIRECTORY);
+	mu_check(bfd >= 0);
+	close(bfd);
+}
+
+MU_TEST(test_longpath) {
+	const char *contents = "over-the-PATH_MAX limit\n";
+	char victim[LP_COMP_LEN + 1];
+	char absdir[LP_PATH_BUF];
+	char base[64] = { 0 };
+	int levels = 0;
+	int savedcwd = open(".", O_PATH | O_CLOEXEC);
+	int rc = -1;
+
+	lp_fill(victim, 'v', LP_COMP_LEN);
+
+	/*
+	 * Build, check, tear down -- then assert. Teardown must run before any
+	 * mu_check() that could return early, and we only descend at all once we
+	 * hold an fd we can fchdir() back to.
+	 */
+	if (savedcwd >= 0) {
+		rc = lp_make_deep(absdir, sizeof(absdir), base, sizeof(base),
+				  &levels, victim, contents);
+		if (rc == 0)
+			lp_check_helpers(absdir, base, victim, contents);
+		lp_destroy_deep(savedcwd, base, victim, levels);
+		close(savedcwd);
+	}
+
+	mu_check(savedcwd >= 0);
+	mu_check(rc == 0);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -355,11 +629,14 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
 	MU_RUN_TEST(test_sanitize_ctrl);
+	MU_RUN_TEST(test_progress_copy_path);
+	MU_RUN_TEST(test_progress_path_two_stage_render);
 	MU_RUN_TEST(test_storage_recommend_io_threads);
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
+	MU_RUN_TEST(test_longpath);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

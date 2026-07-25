@@ -25,11 +25,32 @@
 
 #include "dbfile.h"
 #include "opt.h"
+#include "longpath.h"
 
 static struct dbhandle *gdb = NULL;
 
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly);
+
+int file_set_filename(struct file *f, const char *name)
+{
+	char *dup = NULL;
+
+	if (name) {
+		dup = strdup(name);
+		if (!dup)
+			return -1;
+	}
+	free(f->filename);
+	f->filename = dup;
+	return 0;
+}
+
+void file_cleanup(struct file *f)
+{
+	free(f->filename);
+	f->filename = NULL;
+}
 
 static GMutex io_mutex; /* Locks db writes */
 
@@ -74,6 +95,7 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 	else
 		snprintf(dir, sizeof(dir), ".");
 
+	/* longpath-ok: the hashfile directory, named by the user, never scanned. */
 	if (stat(dir, &st) != 0 && errno == ENOENT) {
 		eprintf("Error: cannot open hashfile \"%s\": directory \"%s\" "
 			"does not exist.\n", filename, dir);
@@ -85,6 +107,7 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 				dir);
 		return;
 	}
+	/* longpath-ok: the hashfile directory. */
 	if (stat(dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
 		eprintf("Error: cannot open hashfile \"%s\": \"%s\" is not a "
 			"directory.\n", filename, dir);
@@ -95,6 +118,7 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 	 * e.g. a hashfile written by a root run (owned root:root, mode 0600)
 	 * being read by a normal user. oans opens hashfiles read/write.
 	 */
+	/* longpath-ok: the hashfile itself. */
 	if (stat(filename, &st) == 0 && access(filename, R_OK | W_OK) != 0) {
 		struct passwd *pw = getpwuid(st.st_uid);
 
@@ -513,7 +537,8 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 		return ret;
 
 	if (strcmp("(null)", dbpath) != 0) {
-		ret = chmod(dbpath, S_IRUSR|S_IWUSR);
+		/* longpath-ok: the hashfile itself. */
+	ret = chmod(dbpath, S_IRUSR|S_IWUSR);
 		if (ret) {
 			perror("setting db file permissions");
 			return ret;
@@ -540,7 +565,8 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 	if (ret && strcmp("(null)", dbpath) != 0) {
 		eprintf("Recreating hashfile ..\n");
 		sqlite3_close(db);
-		ret = unlink(dbpath);
+		/* longpath-ok: the hashfile itself. */
+	ret = unlink(dbpath);
 		if ( ret && errno != ENOENT) {
 			ret = errno;
 			eprintf("Error %d while unlinking old "
@@ -2042,7 +2068,10 @@ int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 	dbfile->size = sqlite3_column_int64(stmt, 1);
 
 	buf = (char *)sqlite3_column_text(stmt, 2);
-	strncpy(dbfile->filename, buf, PATH_MAX);
+	if (file_set_filename(dbfile, buf)) {
+		ret = ENOMEM;
+		goto out;
+	}
 
 	dbfile->id = sqlite3_column_int64(stmt, 3);
 
@@ -2307,7 +2336,7 @@ int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 			continue;
 
 		fn = (const char *)sqlite3_column_text(sel, 1);
-		if (!fn || stat(fn, &st) == 0)
+		if (!fn || longpath_stat(fn, &st) == 0)
 			continue;
 		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */
 		if (errno != ENOENT && errno != ENOTDIR)

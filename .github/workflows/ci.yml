@@ -40,6 +40,11 @@ jobs:
             uuid-dev libbsd-dev libxxhash-dev \
             btrfs-progs xfsprogs
 
+      # Guards the long-path invariant (#117): a syscall taking a scanned
+      # file's path silently ENAMETOOLONGs and drops the file, exit 0.
+      - name: Lint (long-path invariant)
+        run: make lint
+
       - name: Build
         run: make
 

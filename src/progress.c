@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <stdatomic.h>
 #include <inttypes.h>
+#include <string.h>
 
 #include "debug.h"
 #include "opt.h"
@@ -281,6 +282,30 @@ static void ellipsize_path(const char *path, char *out, size_t out_len,
 	head = (cols - 1) * 2 / 5;
 	tail = cols - 1 - head;
 	snprintf(out, out_len, "%.*s…%s", head, path, path + len - tail);
+}
+
+/*
+ * Copy a file path into a fixed status-line buffer, always NUL-terminated. A
+ * path too long for the buffer (an absolute path over PATH_MAX, #117) is
+ * elided by ellipsize_path() above -- the same helper, and so the same single
+ * "…" marker, the renderer uses when it later fits the path to the terminal
+ * width. Display only; never used to reopen the file.
+ *
+ * The budget is cols = cap - 3 so head + "…" (3 bytes) + tail + NUL is exactly
+ * cap. ellipsize_path() raises cols to 8 below that, where snprintf() would
+ * bound the result by truncating -- possibly mid-"…", emitting broken UTF-8 --
+ * so buffers too small to elide cleanly get a plain truncating copy instead.
+ */
+#define ELIDE_MIN_CAP	16
+
+void progress_copy_path(char *dst, size_t cap, const char *src)
+{
+	if (cap == 0)
+		return;
+	if (strlen(src) < cap || cap < ELIDE_MIN_CAP)
+		snprintf(dst, cap, "%s", src);
+	else
+		ellipsize_path(src, dst, cap, (int)cap - 3);
 }
 
 static const char *const stage_name[STAGE_COUNT] = {

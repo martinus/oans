@@ -236,6 +236,7 @@ static int print_hashfile_stats(char *filename)
 	freelist = dbfile_query_u64(sq, "PRAGMA freelist_count");
 
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
+	/* longpath-ok: the hashfile, named by the user, never scanned. */
 	if (stat(filename, &sb) == 0)
 		printf("  %s(%s on disk)%s", col_dim, human_size(sb.st_size), col_reset);
 	printf("\n");
@@ -494,8 +495,13 @@ static int list_db_files(char *filename)
 
 /*
  * Run cb on every line read from stdin, with the trailing newline stripped.
- * Overlong lines are skipped with a warning; a nonzero cb return stops the
- * loop and is passed through.
+ * A nonzero cb return stops the loop and is passed through.
+ *
+ * No length limit here: whether a path is too long is the consumer's business.
+ * -R only DELETEs a row by name, which has no length bound, so bounding it here
+ * meant a path the scan could store was one -R could never remove -- and
+ * `oans -L | oans -R -` silently dropped exactly the deep files #117 added.
+ * scan_file() applies its own limit, since it needs a realpath() buffer.
  */
 static int for_each_stdin_line(int (*cb)(char *line, void *arg), void *arg)
 {
@@ -507,11 +513,6 @@ static int for_each_stdin_line(int (*cb)(char *line, void *arg), void *arg)
 	while (!ret && (len = getline(&line, &buflen, stdin)) != -1) {
 		if (len > 0 && line[len - 1] == '\n')
 			line[--len] = '\0';
-
-		if (len > PATH_MAX - 1) {
-			eprintf("Path max exceeded: %s\n", line);
-			continue;
-		}
 
 		ret = cb(line, arg);
 	}
@@ -1403,6 +1404,8 @@ static int drop_missing_roots(struct scan_config *sc)
 	for (i = 0; i < sc->nroots; i++) {
 		struct stat st;
 
+		/* longpath-ok: a stored scan root, which scan_file() already
+		 * required to fit PATH_MAX. */
 		if (stat(sc->roots[i], &st) == 0) {
 			sc->roots[live++] = sc->roots[i];
 		} else {
@@ -1433,6 +1436,8 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	for (i = 0; i < nroots; i++) {
 		char buf[PATH_MAX];
 
+		/* longpath-ok: a scan root; see scan_file() for the limit and
+		 * the message a user gets when a root exceeds it. */
 		if (realpath(roots[i], buf))
 			abs[sc.nroots++] = strdup(buf);
 	}

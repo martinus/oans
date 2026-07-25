@@ -149,8 +149,15 @@ integration-valgrind: oans
 	fi; \
 	echo "valgrind: no findings"
 
+# Guard the long-path invariant (#117): no syscall may take a scanned file's
+# path as a single argument, or it silently ENAMETOOLONGs and drops the file.
+# See scripts/lint-longpath.py for the waiver syntax.
+.PHONY: lint
+lint:
+	@python3 scripts/lint-longpath.py
+
 .PHONY: check
-check: test integration
+check: lint test integration
 
 # Install oans plus a backward-compatible 'duperemove' symlink, the man page,
 # and the zsh completion. `install -D` creates the target directories.

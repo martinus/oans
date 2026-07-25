@@ -2,6 +2,7 @@
 #define	__PROGRESS_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include "glib.h"
 
@@ -43,6 +44,11 @@ struct pscan_global {
 };
 
 void pscan_finish_listing(void);
+
+/* Copy a path into a fixed status-line buffer (NUL-terminated; a path too long
+ * for it keeps its head and basename around a single "…", the same elision the
+ * renderer applies at terminal width). Display only. */
+void progress_copy_path(char *dst, size_t cap, const char *src);
 
 /*
  * Enable machine-readable progress: the progress thread streams newline-delimited
