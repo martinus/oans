@@ -917,10 +917,16 @@ static void *pscan_progress_thread(void * p)
 
 		/* Do not waste too much cpu */
 		usleep(1000 * (tty ? 100 : 1000));
-	} while (pdd.phase ? pdd.running
-			   : (!pscan.listing_completed
-			      || files_scanned != pscan.total_files_count
-			      || bytes_scanned != pscan.total_bytes_count));
+		/*
+		 * Both phases end when their producer says so, never when a counter
+		 * happens to match. The scan branch used to loop until
+		 * files_scanned/bytes_scanned reached the totals exactly; one file
+		 * counted into a total but not credited back (the invariant
+		 * test_skip_work_is_fully_credited pins) made that unreachable, so
+		 * this thread span in usleep forever and pscan_join() blocked in
+		 * g_thread_join() with all the actual work already finished.
+		 */
+	} while (pdd.phase ? pdd.running : pscan.scan_running);
 
 	return NULL;
 }
@@ -968,11 +974,14 @@ void pscan_run(void)
 	}
 
 	/* Will abort on failure */
+	pscan.scan_running = true;
 	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
 }
 
 void pscan_join(bool continues)
 {
+	/* Tell the thread to stop before waiting for it, or we wait forever. */
+	pscan.scan_running = false;
 	g_thread_join(printer);
 	printer = NULL;
 
@@ -986,20 +995,26 @@ void pscan_join(bool continues)
 		return;
 	}
 
-	if (continues) {
-		/*
-		 * A live dedupe phase will keep drawing this same block, so leave
-		 * it in place - workers and all - and just refresh it once so
-		 * hashing shows ticked. Nothing is wiped or stranded above the
-		 * dedupe view, and the worker list never blinks away. Threads,
-		 * drawn_lines and the hidden cursor are kept for the dedupe phase
-		 * (it reuses the now-idle slots and redraws over this block).
-		 */
-		g_mutex_lock(&pscan.mutex);
-		print_progress();
-		g_mutex_unlock(&pscan.mutex);
+	/*
+	 * One final render, now that the counts are settled and hashing is
+	 * ticked. It is needed on every path, not just `continues`: the thread
+	 * now stops the moment the producer says so, which can be mid-tick, so
+	 * its last frame may show a bar short of 100%. The old counter-equality
+	 * exit gave that completeness as a side effect - at the cost of never
+	 * exiting at all when the counters could not meet.
+	 *
+	 * A live dedupe phase keeps drawing this same block, so leave it in
+	 * place - workers and all - rather than wiping it: nothing is stranded
+	 * above the dedupe view and the worker list never blinks away. Threads,
+	 * drawn_lines and the hidden cursor are kept for the dedupe phase, which
+	 * reuses the now-idle slots and redraws over this block.
+	 */
+	g_mutex_lock(&pscan.mutex);
+	print_progress();
+	g_mutex_unlock(&pscan.mutex);
+
+	if (continues)
 		return;
-	}
 
 	/*
 	 * No live dedupe follows (print-only / non-tty / -v): wipe the live area
