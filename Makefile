@@ -140,9 +140,15 @@ test:
 
 # End-to-end suite (Python stdlib unittest). Dedupe cases need a reflink fs;
 # override the scratch dir with DUPEREMOVE_TEST_DIR=/path.
+#
+# JOBS is tests/run.py's -j: worker processes, or `auto` for min(nproc, 8).
+# The suite is ~4x faster in parallel, which matters most for the sanitizer
+# builds (they re-run all of it at 4-8x the cost). JOBS=1 forces the serial
+# runner - use it when a failure's interleaved output is hard to read.
+JOBS ?= auto
 .PHONY: integration
 integration: oans
-	$(SANITIZE_RUN) DUPEREMOVE=./oans python3 tests/run.py
+	$(SANITIZE_RUN) DUPEREMOVE=./oans python3 tests/run.py -j $(JOBS)
 
 # Same end-to-end suite, but every oans invocation runs under valgrind memcheck
 # (via tests/valgrind-wrap.sh). Findings go to per-pid logs; a non-empty log
@@ -153,7 +159,7 @@ VGLOGDIR = $(CURDIR)/.vglogs
 integration-valgrind: oans
 	@command -v valgrind >/dev/null 2>&1 || { echo "valgrind not installed"; exit 1; }
 	rm -rf $(VGLOGDIR) && mkdir -p $(VGLOGDIR)
-	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py
+	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py -j $(JOBS)
 	@if find $(VGLOGDIR) -type f -size +0c | grep -q .; then \
 		echo "=== valgrind reported errors/leaks ==="; \
 		find $(VGLOGDIR) -type f -size +0c -exec cat {} +; \

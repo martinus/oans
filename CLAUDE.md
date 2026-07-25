@@ -80,6 +80,16 @@ against a scratch tree and assert on the hashfile and on-disk sharing. Dedupe
 cases need a reflink fs (`DUPEREMOVE_TEST_DIR`, set by `devenv.sh`). Keep tests
 in `tests/`; no shell tests.
 
+- **The suite runs in parallel by default** — `tests/run.py -j` (`auto` =
+  `min(nproc, 8)`), i.e. `make integration JOBS=…`. ~3.3× on 4 cores (26.4→7.9s);
+  the real payoff is the sanitizer builds, which re-run all of it. Workers are
+  *processes*, not threads, because `test_long_path` `chdir()`s; work is handed
+  out one test at a time so the slow ones (autotune, vacuum) don't strand a
+  worker. **`JOBS=1` restores the old serial runner** — use it when a failure's
+  interleaved output is hard to read, or to check a suspected ordering
+  dependency. Tests are isolated by `setUp`'s per-test `mkdtemp` + hashfile;
+  anything sharing state outside that will flake in parallel.
+
 - **Never scan/benchmark out of `/tmp` — it's tmpfs**, not reflink-capable and
   rejected by `is_fs_supported()`, so a scan there stores **0 files silently**
   and dedupe is a no-op. Use real btrfs/xfs and verify a non-zero file count
