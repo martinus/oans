@@ -1,7 +1,15 @@
 name: CI
 
+# A PR branch would otherwise match both triggers and run the whole matrix
+# twice for one commit: double the CI spend, and double the exposure to a
+# wedged runner. Restrict push to the branches that have no PR to cover them --
+# in practice just master, for post-merge validation. (This has to be an
+# allowlist: GitHub rejects `branches` and `branches-ignore` on the same event,
+# and a denylist cannot express "every branch that has an open PR".)
 on:
   push:
+    branches:
+      - master
   pull_request:
 
 # Read-only by default; no job here needs to write back to the repo.
