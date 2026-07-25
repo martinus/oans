@@ -27,8 +27,16 @@
 #ifndef __OANS_TSAN_H__
 #define __OANS_TSAN_H__
 
-#if defined(__SANITIZE_THREAD__) || \
-	(defined(__has_feature) && __has_feature(thread_sanitizer))
+/*
+ * GCC has no __has_feature, and a #if expression is expanded whole - guarding it
+ * with defined(__has_feature) in the same expression does not save us, GCC still
+ * chokes on the call. Define it away first, the portable spelling.
+ */
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
 
 #include <glib.h>
 #include <sanitizer/tsan_interface.h>
