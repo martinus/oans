@@ -72,6 +72,7 @@ class Profile:
     min_kb: int = 16
     max_kb: int = 65536
     big_mb: int = 0          # if >0, add one deliberately huge file of this size
+    frag_stride_kb: int = 0  # if >0, fragment every file on this stride (see _fragment)
     external: str | None = None   # benchmark this existing path, don't generate
 
 
@@ -99,6 +100,22 @@ PROFILES: dict[str, Profile] = {
     "big": Profile(
         note="~48 x 40 MiB files — per-thread read buffers; pair with --rss",
         unique=48, dup_groups=1, copies=2, mean_kb=40000, min_kb=40000, max_kb=40000),
+    # Few large files, each shredded into tens of thousands of extents. Every
+    # other profile here generates ~1 extent/file (as does a real source tree:
+    # ~/git/linux measures 1.17 mean, p99 2), which hides all per-file
+    # extent-list cost. This is the shape a long-lived dedupe target actually
+    # degrades into - dedupe fragments what it shares - and the only profile
+    # where the get_extent() resume cursor (#134) is measurable: it was 49% of
+    # all CPU before that fix, and nothing here would have caught a regression.
+    # This is a CPU-cost detector, so run it --warm: a cold run buries the signal
+    # under 4 GiB of read I/O. `user` always shows it; for it to show in *wall*
+    # too, pair with --io-threads 2, since 8 files across 8 threads is one file
+    # per thread and the extra CPU just overlaps (measured: at 8 threads wall is
+    # 2.51 vs 2.50 while user is 3.05 vs 1.05; at 2 threads wall is 3.32 vs 2.51).
+    "fragmented": Profile(
+        note="8 x 512 MiB, ~32k extents each — per-file extent-list cost; --warm, pair with --io-threads 2",
+        unique=8, dup_groups=0, mean_kb=524288, min_kb=524288, max_kb=524288,
+        frag_stride_kb=32),
     # Not generated: an existing real tree (override with --external PATH).
     "git": Profile(note="existing real tree (default ~/git)", external="~/git"),
 }
@@ -121,6 +138,65 @@ def _exp_size_kb(rng: random.Random, mean: int, lo: int, hi: int) -> int:
     return max(4, (s // 4) * 4)
 
 
+def _fragment(tree: Path, stride_kb: int) -> None:
+    """Shred every file into extents by rewriting one block per stride, randomly.
+
+    On btrfs a rewrite is copy-on-write, so each one lands as its own extent:
+    512 MiB at stride 32 comes back as ~16k extents. Random order matters - in
+    ascending order the allocator can merge neighbours back together and the
+    file stays nearly contiguous.
+
+    Must run *after* the `cp` pass: cp writes its destination sequentially, so
+    copying a fragmented original yields a contiguous copy.
+
+    Content varies per write (a rotating pool of random blocks) so the rewrites
+    do not turn into a tree full of identical blocks, which would be a different
+    workload than intended under --dedupe-options=partial.
+    """
+    stride = stride_kb * 1024
+    block = stride // 2
+    rng = random.Random(20260725)
+    pool = [os.urandom(block) for _ in range(64)]
+
+    # Commit the freshly written content first. Without this the rewrites below
+    # land on pages that are still dirty, so they replace them in place, no
+    # copy-on-write happens, and writeback lays the file out contiguously - the
+    # tree comes back at ~6k extents instead of ~30k and the profile measures
+    # nothing. Same trap as forgetting `sync` between rm and cp in bench-dedupe.
+    subprocess.run(["sync"], check=True)
+
+    for p in sorted(q for q in tree.rglob("*") if q.is_file()):
+        size = p.stat().st_size
+        offs = list(range(0, max(0, size - block), stride))
+        if not offs:
+            continue                      # smaller than one stride: nothing to do
+        rng.shuffle(offs)
+        fd = os.open(p, os.O_WRONLY)
+        try:
+            for i, off in enumerate(offs):
+                os.pwrite(fd, pool[i % len(pool)], off)
+            os.fsync(fd)                  # per file, so the next file's rewrites
+        finally:                          # cannot be merged with this one's
+            os.close(fd)
+    subprocess.run(["sync"], check=True)
+
+
+def _mean_extents(tree: Path, sample: int = 8) -> float:
+    """Mean extents/file over a sample, so a profile can prove it fragmented.
+
+    A silently-contiguous tree would make a fragmentation benchmark measure
+    nothing at all, the same way scanning tmpfs silently stores zero files.
+    """
+    files = [p for p in sorted(tree.rglob("*")) if p.is_file()][:sample]
+    if not files:
+        return 0.0
+    out = subprocess.run(["filefrag", *map(str, files)],
+                         capture_output=True, text=True).stdout
+    counts = [int(w) for line in out.splitlines()
+              for w in [line.rsplit(":", 1)[-1].split()[0]] if w.isdigit()]
+    return sum(counts) / len(counts) if counts else 0.0
+
+
 def _require_reflink_fs(path: Path) -> None:
     fstype = subprocess.check_output(["stat", "-f", "-c", "%T", str(path)]).decode().strip()
     if fstype not in ("btrfs", "xfs"):
@@ -138,7 +214,8 @@ def ensure_tree(name: str, prof: Profile, workdir: Path, seed: int = 1) -> Path:
         return tree
 
     key = {k: getattr(prof, k) for k in
-           ("unique", "dup_groups", "copies", "mean_kb", "min_kb", "max_kb", "big_mb")}
+           ("unique", "dup_groups", "copies", "mean_kb", "min_kb", "max_kb", "big_mb",
+            "frag_stride_kb")}
     key["seed"] = seed
     root = workdir / name
     tree = root / "tree"
@@ -195,9 +272,17 @@ def ensure_tree(name: str, prof: Profile, workdir: Path, seed: int = 1) -> Path:
         subprocess.run(["xargs", "-0", "-n2", f"-P{nworkers}", "cp", "--reflink=never"],
                        input=payload, check=True)
 
+    # After the copies, never before: cp writes sequentially and would undo it.
+    frag = ""
+    if prof.frag_stride_kb:
+        print(f"  fragmenting on a {prof.frag_stride_kb} KiB stride ...", file=sys.stderr)
+        _fragment(tree, prof.frag_stride_kb)
+        frag = f", {_mean_extents(tree):.0f} extents/file"
+
     manifest.write_text(json.dumps(key))
     du = subprocess.check_output(["du", "-sh", str(tree)]).split()[0].decode()
-    print(f"  {name}: {du} in {len(gen_jobs) + len(copy_jobs)} files", file=sys.stderr)
+    print(f"  {name}: {du} in {len(gen_jobs) + len(copy_jobs)} files{frag}",
+          file=sys.stderr)
     return tree
 
 

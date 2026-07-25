@@ -105,8 +105,20 @@ in `tests/`; no shell tests.
     everyday regression check), `mixed` (pure hashing, bandwidth-bound), `bigfile`
     (one huge file → largest-first idle-tail; pair with `--io-threads 2`), `many`
     (~250k tiny dup-heavy → find_dupes pool + walk), `big` (few large → read
-    buffers; pair with `--rss`), and `git` (an *existing* real tree, default
-    `~/git`, via `--external`). Synthetic sizes target ~10 s cold on NVMe.
+    buffers; pair with `--rss`), `fragmented` (8 x 512 MiB shredded to ~32k
+    extents each → per-file extent-list cost; run `--warm` and pair with
+    `--io-threads 2`), and `git` (an *existing* real tree, default `~/git`, via
+    `--external`). Synthetic sizes target ~10 s cold on NVMe.
+    - **`fragmented` is the only profile with a non-trivial extent count.** Every
+      other one generates ~1 extent/file, as does a real source tree (`~/git/linux`
+      measures 1.17 mean, p99 2) — so none of them can see per-file extent-list
+      cost, and none would have caught the O(extents²) `get_extent` scan that was
+      **49% of all CPU** until #134. That is the shape a long-lived dedupe target
+      degrades into, since dedupe fragments what it shares.
+    - Generating it needs a `sync` *before* the rewrites (`_fragment`): rewriting
+      still-dirty pages replaces them in place, no CoW happens, and writeback lays
+      the file out contiguously — the tree comes back at ~6k extents instead of
+      ~32k and the profile silently measures nothing.
   - Examples: `scripts/bench.py -p mixed --bin base=/tmp/oans-master --bin new=./oans`
     (A/B two builds); `scripts/bench.py -p git --walk-threads 4,8,16,32` (thread
     sweep); `scripts/bench.py -p git --variant a: --variant b:DUPEREMOVE_FOO=1`
