@@ -19,7 +19,7 @@ test process cannot name them with an absolute path either.
 
 import os
 
-from harness import DuperemoveTest, requires_reflink, phys_extents_fd
+from harness import DuperemoveTest, requires_reflink
 
 # The kernel PATH_MAX on Linux; a single path component maxes out at NAME_MAX
 # (255). Chaining 255-char directories steps the absolute path in ~256-byte
@@ -48,10 +48,10 @@ class LongPathTest(DuperemoveTest):
 
         comp = "d" * NAME_MAX
         cur_len = len(top)
-        # deep_parent: dir path must itself exceed PATH_MAX.
-        # else: stop one component short so a 255-char filename tips over.
-        while (cur_len <= PATH_MAX) if deep_parent \
-                else (cur_len + 1 + NAME_MAX <= PATH_MAX):
+        # deep_parent: descend until the dir path itself exceeds PATH_MAX.
+        # else: stop one component short, so only the 255-char filename tips over.
+        limit = PATH_MAX if deep_parent else PATH_MAX - NAME_MAX - 1
+        while cur_len <= limit:
             os.mkdir(comp)
             os.chdir(comp)
             cur_len += 1 + NAME_MAX
@@ -72,14 +72,6 @@ class LongPathTest(DuperemoveTest):
         self.addCleanup(os.close, deep_fd)
         os.chdir(orig)                    # leave the tree; oans uses abs paths
         return top, dir_len, deep_fd
-
-    def _victim_phys(self, deep_fd, name):
-        """Physical extents of a victim, opened relative to the leaf dir fd."""
-        fd = os.open(name, os.O_RDONLY, dir_fd=deep_fd)
-        try:
-            return phys_extents_fd(fd)
-        finally:
-            os.close(fd)
 
     def _hf_has(self, victim):
         return self.hf_scalar(
@@ -127,17 +119,40 @@ class LongPathTest(DuperemoveTest):
         top, _, deep_fd = self._make_victims({a: data, b: data},
                                              deep_parent=True)
         self.sync()
-        self.assertFalse(
-            self._victim_phys(deep_fd, a) & self._victim_phys(deep_fd, b),
-            "independently written files start unshared")
+        self.assertNotShared(a, b, "independently written files start unshared",
+                             dir_fd=deep_fd)
 
         self.dedupe(top)
         self.assertDmOk()
         self.assertNotIn("exceeds PATH_MAX", self.out)
         self.sync()
-        self.assertTrue(
-            self._victim_phys(deep_fd, a) & self._victim_phys(deep_fd, b),
-            "identical over-PATH_MAX files must share storage after dedupe")
+        self.assertShared(
+            a, b,
+            "identical over-PATH_MAX files must share storage after dedupe",
+            dir_fd=deep_fd)
+
+    @requires_reflink
+    def test_deep_branch_does_not_derail_siblings(self):
+        """An ordinary duplicate pair still dedupes when a >PATH_MAX branch
+        sits beside it in the same scan.
+
+        The deep branch is the risky one: anything that makes the walk bail
+        early on it (an ENAMETOOLONG that aborts a directory, a probe that
+        rejects a subtree) would silently cost the *rest* of the tree too. Every
+        other test here scans a tree made only of long paths, so none of them
+        would notice. Scan the whole work dir, not just `top`.
+        """
+        deep_victim = "v" * NAME_MAX
+        self._make_victims({deep_victim: b"deep contents\n"}, deep_parent=True)
+        a, b = self.mkdup("pair/a.bin", "pair/b.bin", 128 * 1024)
+
+        self.dedupe(self.work)
+        self.assertDmOk()
+        self.assertShared(a, b,
+                          "in-range duplicates must dedupe despite an "
+                          "over-PATH_MAX sibling branch")
+        self.assertEqual(1, self._hf_has(deep_victim),
+                         "the deep file is hashed in the same run")
 
     # -- no-op rescan ------------------------------------------------------
 
@@ -174,7 +189,6 @@ class LongPathTest(DuperemoveTest):
         self.assertEqual(1, self._hf_has(kept))
 
         os.unlink(gone, dir_fd=deep_fd)   # remove the deep file relatively
-        self.sync()
 
         self.scan(top)
         self.assertDmOk()

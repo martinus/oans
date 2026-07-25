@@ -45,8 +45,9 @@ struct pscan_global {
 
 void pscan_finish_listing(void);
 
-/* Copy a path into a fixed status-line buffer (NUL-terminated; long paths are
- * tail-elided). Display only. */
+/* Copy a path into a fixed status-line buffer (NUL-terminated; a path too long
+ * for it keeps its head and basename around a single "…", the same elision the
+ * renderer applies at terminal width). Display only. */
 void progress_copy_path(char *dst, size_t cap, const char *src);
 
 /*

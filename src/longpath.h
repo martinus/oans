@@ -5,12 +5,35 @@
  * rejects any single open()/statx()/stat() argument longer than PATH_MAX with
  * ENAMETOOLONG, so the only way to reach such a file is to open a reachable
  * ancestor and openat-walk the remaining components, keeping every individual
- * argument within PATH_MAX. These helpers encapsulate that walk; see issue
- * #117 (follow-up to #108/#115).
+ * argument within PATH_MAX. These helpers encapsulate that walk, advancing by
+ * the longest run of components that fits one argument rather than one
+ * component per syscall; see issue #117 (follow-up to #108/#115).
  *
  * Each helper takes the plain open()/stat()/opendir() fast path internally when
  * the path fits, so ordinary-length paths cost nothing extra and callers never
  * need to gate on length themselves.
+ *
+ * THE INVARIANT THIS MODULE EXISTS TO PROTECT
+ * -------------------------------------------
+ * No syscall may take the path of a *scanned file* as a single argument. Any
+ * such call silently loses long-path support again: the kernel answers
+ * ENAMETOOLONG and the caller usually reads that as "gone" or "unreadable" and
+ * drops the file -- which is #108/#115/#117 all over again, and it fails
+ * quietly, with an exit status of 0. When you add or move code in the scan,
+ * dedupe, prune or report paths, reach files through these helpers (or through
+ * a dirfd you already hold, as process_dir() does with statx()).
+ *
+ * Deliberate, documented exceptions -- all operate on things the user names,
+ * not on scanned files:
+ *   - scan_file()'s realpath() on a scan root (src/file_scan.c): a root's own
+ *     absolute path must fit PATH_MAX. Everything *below* it may be any depth.
+ *     Reported with an explicit message; see NOTES in docs/man/oans.md.
+ *   - collect_dir() in src/autotune.c: the --autotune sampler feeds paths back
+ *     as roots, so it inherits the same limit and counts what it skips.
+ *   - the hashfile, /proc, and device nodes, which are never scan targets.
+ *
+ * Covered by tests/integration/test_long_path.py (scan, dedupe, rescan, prune,
+ * and a mixed deep+shallow tree) and test_longpath in src/tests.c.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public

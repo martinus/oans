@@ -107,6 +107,16 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 	struct dupe_extents *dext;
 	struct extent *extent;
 	char *kind;
+	/*
+	 * Grown to fit the longest path in the report rather than fixed at
+	 * PATH_MAX: a path may now exceed it (#117), and this report is what a
+	 * user feeds back to -R. A fixed buffer truncated such a path to a
+	 * string that still looked valid but named the parent directory, making
+	 * two distinct members of a group print identically. One buffer for the
+	 * whole report, not one allocation per printed line.
+	 */
+	_cleanup_(freep) char *clean = NULL;
+	size_t clean_sz = 0;
 
 	if (whole_file)
 		kind = "files";
@@ -132,12 +142,24 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 		printf("\n");
 		printf("Start\t\tFilename\n");
 		list_for_each_entry(extent, &dext->de_extents, e_list) {
-			char clean[PATH_MAX + 1];
+			const char *name = extent->e_file->filename;
+			/* sanitize_ctrl() never expands: its worst case is two
+			 * input bytes -> one '?'. */
+			size_t need = strlen(name) + 1;
 
+			if (need > clean_sz) {
+				char *grown = realloc(clean, need);
+
+				if (!grown) {
+					eprintf("Memory allocation failed\n");
+					return;
+				}
+				clean = grown;
+				clean_sz = need;
+			}
 			/* Default (non-quiet) output: keep control bytes in a
 			 * filename from reaching the terminal (#353). */
-			sanitize_ctrl(extent->e_file->filename, clean,
-				      sizeof(clean));
+			sanitize_ctrl(name, clean, clean_sz);
 			printf("%s\t\"%s\"\n",
 			       pretty_size(extent->e_loff), clean);
 		}

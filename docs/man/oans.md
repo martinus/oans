@@ -446,6 +446,15 @@ boundaries, so files with the same content but a different on-disk extent layout
 may not match unless block-level matching is enabled with
 **\--dedupe-options=partial**.
 
+Files nested arbitrarily deep are supported: `oans` hashes and dedupes files
+whose absolute path exceeds the kernel's `PATH_MAX` (4096 bytes), reaching them
+by walking down from a reachable ancestor. The one limit is the **root you name
+on the command line** (or feed to **\--file-list**): its own absolute path must
+fit in `PATH_MAX`, since `oans` canonicalises it up front. A root over the limit
+is skipped with an explicit message — scan a shorter ancestor instead, or
+bind-mount the directory somewhere shorter. Everything *below* a reachable root
+may be any depth.
+
 `oans` is offline, batch deduplication: you point it at specific trees and run it
 on demand or on a timer. This differs from `bees`, an always-on daemon that
 deduplicates the whole filesystem continuously, and from inline filesystem

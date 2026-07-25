@@ -521,6 +521,18 @@ works on extent boundaries, so files with the same content but a
 different on\-disk extent layout may not match unless block\-level
 matching is enabled with \f[B]\-\-dedupe\-options=partial\f[R].
 .PP
+Files nested arbitrarily deep are supported: \f[CR]oans\f[R] hashes and
+dedupes files whose absolute path exceeds the kernel\[cq]s
+\f[CR]PATH_MAX\f[R] (4096 bytes), reaching them by walking down from a
+reachable ancestor.
+The one limit is the \f[B]root you name on the command line\f[R] (or
+feed to \f[B]\-\-file\-list\f[R]): its own absolute path must fit in
+\f[CR]PATH_MAX\f[R], since \f[CR]oans\f[R] canonicalises it up front.
+A root over the limit is skipped with an explicit message \[em] scan a
+shorter ancestor instead, or bind\-mount the directory somewhere
+shorter.
+Everything \f[I]below\f[R] a reachable root may be any depth.
+.PP
 \f[CR]oans\f[R] is offline, batch deduplication: you point it at
 specific trees and run it on demand or on a timer.
 This differs from \f[CR]bees\f[R], an always\-on daemon that

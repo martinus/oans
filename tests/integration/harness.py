@@ -101,37 +101,30 @@ def fiemap_extents_fd(fd):
     return out
 
 
-def fiemap_extents(path):
+def fiemap_extents(path, dir_fd=None):
     """Return [(logical, physical, length, flags), ...] for path's data extents.
 
     Holes are not returned by FIEMAP, so every entry is real data. Uses
-    FIEMAP_FLAG_SYNC so results are stable right after writes.
+    FIEMAP_FLAG_SYNC so results are stable right after writes. Pass dir_fd to
+    reach a file whose absolute path exceeds PATH_MAX (#117) -- the test process
+    cannot name those either.
     """
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(path, os.O_RDONLY, dir_fd=dir_fd)
     try:
         return fiemap_extents_fd(fd)
     finally:
         os.close(fd)
 
 
-def phys_extents_fd(fd):
-    """Set of physical start offsets of an open file's real data extents."""
-    return {phys for _log, phys, _len, flags in fiemap_extents_fd(fd)
+def phys_extents(path, dir_fd=None):
+    """Set of physical start offsets of path's real (allocated) data extents."""
+    return {phys for _log, phys, _len, flags in fiemap_extents(path, dir_fd)
             if not (flags & _NO_PHYS)}
 
 
-def phys_extents(path):
-    """Set of physical start offsets of path's real (allocated) data extents."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        return phys_extents_fd(fd)
-    finally:
-        os.close(fd)
-
-
-def files_share(a, b):
+def files_share(a, b, dir_fd=None):
     """True if a and b have at least one physical extent in common (reflinked)."""
-    return bool(phys_extents(a) & phys_extents(b))
+    return bool(phys_extents(a, dir_fd) & phys_extents(b, dir_fd))
 
 
 # --------------------------------------------------------------------------
@@ -304,12 +297,12 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- on-disk sharing ---------------------------------------------------
 
-    def assertShared(self, a, b, msg=None):
-        self.assertTrue(files_share(a, b),
+    def assertShared(self, a, b, msg=None, dir_fd=None):
+        self.assertTrue(files_share(a, b, dir_fd),
                         msg or f"expected {a} and {b} to share storage")
 
-    def assertNotShared(self, a, b, msg=None):
-        self.assertFalse(files_share(a, b),
+    def assertNotShared(self, a, b, msg=None, dir_fd=None):
+        self.assertFalse(files_share(a, b, dir_fd),
                          msg or f"expected {a} and {b} to be independent")
 
     # -- data integrity ----------------------------------------------------

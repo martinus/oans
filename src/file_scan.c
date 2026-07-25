@@ -606,13 +606,37 @@ static char *extract_first_device(const char *fs_source)
 		     : strdup(fs_source);
 }
 
-/* Get the UUID associated with the FS that stores path */
-int get_uuid(char *path, uuid_t *uuid)
+/* What check_file() needs to know about the fs a path lives on. */
+struct fs_probe {
+	uuid_t	uuid;
+	bool	is_btrfs;
+	bool	supported;
+};
+
+/* True for a filesystem oans knows how to deduplicate on. */
+static bool is_fs_supported(const struct statfs *fs)
+{
+	return fs->f_type == BTRFS_SUPER_MAGIC || fs->f_type == XFS_SB_MAGIC;
+}
+
+/*
+ * Probe the filesystem that stores `path`: its UUID, whether it is btrfs, and
+ * whether oans can deduplicate on it.
+ *
+ * Everything is derived from a single fd. That matters for correctness, not
+ * just cost: the fd comes from longpath_open(), so a path over PATH_MAX is
+ * reachable here (#117). The previous shape called open(), is_btrfs() and
+ * statfs() on the path separately, and the latter two would fail
+ * ENAMETOOLONG on exactly the deep paths this file now supports -- silently
+ * dropping, for instance, a whole btrfs subvolume nested below PATH_MAX depth.
+ */
+static int probe_fs(char *path, struct fs_probe *probe)
 {
 	struct statx st;
+	struct statfs fs;
 	int ret;
 	_cleanup_(mnt_unref_table_cleanup) struct libmnt_table *tb = NULL;
-	_cleanup_(closefd) int fd = open(path, O_RDONLY);
+	_cleanup_(closefd) int fd = longpath_open(path, O_RDONLY);
 	_cleanup_(freep) char *uuid_found = NULL;
 
 	struct libmnt_fs *dev = NULL;
@@ -622,9 +646,17 @@ int get_uuid(char *path, uuid_t *uuid)
 		return 1;
 	}
 
-	if (is_btrfs(path)) {
-		dprintf("get_uuid: %s lives on btrfs\n", path);
-		ret = btrfs_get_fsuuid(fd, uuid);
+	if (fstatfs(fd, &fs)) {
+		eprintf("Error %d: %s while checking fs type on %s\n",
+			errno, strerror(errno), path);
+		return 1;
+	}
+	probe->is_btrfs = fs.f_type == BTRFS_SUPER_MAGIC;
+	probe->supported = is_fs_supported(&fs);
+
+	if (probe->is_btrfs) {
+		dprintf("probe_fs: %s lives on btrfs\n", path);
+		ret = btrfs_get_fsuuid(fd, &probe->uuid);
 		if (ret) {
 			eprintf("%s: btrfs_get_fsuuid failed\n",
 				path);
@@ -635,7 +667,7 @@ int get_uuid(char *path, uuid_t *uuid)
 		char *first_device;
 		struct fsuuid2 fsuuid = {0,};
 
-		dprintf("get_uuid: %s do not live on btrfs\n", path);
+		dprintf("probe_fs: %s do not live on btrfs\n", path);
 
 		/*
 		 * Preferred path: ask the filesystem for its UUID directly
@@ -645,11 +677,12 @@ int get_uuid(char *path, uuid_t *uuid)
 		 */
 		if (ioctl(fd, FS_IOC_GETFSUUID, &fsuuid) == 0 &&
 		    fsuuid.len == sizeof(uuid_t)) {
-			uuid_copy(*uuid, fsuuid.uuid);
+			uuid_copy(probe->uuid, fsuuid.uuid);
 			return 0;
 		}
 
-		ret = statx(0, path, 0, STATX_BASIC_STATS, &st);
+		/* Relative to the fd: `path` may be over PATH_MAX (#117). */
+		ret = statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st);
 		if (ret) {
 			eprintf("Failed to stat %s: %s\n",
 					path, strerror(errno));
@@ -694,7 +727,7 @@ int get_uuid(char *path, uuid_t *uuid)
 			return 1;
 		}
 
-		uuid_parse(uuid_found, *uuid);
+		uuid_parse(uuid_found, probe->uuid);
 	}
 	return 0;
 }
@@ -702,26 +735,6 @@ int get_uuid(char *path, uuid_t *uuid)
 static inline uint64_t timestamp_to_nano(struct statx_timestamp t)
 {
 	return t.tv_sec * 1000000000 + t.tv_nsec;
-}
-
-/*
- * Check if path lives on a filesystem that is supported, eg
- * that is known to support deduplication.
- */
-bool is_fs_supported(char *path)
-{
-	struct statfs fs;
-	int ret;
-
-	ret = statfs(path, &fs);
-	if (ret) {
-		eprintf("Error %d: %s while check fs type on %s",
-			errno, strerror(errno), path);
-		return false;
-	}
-
-	return (fs.f_type == BTRFS_SUPER_MAGIC ||
-		fs.f_type == XFS_SB_MAGIC);
 }
 
 /* Check if path should be processed:
@@ -737,7 +750,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 {
 	int ret;
 	struct dbfile_config cfg;
-	uuid_t uuid = {0,};
+	struct fs_probe probe = {0,};
 	dev_t dev;
 
 	if (is_excluded(path))
@@ -775,7 +788,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	/* hashfile was empty. We lock on the file. */
 	if (uuid_is_null(locked_fs.uuid)) {
 		dprintf("Empty hashfile, locking on the current file\n");
-		ret = get_uuid(path, &uuid);
+		ret = probe_fs(path, &probe);
 		if (ret)
 			return seed_reject(parent_checked);
 
@@ -790,15 +803,15 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		 * supported roots. Commit locked_fs only once supported, so a
 		 * rejected root does not pollute the lock for later roots.
 		 */
-		if (!is_fs_supported(path)) {
+		if (!probe.supported) {
 			eprintf("Skipping %s: its filesystem is not btrfs or XFS, "
 				"which oans needs to deduplicate.\n", path);
 			return seed_reject(parent_checked);
 		}
 
-		uuid_copy(locked_fs.uuid, uuid);
+		uuid_copy(locked_fs.uuid, probe.uuid);
 		locked_fs.dev = stx_to_dev(st);
-		locked_fs.is_btrfs = is_btrfs(path);
+		locked_fs.is_btrfs = probe.is_btrfs;
 
 		return true;
 	}
@@ -808,13 +821,13 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	 * and store them for future calls
 	 */
 	if (locked_fs.dev == 0) {
-		ret = get_uuid(path, &uuid);
+		ret = probe_fs(path, &probe);
 		if (ret)
 			return seed_reject(parent_checked);
 
-		if (uuid_compare(uuid, locked_fs.uuid) != 0) {
+		if (uuid_compare(probe.uuid, locked_fs.uuid) != 0) {
 			eprintf("%s lives on fs ", path);
-			debug_print_uuid(uuid);
+			debug_print_uuid(probe.uuid);
 			eprintf(" will we are locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
 			eprintf(".\n");
@@ -822,7 +835,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		}
 
 		locked_fs.dev = stx_to_dev(st);
-		locked_fs.is_btrfs = is_btrfs(path);
+		locked_fs.is_btrfs = probe.is_btrfs;
 		return true;
 	}
 
@@ -831,18 +844,18 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 	/*
 	 * On btrfs each subvolume has a distinct st_dev, so verify by fs UUID
-	 * rather than by device. That costs an open()+statfs()+ioctl, so cache
+	 * rather than by device. That costs an open()+fstatfs()+ioctl, so cache
 	 * devices already confirmed to be on the locked fs and skip the recheck.
 	 */
 	dev = stx_to_dev(st);
 	if (verified_dev_get(dev))
 		return true;
 
-	ret = get_uuid(path, &uuid);
+	ret = probe_fs(path, &probe);
 	if (ret)
 		return false;
 
-	if (uuid_compare(uuid, locked_fs.uuid) != 0)
+	if (uuid_compare(probe.uuid, locked_fs.uuid) != 0)
 		return false;
 
 	verified_dev_put(dev);
@@ -985,7 +998,17 @@ static void process_dir(const char *path, struct dbhandle *db)
 	struct dirent *entry;
 	struct statx st;
 	_cleanup_(closedirectory) DIR *dirp = longpath_opendir(path);
-	size_t dirlen = strlen(path);
+	_cleanup_(freep) char *child = NULL;
+	size_t dirlen;
+
+	/* Report before allocating anything: malloc() may leave errno set even
+	 * when it succeeds, which would misattribute the opendir failure. */
+	if (dirp == NULL) {
+		eprintf("Error %d: %s while opening directory %s\n",
+			errno, strerror(errno), path);
+		return;
+	}
+
 	/*
 	 * Full child path. A deep directory prefix can itself exceed PATH_MAX
 	 * (#117), so size the buffer to the prefix plus one component (bounded
@@ -993,13 +1016,8 @@ static void process_dir(const char *path, struct dbhandle *db)
 	 * built for exclude matching, queueing and messages; children are
 	 * reached with dir-fd-relative syscalls below.
 	 */
-	_cleanup_(freep) char *child = malloc(dirlen + 1 + NAME_MAX + 1);
-
-	if (dirp == NULL) {
-		eprintf("Error %d: %s while opening directory %s\n",
-			errno, strerror(errno), path);
-		return;
-	}
+	dirlen = strlen(path);
+	child = malloc(dirlen + 1 + NAME_MAX + 1);
 	if (child == NULL) {
 		eprintf("Out of memory while scanning directory %s\n", path);
 		return;
@@ -1040,7 +1058,9 @@ static void process_dir(const char *path, struct dbhandle *db)
 				path, entry->d_name, namelen, NAME_MAX);
 			continue;
 		}
-		strcpy(child + dirlen, entry->d_name);
+		/* memcpy, not strcpy: namelen is already known, so this avoids a
+		 * second pass over every name in the walk's hottest loop. */
+		memcpy(child + dirlen, entry->d_name, namelen + 1);
 
 		/*
 		 * Stat relative to the open directory fd, not by absolute path:
@@ -1343,13 +1363,33 @@ int scan_file(char *in_path, struct dbhandle *db)
 	 * - Absolute path allows the user to re-run this hash from
 	 *   any directory.
 	 */
+	/*
+	 * longpath-ok: this is the scan root -- the one place a path is still
+	 * bounded by PATH_MAX, and the reason is right below.
+	 */
 	if (realpath(in_path, path) == NULL) {
+		/*
+		 * A root whose *resolved* path exceeds PATH_MAX is the one long-path
+		 * shape oans cannot handle: realpath() has nowhere to put the answer,
+		 * and every later stage keys off this canonical string. Deep trees
+		 * under a reachable root are fully supported (#117) -- say which case
+		 * this is instead of leaving the user with a bare ENAMETOOLONG.
+		 */
+		if (errno == ENAMETOOLONG) {
+			eprintf("Skipping %s: its absolute path exceeds PATH_MAX (%d). "
+				"Files *below* a reachable root may be any depth; "
+				"only the root itself is limited. Scan a shorter "
+				"ancestor, or bind-mount this directory somewhere "
+				"shorter.\n", in_path, PATH_MAX);
+			return 0;
+		}
 		eprintf("Error %d: %s while getting path to file %s. "
 			"Skipping.\n",
 			errno, strerror(errno), in_path);
 		return 0;
 	}
 
+	/* longpath-ok: `path` is the realpath'd root, so it fits by construction. */
 	ret = statx(0, path, 0, STATX_BASIC_STATS, &st);
 	if (ret || !(st.stx_mask & STATX_BASIC_STATS)) {
 		eprintf("Error %d: %s while stating file %s. "

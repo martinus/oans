@@ -62,18 +62,6 @@ int lookup_btrfs_subvol(int fd, uint64_t *subvol)
 	return 0;
 }
 
-int is_btrfs(char *path)
-{
-	struct statfs fs;
-	int ret;
-
-	ret = statfs(path, &fs);
-	if (ret)
-		return errno;
-
-	return fs.f_type == BTRFS_SUPER_MAGIC;
-}
-
 int btrfs_get_fsuuid(int fd, uuid_t *uuid)
 {
 	int ret;

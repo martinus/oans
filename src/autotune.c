@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -45,6 +46,7 @@ struct sample {
 	uint64_t	total_bytes;
 	uint64_t	max_files;
 	uint64_t	max_bytes;
+	uint64_t	skipped_long;	/* entries unreachable via the file list */
 };
 
 static bool sample_full(const struct sample *s)
@@ -62,6 +64,9 @@ static void sample_add(struct sample *s, const char *path, uint64_t size)
 /* Recursively collect regular files under `dir` until the sample is full. */
 static void collect_dir(struct sample *s, const char *dir)
 {
+	/* longpath-ok: the sampler feeds its paths back as scan roots, so it
+	 * inherits the root PATH_MAX limit; over-long entries are counted and
+	 * reported below rather than reached. */
 	DIR *d = opendir(dir);
 	struct dirent *de;
 
@@ -74,10 +79,23 @@ static void collect_dir(struct sample *s, const char *dir)
 
 		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
 			continue;
+		/*
+		 * The trials re-exec oans with this sample as a `-` file list,
+		 * and each entry there is a *root*, which scan_file() must be
+		 * able to realpath() into a PATH_MAX buffer. So unlike the real
+		 * walk -- which does reach over-PATH_MAX files (#117) -- the
+		 * sampler cannot use them, and skipping a directory skips
+		 * whatever is under it. Count them so the sample can say it is
+		 * incomplete instead of quietly measuring a different tree.
+		 */
 		if ((size_t)snprintf(child, sizeof(child), "%s/%s", dir,
-				     de->d_name) >= sizeof(child))
+				     de->d_name) >= sizeof(child)) {
+			s->skipped_long++;
 			continue;
-		/* Don't follow symlinks: mirrors the scan and avoids loops. */
+		}
+		/* Don't follow symlinks: mirrors the scan and avoids loops.
+		 * longpath-ok: child is bounded by the snprintf truncation
+		 * check above, which skips anything over PATH_MAX. */
 		if (lstat(child, &st) != 0)
 			continue;
 
@@ -100,6 +118,7 @@ static void collect_sample(struct sample *s, char **roots, int nroots)
 	for (int i = 0; i < nroots && !sample_full(s); i++) {
 		struct stat st;
 
+		/* longpath-ok: a scan root, not a scanned file. */
 		if (lstat(roots[i], &st) != 0)
 			continue;
 		if (S_ISDIR(st.st_mode))
@@ -156,6 +175,7 @@ static double ts_diff(struct timespec a, struct timespec b)
  */
 static bool drop_caches(void)
 {
+	/* longpath-ok: fixed procfs path. */
 	int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
 	ssize_t w;
 
@@ -175,6 +195,7 @@ static bool drop_caches(void)
  */
 static double run_trial(const char *self, const char *listpath, unsigned int k)
 {
+	/* longpath-ok: our own mkstemp() file list. */
 	_cleanup_(closefd) int fd_list = open(listpath, O_RDONLY | O_CLOEXEC);
 	struct timespec t0, t1;
 	char kbuf[32];
@@ -192,6 +213,7 @@ static double run_trial(const char *self, const char *listpath, unsigned int k)
 		return -1.0;
 
 	if (pid == 0) {
+		/* longpath-ok: fixed device path. */
 		int devnull = open("/dev/null", O_WRONLY);
 		char *argv[] = { (char *)self, (char *)"--quiet", kbuf,
 				 (char *)"-", NULL };
@@ -255,6 +277,7 @@ int autotune_run(char **roots, int nroots)
 	bool cold;
 	int listfd, ret = 0;
 
+	/* longpath-ok: fixed procfs path. */
 	self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
 	if (self_len <= 0) {
 		eprintf("autotune: cannot find my own executable path\n");
@@ -273,6 +296,11 @@ int autotune_run(char **roots, int nroots)
 	}
 	printf("Sample: %u files, %s\n", s.paths->len,
 	       human_size(s.total_bytes));
+	if (s.skipped_long)
+		printf("        (skipped %"PRIu64" entr%s whose path exceeds "
+		       "PATH_MAX; those are scanned normally, but cannot be "
+		       "measured through a file list)\n",
+		       s.skipped_long, s.skipped_long == 1 ? "y" : "ies");
 
 	/* Write the sample as a newline-separated file list for the trials. */
 	listfd = mkstemp(listpath);
@@ -368,7 +396,7 @@ int autotune_run(char **roots, int nroots)
 out_best:
 	free(best);
 out_list:
-	unlink(listpath);
+	unlink(listpath);	/* longpath-ok: our own mkstemp() file list. */
 out_paths:
 	g_ptr_array_free(s.paths, TRUE);
 	return ret;
