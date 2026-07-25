@@ -183,8 +183,40 @@ requires_btrfs = unittest.skipUnless(
 # Base test case
 # --------------------------------------------------------------------------
 
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def _settle_scratch():
+    """syncfs() the scratch filesystem so FIEMAP sees real extents.
+
+    A test builds files and hands them straight to a scan that asserts on their
+    extents. Under delayed allocation those extents may not exist yet when oans
+    maps the file - it correctly records none, and the test reads the shortfall
+    as a scanner bug. Running the suite in parallel pushes writeback far enough
+    behind to lose this routinely: test_sparse_file_scans failed 4 runs in 12,
+    and test_hardlink_pair_does_not_empty_hashfile saw 381 of 401 extents.
+
+    Once per oans invocation, not once per file: fsync()ing each created file
+    costs a journal commit apiece and took the suite from 5.4s to 18s, where one
+    syncfs() of the whole scratch is a single syscall for the same guarantee.
+    """
+    fd = os.open(TEST_ROOT, os.O_RDONLY)
+    try:
+        _libc.syncfs(fd)
+    finally:
+        os.close(fd)
+
+
 class DuperemoveTest(unittest.TestCase):
     """Base class: a fresh scratch dir + hashfile per test, plus helpers."""
+
+    # Set True on a class whose assertions depend on the *physical* extent
+    # layout the kernel happens to produce - the fsync-forced extent boundary
+    # trick, or fiemap counts. Concurrent I/O perturbs btrfs writeback enough
+    # that the layout the setup intends is not the one it gets, so tests/run.py
+    # holds these back and runs them one at a time after the pool drains.
+    # Per-test scratch isolation is *not* what this is for; that already works.
+    serial = False
 
     @classmethod
     def setUpClass(cls):
@@ -211,6 +243,7 @@ class DuperemoveTest(unittest.TestCase):
         Runs with -q by default (terse output); pass quiet=False to get the
         full human summary block (e.g. to assert on the 'Reclaimed' line).
         """
+        _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
         if quiet:
             cmd.insert(1, "-q")
@@ -382,8 +415,10 @@ class DuperemoveTest(unittest.TestCase):
 
     def make_trailing_hole(self, relpath, data, size):
         """Write `data`, then extend the file to `size` so it ends in a hole."""
-        p = self.write(relpath, data)
-        os.truncate(p, size)
+        p = self.path(relpath)
+        with open(p, "wb") as f:
+            f.write(data)
+            f.truncate(size)
         return p
 
     def reflink(self, src_rel, dst_rel):

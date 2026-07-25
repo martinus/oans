@@ -21,10 +21,16 @@ Run both with `make check`.
 
 ```sh
 make integration                         # build oans and run the suite
+make integration TEST_JOBS=1             # ... sequentially (see -j below)
 python3 tests/run.py                      # run directly (binary must be built)
 python3 tests/run.py hardlink dedupe      # only tests whose id matches a pattern
+python3 tests/run.py -j 8                 # 8 workers ('auto' by default)
 python3 -m unittest discover -s tests/integration -v   # plain unittest, no banner
 ```
+
+The suite runs across worker processes by default, so tests must keep to the
+per-test scratch `setUp` hands them. `-j 1` runs them one at a time, which is
+where to start if a test only fails in company.
 
 Environment:
 
@@ -51,6 +57,12 @@ tests/
 Subclass `DuperemoveTest` (from `harness`) and add `test_*` methods. Each test
 gets a fresh scratch directory in `self.work` and a per-test hashfile in
 `self.hf`; both are cleaned up automatically.
+
+That isolation is what lets the suite run in parallel, so keep to it — a test
+reaching outside its own `self.work` will flake. If a test asserts on the
+*physical* extent layout (the fsync-forced extent boundary trick, or fiemap
+extent counts), set `serial = True` on the class: no amount of file isolation
+helps there, because concurrent I/O changes how the kernel lays extents out.
 
 ```python
 from harness import DuperemoveTest, requires_reflink

@@ -13,6 +13,9 @@ MiB = 1 << 20
 
 @requires_btrfs
 class LeastFragmentedTargetTest(DuperemoveTest):
+    # Extent-layout sensitive: see DuperemoveTest.serial.
+    serial = True
+
     def _fragment(self, rel, content):
         """Write content, then rewrite alternate 4K blocks in place (COW) so the
         file ends up split across many physical extents."""

@@ -140,9 +140,14 @@ test:
 
 # End-to-end suite (Python stdlib unittest). Dedupe cases need a reflink fs;
 # override the scratch dir with DUPEREMOVE_TEST_DIR=/path.
+#
+# Worker processes for the suite - tests/run.py's -j, see `tests/run.py --help`.
+# Not make's own -j; TEST_JOBS=1 is the sequential fallback. The same value
+# sizes the valgrind leg below, where each worker is far heavier.
+TEST_JOBS ?= auto
 .PHONY: integration
 integration: oans
-	$(SANITIZE_RUN) DUPEREMOVE=./oans python3 tests/run.py
+	$(SANITIZE_RUN) DUPEREMOVE=./oans python3 tests/run.py -j $(TEST_JOBS)
 
 # Same end-to-end suite, but every oans invocation runs under valgrind memcheck
 # (via tests/valgrind-wrap.sh). Findings go to per-pid logs; a non-empty log
@@ -153,7 +158,7 @@ VGLOGDIR = $(CURDIR)/.vglogs
 integration-valgrind: oans
 	@command -v valgrind >/dev/null 2>&1 || { echo "valgrind not installed"; exit 1; }
 	rm -rf $(VGLOGDIR) && mkdir -p $(VGLOGDIR)
-	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py
+	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py -j $(TEST_JOBS)
 	@if find $(VGLOGDIR) -type f -size +0c | grep -q .; then \
 		echo "=== valgrind reported errors/leaks ==="; \
 		find $(VGLOGDIR) -type f -size +0c -exec cat {} +; \

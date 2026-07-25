@@ -18,6 +18,9 @@ MiB = 1 << 20
 
 @requires_reflink
 class StreamingDedupeTest(DuperemoveTest):
+    # Extent-layout sensitive: see DuperemoveTest.serial.
+    serial = True
+
     # tiny passes + small batchsize => work spans many generation batches, so
     # the producer/watermark and cross-batch anchor paths are all exercised.
     ENV = {"DUPEREMOVE_FILES_PER_PASS": "8"}
