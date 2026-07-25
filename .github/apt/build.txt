@@ -1,0 +1,15 @@
+# Packages for the build-and-test matrix. One per line; blank lines and
+# # comments ignored. The cache key hashes this file, so editing it
+# invalidates the cached .debs - which is the point.
+build-essential
+clang
+pkg-config
+libsqlite3-dev
+libglib2.0-dev
+libblkid-dev
+libmount-dev
+uuid-dev
+libbsd-dev
+libxxhash-dev
+btrfs-progs
+xfsprogs

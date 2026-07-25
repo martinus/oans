@@ -1,0 +1,13 @@
+# Packages for the sanitizer legs (clang only). See build.txt for the format.
+clang
+llvm
+libclang-rt-dev
+pkg-config
+libsqlite3-dev
+libglib2.0-dev
+libblkid-dev
+libmount-dev
+uuid-dev
+libbsd-dev
+libxxhash-dev
+btrfs-progs

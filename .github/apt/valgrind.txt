@@ -1,0 +1,12 @@
+# Packages for the valgrind leg. See build.txt for the format.
+build-essential
+pkg-config
+libsqlite3-dev
+libglib2.0-dev
+libblkid-dev
+libmount-dev
+uuid-dev
+libbsd-dev
+libxxhash-dev
+btrfs-progs
+valgrind
