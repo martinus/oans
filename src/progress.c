@@ -1084,16 +1084,15 @@ void pscan_slot_idle(struct pscan_thread *slot)
 {
 	if (!slot)
 		return;
+	/*
+	 * Park the slot under the same mutex pscan_claim_slot() scans with, so
+	 * that lock is the handoff edge to whichever worker picks it up next.
+	 * (Every other slot field is either _Atomic or written under this mutex.)
+	 */
 	g_mutex_lock(&pscan.mutex);
 	slot->file_path[0] = '\0';
+	slot->status = thread_idle;
 	g_mutex_unlock(&pscan.mutex);
-	/*
-	 * Release: everything this worker wrote into the slot must be visible to
-	 * whichever worker claims it next. Parking it idle is the publish, so it
-	 * has to be the last store and it has to carry the ordering - the two
-	 * workers share no lock across the handoff.
-	 */
-	atomic_store_explicit(&slot->status, thread_idle, memory_order_release);
 }
 
 bool is_progress_printer_running(void)
@@ -1144,10 +1143,7 @@ struct pscan_thread *pscan_claim_slot(pid_t tid,
 
 	g_mutex_lock(&pscan.mutex);
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
-		/* Acquire: pairs with the release in pscan_slot_idle(), so the
-		 * previous owner's writes are visible before we reuse the slot. */
-		if (atomic_load_explicit(&pscan.threads[i]->status,
-					 memory_order_acquire) == thread_idle) {
+		if (pscan.threads[i]->status == thread_idle) {
 			slot = pscan.threads[i];
 			slot->tid = tid;
 			slot->status = status;

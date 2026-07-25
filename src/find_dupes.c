@@ -356,10 +356,6 @@ static void find_dupes_thread(void *item, void *priv [[maybe_unused]])
 {
 	struct cmp_ctxt *ctxt = item;
 
-	/* Close the handoff edge the producer opened at push (see src/tsan.h);
-	 * a no-op outside a ThreadSanitizer build. */
-	oans_tsan_work_acquire(ctxt);
-
 	struct results_tree *dupe_extents = ctxt->dupe_extents;
 	struct filerec *file = ctxt->file;
 
@@ -432,9 +428,8 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 	 * already freed (#123).
 	 *
 	 * psearch_join() does not cover this: in the dedupe phase it returns
-	 * immediately, and otherwise it joins the progress printer, not the pool.
-	 * (Before the streaming phase existed, that printer join happened to
-	 * outlast the workers, which is why this went unnoticed.)
+	 * immediately, and otherwise it joins the progress printer, not the pool
+	 * - it only ever outlasted the workers by accident.
 	 */
 	threads_pool_wait_idle(&search_pool);
 

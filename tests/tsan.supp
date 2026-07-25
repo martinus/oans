@@ -16,13 +16,3 @@
 # place the matching acquire.
 race:g_queue_pop_tail
 
-# Progress-slot teardown. dedupe_phase_end() drains the pool and calls
-# g_thread_pool_free(pool, FALSE, TRUE), which waits for every task to finish,
-# before pdedupe_end() -> pscan_free_threads() releases the slots, so the frees
-# genuinely happen after the last worker write. GLib recycles its pool threads
-# instead of joining them, though, so from TSAN's point of view the worker is
-# still "running" and the ordering lives entirely inside uninstrumented GLib.
-# Unlike the races src/tsan.h annotates, there is no point in oans code after
-# the worker's cleanup handlers at which to publish the edge - the writes happen
-# in a _cleanup_ handler that runs after the function body.
-race:pscan_free_threads

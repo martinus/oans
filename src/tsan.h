@@ -124,12 +124,35 @@ static inline gpointer oans_tsan_queue_pop(GAsyncQueue *q)
 
 /*
  * A GThreadPool worker is entered by GLib itself, so there is no pop call to
- * wrap - the worker function calls this on its own argument instead.
+ * wrap - the pool trampoline (or the worker) calls this on the item instead.
  */
 static inline void oans_tsan_work_acquire(void *item)
 {
 	if (item)
 		__tsan_acquire(item);
+}
+
+/*
+ * The other end of the pool's lifetime: g_thread_pool_free(wait=TRUE) waits for
+ * every task, so whatever the workers wrote is safely visible to the thread that
+ * tears the pool down - but GLib recycles pool threads rather than joining them,
+ * so TSAN sees no edge and calls the teardown's frees a race. Each worker
+ * publishes on the pool once it is completely done (after any _cleanup_ handlers
+ * have run, which is why this cannot simply be the worker's last statement), and
+ * the free wrapper below collects it.
+ */
+static inline void oans_tsan_work_done(void *pool)
+{
+	if (pool)
+		__tsan_release(pool);
+}
+
+static inline void oans_tsan_pool_free(GThreadPool *pool, gboolean immediate,
+				       gboolean wait_)
+{
+	g_thread_pool_free(pool, immediate, wait_);
+	if (wait_ && pool)
+		__tsan_acquire(pool);
 }
 
 #define g_mutex_lock(m)			oans_tsan_mutex_lock(m)
@@ -139,12 +162,14 @@ static inline void oans_tsan_work_acquire(void *item)
 #define g_cond_signal(c)		oans_tsan_cond_signal(c)
 #define g_cond_broadcast(c)		oans_tsan_cond_broadcast(c)
 #define g_thread_pool_push(p, d, e)	oans_tsan_pool_push(p, d, e)
+#define g_thread_pool_free(p, i, w)	oans_tsan_pool_free(p, i, w)
 #define g_async_queue_push(q, d)	oans_tsan_queue_push(q, d)
 #define g_async_queue_pop(q)		oans_tsan_queue_pop(q)
 
 #else	/* not a TSAN build: nothing to annotate */
 
 static inline void oans_tsan_work_acquire(void *item) { (void)item; }
+static inline void oans_tsan_work_done(void *pool) { (void)pool; }
 
 #endif
 #endif	/* __OANS_TSAN_H__ */

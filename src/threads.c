@@ -14,23 +14,37 @@
 
 #include "threads.h"
 #include "debug.h"
+#include "tsan.h"
 
-/*
- * Every item runs through here so the outstanding count is dropped no matter
- * how the real worker returns. GLib hands us the pool as the GFunc's user_data
- * (see setup_pool), and the caller's original arg travels in worker_arg.
- */
-static void pool_trampoline(gpointer item, gpointer user_data)
+static void pool_work_done(struct threads_pool *pool)
 {
-	struct threads_pool *pool = user_data;
-
-	pool->worker(item, pool->worker_arg);
-
 	g_mutex_lock(&pool->mutex);
 	pool->outstanding--;
 	if (pool->outstanding == 0)
 		g_cond_broadcast(&pool->idle_cond);
 	g_mutex_unlock(&pool->mutex);
+}
+
+/*
+ * Every item runs through here so the outstanding count is dropped no matter
+ * how the real worker returns. GLib hands us the pool as the GFunc's user_data
+ * (see setup_pool), and the caller's original arg travels in worker_arg.
+ *
+ * This is also the one place the push -> worker handoff is crossed for every
+ * pool item, so it is where the ThreadSanitizer edge is closed: doing it here
+ * rather than in each worker keeps it structural instead of a convention every
+ * future worker has to remember (see src/tsan.h).
+ */
+static void pool_trampoline(gpointer item, gpointer user_data)
+{
+	struct threads_pool *pool = user_data;
+
+	oans_tsan_work_acquire(item);
+
+	pool->worker(item, pool->worker_arg);
+
+	oans_tsan_work_done(pool->pool);
+	pool_work_done(pool);
 }
 
 void setup_pool(struct threads_pool *pool, threads_pool_worker function,
@@ -63,14 +77,9 @@ void threads_pool_push(struct threads_pool *pool, void *item, GError **err)
 
 	g_thread_pool_push(pool->pool, item, err);
 
-	if (err && *err) {
-		/* Never queued, so nothing will ever decrement it. */
-		g_mutex_lock(&pool->mutex);
-		pool->outstanding--;
-		if (pool->outstanding == 0)
-			g_cond_broadcast(&pool->idle_cond);
-		g_mutex_unlock(&pool->mutex);
-	}
+	/* Never queued, so nothing will ever decrement it. */
+	if (err && *err)
+		pool_work_done(pool);
 }
 
 /*
@@ -115,12 +124,10 @@ void free_pool(struct threads_pool *pool)
 {
 	g_thread_pool_free(pool->pool, FALSE, TRUE);
 
-	/*
-	 * The wait above means no worker can still be registering, but take the
-	 * mutex anyway: it is the same lock register_cleanup() writes under, so
-	 * the ordering is stated in the code rather than left to GLib internals
-	 * (which a race detector cannot see through).
-	 */
+	/* No worker can still be registering after that wait, but take the lock
+	 * register_cleanup() writes under anyway, so the ordering is stated in
+	 * the code rather than left to GLib internals a race detector cannot
+	 * see through. */
 	g_mutex_lock(&pool->mutex);
 	for (unsigned int i = 0; i < pool->item_count; i++) {
 		struct threads_cleanup_item *item;

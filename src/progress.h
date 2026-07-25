@@ -36,13 +36,9 @@ struct pscan_thread {
 	_Atomic uint64_t		file_total_bytes;
 	char				file_path[PATH_MAX + 1];
 
-	/*
-	 * Published with release semantics when a slot is parked idle and read
-	 * with acquire semantics when one is claimed: that store/load pair is
-	 * the only thing ordering a slot's other fields between the worker that
-	 * finishes with it and the one that picks it up (pscan_slot_idle ->
-	 * pscan_claim_slot), which otherwise hand off with no lock in common.
-	 */
+	/* Workers advance this outside the progress mutex as they work, while
+	 * the renderer reads it every redraw - hence atomic. The idle/claim
+	 * handoff itself is ordered by the mutex, not by this field. */
 	_Atomic enum pscan_thread_status	status;
 };
 
@@ -191,8 +187,7 @@ void pdedupe_add_pushed_work(uint64_t bytes);
 
 /*
  * Claim a per-thread display line for one unit of work (file scan / dedupe
- * group) and mark it with `status`; fill in file_path / file_total_bytes /
- * file_scanned_bytes afterwards. Release it with pscan_reset_thread(). Claim
+ * group) and mark it with `status`; point it at the work with pscan_set_file(). Release it with pscan_reset_thread(). Claim
  * per work item, not per OS thread: pool threads get reaped and respawned,
  * which would strand dead threads' lines and grow the display unboundedly.
  */

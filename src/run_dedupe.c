@@ -798,16 +798,11 @@ static void batch_maybe_complete_locked(struct dedupe_batch *batch)
 		g_cond_signal(&producer_cond);
 }
 
-static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
+static void dedupe_worker_body(void *priv)
 {
 	uint64_t fiemap_bytes = 0ULL;
 	uint64_t kern_bytes = 0ULL;
 	struct dedupe_work_item *item = priv;
-
-	/* Close the handoff edge the producer opened at push (see src/tsan.h);
-	 * a no-op outside a ThreadSanitizer build. */
-	oans_tsan_work_acquire(item);
-
 	struct dupe_extents *dext = item->dext;
 	struct dedupe_batch *batch = item->batch;
 	bool whole_file = item->whole_file;
@@ -860,6 +855,19 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	batch->outstanding--;
 	batch_maybe_complete_locked(batch);
 	g_mutex_unlock(&producer_mutex);
+}
+
+/*
+ * The pool entry point. The body's _cleanup_ handlers (the progress slot among
+ * them) run as it returns, so the ThreadSanitizer release has to sit out here
+ * to cover what they write; it pairs with the acquire in the
+ * g_thread_pool_free() wrapper. Both calls compile away outside a TSAN build.
+ */
+static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
+{
+	oans_tsan_work_acquire(priv);
+	dedupe_worker_body(priv);
+	oans_tsan_work_done(dedupe_pool);
 }
 
 /*

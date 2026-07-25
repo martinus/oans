@@ -75,14 +75,12 @@ else ifdef SANITIZE
 		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 		LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp
 
-	# ThreadSanitizer needs two extra things (see src/tsan.h for the why):
-	#   - the GLib synchronization annotations, force-included so no call site
-	#     has to change. It must be -include'd rather than #include'd because it
-	#     has to sit ahead of every translation unit; it pulls in <glib.h>
-	#     itself so its macros cannot mangle GLib's own prototypes.
-	#   - LOCK_MEMSTATS: the allocation counters in memstats.h are deliberately
-	#     unlocked outside DEBUG_BUILD, which is a genuine (if benign) race that
-	#     would otherwise bury the reports worth reading.
+	# ThreadSanitizer needs two extra things (src/tsan.h explains why):
+	#   - the GLib annotations, -include'd rather than #include'd so they sit
+	#     ahead of every translation unit without touching any call site.
+	#   - LOCK_MEMSTATS: memstats.h's counters are deliberately unlocked
+	#     outside DEBUG_BUILD, a real if benign race that would bury the
+	#     reports worth reading.
 	ifneq (,$(findstring thread,$(SANITIZE)))
 		DEBUG_FLAGS += -include $(CURDIR)/src/tsan.h -DLOCK_MEMSTATS
 		SANITIZE_RUN += \
