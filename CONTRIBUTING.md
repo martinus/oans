@@ -21,9 +21,15 @@ on a fresh hashfile.
 Install the build dependencies listed in the [README](README.md), then:
 
 ```sh
-make -j$(nproc)     # build (warnings are treated as failures)
-make check          # C unit tests + Python integration suite
+make -j$(nproc)              # build
+make check                   # C unit tests + Python integration suite
+make -j$(nproc) WERROR=1     # ...with any warning treated as an error, as CI builds
 ```
+
+`WERROR=1` is how every CI job builds, so a warning fails the build rather than
+scrolling past in the log. The tree is warning-free under both gcc and clang;
+the Makefile probes `$(CC)` for each extra warning flag it enables, since the two
+compilers accept different sets (`-Wduplicated-cond` and friends are GCC-only).
 
 The integration suite is stdlib-only Python `unittest`. Dedupe test cases need a
 **reflink-capable filesystem** (btrfs or xfs) as the scratch dir — see

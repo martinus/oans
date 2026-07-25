@@ -15,6 +15,29 @@ CFLAGS ?= -Wall -Wextra -Wno-unused-parameter -ggdb -std=gnu11 \
 	-Werror=strict-prototypes -MMD
 PKG_CONFIG ?= pkg-config
 
+# Extra warnings the tree is already clean under. Not every compiler knows every
+# flag (-Wduplicated-cond, -Wduplicated-branches, -Wlogical-op and
+# -Wjump-misses-init are GCC-only), and clang turns an unknown -W into an error
+# once -Werror is on, so probe each against $(CC) and keep what it accepts.
+# Assigned with := so the probes run once, not on every CFLAGS expansion.
+cc-option = $(shell $(CC) -Werror $(1) -E -x c /dev/null >/dev/null 2>&1 && echo $(1))
+WARN_EXTRA := $(foreach w,-Wundef -Wvla -Wstrict-overflow=2 \
+	-Wduplicated-cond -Wduplicated-branches -Wlogical-op -Wjump-misses-init \
+	-Wold-style-definition -Wmissing-include-dirs,$(call cc-option,$(w)))
+
+# src/fiemap.c embeds a variable-sized `struct fiemap` ahead of its extent array
+# - the layout the ioctl wants, and a deliberate GNU extension under -std=gnu11.
+# clang diagnoses it, gcc does not. Probe the *positive* flag (gcc rejects it) so
+# only clang is handed the -Wno- form instead of gcc carrying a dead option.
+WARN_EXTRA += $(if $(call cc-option,-Wgnu-variable-sized-type-not-at-end),\
+	-Wno-gnu-variable-sized-type-not-at-end)
+
+# make WERROR=1 to make any warning fatal. CI builds this way so a warning can
+# never land silently; locally `scripts/verify.sh` greps the build log instead.
+ifdef WERROR
+	override CFLAGS += -Werror
+endif
+
 MANPAGE    = docs/man/oans.8
 COMPLETION = completion/zsh/_oans
 
@@ -59,7 +82,7 @@ else
 	LIBRARY_FLAGS += -Wl,-z,relro -Wl,-z,now
 endif
 
-override CFLAGS += -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE \
+override CFLAGS += $(WARN_EXTRA) -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE \
 	-DVERSTRING=\"$(VERSION)\" $(EXTRA_CFLAGS) $(DEBUG_FLAGS)
 LIBRARY_FLAGS += -Wl,--as-needed -latomic -lm $(EXTRA_LIBS)
 

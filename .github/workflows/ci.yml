@@ -4,13 +4,30 @@ on:
   push:
   pull_request:
 
+# Read-only by default; no job here needs to write back to the repo.
+permissions:
+  contents: read
+
+# Every job builds with WERROR=1 so a new compiler warning fails CI rather than
+# scrolling past in the log (scripts/verify.sh greps the build output locally,
+# but CI never runs it - without this a warning could land unnoticed).
+env:
+  WERROR: 1
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # Both compilers: they disagree on plenty (clang's -Wcast-align fires on
+        # the container_of idiom, gcc has no -Wgnu-* checks), so building each at
+        # -O2 catches warnings and codegen the other misses. The sanitizer jobs
+        # below only cover clang at -O1.
         scratch_fs: [btrfs, xfs]
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
+            build-essential clang pkg-config \
             libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
             uuid-dev libbsd-dev libxxhash-dev \
             btrfs-progs xfsprogs
