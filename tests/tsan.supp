@@ -7,12 +7,32 @@
 # Everything TSAN found in oans's own code was fixed rather than listed here.
 #
 # GThreadPool/GAsyncQueue internal queue nodes: the pushing thread g_malloc()s a
-# node and the worker thread frees it in g_queue_pop_tail(). GLib orders that
-# with its own mutex, but libglib-2.0 is not built with -fsanitize=thread, so
-# TSAN cannot see the edge and reports the malloc/free pair as a race on
-# glib-internal memory. We cannot annotate our way out of this one the way
-# src/tsan.h does for the rest: the node is freed inside GLib *before* our
-# worker function is entered, so there is no point in oans code at which to
-# place the matching acquire.
+# node and the worker thread frees it after popping. GLib orders that with its
+# own mutex, but libglib-2.0 is not built with -fsanitize=thread, so TSAN cannot
+# see the edge and reports the malloc/free pair as a race on glib-internal
+# memory. We cannot annotate our way out of this one the way src/tsan.h does for
+# the rest: the node is freed inside GLib *before* our worker function is
+# entered, so there is no point in oans code at which to place the matching
+# acquire -- and the release cannot cover it either, since the node is allocated
+# *by* the push, after the release that precedes it.
+#
+# Two entries, because which frames carry a symbol depends on the GLib build:
+#
+#   g_queue_pop_tail  the pop path itself; resolves where libglib's own frame
+#                     for the free is an exported symbol.
+#   g_free*           the allocator entry point. Needed where that intermediate
+#                     glib frame is internal and prints as `<null>` with only an
+#                     address, which is what a current distro does (seen on
+#                     Fedora 44, glib 2.88 + glibc 2.43, where the free runs
+#                     through the C23 g_free_sized). Without it the whole suite
+#                     fails there -- ~85 tests, since a race exits 66.
+#
+# Both are GLib-internal by construction: oans calls no GLib allocator itself
+# (`grep -rE '\bg_(free|malloc|new|new0|strdup|slice_)' src/` is empty), so
+# neither entry can hide a race on memory oans owns. Checked the other way too,
+# by injecting an unsynchronized write into the csum workers and confirming TSAN
+# still reports it with both entries active -- do that again before adding a
+# third.
 race:g_queue_pop_tail
+race:g_free*
 
