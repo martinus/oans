@@ -22,9 +22,17 @@ permissions:
 env:
   WERROR: 1
 
+# Every job carries a timeout-minutes. GitHub's default is 360, so a hung test
+# holds a runner (and blocks the PR) for six hours before anything notices -- a
+# TSAN leg once wedged in the integration suite with oans and llvm-symbolizer
+# both live, and looked simply "in progress" the whole time. The bounds below
+# are ~8x the observed medians (build ~1 min, sanitizers ~1-2.6 min, valgrind
+# ~6.6 min): loose enough not to police normal runner variance, tight enough
+# that a wedge fails fast and visibly.
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +98,7 @@ jobs:
   # memory behaviour is fs-independent - so it runs on btrfs only.
   valgrind:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -136,6 +145,7 @@ jobs:
   # one filesystem is enough (the checks are fs-independent), so btrfs only.
   sanitizers:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
