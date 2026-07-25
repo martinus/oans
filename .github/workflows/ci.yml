@@ -131,7 +131,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitize: [address, undefined]
+        # thread is the odd one out: it needs src/tsan.h's GLib annotations to
+        # produce a usable signal at all (libglib is uninstrumented and GMutex
+        # is futex-based, so TSAN sees no happens-before edge across a correctly
+        # locked section). The Makefile wires that up for SANITIZE=thread.
+        sanitize: [address, undefined, thread]
     env:
       CC: clang
       SANITIZE: ${{ matrix.sanitize }}
