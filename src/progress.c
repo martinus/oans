@@ -58,7 +58,36 @@
  */
 
 struct pscan_global pscan = {};
+
+/*
+ * The one progress thread, and the only thing that ends it.
+ *
+ * Every render loop below exits on printer_running and nothing else. A loop
+ * must never infer that it is finished by comparing counters (say, scanned ==
+ * total): a single item counted into a total but not credited back leaves them
+ * unequal forever, the loop spins in usleep, and the join blocks for good with
+ * all the real work already done. Only the producer knows when the work is
+ * over. printer_stop() clears the flag and joins in one step so no caller can
+ * do one without the other.
+ */
 static GThread *printer = NULL;
+static _Atomic bool printer_running;
+
+static void printer_start(GThreadFunc fn)
+{
+	printer_running = true;
+	printer = g_thread_new("progress_printer", fn, NULL);	/* aborts on failure */
+}
+
+static void printer_stop(void)
+{
+	if (!printer)
+		return;
+	printer_running = false;
+	g_thread_join(printer);
+	printer = NULL;
+}
+
 bool tty;
 unsigned int w_col;
 
@@ -174,16 +203,15 @@ static _Atomic uint64_t search_total, search_processed;
 
 /*
  * Dedupe-phase status. The counters accumulate whether or not the live
- * display runs (they feed the final summary). `running` gates the printer
- * thread; `phase` switches the shared screen area between scan and dedupe
- * rendering.
+ * display runs (they feed the final summary). `phase` switches the shared
+ * screen area between scan and dedupe rendering; whether a printer thread is
+ * up at all is printer_running's business, not this struct's.
  */
 static struct {
-	/* phase/running/activity/estimate are set by the main thread and read
-	 * every redraw by the progress thread; atomic for the same reason the
+	/* phase/activity/estimate are set by the main thread and read every
+	 * redraw by the progress thread; atomic for the same reason the
 	 * scan-side counters are (volatile orders nothing). */
 	_Atomic bool		phase;		/* rendering dedupe, not scan */
-	_Atomic int		running;
 	gint64			start_us;	/* phase start, monotonic */
 
 	_Atomic uint64_t	done;		/* groups finished */
@@ -883,15 +911,18 @@ static void *pscan_progress_thread(void * p)
 			gint64 now = g_get_monotonic_time();
 			enum jphase phase = json_phase();
 
-			/* Refresh the per-run sums every tick so the loop's exit test
-			 * stays responsive (~100ms). Emit ~1/s, but always right away
-			 * on a phase change so every phase is reported even on a fast
-			 * run. */
-			g_mutex_lock(&pscan.mutex);
-			sum_scanned();
-			g_mutex_unlock(&pscan.mutex);
-
+			/* Emit ~1/s, but always right away on a phase change so every
+			 * phase is reported even on a fast run. The sums are refreshed
+			 * only for the emit that reads them: ticking them every 100ms
+			 * took pscan.mutex - which every worker contends for - to
+			 * produce a value that was overwritten unused nine times out of
+			 * ten, and never read at all outside the hashing phase. */
 			if (phase != json_last_phase || now - json_last >= 1000000) {
+				if (phase == JP_HASH) {
+					g_mutex_lock(&pscan.mutex);
+					sum_scanned();
+					g_mutex_unlock(&pscan.mutex);
+				}
 				emit_json_progress(phase);
 				json_last = now;
 				json_last_phase = phase;
@@ -917,10 +948,7 @@ static void *pscan_progress_thread(void * p)
 
 		/* Do not waste too much cpu */
 		usleep(1000 * (tty ? 100 : 1000));
-	} while (pdd.phase ? pdd.running
-			   : (!pscan.listing_completed
-			      || files_scanned != pscan.total_files_count
-			      || bytes_scanned != pscan.total_bytes_count));
+	} while (printer_running);
 
 	return NULL;
 }
@@ -967,14 +995,12 @@ void pscan_run(void)
 		prepare_screen_area();
 	}
 
-	/* Will abort on failure */
-	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
+	printer_start(pscan_progress_thread);
 }
 
 void pscan_join(bool continues)
 {
-	g_thread_join(printer);
-	printer = NULL;
+	printer_stop();
 
 	/* The listing is done (STAGE_SCAN) and the csum pool has drained. */
 	stage_set(STAGE_HASH, ST_DONE);
@@ -990,10 +1016,12 @@ void pscan_join(bool continues)
 		/*
 		 * A live dedupe phase will keep drawing this same block, so leave
 		 * it in place - workers and all - and just refresh it once so
-		 * hashing shows ticked. Nothing is wiped or stranded above the
-		 * dedupe view, and the worker list never blinks away. Threads,
-		 * drawn_lines and the hidden cursor are kept for the dedupe phase
-		 * (it reuses the now-idle slots and redraws over this block).
+		 * hashing shows ticked. The refresh also settles the bar: the
+		 * printer stops the moment the producer says so, which can be
+		 * mid-tick. Nothing is wiped or stranded above the dedupe view,
+		 * and the worker list never blinks away. Threads, drawn_lines and
+		 * the hidden cursor are kept for the dedupe phase (it reuses the
+		 * now-idle slots and redraws over this block).
 		 */
 		g_mutex_lock(&pscan.mutex);
 		print_progress();
@@ -1202,8 +1230,7 @@ void pdedupe_begin(unsigned int batches)
 		 * When there was no scan block (drawn_lines already 0) it draws fresh.
 		 */
 	}
-	pdd.running = 1;
-	printer = g_thread_new("progress_printer", pscan_progress_thread, NULL);
+	printer_start(pscan_progress_thread);
 }
 
 void pdedupe_end(void)
@@ -1212,10 +1239,8 @@ void pdedupe_end(void)
 	stage_set(STAGE_DEDUPE, ST_DONE);
 	stage_set(STAGE_DONE, ST_DONE);
 
-	if (pdd.running) {
-		pdd.running = 0;
-		g_thread_join(printer);
-		printer = NULL;
+	if (printer) {
+		printer_stop();
 
 		/* Show the cursor again, wipe the live block, and leave the
 		 * fully-ticked stage line in place; the caller prints the final
@@ -1330,7 +1355,7 @@ static void *psearch_progress_thread(void * p)
 
 		/* Do not waste too much cpu */
 		usleep(100 * 1000);
-	} while (search_total != search_processed);
+	} while (printer_running);
 	printf("\n");
 	return NULL;
 }
@@ -1349,7 +1374,7 @@ void psearch_run(uint64_t num_filerecs)
 		pdedupe_set_activity("searching block-level matches");
 		return;
 	}
-	printer = g_thread_new("progress_printer", psearch_progress_thread, NULL);
+	printer_start(psearch_progress_thread);
 }
 
 void psearch_join(void)
@@ -1359,8 +1384,7 @@ void psearch_join(void)
 		search_processed = 0;
 		return;
 	}
-	g_thread_join(printer);
-	printer = NULL;
+	printer_stop();
 }
 
 void psearch_update_processed_count(unsigned int processed)
