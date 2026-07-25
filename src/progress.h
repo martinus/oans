@@ -50,16 +50,6 @@ struct pscan_global {
 	_Atomic uint64_t	files_examined;	/* visited during listing */
 	_Atomic bool		listing_completed;
 
-	/* Whether the scan-phase progress thread should keep running. Set before
-	 * the thread starts, cleared by pscan_join() before it joins - the same
-	 * edge-triggered shutdown the dedupe phase already uses via pdd.running.
-	 * The thread must NOT decide to exit by comparing scanned counts against
-	 * totals: any file counted into the totals but never credited back leaves
-	 * them unequal forever, and the join then blocks for good (a real hang,
-	 * seen on slow/few-core machines). Only the producer knows when the work
-	 * is over, so only the producer ends the thread. */
-	_Atomic bool		scan_running;
-
 	/* Each thread tracks its own progress separately */
 	GMutex			mutex;
 	unsigned int		thread_count;
