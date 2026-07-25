@@ -1,0 +1,14 @@
+version: 2
+
+# The only third-party dependencies pinned in this repo are the GitHub Actions
+# used by the CI and release workflows (the C build deps come from the distro's
+# packages, so there is no manifest here for dependabot to track). This opens a
+# PR when an action publishes a new release, which is also what keeps commit-SHA
+# pins current if the workflows move to pinning by SHA.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

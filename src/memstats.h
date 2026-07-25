@@ -60,7 +60,7 @@ static inline void decrement_counters(unsigned long long *num_type,
 static GMutex alloc_##_type##_mutex;					\
 unsigned long long num_##_type = 0;					\
 unsigned long long max_##_type = 0;					\
-static inline struct _type *malloc_##_type(void)			\
+[[maybe_unused]] static inline struct _type *malloc_##_type(void)	\
 {									\
 	struct _type *t = malloc(sizeof(struct _type));			\
 	if (t)								\
@@ -68,7 +68,7 @@ static inline struct _type *malloc_##_type(void)			\
 				   &alloc_##_type##_mutex);		\
 	return t;							\
 }									\
-static inline struct _type *calloc_##_type(int n)			\
+[[maybe_unused]] static inline struct _type *calloc_##_type(int n)	\
 {									\
 	struct _type *t = calloc(n, sizeof(struct _type));		\
 	if (t)								\
