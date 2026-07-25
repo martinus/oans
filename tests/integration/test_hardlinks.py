@@ -23,7 +23,13 @@ class HardlinkTest(DuperemoveTest):
         self.assertDmOk()
         # 400 plain files + 1 shared inode = 401 distinct inodes/rows.
         self.assertEqual(401, self.hf_count("files"), "every inode recorded exactly once")
-        self.assertEqual(401, self.hf_count("extents"), "extents present for every inode")
+        # At least one extent per inode. Not exactly one: how many extents a
+        # file gets is btrfs's business, and under the load of a parallel suite
+        # writeback can split one of these into two (CI saw 402). The bug this
+        # test guards emptied the hashfile, so what matters is that every inode
+        # has extents at all - the count above is the exact invariant.
+        self.assertGreaterEqual(self.hf_count("extents"), 401,
+                                "extents present for every inode")
 
     def test_many_hardlinks_one_row_each(self):
         for n in range(50):
