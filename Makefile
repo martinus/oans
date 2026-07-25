@@ -171,6 +171,37 @@ lint:
 .PHONY: check
 check: lint test integration
 
+# Everything CI runs, in one command. Each leg rebuilds from scratch on purpose:
+# the sanitizer builds use incompatible flags, and a stale object from a previous
+# leg fails to link (undefined __ubsan_handle_* / __tsan_* symbols). Ordered
+# fastest-failing first, so a plain compile error costs seconds rather than the
+# whole run (~7 min with -j on 16 cores; TSAN and valgrind are most of it).
+#
+# Sanitizer legs must go through make, not a bare `python3 tests/run.py`: the
+# SANITIZE_RUN above is what exports the ASAN/UBSAN/LSAN/TSAN options, and
+# without them TSAN runs with no suppressions and reports GLib's internals as
+# races. Use SAN_CC= to override the sanitizer compiler (clang by default; gcc
+# has no ThreadSanitizer support for this configuration).
+SAN_CC ?= clang
+
+.PHONY: check-all
+check-all:
+	@command -v $(SAN_CC) >/dev/null 2>&1 || \
+		{ echo "check-all needs $(SAN_CC) for the sanitizer legs (override with SAN_CC=)"; exit 1; }
+	@command -v valgrind >/dev/null 2>&1 || { echo "check-all needs valgrind"; exit 1; }
+	@echo "=== [1/5] build + lint + unit + integration ==="
+	$(MAKE) clean && $(MAKE) check
+	@echo "=== [2/5] AddressSanitizer ==="
+	$(MAKE) clean && $(MAKE) integration SANITIZE=address CC=$(SAN_CC)
+	@echo "=== [3/5] UndefinedBehaviorSanitizer ==="
+	$(MAKE) clean && $(MAKE) integration SANITIZE=undefined CC=$(SAN_CC)
+	@echo "=== [4/5] ThreadSanitizer ==="
+	$(MAKE) clean && $(MAKE) integration SANITIZE=thread CC=$(SAN_CC)
+	@echo "=== [5/5] valgrind memcheck ==="
+	$(MAKE) clean && $(MAKE) integration-valgrind
+	@echo
+	@echo "check-all: all 5 legs passed"
+
 # Install oans plus a backward-compatible 'duperemove' symlink, the man page,
 # and the zsh completion. `install -D` creates the target directories.
 install: oans $(MANPAGE) $(COMPLETION)
