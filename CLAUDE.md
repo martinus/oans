@@ -87,6 +87,13 @@ in `tests/`; no shell tests.
   will flake in parallel; `TEST_JOBS=1` is the sequential fallback for pinning
   such a flake down. The suite is I/O-bound, so `auto` deliberately
   over-subscribes (`2 × nproc`, capped) — don't "fix" it back to `nproc`.
+- **A test asserting on the *physical* extent layout must set `serial = True`**
+  (`DuperemoveTest.serial`), which holds it back to a one-at-a-time pass after
+  the pool drains. Per-test scratch isolation doesn't help here: the
+  fsync-forced-extent-boundary trick and fiemap counts depend on btrfs
+  writeback, which concurrent I/O perturbs — CI caught exactly this on btrfs
+  (`test_extent_order_independent`, `test_streaming_dedupe`) while xfs passed.
+  The four `fsync`-boundary files are already marked.
 
 - **Never scan/benchmark out of `/tmp` — it's tmpfs**, not reflink-capable and
   rejected by `is_fs_supported()`, so a scan there stores **0 files silently**

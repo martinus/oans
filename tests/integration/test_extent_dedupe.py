@@ -23,6 +23,9 @@ MiB = 1 << 20
 
 @requires_btrfs
 class ExtentDedupeTest(DuperemoveTest):
+    # Extent-layout sensitive: see DuperemoveTest.serial.
+    serial = True
+
     def _mkfile(self, rel, head, tail):
         """head, an fsync to force an extent boundary, then the shared tail."""
         p = self.path(rel)

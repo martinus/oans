@@ -183,8 +183,29 @@ requires_btrfs = unittest.skipUnless(
 # Base test case
 # --------------------------------------------------------------------------
 
+def _settle(f):
+    """fsync f so FIEMAP reports real extents rather than delayed allocation.
+
+    The sparse-layout helpers below build a file and hand it straight to a scan
+    that asserts on its extents. Without the fsync those extents may still be
+    unallocated when oans maps the file, and it correctly records none - which
+    surfaced as test_sparse_file_scans failing 4 runs in 12 once the suite
+    started running in parallel and writeback fell further behind.
+    """
+    f.flush()
+    os.fsync(f.fileno())
+
+
 class DuperemoveTest(unittest.TestCase):
     """Base class: a fresh scratch dir + hashfile per test, plus helpers."""
+
+    # Set True on a class whose assertions depend on the *physical* extent
+    # layout the kernel happens to produce - the fsync-forced extent boundary
+    # trick, or fiemap counts. Concurrent I/O perturbs btrfs writeback enough
+    # that the layout the setup intends is not the one it gets, so tests/run.py
+    # holds these back and runs them one at a time after the pool drains.
+    # Per-test scratch isolation is *not* what this is for; that already works.
+    serial = False
 
     @classmethod
     def setUpClass(cls):
@@ -378,12 +399,16 @@ class DuperemoveTest(unittest.TestCase):
             f.write(head)
             f.seek(len(head) + hole)
             f.write(tail)
+            _settle(f)
         return p
 
     def make_trailing_hole(self, relpath, data, size):
         """Write `data`, then extend the file to `size` so it ends in a hole."""
-        p = self.write(relpath, data)
-        os.truncate(p, size)
+        p = self.path(relpath)
+        with open(p, "wb") as f:
+            f.write(data)
+            f.truncate(size)
+            _settle(f)
         return p
 
     def reflink(self, src_rel, dst_rel):

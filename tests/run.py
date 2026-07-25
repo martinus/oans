@@ -16,7 +16,10 @@ Usage:
 Workers are *processes*, not threads: test_long_path chdir()s and cwd is
 process-global. Tests need no cooperation to be split up - harness.setUp already
 gives each one its own mkdtemp scratch and its own hashfile inside it - but a
-test that reaches outside that will flake in parallel.
+test that reaches outside that will flake in parallel. The exception is tests
+asserting on the *physical* extent layout, which concurrent I/O perturbs no
+matter how isolated their files are; those set DuperemoveTest.serial and run one
+at a time once the pool has drained.
 
 Results are collected as they land and replayed into a real unittest result, so
 the output is unittest's own in every mode, `-j 1` included.
@@ -154,10 +157,8 @@ def _run_one(test_id):
     return elapsed, outcomes
 
 
-def _run_suite(test_ids, jobs, verbosity=2):
-    result = _ReplayResult(_Stream(), True, verbosity)
-    started = time.monotonic()
-
+def _dispatch(test_ids, jobs, result):
+    """Run test_ids across `jobs` workers, recording outcomes into `result`."""
     # Pin fork: workers inherit the parent's already-imported test modules, so
     # loadTestsFromName costs ~0.2ms. Python 3.14 defaults Linux to forkserver,
     # under which every worker would re-import harness - whose module level
@@ -179,10 +180,23 @@ def _run_suite(test_ids, jobs, verbosity=2):
                 add(test) if detail is None else add(test, detail)
             result.stopTest(test)
 
+
+def _run_suite(parallel_ids, serial_ids, jobs, verbosity=2):
+    result = _ReplayResult(_Stream(), True, verbosity)
+    started = time.monotonic()
+
+    _dispatch(parallel_ids, jobs, result)
+    # DuperemoveTest.serial tests want the box to themselves: their setup builds
+    # a specific physical extent layout, which concurrent I/O disturbs. Held to
+    # the end so they don't serialise the rest of the run either.
+    if serial_ids:
+        _dispatch(serial_ids, 1, result)
+
     result.printErrors()
+    tail = f" (+{len(serial_ids)} serial)" if serial_ids else ""
     result.stream.writeln(result.separator2)
     result.stream.writeln(f"Ran {result.testsRun} tests in "
-                          f"{time.monotonic() - started:.2f}s on {jobs} workers")
+                          f"{time.monotonic() - started:.2f}s on {jobs} workers{tail}")
     result.stream.writeln()
     if result.wasSuccessful():
         result.stream.writeln(f"OK (skipped={len(result.skipped)})")
@@ -218,7 +232,12 @@ def main(argv):
     loader = unittest.TestLoader()
     discovered = loader.discover(start_dir=INTEGRATION_DIR, pattern="test_*.py")
     tests = [t for t in _iter_tests(discovered) if _matches(t.id(), args.patterns)]
-    return _run_suite([t.id() for t in tests], args.jobs)
+    serial = [t.id() for t in tests if getattr(t, "serial", False)]
+    parallel = [t.id() for t in tests if not getattr(t, "serial", False)]
+    if serial:
+        print(f"  serial : {len(serial)} extent-layout tests held to the end\n",
+              flush=True)
+    return _run_suite(parallel, serial, args.jobs)
 
 
 def _iter_tests(suite):

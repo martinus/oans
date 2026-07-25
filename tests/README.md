@@ -58,6 +58,12 @@ Subclass `DuperemoveTest` (from `harness`) and add `test_*` methods. Each test
 gets a fresh scratch directory in `self.work` and a per-test hashfile in
 `self.hf`; both are cleaned up automatically.
 
+That isolation is what lets the suite run in parallel, so keep to it — a test
+reaching outside its own `self.work` will flake. If a test asserts on the
+*physical* extent layout (the fsync-forced extent boundary trick, or fiemap
+extent counts), set `serial = True` on the class: no amount of file isolation
+helps there, because concurrent I/O changes how the kernel lays extents out.
+
 ```python
 from harness import DuperemoveTest, requires_reflink
 
