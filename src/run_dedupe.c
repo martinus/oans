@@ -43,6 +43,7 @@
 #include "dbfile.h"
 #include "fiemap.h"
 #include "find_dupes.h"
+#include "tsan.h"
 
 #include "run_dedupe.h"
 
@@ -397,11 +398,10 @@ static void pick_least_fragmented_target(struct dupe_extents *dext)
  * member) plus the bytes the kernel still has to byte-verify as work total. */
 static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext)
 {
-	progress_copy_path(slot->file_path, sizeof(slot->file_path),
-			   list_first_entry(&dext->de_extents, struct extent,
-					    e_list)->e_file->filename);
-	slot->file_total_bytes = dext_work(dext);
-	slot->file_scanned_bytes = 0;
+	pscan_set_file(slot,
+		       list_first_entry(&dext->de_extents, struct extent,
+					e_list)->e_file->filename,
+		       dext_work(dext));
 }
 
 /*
@@ -803,6 +803,11 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	uint64_t fiemap_bytes = 0ULL;
 	uint64_t kern_bytes = 0ULL;
 	struct dedupe_work_item *item = priv;
+
+	/* Close the handoff edge the producer opened at push (see src/tsan.h);
+	 * a no-op outside a ThreadSanitizer build. */
+	oans_tsan_work_acquire(item);
+
 	struct dupe_extents *dext = item->dext;
 	struct dedupe_batch *batch = item->batch;
 	bool whole_file = item->whole_file;

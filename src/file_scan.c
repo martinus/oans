@@ -1929,10 +1929,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 */
 	abort_on(!tprogress);
 	tprogress->status = thread_mapping;	/* open + do_fiemap: no bytes yet */
-	tprogress->file_scanned_bytes = 0;
-	tprogress->file_total_bytes = file->filesize;
-	progress_copy_path(tprogress->file_path, sizeof(tprogress->file_path),
-			   file->path);
+	pscan_set_file(tprogress, file->path, file->filesize);
 	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
 
 	/* Dummy variables used to trigger the cleanup code */

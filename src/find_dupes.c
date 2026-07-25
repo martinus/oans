@@ -36,6 +36,7 @@
 #include "debug.h"
 #include "progress.h"
 #include "threads.h"
+#include "tsan.h"
 
 #include "find_dupes.h"
 
@@ -365,6 +366,10 @@ struct cmp_ctxt {
 
 static void find_dupes_thread(struct cmp_ctxt *ctxt, void *priv [[maybe_unused]])
 {
+	/* Close the handoff edge the producer opened at push (see src/tsan.h);
+	 * a no-op outside a ThreadSanitizer build. */
+	oans_tsan_work_acquire(ctxt);
+
 	struct results_tree *dupe_extents = ctxt->dupe_extents;
 	struct filerec *file = ctxt->file;
 
