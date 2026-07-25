@@ -137,14 +137,27 @@ static inline void oans_tsan_work_acquire(void *item)
  * every task, so whatever the workers wrote is safely visible to the thread that
  * tears the pool down - but GLib recycles pool threads rather than joining them,
  * so TSAN sees no edge and calls the teardown's frees a race. Each worker
- * publishes on the pool once it is completely done (after any _cleanup_ handlers
- * have run, which is why this cannot simply be the worker's last statement), and
- * the free wrapper below collects it.
+ * publishes once it is completely done (after any _cleanup_ handlers have run,
+ * which is why this cannot simply be the worker's last statement), and the
+ * teardown collects it with oans_tsan_work_collect().
+ *
+ * Both sides name a *token* the caller owns, not the GThreadPool pointer.
+ * Teardown clears that pointer - dedupe_pool = NULL, pool->pool = NULL - and it
+ * does so while a worker can still be in its tail, so a worker reading it there
+ * is itself a data race. Worse, the read could land after the store and hand a
+ * NULL to a `if (pool)` guard, silently skipping the release: the edge would
+ * never be published and the teardown's frees would be reported as races
+ * *elsewhere*, which is exactly how this surfaced. A token is written once,
+ * never cleared, and lives as long as the pool's owner.
  */
-static inline void oans_tsan_work_done(void *pool)
+static inline void oans_tsan_work_done(void *token)
 {
-	if (pool)
-		__tsan_release(pool);
+	__tsan_release(token);
+}
+
+static inline void oans_tsan_work_collect(void *token)
+{
+	__tsan_acquire(token);
 }
 
 static inline void oans_tsan_pool_free(GThreadPool *pool, gboolean immediate,
@@ -169,7 +182,8 @@ static inline void oans_tsan_pool_free(GThreadPool *pool, gboolean immediate,
 #else	/* not a TSAN build: nothing to annotate */
 
 static inline void oans_tsan_work_acquire(void *item) { (void)item; }
-static inline void oans_tsan_work_done(void *pool) { (void)pool; }
+static inline void oans_tsan_work_done(void *token) { (void)token; }
+static inline void oans_tsan_work_collect(void *token) { (void)token; }
 
 #endif
 #endif	/* __OANS_TSAN_H__ */

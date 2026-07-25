@@ -36,6 +36,12 @@ struct threads_cleanup_item {
 
 struct threads_pool {
 	GThreadPool *pool;
+	/*
+	 * Address only: the happens-before token workers publish on when they
+	 * finish, collected in free_pool(). Deliberately not `pool`, which that
+	 * teardown clears while a worker can still be in its tail. See tsan.h.
+	 */
+	char tsan_token;
 	struct threads_cleanup_item** items;
 	unsigned int item_count;
 	GMutex mutex; /* Protect the cleanup items operations */

@@ -94,6 +94,12 @@ struct dedupe_work_item {
 };
 
 static GThreadPool	*dedupe_pool;
+/*
+ * Address only: the happens-before token workers publish on when they finish,
+ * collected in dedupe_phase_end(). Deliberately not dedupe_pool, which that
+ * teardown clears out from under a worker's tail. See tsan.h.
+ */
+static char		dedupe_pool_token;
 static GMutex		producer_mutex;	/* guards the in-flight list + counts */
 static GCond		producer_cond;	/* producer waits; workers/seal signal */
 static struct list_head	inflight_batches = LIST_HEAD_INIT(inflight_batches);
@@ -867,7 +873,7 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 {
 	oans_tsan_work_acquire(priv);
 	dedupe_worker_body(priv);
-	oans_tsan_work_done(dedupe_pool);
+	oans_tsan_work_done(&dedupe_pool_token);
 }
 
 /*
@@ -1161,6 +1167,7 @@ void dedupe_phase_end(void)
 	if (dedupe_pool) {
 		g_thread_pool_free(dedupe_pool, FALSE, TRUE);	/* waits for exit */
 		dedupe_pool = NULL;
+		oans_tsan_work_collect(&dedupe_pool_token);
 	}
 
 	pdedupe_end();

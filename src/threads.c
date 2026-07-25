@@ -43,7 +43,7 @@ static void pool_trampoline(gpointer item, gpointer user_data)
 
 	pool->worker(item, pool->worker_arg);
 
-	oans_tsan_work_done(pool->pool);
+	oans_tsan_work_done(&pool->tsan_token);
 	pool_work_done(pool);
 }
 
@@ -123,6 +123,7 @@ void register_cleanup(struct threads_pool *pool, void *function, void *ptr)
 void free_pool(struct threads_pool *pool)
 {
 	g_thread_pool_free(pool->pool, FALSE, TRUE);
+	oans_tsan_work_collect(&pool->tsan_token);
 
 	/* No worker can still be registering after that wait, but take the lock
 	 * register_cleanup() writes under anyway, so the ordering is stated in
