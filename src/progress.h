@@ -41,10 +41,10 @@ struct pscan_thread {
 	 * handoff itself is ordered by the mutex, not by this field. */
 	_Atomic enum pscan_thread_status	status;
 
-	/* A worker still owns this slot and will come back to it, so no other
-	 * worker may claim it - even while it sits idle (pscan_slot_wait()).
-	 * Only ever read/written under pscan.mutex. */
-	bool				owned;
+	/* Monotonic us at which this slot's worker started waiting for its next
+	 * unit of work, or 0 while it has work. Set by the worker, read by the
+	 * renderer every redraw - hence atomic. See pscan_slot_waiting(). */
+	_Atomic gint64			waiting_since;
 };
 
 struct pscan_global {
@@ -125,13 +125,22 @@ void pscan_reset_thread(struct pscan_thread **progress);
  * For a persistently-held slot (one kept by a long-lived worker across many
  * files, rather than re-claimed per file): pscan_finish_file() does the per-file
  * byte/count accounting without going idle, so no "idle" flashes between files;
- * pscan_slot_wait() shows the slot as idle while its worker waits for more work
- * but keeps it reserved (the worker comes back to the same line);
- * pscan_slot_idle() releases it when the worker finally runs out of work.
+ * pscan_slot_idle() parks the slot when the worker finally runs out of work.
  */
 void pscan_finish_file(struct pscan_thread **progress);
-void pscan_slot_wait(struct pscan_thread *slot);
 void pscan_slot_idle(struct pscan_thread *slot);
+
+/*
+ * Bracket a persistently-held slot's wait for its next unit of work. Such a
+ * slot keeps showing the last file's status between files, which is right for
+ * the microsecond gap between two small files and a lie once the worker is
+ * starved (the walk is the bottleneck, or nearly everything is up to date).
+ * The worker just publishes when the wait started; the renderer decides when
+ * that has gone on long enough to draw the line as idle instead. One atomic
+ * store (plus a clock read on the `true` side), so it is cheap enough for the
+ * per-file path.
+ */
+void pscan_slot_waiting(struct pscan_thread *slot, bool waiting);
 
 bool is_progress_printer_running(void);
 
