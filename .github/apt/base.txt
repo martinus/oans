@@ -1,0 +1,12 @@
+# Dependencies every CI leg needs. Per-leg extras live in build.txt,
+# valgrind.txt and sanitizers.txt; the installer takes both files, and the
+# cache key hashes both, so editing either invalidates the cached .debs.
+pkg-config
+libsqlite3-dev
+libglib2.0-dev
+libblkid-dev
+libmount-dev
+uuid-dev
+libbsd-dev
+libxxhash-dev
+btrfs-progs

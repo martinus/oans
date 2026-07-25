@@ -1,0 +1,5 @@
+# Extras for the sanitizer legs, on top of base.txt. clang only: gcc has no
+# ThreadSanitizer support for this configuration.
+clang
+llvm
+libclang-rt-dev

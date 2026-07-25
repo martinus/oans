@@ -47,14 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang pkg-config \
-            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
-            uuid-dev libbsd-dev libxxhash-dev \
-            btrfs-progs xfsprogs
+      - uses: ./.github/actions/apt-deps
+        with:
+          leg: build
 
       # Guards the long-path invariant (#117): a syscall taking a scanned
       # file's path silently ENAMETOOLONGs and drops the file, exit 0.
@@ -102,14 +97,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
-            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
-            uuid-dev libbsd-dev libxxhash-dev \
-            btrfs-progs valgrind
+      - uses: ./.github/actions/apt-deps
+        with:
+          leg: valgrind
 
       - name: Build
         run: make
@@ -158,14 +148,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang llvm libclang-rt-dev pkg-config \
-            libsqlite3-dev libglib2.0-dev libblkid-dev libmount-dev \
-            uuid-dev libbsd-dev libxxhash-dev \
-            btrfs-progs
+      - uses: ./.github/actions/apt-deps
+        with:
+          leg: sanitizers
 
       # Newer runners default vm.mmap_rnd_bits to 32, which clang's ASAN shadow
       # mapping can't accommodate ("Shadow memory range interleaves..."). 28 is

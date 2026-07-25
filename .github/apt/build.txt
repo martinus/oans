@@ -1,0 +1,5 @@
+# Extras for the build-and-test matrix, on top of base.txt. Both compilers,
+# and xfs because that matrix covers both scratch filesystems.
+build-essential
+clang
+xfsprogs

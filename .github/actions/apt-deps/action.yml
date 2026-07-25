@@ -1,0 +1,35 @@
+name: Install apt dependencies
+description: >-
+  Install a leg's build dependencies, reusing .debs cached from a previous run.
+  apt-get was 15-37s in every job, most of it `apt-get update`; a cache hit
+  skips it entirely.
+
+inputs:
+  leg:
+    description: Which .github/apt/<leg>.txt to install alongside base.txt.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The cache must be keyed on the image, or a runner upgrade would reuse
+    # .debs built against the old one. ImageOS/ImageVersion are set in the
+    # runner's environment but are NOT visible to `${{ env.* }}` in a workflow
+    # expression - keying on those directly silently produced `apt---build-...`
+    # and pinned nothing. Read them in a shell, where they do exist, and fall
+    # back to /etc/os-release so the key is never image-blind.
+    - id: image
+      shell: bash
+      run: |
+        os="${ImageOS:-$(. /etc/os-release && echo "$ID$VERSION_ID")}"
+        echo "id=${os}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v4
+      with:
+        path: ~/.apt-archives
+        key: apt-${{ steps.image.outputs.id }}-${{ hashFiles('.github/apt/base.txt', format('.github/apt/{0}.txt', inputs.leg)) }}
+
+    - shell: bash
+      run: |
+        .github/scripts/apt-install.sh \
+          .github/apt/base.txt ".github/apt/${{ inputs.leg }}.txt"
