@@ -1465,34 +1465,52 @@ static int add_block_hash(struct hashes *hashes,
 
 /*
  * Check if the area should be scanned.
+ *
+ * `cursor` is the caller's get_extent() resume hint (see fiemap.c). The walk
+ * below queries strictly increasing offsets, so without a hint every iteration
+ * rescans the extent array from index 0 - quadratic in the extent count. On a
+ * heavily fragmented file (65k extents in 1 GiB is ordinary for btrfs CoW, and
+ * dedupe itself fragments) that dominated the scan at ~49% of CPU. Threading
+ * the hint through makes one pass over a file O(extents). A stale hint stays
+ * correct: get_extent() validates it and falls back to a full scan.
  */
-static bool is_area_ignored(struct fiemap *fiemap, size_t start, size_t len)
+static bool is_area_ignored(struct fiemap *fiemap, size_t start, size_t len,
+			    unsigned int *cursor)
 {
 	size_t end = start + len;
 	struct fiemap_extent *current_extent;
+	unsigned int cur = cursor ? *cursor : 0;
+	bool ignored = false;
+
 	while (start < end) {
-		current_extent = get_extent(fiemap, start, NULL);
+		current_extent = get_extent(fiemap, start, &cur);
 
 		/* File changed since we fiemap */
 		if (!current_extent)
-			return false;
+			break;
 
-		if (current_extent->fe_flags & FIEMAP_SKIP_FLAGS)
-			return true;
+		if (current_extent->fe_flags & FIEMAP_SKIP_FLAGS) {
+			ignored = true;
+			break;
+		}
 
 		if (current_extent->fe_flags & FIEMAP_EXTENT_LAST)
 			break;
 		start = current_extent->fe_logical + current_extent->fe_length + 1;
 	}
-	return false;
+
+	if (cursor)
+		*cursor = cur;
+	return ignored;
 }
 
 /*
  * Check if the block starting at off should be ignored.
  */
-static inline bool is_block_ignored(struct fiemap *fiemap, size_t off)
+static inline bool is_block_ignored(struct fiemap *fiemap, size_t off,
+				    unsigned int *cursor)
 {
-	return is_area_ignored(fiemap, off, blocksize);
+	return is_area_ignored(fiemap, off, blocksize, cursor);
 }
 
 /*
@@ -1584,7 +1602,8 @@ static ssize_t process_blocks(struct scan_ctxt *ctxt, struct buffer *buffer,
 		return buffer->dl_len;
 
 	for (unsigned int i = 0; i < nb_blocks; i++) {
-		if (!is_block_ignored(ctxt->fiemap, curr_file_off) &&
+		if (!is_block_ignored(ctxt->fiemap, curr_file_off,
+				      &ctxt->extent_cursor) &&
 		    !(options.skip_zeroes &&
 		      is_block_zeroed(buffer->buf + i * blocksize))) {
 			ret = process_block(buffer->buf + i * blocksize,
@@ -1713,7 +1732,8 @@ static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 	 * The entire buffer could be ignored. Let's fast forward
 	 * and mark the buffer as faked
 	 */
-	if (is_area_ignored(ctxt->fiemap, ctxt->off, buffer->size)
+	if (is_area_ignored(ctxt->fiemap, ctxt->off, buffer->size,
+			    &ctxt->extent_cursor)
 			&& ctxt->off + buffer->size <= ctxt->filesize) {
 		memset(buffer->buf, 0, buffer->size);
 		buffer->dl_len = buffer->size;
