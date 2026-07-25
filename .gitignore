@@ -9,6 +9,7 @@ test
 *.d
 .itest-scratch/
 .vglogs/
+.tsanlogs/
 __pycache__/
 version
 .version-stamp

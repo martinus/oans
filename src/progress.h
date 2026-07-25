@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 #include "glib.h"
 
@@ -20,22 +21,34 @@ struct pscan_thread {
 	pid_t				tid;
 
 	/* Tracks data for the entire thread lifetime */
-	uint64_t			total_scanned_files;
-	uint64_t			total_scanned_bytes;
+	/* Summed by the progress thread while their owning worker updates them
+	 * (sum_scanned), so they are atomic rather than plain. Per-file
+	 * granularity, so the default ordering costs nothing measurable. */
+	_Atomic uint64_t		total_scanned_files;
+	_Atomic uint64_t		total_scanned_bytes;
 
-	/* Tracks data for the file currently being processed */
-	uint64_t			file_scanned_bytes;
-	uint64_t			file_total_bytes;
+	/* Tracks data for the file currently being processed. Read by the
+	 * progress thread while the owning worker updates them, hence atomic;
+	 * updated per read chunk at worst, so the ordering costs nothing next to
+	 * the I/O. file_path is a string and cannot be atomic - it is written
+	 * via pscan_set_file() under the same mutex the renderer reads it. */
+	_Atomic uint64_t		file_scanned_bytes;
+	_Atomic uint64_t		file_total_bytes;
 	char				file_path[PATH_MAX + 1];
 
-	enum pscan_thread_status	status;
+	/* Workers advance this outside the progress mutex as they work, while
+	 * the renderer reads it every redraw - hence atomic. The idle/claim
+	 * handoff itself is ordered by the mutex, not by this field. */
+	_Atomic enum pscan_thread_status	status;
 };
 
 struct pscan_global {
-	uint64_t		total_files_count;
-	uint64_t		total_bytes_count;
-	uint64_t		files_examined;	/* visited during listing */
-	bool			listing_completed;
+	/* Written by the listing/scan producer and read concurrently by the
+	 * progress thread to render the bar, so these are atomic too. */
+	_Atomic uint64_t	total_files_count;
+	_Atomic uint64_t	total_bytes_count;
+	_Atomic uint64_t	files_examined;	/* visited during listing */
+	_Atomic bool		listing_completed;
 
 	/* Each thread tracks its own progress separately */
 	GMutex			mutex;
@@ -174,13 +187,20 @@ void pdedupe_add_pushed_work(uint64_t bytes);
 
 /*
  * Claim a per-thread display line for one unit of work (file scan / dedupe
- * group) and mark it with `status`; fill in file_path / file_total_bytes /
- * file_scanned_bytes afterwards. Release it with pscan_reset_thread(). Claim
+ * group) and mark it with `status`; point it at the work with pscan_set_file(). Release it with pscan_reset_thread(). Claim
  * per work item, not per OS thread: pool threads get reaped and respawned,
  * which would strand dead threads' lines and grow the display unboundedly.
  */
 struct pscan_thread *pscan_claim_slot(pid_t tid,
 				      enum pscan_thread_status status);
+
+/*
+ * Point a claimed slot at the work it is now doing: copy the display path and
+ * set the byte total, resetting progress to zero. Takes the progress mutex, so
+ * the renderer never reads a half-written path out from under the worker.
+ */
+void pscan_set_file(struct pscan_thread *slot, const char *path,
+		    uint64_t total_bytes);
 
 /*
  * Read back the accumulated totals (for the end-of-run summary). reclaimed is

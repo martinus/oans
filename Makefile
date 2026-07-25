@@ -74,6 +74,18 @@ else ifdef SANITIZE
 		ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1 \
 		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 		LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp
+
+	# ThreadSanitizer needs two extra things (src/tsan.h explains why):
+	#   - the GLib annotations, -include'd rather than #include'd so they sit
+	#     ahead of every translation unit without touching any call site.
+	#   - LOCK_MEMSTATS: memstats.h's counters are deliberately unlocked
+	#     outside DEBUG_BUILD, a real if benign race that would bury the
+	#     reports worth reading.
+	ifneq (,$(findstring thread,$(SANITIZE)))
+		DEBUG_FLAGS += -include $(CURDIR)/src/tsan.h -DLOCK_MEMSTATS
+		SANITIZE_RUN += \
+			TSAN_OPTIONS=suppressions=$(CURDIR)/tests/tsan.supp:halt_on_error=0:second_deadlock_stack=1
+	endif
 else
 	# Release hardening (needs optimization, hence not in the debug build).
 	# Override with HARDENING= to disable.

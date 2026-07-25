@@ -1,0 +1,18 @@
+# ThreadSanitizer suppressions for oans.
+#
+# Used by the SANITIZE=thread build; see src/tsan.h for why GLib needs help from
+# us at all. Keep this file as close to empty as possible: unlike a leak
+# suppression, a `race:` entry hides a whole class of report, so an entry has to
+# be a library artefact we cannot annotate rather than an oans race worth fixing.
+# Everything TSAN found in oans's own code was fixed rather than listed here.
+#
+# GThreadPool/GAsyncQueue internal queue nodes: the pushing thread g_malloc()s a
+# node and the worker thread frees it in g_queue_pop_tail(). GLib orders that
+# with its own mutex, but libglib-2.0 is not built with -fsanitize=thread, so
+# TSAN cannot see the edge and reports the malloc/free pair as a race on
+# glib-internal memory. We cannot annotate our way out of this one the way
+# src/tsan.h does for the rest: the node is freed inside GLib *before* our
+# worker function is entered, so there is no point in oans code at which to
+# place the matching acquire.
+race:g_queue_pop_tail
+

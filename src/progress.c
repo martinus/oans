@@ -93,7 +93,9 @@ static unsigned int drawn_lines;
 enum stage { STAGE_SCAN, STAGE_HASH, STAGE_DEDUPE, STAGE_DONE, STAGE_COUNT };
 enum stage_state { ST_PENDING, ST_RUNNING, ST_DONE };
 
-static enum stage_state stages[STAGE_COUNT];
+/* Written by whichever thread advances a stage and read every redraw by the
+ * progress thread, so atomic rather than plain. */
+static _Atomic enum stage_state stages[STAGE_COUNT];
 
 static void stage_set(enum stage s, enum stage_state st)
 {
@@ -177,13 +179,16 @@ static _Atomic uint64_t search_total, search_processed;
  * rendering.
  */
 static struct {
-	bool			phase;		/* rendering dedupe, not scan */
-	volatile int		running;
+	/* phase/running/activity/estimate are set by the main thread and read
+	 * every redraw by the progress thread; atomic for the same reason the
+	 * scan-side counters are (volatile orders nothing). */
+	_Atomic bool		phase;		/* rendering dedupe, not scan */
+	_Atomic int		running;
 	gint64			start_us;	/* phase start, monotonic */
 
 	_Atomic uint64_t	done;		/* groups finished */
 	_Atomic uint64_t	queued;		/* groups pushed to the pool */
-	uint64_t		estimate;	/* fuzzy total, see dbfile */
+	_Atomic uint64_t	estimate;	/* fuzzy total, see dbfile */
 	/*
 	 * Byte-weighted progress: the kernel byte-verify volume the phase will
 	 * do. work_total_bytes is the exact upfront SQL sum (grow-only, clamped
@@ -196,7 +201,7 @@ static struct {
 	_Atomic uint64_t	pushed_bytes;	/* sum of W0 pushed so far */
 	uint64_t		shown_pct;	/* printer thread only */
 	unsigned int		batch, batches;
-	const char		*activity;	/* static string */
+	const char *_Atomic	activity;	/* static string */
 	/* reclaimed: honest disk freed (kernel-deduped bytes). net_shared: fiemap
 	 * "net change in shared extents", a diagnostic for the machine-readable
 	 * line only (it counts the surviving copy as shared too, so ~2x for pairs). */
@@ -1053,6 +1058,25 @@ void pscan_finish_file(struct pscan_thread **progress)
 }
 
 /*
+ * Point a claimed slot at its current unit of work. The path is a plain string
+ * the renderer reads under pscan.mutex, so the write takes that mutex too; the
+ * byte fields are atomic and need no lock.
+ */
+void pscan_set_file(struct pscan_thread *slot, const char *path,
+		    uint64_t total_bytes)
+{
+	if (!slot)
+		return;
+
+	g_mutex_lock(&pscan.mutex);
+	progress_copy_path(slot->file_path, sizeof(slot->file_path), path);
+	g_mutex_unlock(&pscan.mutex);
+
+	slot->file_total_bytes = total_bytes;
+	slot->file_scanned_bytes = 0;
+}
+
+/*
  * Park a persistently-held slot as idle once its worker has no more work (drain).
  * No per-file accounting - pscan_finish_file() already ran for the last file.
  */
@@ -1060,8 +1084,15 @@ void pscan_slot_idle(struct pscan_thread *slot)
 {
 	if (!slot)
 		return;
-	slot->status = thread_idle;
+	/*
+	 * Park the slot under the same mutex pscan_claim_slot() scans with, so
+	 * that lock is the handoff edge to whichever worker picks it up next.
+	 * (Every other slot field is either _Atomic or written under this mutex.)
+	 */
+	g_mutex_lock(&pscan.mutex);
 	slot->file_path[0] = '\0';
+	slot->status = thread_idle;
+	g_mutex_unlock(&pscan.mutex);
 }
 
 bool is_progress_printer_running(void)

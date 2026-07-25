@@ -43,6 +43,7 @@
 #include "dbfile.h"
 #include "fiemap.h"
 #include "find_dupes.h"
+#include "tsan.h"
 
 #include "run_dedupe.h"
 
@@ -397,11 +398,10 @@ static void pick_least_fragmented_target(struct dupe_extents *dext)
  * member) plus the bytes the kernel still has to byte-verify as work total. */
 static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext)
 {
-	progress_copy_path(slot->file_path, sizeof(slot->file_path),
-			   list_first_entry(&dext->de_extents, struct extent,
-					    e_list)->e_file->filename);
-	slot->file_total_bytes = dext_work(dext);
-	slot->file_scanned_bytes = 0;
+	pscan_set_file(slot,
+		       list_first_entry(&dext->de_extents, struct extent,
+					e_list)->e_file->filename,
+		       dext_work(dext));
 }
 
 /*
@@ -798,7 +798,7 @@ static void batch_maybe_complete_locked(struct dedupe_batch *batch)
 		g_cond_signal(&producer_cond);
 }
 
-static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
+static void dedupe_worker_body(void *priv)
 {
 	uint64_t fiemap_bytes = 0ULL;
 	uint64_t kern_bytes = 0ULL;
@@ -855,6 +855,19 @@ static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
 	batch->outstanding--;
 	batch_maybe_complete_locked(batch);
 	g_mutex_unlock(&producer_mutex);
+}
+
+/*
+ * The pool entry point. The body's _cleanup_ handlers (the progress slot among
+ * them) run as it returns, so the ThreadSanitizer release has to sit out here
+ * to cover what they write; it pairs with the acquire in the
+ * g_thread_pool_free() wrapper. Both calls compile away outside a TSAN build.
+ */
+static void dedupe_worker(void *priv, void *unused [[maybe_unused]])
+{
+	oans_tsan_work_acquire(priv);
+	dedupe_worker_body(priv);
+	oans_tsan_work_done(dedupe_pool);
 }
 
 /*

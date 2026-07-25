@@ -131,7 +131,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitize: [address, undefined]
+        # thread additionally needs src/tsan.h's GLib annotations to say
+        # anything useful; the Makefile wires those up for SANITIZE=thread.
+        sanitize: [address, undefined, thread]
     env:
       CC: clang
       SANITIZE: ${{ matrix.sanitize }}

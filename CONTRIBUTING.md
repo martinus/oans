@@ -58,6 +58,33 @@ fails the suite. LeakSanitizer's GLib false positives are filtered by
 [`tests/lsan.supp`](tests/lsan.supp) (the ASAN analogue of `tests/valgrind.supp`).
 CI runs ASAN and UBSAN as separate legs; combining them locally as above is fine.
 
+#### ThreadSanitizer
+
+```sh
+make check CC=clang SANITIZE=thread
+```
+
+TSAN needs one extra thing the other sanitizers do not, because the codebase
+synchronizes with GLib rather than pthreads. `libglib-2.0` is a system library
+built without instrumentation, and on Linux `GMutex`/`GCond` sit directly on
+futexes rather than on `pthread_mutex` (which TSAN intercepts), so TSAN sees no
+happens-before edge across a correctly locked critical section and reports it as
+a race — an unannotated run reported ~145 of them, and even a *provably* correct
+two-thread `GMutex` program reports one.
+
+[`src/tsan.h`](src/tsan.h) closes that gap: it publishes the edges TSAN cannot
+see (`__tsan_acquire`/`__tsan_release` keyed on each primitive, plus the
+pool/queue handoffs keyed on the item). The Makefile force-includes it with
+`-include` for `SANITIZE=thread`, so no call site changes, and it also defines
+`LOCK_MEMSTATS` — the allocation counters in `memstats.h` are deliberately
+unlocked outside `DEBUG_BUILD`, a genuine if benign race that would otherwise
+bury the reports worth reading.
+
+Keep the annotations tight and prefer fixing a race over widening one:
+over-annotating hides real bugs, which is the whole point of the tool.
+[`tests/tsan.supp`](tests/tsan.supp) is for the residue that genuinely cannot be
+annotated — synchronization that happens entirely inside GLib.
+
 ## Pull requests
 
 - Branch from `master`, keep the change focused, and describe what you measured.
