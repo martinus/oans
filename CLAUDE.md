@@ -371,6 +371,14 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
   `dedupe_drain()` before the block-hash search — earlier batches are reaped
   (filerecs freed) first, at the cost of cross-batch pipelining in that mode.
   Default mode keeps the full overlap; don't add other drain points.
+- **The search must outlive nothing.** `find_additional_dedupe()` waits for
+  every worker it pushed (its own counter/cond in `find_dupes.c`) before
+  returning, because the caller reaps batches — freeing filerecs — right after.
+  Don't route that wait through `psearch_join()`: that's a *progress* concern
+  and no-ops during the dedupe phase, which was #123 (a UAF that reproduced in
+  ~5% of memcheck runs). `free_batch()` asserts `extents_search_idle()`, and
+  `DUPEREMOVE_SEARCH_DELAY_MS` makes the race deterministic for the regression
+  test (`test_partial_search_waits_for_its_workers`).
 - **Valgrind is the gate** (`make integration-valgrind`): this is the UAF-prone
   area (see the "Valgrind" section / PR #105). Run it before any PR here — but
   note it did **not** catch the pushed-dext race above (valgrind's serialization

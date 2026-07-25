@@ -42,6 +42,7 @@
 #include "debug.h"
 #include "dbfile.h"
 #include "fiemap.h"
+#include "find_dupes.h"
 
 #include "run_dedupe.h"
 
@@ -1009,6 +1010,17 @@ void dedupe_push(struct dedupe_batch *b, bool whole_file)
 static void free_batch(struct dedupe_batch *b)
 {
 	unsigned int i;
+
+	/*
+	 * Dropping the refs below can free these filerecs, and the block-hash
+	 * search (--dedupe-options=partial) reads filerecs on its own pool. It
+	 * must therefore be idle by now -- find_additional_dedupe() guarantees
+	 * that on return. Assert rather than trust it: this was #123, where the
+	 * search returned while its workers were still running and a worker
+	 * dereferenced a filerec freed right here. A silent UAF is far worse
+	 * than an abort.
+	 */
+	abort_on(!extents_search_idle());
 
 	if (batch_complete_cb)
 		batch_complete_cb(b->seq_hi);

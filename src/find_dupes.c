@@ -41,6 +41,34 @@
 
 static struct threads_pool search_pool;
 
+/*
+ * Completion tracking for one find_additional_dedupe() round.
+ *
+ * This is a *lifetime* guarantee, not bookkeeping. The caller
+ * (stream_load_batch, --dedupe-options=partial) reaps earlier dedupe batches
+ * right after the search returns, and reaping frees their filerecs -- the very
+ * filerecs these workers hold in cmp_ctxt. So find_additional_dedupe() must not
+ * return until every worker it pushed has finished.
+ *
+ * The pool is persistent across batches (extents_search_init/free), so it
+ * cannot be waited on by freeing it, and psearch_join() is a *progress* concern
+ * that no-ops during the dedupe phase. Relying on it was the bug (#123): in the
+ * streaming phase nothing waited, and a worker could still be dereferencing a
+ * filerec that free_batch() had already freed.
+ */
+static GMutex	search_done_mutex;
+static GCond	search_done_cond;
+static uint64_t	search_target;		/* items pushed this round */
+static uint64_t	search_finished;	/* items completed this round */
+
+/*
+ * Test hook (DUPEREMOVE_SEARCH_DELAY_MS): hold each worker back so the producer
+ * reliably wins the race the wait above exists to prevent. Without it the
+ * window is microseconds wide and reproduces in only a few percent of runs.
+ * Unset in normal use, so this costs a predictable-branch load per file.
+ */
+static useconds_t search_delay_us;
+
 static inline unsigned long block_len(struct file_block *block)
 {
 	/* Block is not near the end of file */
@@ -342,6 +370,9 @@ static void find_dupes_thread(struct cmp_ctxt *ctxt, void *priv [[maybe_unused]]
 
 	free(ctxt);
 
+	if (search_delay_us)
+		usleep(search_delay_us);	/* test hook, see above */
+
 	search_file_extents(file, dupe_extents);
 
 	/*
@@ -349,6 +380,15 @@ static void find_dupes_thread(struct cmp_ctxt *ctxt, void *priv [[maybe_unused]]
 	 * the function's outcome.
 	 */
 	psearch_update_processed_count(1);
+
+	/*
+	 * Signal completion last: after this the producer may free `file`, so
+	 * nothing below may touch it.
+	 */
+	g_mutex_lock(&search_done_mutex);
+	search_finished++;
+	g_cond_broadcast(&search_done_cond);
+	g_mutex_unlock(&search_done_mutex);
 }
 
 int find_additional_dedupe(struct results_tree *dupe_extents)
@@ -356,12 +396,17 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 	int ret = 0;
 	GError *err = NULL;
 	struct filerec *file;
+	uint64_t pushed = 0;
 
 	qprintf("Using %u threads to search within extents for "
 		"additional dedupe. This process will take some time, during "
 		"which oans can safely be ctrl-c'd.\n", options.cpu_threads);
 
 	psearch_run(num_filerec);
+
+	g_mutex_lock(&search_done_mutex);
+	search_target = search_finished = 0;
+	g_mutex_unlock(&search_done_mutex);
 
 	list_for_each_entry(file, &filerec_head, rec_list) {
 		/*
@@ -375,8 +420,10 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 
 		struct cmp_ctxt *ctxt = malloc(sizeof(*ctxt));
 
-		if (!ctxt)
-			return ENOMEM;
+		if (!ctxt) {
+			ret = ENOMEM;
+			break;		/* still wait for what we pushed */
+		}
 
 		ctxt->file = file;
 		ctxt->dupe_extents = dupe_extents;
@@ -386,17 +433,51 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 			eprintf("Error from thread pool: %s\n ",
 				err->message);
 			g_error_free(err);
-			return ENOMEM;
+			free(ctxt);
+			ret = ENOMEM;
+			break;
 		}
+		pushed++;
 	}
+
+	/*
+	 * Wait for every worker we pushed. Breaking out of the loop above is not
+	 * an escape hatch: those workers are still holding filerecs the caller
+	 * is about to free, so the error paths have to wait too.
+	 */
+	g_mutex_lock(&search_done_mutex);
+	search_target = pushed;
+	while (search_finished < search_target)
+		g_cond_wait(&search_done_cond, &search_done_mutex);
+	g_mutex_unlock(&search_done_mutex);
 
 	psearch_join();
 
 	return ret;
 }
 
+/*
+ * True when no search worker is running. The dedupe producer asserts this
+ * before freeing a batch's filerecs -- see the comment on search_done_mutex.
+ */
+bool extents_search_idle(void)
+{
+	bool idle;
+
+	g_mutex_lock(&search_done_mutex);
+	idle = search_finished >= search_target;
+	g_mutex_unlock(&search_done_mutex);
+
+	return idle;
+}
+
 void extents_search_init(void)
 {
+	const char *delay = getenv("DUPEREMOVE_SEARCH_DELAY_MS");
+
+	if (delay)
+		search_delay_us = (useconds_t)strtoul(delay, NULL, 10) * 1000;
+
 	setup_pool(&search_pool, find_dupes_thread, NULL, options.cpu_threads);
 }
 

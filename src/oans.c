@@ -1438,8 +1438,20 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 
 		/* longpath-ok: a scan root; see scan_file() for the limit and
 		 * the message a user gets when a root exceeds it. */
-		if (realpath(roots[i], buf))
+		if (realpath(roots[i], buf)) {
 			abs[sc.nroots++] = strdup(buf);
+			continue;
+		}
+		/*
+		 * Say so rather than dropping it. This config is what a bare
+		 * `oans --hashfile=X` replays, so an omitted root means a later
+		 * scheduled run silently covers less ground than this one did --
+		 * and the "all roots gone" guard never fires, because the root
+		 * was never stored to go missing.
+		 */
+		eprintf("Warning: not storing root \"%s\" in the hashfile: %s. "
+			"A later replay of this hashfile will not cover it.\n",
+			roots[i], strerror(errno));
 	}
 
 	sc.run_dedupe = options.run_dedupe;

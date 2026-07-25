@@ -25,6 +25,7 @@
 #include <linux/magic.h>
 #include <linux/btrfs.h>
 
+#include "longpath.h"
 #include "storage.h"
 
 /*
@@ -117,22 +118,31 @@ int storage_detect(const char *path, struct storage_profile *p)
 	memset(p, 0, sizeof(*p));
 	p->num_devices = 1;
 
-	/* longpath-ok: a scan root, not a scanned file. NOTE: if the root
-	 * PATH_MAX limit is ever lifted, this function needs an fd and
-	 * fstat()/fstatfs() instead -- see src/longpath.h. */
-	if (stat(path, &st) != 0)
+	/*
+	 * Everything from one fd (fstat/fstatfs), not stat()+statfs()+open() on
+	 * the path: three path lookups become one, and it keeps working for a
+	 * path over PATH_MAX. This runs on a scan root, which today still has to
+	 * fit PATH_MAX -- but that is the one long-path limit left (#117), and
+	 * this function should not be another thing standing in the way of
+	 * lifting it.
+	 */
+	fd = longpath_open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
 		return -errno;
 
-		/* longpath-ok: a scan root; see the note above. */
-	if (statfs(path, &sfs) == 0 && sfs.f_type == BTRFS_SUPER_MAGIC) {
-		fd = open(path, O_RDONLY | O_CLOEXEC);
-		if (fd >= 0) {
-			detect_btrfs(fd, p);
-			close(fd);
-			return 0;
-		}
-		/* fall through: still report it as a single-device guess */
+	if (fstat(fd, &st) != 0) {
+		int err = errno;
+
+		close(fd);
+		return -err;
 	}
+
+	if (fstatfs(fd, &sfs) == 0 && sfs.f_type == BTRFS_SUPER_MAGIC) {
+		detect_btrfs(fd, p);
+		close(fd);
+		return 0;
+	}
+	close(fd);
 
 	/* Single-device filesystem: the file's st_dev is the block device. */
 	fold_rotational(p, st.st_dev);

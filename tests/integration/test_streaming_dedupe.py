@@ -135,6 +135,45 @@ class StreamingDedupeTest(DuperemoveTest):
         self.assertDmOk()
         self.assertNoNewSharing()
 
+    def test_partial_search_waits_for_its_workers(self):
+        """find_additional_dedupe() must not return while its pool still holds
+        filerecs the producer is about to free (#123).
+
+        The block-hash search runs on a persistent pool, and the producer reaps
+        the previous batches right afterwards -- which frees their filerecs. The
+        search used to rely on psearch_join() to wait, but that is a *progress*
+        concern and no-ops during the dedupe phase, so nothing waited: a worker
+        could still be dereferencing a filerec that free_batch() had freed. The
+        window is microseconds wide, so it reproduced in only a few percent of
+        runs (and only under valgrind/ASAN, since a plain build reads the freed
+        memory silently).
+
+        DUPEREMOVE_SEARCH_DELAY_MS holds every worker back so the producer wins
+        the race every time, and free_batch() asserts the search is idle. On the
+        unfixed code this aborts on the first reap; fixed, it just runs slower.
+        """
+        pairs = []
+        for i in range(24):
+            d = os.urandom(200000 + i)
+            a = self.write(f"tree/a{i:02d}", d)
+            b = self.write(f"tree/b{i:02d}", d)
+            pairs.append((a, b))
+        self.sync()
+
+        env = dict(self.ENV, DUPEREMOVE_SEARCH_DELAY_MS="40")
+        self.dm("-rd", "--dedupe-options=partial", *self.BOPT,
+                self.path("tree"), env=env)
+        self.assertDmOk()   # SIGABRT here => the search returned too early
+        self.sync()
+
+        # The run still has to do its job, not just avoid the abort.
+        self.assertGreater(
+            self.hf_scalar("select count(*) from blocks"), 0,
+            "block hashes stored under --dedupe-options=partial")
+        for a, b in pairs:
+            self.assertTrue(files_share(a, b),
+                            f"{os.path.basename(a)} pair deduped")
+
     def test_in_memory_dedupe_streams(self):
         # No --hashfile: the producer shares the in-memory handle and serializes
         # loads with the write lock. Dedupe must still happen on disk.

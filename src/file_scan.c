@@ -2170,12 +2170,15 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
 }
 
+/*
+ * An exclude pattern is only ever matched with fnmatch()/strcmp() against a
+ * path -- it is never handed to a syscall -- so nothing here needs to fit
+ * PATH_MAX. It used to, which meant a relative --exclude naming a deep subtree
+ * was rejected with "cannot prepend cwd to ...": you could not exclude the very
+ * trees #117 made scannable. Build the expansion on the heap instead.
+ */
 int add_exclude_pattern(const char *pattern)
 {
-	char cwd[PATH_MAX] = { 0, };
-
-	/* Overallocate to peace the compiler. */
-	char exp_pattern[PATH_MAX * 2 + 1] = { 0, };
 	struct exclude_file *exclude = malloc(sizeof(*exclude));
 
 	if (!exclude)
@@ -2184,20 +2187,22 @@ int add_exclude_pattern(const char *pattern)
 	if (pattern[0] == '/') {
 		exclude->pattern = strdup(pattern);
 	} else {
-		if (!getcwd(cwd, PATH_MAX)) {
+		_cleanup_(freep) char *cwd = get_current_dir_name();
+
+		if (!cwd) {
 			eprintf("Error: cannot read cwd for pattern %s\n", pattern);
 			free(exclude);
 			return 1;
 		}
+		if (asprintf(&exclude->pattern, "%s/%s", cwd, pattern) < 0)
+			exclude->pattern = NULL;
+	}
 
-		if (strlen(cwd) + strlen(pattern) > PATH_MAX) {
-			eprintf("Error: cannot prepend cwd to %s\n", pattern);
-			free(exclude);
-			return 1;
-		}
-
-		sprintf(exp_pattern, "%s/%s", cwd, pattern);
-		exclude->pattern = strdup(exp_pattern);
+	if (!exclude->pattern) {
+		eprintf("Error: out of memory adding exclude pattern %s\n",
+			pattern);
+		free(exclude);
+		return 1;
 	}
 
 	exclude->is_glob = strpbrk(exclude->pattern, "*?[\\") != NULL;
