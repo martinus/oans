@@ -21,10 +21,16 @@ Run both with `make check`.
 
 ```sh
 make integration                         # build oans and run the suite
+make integration TEST_JOBS=1             # ... sequentially (see -j below)
 python3 tests/run.py                      # run directly (binary must be built)
 python3 tests/run.py hardlink dedupe      # only tests whose id matches a pattern
+python3 tests/run.py -j 8                 # 8 workers ('auto' by default)
 python3 -m unittest discover -s tests/integration -v   # plain unittest, no banner
 ```
+
+The suite runs across worker processes by default, so tests must keep to the
+per-test scratch `setUp` hands them. `-j 1` runs them one at a time, which is
+where to start if a test only fails in company.
 
 Environment:
 

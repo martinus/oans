@@ -80,15 +80,13 @@ against a scratch tree and assert on the hashfile and on-disk sharing. Dedupe
 cases need a reflink fs (`DUPEREMOVE_TEST_DIR`, set by `devenv.sh`). Keep tests
 in `tests/`; no shell tests.
 
-- **The suite runs in parallel by default** — `tests/run.py -j` (`auto` =
-  `min(nproc, 8)`), i.e. `make integration JOBS=…`. ~3.3× on 4 cores (26.4→7.9s);
-  the real payoff is the sanitizer builds, which re-run all of it. Workers are
-  *processes*, not threads, because `test_long_path` `chdir()`s; work is handed
-  out one test at a time so the slow ones (autotune, vacuum) don't strand a
-  worker. **`JOBS=1` restores the old serial runner** — use it when a failure's
-  interleaved output is hard to read, or to check a suspected ordering
-  dependency. Tests are isolated by `setUp`'s per-test `mkdtemp` + hashfile;
-  anything sharing state outside that will flake in parallel.
+- **The suite runs in parallel by default** (`make integration TEST_JOBS=…`,
+  `tests/run.py -j`; the why is in that file's docstring). 26.4→4.3s on 4 cores;
+  the real payoff is the sanitizer builds, which re-run all of it. **A new test
+  must not share state outside `setUp`'s per-test `mkdtemp` + hashfile** or it
+  will flake in parallel; `TEST_JOBS=1` is the sequential fallback for pinning
+  such a flake down. The suite is I/O-bound, so `auto` deliberately
+  over-subscribes (`2 × nproc`, capped) — don't "fix" it back to `nproc`.
 
 - **Never scan/benchmark out of `/tmp` — it's tmpfs**, not reflink-capable and
   rejected by `is_fs_supported()`, so a scan there stores **0 files silently**
