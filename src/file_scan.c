@@ -1002,9 +1002,17 @@ static void process_dir(const char *path, struct dbhandle *db)
 	 * by NAME_MAX) instead of a fixed PATH_MAX. The absolute string is only
 	 * built for exclude matching, queueing and messages; children are
 	 * reached with dir-fd-relative syscalls below.
+	 *
+	 * calloc, not malloc: each entry writes only up to its own terminator,
+	 * so with malloc the tail past it stays uninitialised for the life of
+	 * the buffer. PCRE2's JIT matches a word at a time and reads those
+	 * bytes - harmlessly, they are inside the allocation, but memcheck
+	 * rightly flags the branch on them. Zeroing once per directory (not per
+	 * entry) makes every byte defined; the cost is nothing next to the
+	 * opendir/readdir/statx this loop is about to do.
 	 */
 	dirlen = strlen(path);
-	child = malloc(dirlen + 1 + NAME_MAX + 1);
+	child = calloc(1, dirlen + 1 + NAME_MAX + 1);
 	if (child == NULL) {
 		eprintf("Out of memory while scanning directory %s\n", path);
 		return;
@@ -1338,7 +1346,15 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 int scan_file(char *in_path, struct dbhandle *db)
 {
 	struct statx st;
-	char path[PATH_MAX];
+	/*
+	 * Zeroed, not just realpath'd into: realpath() writes up to the
+	 * terminator and leaves the rest of the buffer as whatever was on the
+	 * stack, and this path is then handed to the exclude matcher, whose
+	 * PCRE2 JIT reads a word at a time past the end of the string. The read
+	 * is harmless but the branch on undefined bytes is not something to
+	 * leave in place. Once per scan root, so the memset costs nothing.
+	 */
+	char path[PATH_MAX] = {0};
 	int ret;
 
 	/*
