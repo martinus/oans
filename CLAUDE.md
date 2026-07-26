@@ -288,6 +288,31 @@ roots are known (`apply_storage_defaults()` in `oans.c`).
   timer, replaying the stored config. Guide: `docs/nas-quickstart.md`.
 - The `fdupes` mode was **removed** — don't reintroduce it.
 
+## --exclude matching (src/glob.{c,h})
+
+`.gitignore` syntax — the one git/ripgrep/fd use — not POSIX `fnmatch`. Bare
+name = basename at any depth, leading `/` = absolute anchor, interior `/` = any
+depth, trailing `/` = directories only, `*` stops at `/`, `**` does not.
+Negation (`!`) is deliberately unsupported.
+
+- **Breaking change in 1.6.0.** Patterns used to be `fnmatch`'d against the full
+  path with relative ones resolved against the cwd, so `--exclude node_modules`
+  matched at most one literal directory — usually nothing, silently (#147). Old
+  patterns stored in a hashfile are replayed under the *new* semantics; that was
+  a deliberate call (no syntax versioning) so there is only ever one meaning.
+- Patterns compile to PCRE2 fragments joined into **one** combined `GRegex`, so
+  match cost is independent of pattern count. `GRegex` is PCRE2 and GLib is
+  already linked — no new dependency. Exact absolute paths skip the regex via a
+  hash lookup.
+- **Compile once in `filescan_init()`**, on the main thread before any walker
+  exists; the set is read-only afterwards so walkers need no lock. Don't move
+  the compile later or make it lazy.
+- The hashfile and its `-wal`/`-shm` sidecars are added with
+  `add_exclude_path()` (literal), not as globs — a `*` or `[` in the hashfile's
+  own path must not become a wildcard.
+- Per-pattern match counts back the "matched nothing" warning; `glob_set_stat()`
+  enumerates **user** patterns only, skipping the internal ones.
+
 ## Measured dead-ends — don't re-attempt without new evidence
 
 - **Separating the walk from hashing into two sequential phases is not worth it.**

@@ -123,6 +123,16 @@ stream to parse.
   `oans@backups`, …). Each is an independent timer you can schedule separately.
 - **Report-only mode:** set the job up with `-r` instead of `-dr` and the
   scheduled runs will only refresh hashes and report, never change data.
+- **Skipping snapshots and NAS metadata.** `--exclude` takes `.gitignore`-style
+  patterns, so a bare name matches at any depth — no path juggling:
+
+  ```sh
+  sudo oans -dr --hashfile=/var/cache/oans/media.hash \
+      --exclude '.snapshots' --exclude '@eaDir' /srv/media
+  ```
+
+  The patterns are stored with the rest of the run, so later scheduled runs
+  reuse them. A pattern that matches nothing is reported as a warning.
 - **The hashfile is just a cache** (under `/var/cache/oans`). Deleting it only
   forces the next run to re-hash from scratch; it can live on your system SSD,
   separate from the data pool.

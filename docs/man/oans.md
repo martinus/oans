@@ -139,10 +139,47 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 
 **\--exclude**=*PATTERN*
   ~ Exclude matching files and directories from the scan — handy for skipping
-    snapshot mounts or caches. A *PATTERN* without a leading `/` is matched
-    relative to the current directory. Because the shell also expands globs,
-    quote the pattern, e.g. `oans --exclude "/srv/media/tmp/*" /srv/media`. May
-    be given multiple times.
+    snapshot mounts, caches and download staging areas. May be given multiple
+    times. Because the shell also expands globs, **quote the pattern**.
+
+    <!-- -->
+
+    *PATTERN* uses the same syntax as `.gitignore` (and `ripgrep`, `fd`):
+
+    - A pattern with **no `/`** matches the **file or directory name at any
+      depth**: `--exclude '@eaDir'` skips every `@eaDir` in the tree, and
+      `--exclude '*.iso'` every `.iso` file.
+    - A pattern **starting with `/`** is an absolute path, anchored at the
+      filesystem root: `--exclude '/srv/media/cache*'`.
+    - A pattern with a **`/` elsewhere** matches at any depth, so
+      `--exclude 'Steam/temp'` skips `/data/Steam/temp` and
+      `/home/u/Steam/temp` alike. Write a leading `/` to anchor it instead.
+    - A **trailing `/`** restricts the pattern to directories, so
+      `--exclude 'cache/'` skips directories named `cache` but keeps files of
+      that name.
+    - `*` matches any run of characters **except `/`**, `?` matches one
+      non-`/` character, `[a-z]` and `[!a-z]` are character classes, and `**`
+      crosses directory boundaries.
+
+    <!-- -->
+
+    Excluding a directory prunes the walk there, so naming a directory also
+    skips everything inside it — there is no need to add a wildcard for its
+    contents. Negation (`!`) is not supported.
+
+    <!-- -->
+
+    A pattern that matches nothing during the scan is reported as a warning; a
+    malformed one (an unterminated `[`) is an error and `oans` refuses to run.
+
+    <!-- -->
+
+    **Changed in 1.6.0.** Patterns used to be matched with `fnmatch()` against
+    the whole path, and a pattern without a leading `/` was resolved against
+    the current directory. `--exclude node_modules` therefore matched at most
+    one literal directory, and usually nothing at all, silently. If you have
+    stored patterns in a hashfile from an earlier release, check them with a
+    scan before relying on the next scheduled run.
 
 **\--dedupe-options**=*opt*\[,*opt*...]
   ~ Comma-separated switches that alter *what* gets deduplicated. Prefix an
@@ -338,11 +375,12 @@ Preview what a run would dedupe, without changing anything (omit **-d**):
 oans -r foo/
 ```
 
-Skip tiny files and a snapshot directory on a media server:
+Skip tiny files, and every snapshot or NAS metadata directory anywhere in the
+tree (the bare names match at any depth):
 
 ```
 oans -dr --hashfile=media.hash --min-filesize=1M \
-     --exclude "/srv/media/.snapshots/*" /srv/media
+     --exclude '.snapshots' --exclude '@eaDir' /srv/media
 ```
 
 Inspect a hashfile, watch savings over time, and export metrics:

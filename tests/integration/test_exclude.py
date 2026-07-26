@@ -1,4 +1,4 @@
-"""Exclude patterns: literal paths and globs are skipped during listing."""
+"""--exclude: gitignore-style glob matching (see src/glob.h)."""
 
 import os
 
@@ -39,15 +39,14 @@ class ExcludeTest(DuperemoveTest):
         self.assertEqual(1, self.hf_count("files"), "subtree contents excluded")
 
     def test_relative_exclude_longer_than_path_max(self):
-        """A relative --exclude whose cwd-expansion exceeds PATH_MAX works.
+        """A pattern longer than PATH_MAX is accepted, not rejected.
 
-        An exclude pattern is only ever matched with fnmatch()/strcmp(); it is
-        never passed to a syscall, so PATH_MAX has no business bounding it. It
-        used to: add_exclude_pattern() built the expansion in a fixed buffer and
-        bailed with "cannot prepend cwd to ...", which meant you could not
-        exclude the deep subtrees #117 had just made scannable -- and excluding
-        one is the natural workaround for the remaining over-PATH_MAX root
-        limit.
+        A pattern is only ever matched against a path string, never passed to a
+        syscall, so PATH_MAX has no business bounding it. It used to: the old
+        add_exclude_pattern() resolved relative patterns against the cwd in a
+        fixed buffer and bailed with "cannot prepend cwd to ...", so you could
+        not exclude the deep subtrees #117 had just made scannable. Patterns are
+        no longer cwd-resolved at all, but the length must still be fine.
         """
         deep = self.path("tree")
         comp = "c" * 200
@@ -74,3 +73,96 @@ class ExcludeTest(DuperemoveTest):
         # The pattern does not match anything, so both files are still scanned;
         # the point is that oans accepted it instead of refusing to start.
         self.assertEqual(2, self.hf_count("files"))
+
+    # --- gitignore semantics ---
+
+    def test_bare_name_matches_at_any_depth(self):
+        """The #147 case: `--exclude node_modules` used to match nothing.
+
+        Patterns were fnmatch'd against the full path and relative ones were
+        resolved against the cwd, so a bare name could only ever match one
+        literal directory. Every NAS user's first instinct -- @eaDir,
+        .snapshots, node_modules -- was a silent no-op.
+        """
+        self.mkrand("tree/keep.bin", 4000)
+        self.mkrand("tree/node_modules/a.bin", 4000)
+        self.mkrand("tree/deep/nested/node_modules/b.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=node_modules")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"),
+                         "every node_modules at any depth is pruned")
+        self.assertNotIn("matched nothing", self.out)
+
+    def test_bare_name_matches_whole_components_only(self):
+        self.mkrand("tree/node_modules/a.bin", 4000)
+        self.mkrand("tree/node_modules_old/b.bin", 4000)
+        self.mkrand("tree/xnode_modules/c.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=node_modules")
+        self.assertDmOk()
+        self.assertEqual(2, self.hf_count("files"),
+                         "a substring of a component is not a match")
+
+    def test_leading_slash_anchors_absolute(self):
+        self.mkrand("tree/cache/a.bin", 4000)
+        self.mkrand("tree/sub/cache/b.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=" + self.path("tree/cache"))
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"),
+                         "an absolute pattern anchors, so the nested cache stays")
+
+    def test_interior_slash_matches_any_depth(self):
+        self.mkrand("tree/keep.bin", 4000)
+        self.mkrand("tree/Steam/temp/a.bin", 4000)
+        self.mkrand("tree/deep/Steam/temp/b.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=Steam/temp")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"))
+
+    def test_double_star_crosses_directories(self):
+        self.mkrand("tree/a/t.bin", 4000)
+        self.mkrand("tree/a/b/c/t.bin", 4000)
+        self.mkrand("tree/a/keep.txt", 4000)
+        self.scan(self.path("tree"), "--exclude=a/**/t.bin")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"), "only keep.txt survives")
+
+    def test_single_star_does_not_cross_directories(self):
+        self.mkrand("tree/a/x.bin", 4000)
+        self.mkrand("tree/a/b/y.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=" + self.path("tree/a/*.bin"))
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"),
+                         "'*' stops at '/', so the nested file is kept")
+
+    def test_character_class(self):
+        for n in ("f1.log", "f2.log", "fx.log"):
+            self.mkrand("tree/" + n, 4000)
+        self.scan(self.path("tree"), "--exclude=f[0-9].log")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"), "only fx.log survives")
+
+    def test_trailing_slash_matches_directories_only(self):
+        self.mkrand("tree/cache/a.bin", 4000)      # a directory named cache
+        self.write("tree/plain/cache", b"x" * 4000)  # a *file* named cache
+        self.scan(self.path("tree"), "--exclude=cache/")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"),
+                         "only the directory is pruned")
+        self.assertEqual(
+            1, self.hf_scalar(
+                "select count(*) from files where filename like '%/plain/cache'"),
+            "the file named cache is kept")
+
+    def test_unmatched_pattern_warns(self):
+        self.mkrand("tree/a.bin", 4000)
+        self.scan(self.path("tree"), "--exclude=definitely-not-here")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"))
+        self.assertIn('matched nothing', self.out,
+                      "a pattern that matches nothing must say so (#147)")
+
+    def test_malformed_pattern_is_rejected(self):
+        self.mkrand("tree/a.bin", 4000)
+        self.dm("-r", "--exclude=f[abc", self.path("tree"))
+        self.assertNotEqual(0, self.rc, "an unterminated class is an error")
+        self.assertIn("unterminated", self.out)

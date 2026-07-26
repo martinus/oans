@@ -846,14 +846,18 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			}
 			break;
 		case EXCLUDE_OPTION:
-			if (add_exclude_pattern(optarg)) {
-				eprintf("Error: cannot exclude %s\n", optarg);
-			} else {
-				user_excludes = realloc(user_excludes,
-					(n_user_excludes + 1) * sizeof(*user_excludes));
-				abort_on(!user_excludes);
-				user_excludes[n_user_excludes++] = strdup(optarg);
-			}
+			/*
+			 * A rejected pattern is a typo in the command line, and
+			 * carrying on would scan a wider tree than asked for -
+			 * silently, since the run would still exit 0.
+			 * add_exclude_pattern() has already said what is wrong.
+			 */
+			if (add_exclude_pattern(optarg))
+				return EINVAL;
+			user_excludes = realloc(user_excludes,
+				(n_user_excludes + 1) * sizeof(*user_excludes));
+			abort_on(!user_excludes);
+			user_excludes[n_user_excludes++] = strdup(optarg);
 			break;
 		case BATCH_SIZE_OPTION:
 		case 'B':
@@ -883,11 +887,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	 */
 	if (options.hashfile != NULL) {
 		char tmp[PATH_MAX + 10 ] = {0,};
-		add_exclude_pattern(options.hashfile);
+		add_exclude_path(options.hashfile);
 		snprintf(tmp, PATH_MAX + 9, "%s-wal", options.hashfile);
-		add_exclude_pattern(tmp);
+		add_exclude_path(tmp);
 		snprintf(tmp, PATH_MAX + 9, "%s-shm", options.hashfile);
-		add_exclude_pattern(tmp);
+		add_exclude_path(tmp);
 	}
 
 	*filelist_idx = optind;
