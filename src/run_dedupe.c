@@ -180,8 +180,13 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
  * Per-destination failures, tallied across the whole phase. A single bad
  * group can have a hundred failing destinations; printing one line each
  * floods the console, so the default view is one aggregate line in the final
- * summary and the per-file detail moved behind -v.
+ * summary and the per-file detail moved behind -v. dest_changed is our own
+ * pre-flight size check (this file moved since the scan); dest_differs is the
+ * kernel's byte-compare verdict on a pair we believed identical - a property
+ * of the pair, not of the file we happen to name. Different causes, counted
+ * apart so the summary can name the right one.
  */
+static _Atomic uint64_t dedupe_dest_changed;
 static _Atomic uint64_t dedupe_dest_differs;
 static _Atomic uint64_t dedupe_dest_errors;
 /* Destinations skipped because they already shared all storage with the
@@ -216,7 +221,8 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 			continue;
 
 		if (target_status == FILE_DEDUPE_RANGE_DIFFERS) {
-			status_str = "data changed";
+			status_str = "content does not match the target "
+				     "(kernel byte-compare); left untouched";
 			atomic_fetch_add(&dedupe_dest_differs, 1);
 		} else {
 			if (target_status < 0)
@@ -560,9 +566,11 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			    (whole_file_dedup ?
 			     (uint64_t)st.st_size != len :
 			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
-				atomic_fetch_add(&dedupe_dest_differs, 1);
-				vprintf("%s: changed since scan (size %llu, "
-					"expected %llu). Skipping dedupe.\n",
+				atomic_fetch_add(&dedupe_dest_changed, 1);
+				vprintf("%s: size changed since the scan (now "
+					"%llu bytes, needs at least %llu). "
+					"Skipped - the next scan will re-hash "
+					"it.\n",
 					extent->e_file->filename,
 					(unsigned long long)st.st_size,
 					(unsigned long long)(extent->e_loff + len));
@@ -1186,12 +1194,38 @@ void dedupe_phase_end(void)
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
-		if (dedupe_dest_differs || dedupe_dest_errors)
-			printf("  %sNot deduped%s    %lu changed since scan, "
-			       "%lu failed (rerun with -v for detail)\n",
-			       col_dim, col_reset,
-			       (uint64_t)dedupe_dest_differs,
-			       (uint64_t)dedupe_dest_errors);
+		/*
+		 * Name only the causes that actually occurred: three numbers
+		 * where two are usually 0 reads as noise and buries the one
+		 * that matters.
+		 */
+		const struct {
+			uint64_t n;
+			const char *what;
+		} causes[] = {
+			{ dedupe_dest_changed, "changed since scan" },
+			{ dedupe_dest_differs, "content mismatch" },
+			{ dedupe_dest_errors,  "failed" },
+		};
+		uint64_t not_deduped = 0;
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++)
+			not_deduped += causes[i].n;
+
+		if (not_deduped) {
+			const char *sep = "";
+
+			printf("  %sNot deduped%s    ", col_dim, col_reset);
+			for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++) {
+				if (!causes[i].n)
+					continue;
+				printf("%s%"PRIu64" %s", sep, causes[i].n,
+				       causes[i].what);
+				sep = ", ";
+			}
+			printf(" %s(rerun with -v for detail)%s\n",
+			       col_dim, col_reset);
+		}
 		if (dedupe_dest_already_shared)
 			printf("  %sAlready shared%s %lu file%s skipped (no work "
 			       "needed)\n", col_dim, col_reset,

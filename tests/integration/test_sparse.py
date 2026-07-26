@@ -48,6 +48,34 @@ class SparseTest(DuperemoveTest):
             0, self.hf_scalar("select count(*) from files where digest is null"),
             "trailing-hole file digested (not abandoned)")
 
+    def test_trailing_hole_to_unaligned_eof_scans(self):
+        # Same as above but with an EOF that is NOT block-aligned, the shape of
+        # a real sparse torrent stub. hole_run_length() floored the hole run to
+        # a block, so the final partial block was never consumed and the file
+        # was reported "changed while hashing" and skipped, forever.
+        self.make_trailing_hole("tree/th", os.urandom(200000),
+                                4 * 1024 * 1024 + 91943)
+        self.scan(self.path("tree"))
+        self.assertDmOk()
+        self.assertNotIn("changed", self.out)
+        self.assertEqual(1, self.hf_count("files"),
+                         "unaligned trailing-hole file recorded")
+        self.assertEqual(
+            0, self.hf_scalar("select count(*) from files where digest is null"),
+            "unaligned trailing-hole file digested (not abandoned)")
+
+    def test_hole_only_file_unaligned_eof(self):
+        # The same flooring bug with no data at all: a fully sparse file whose
+        # size is not a multiple of the block size.
+        self.make_trailing_hole("tree/hole", b"", 8 * 1024 * 1024 + 1)
+        self.scan(self.path("tree"))
+        self.assertDmOk()
+        self.assertNotIn("changed", self.out)
+        self.assertEqual(1, self.hf_count("files"), "hole-only file recorded")
+        self.assertEqual(
+            0, self.hf_scalar("select count(*) from files where digest is null"),
+            "hole-only file still digested")
+
     @requires_reflink
     def test_trailing_hole_dedupes_and_preserves_data(self):
         data = os.urandom(240000)

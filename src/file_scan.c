@@ -1542,14 +1542,24 @@ static size_t hole_run_length(struct scan_ctxt *ctxt)
 {
 	struct fiemap_extent *e = get_extent(ctxt->fiemap, ctxt->off,
 					     &ctxt->extent_cursor);
-	size_t next_data;
 
 	if (!block_is_hole(e, ctxt->off))
 		return 0;			/* block holds some data */
 
-	next_data = e ? e->fe_logical : ctxt->filesize;
+	/*
+	 * A trailing hole (no extent follows) runs to EOF, which need not be
+	 * block-aligned. Flooring here would leave the final partial block
+	 * unconsumed: nothing can read it (it maps no data, so fill_buffer caps
+	 * the read at zero bytes), the loop would exit with off < filesize, and
+	 * the caller would report the file as "changed while hashing" and skip
+	 * it - permanently, on every run. Only an *interior* hole floors, so
+	 * that the block holding the first data byte is read whole.
+	 */
+	if (!e)
+		return ctxt->filesize - ctxt->off;
+
 	/* Stop at the block that first contains data (floor to block size). */
-	return (next_data / blocksize) * blocksize - ctxt->off;
+	return (e->fe_logical / blocksize) * blocksize - ctxt->off;
 }
 
 /*
@@ -2109,8 +2119,16 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			break;
 	}
 
+	/*
+	 * The size moved under us while we were reading, so the digest we just
+	 * computed describes a state that no longer exists. Drop it rather than
+	 * store a hash that matches nothing.
+	 */
 	if (ctxt.off != ctxt.filesize) {
-		eprintf("file %s changed\n", file->path);
+		eprintf("%s: size changed while hashing (read %"PRIu64" bytes, "
+			"expected %"PRIu64"). Skipped - it is probably still "
+			"being written; the next run will hash it.\n",
+			file->path, (uint64_t)ctxt.off, (uint64_t)ctxt.filesize);
 		return;
 	}
 
