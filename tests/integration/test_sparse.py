@@ -49,12 +49,10 @@ class SparseTest(DuperemoveTest):
             "trailing-hole file digested (not abandoned)")
 
     def test_trailing_hole_to_unaligned_eof_scans(self):
-        # Regression: a trailing hole whose EOF is NOT block-aligned. The hole
-        # run was floored to a block boundary, leaving a final partial block
-        # that maps no data - nothing could read it, so the loop exited with
-        # off < filesize and the file was reported "changed while hashing" and
-        # skipped, on every run, forever. The aligned case above never saw it.
-        # Shape taken from a real 2 GiB sparse torrent stub.
+        # Same as above but with an EOF that is NOT block-aligned, the shape of
+        # a real sparse torrent stub. hole_run_length() floored the hole run to
+        # a block, so the final partial block was never consumed and the file
+        # was reported "changed while hashing" and skipped, forever.
         self.make_trailing_hole("tree/th", os.urandom(200000),
                                 4 * 1024 * 1024 + 91943)
         self.scan(self.path("tree"))
@@ -69,8 +67,7 @@ class SparseTest(DuperemoveTest):
     def test_hole_only_file_unaligned_eof(self):
         # The same flooring bug with no data at all: a fully sparse file whose
         # size is not a multiple of the block size.
-        p = self.write("tree/hole", b"")
-        os.truncate(p, 8 * 1024 * 1024 + 1)
+        self.make_trailing_hole("tree/hole", b"", 8 * 1024 * 1024 + 1)
         self.scan(self.path("tree"))
         self.assertDmOk()
         self.assertNotIn("changed", self.out)

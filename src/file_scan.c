@@ -1542,7 +1542,6 @@ static size_t hole_run_length(struct scan_ctxt *ctxt)
 {
 	struct fiemap_extent *e = get_extent(ctxt->fiemap, ctxt->off,
 					     &ctxt->extent_cursor);
-	size_t next_data;
 
 	if (!block_is_hole(e, ctxt->off))
 		return 0;			/* block holds some data */
@@ -1559,9 +1558,8 @@ static size_t hole_run_length(struct scan_ctxt *ctxt)
 	if (!e)
 		return ctxt->filesize - ctxt->off;
 
-	next_data = e->fe_logical;
 	/* Stop at the block that first contains data (floor to block size). */
-	return (next_data / blocksize) * blocksize - ctxt->off;
+	return (e->fe_logical / blocksize) * blocksize - ctxt->off;
 }
 
 /*
@@ -2124,9 +2122,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	/*
 	 * The size moved under us while we were reading, so the digest we just
 	 * computed describes a state that no longer exists. Drop it rather than
-	 * store a hash that matches nothing. Routinely hit on files that are
-	 * still being written (downloads, torrents, logs, VM images), so say so
-	 * and say that it resolves itself - "changed" alone reads like damage.
+	 * store a hash that matches nothing.
 	 */
 	if (ctxt.off != ctxt.filesize) {
 		eprintf("%s: size changed while hashing (read %"PRIu64" bytes, "

@@ -180,15 +180,11 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
  * Per-destination failures, tallied across the whole phase. A single bad
  * group can have a hundred failing destinations; printing one line each
  * floods the console, so the default view is one aggregate line in the final
- * summary and the per-file detail moved behind -v.
- */
-/*
- * Two distinct conditions, deliberately counted apart: dest_changed is our own
- * pre-flight size check (the file moved since the scan), dest_differs is the
- * kernel's byte-compare verdict on a pair we believed identical. They used to
- * share one counter reported as "changed since scan", which named the wrong
- * cause for every kernel mismatch - and a mismatch is a property of the pair,
- * not of the file we happen to name.
+ * summary and the per-file detail moved behind -v. dest_changed is our own
+ * pre-flight size check (this file moved since the scan); dest_differs is the
+ * kernel's byte-compare verdict on a pair we believed identical - a property
+ * of the pair, not of the file we happen to name. Different causes, counted
+ * apart so the summary can name the right one.
  */
 static _Atomic uint64_t dedupe_dest_changed;
 static _Atomic uint64_t dedupe_dest_differs;
@@ -1198,29 +1194,35 @@ void dedupe_phase_end(void)
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
-		if (dedupe_dest_changed || dedupe_dest_differs ||
-		    dedupe_dest_errors) {
-			/*
-			 * Name only the causes that actually occurred. Three
-			 * numbers where two are usually 0 reads as noise and
-			 * buries the one that matters.
-			 */
+		/*
+		 * Name only the causes that actually occurred: three numbers
+		 * where two are usually 0 reads as noise and buries the one
+		 * that matters.
+		 */
+		const struct {
+			uint64_t n;
+			const char *what;
+		} causes[] = {
+			{ dedupe_dest_changed, "changed since scan" },
+			{ dedupe_dest_differs, "content mismatch" },
+			{ dedupe_dest_errors,  "failed" },
+		};
+		uint64_t not_deduped = 0;
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++)
+			not_deduped += causes[i].n;
+
+		if (not_deduped) {
 			const char *sep = "";
 
 			printf("  %sNot deduped%s    ", col_dim, col_reset);
-			if (dedupe_dest_changed) {
-				printf("%s%lu changed since scan", sep,
-				       (uint64_t)dedupe_dest_changed);
+			for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++) {
+				if (!causes[i].n)
+					continue;
+				printf("%s%"PRIu64" %s", sep, causes[i].n,
+				       causes[i].what);
 				sep = ", ";
 			}
-			if (dedupe_dest_differs) {
-				printf("%s%lu content mismatch", sep,
-				       (uint64_t)dedupe_dest_differs);
-				sep = ", ";
-			}
-			if (dedupe_dest_errors)
-				printf("%s%lu failed", sep,
-				       (uint64_t)dedupe_dest_errors);
 			printf(" %s(rerun with -v for detail)%s\n",
 			       col_dim, col_reset);
 		}
