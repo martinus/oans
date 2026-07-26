@@ -279,8 +279,8 @@ Under the hood, for each round and interleaving the binaries, it:
   `compsize` **Disk Usage** before/after; `Referenced` staying constant proves
   nothing was lost.
 - **Walker parallelism plateaus.** On btrfs, scaling `--io-threads` past ~8 gives
-  no wall-clock gain — it is metadata b-tree lock contention, not I/O. Use
-  `--autotune` to pick the fastest count for your disks.
+  no wall-clock gain — it is metadata b-tree lock contention, not I/O. oans sizes
+  the default from the detected storage; pass `--io-threads=N` to override.
 - **One machine, one filesystem.** A fast NVMe here — on a slow HDD (a typical
   NAS) the cold dedupe re-read is far more expensive, so the larger-than-RAM gap
   would be *larger*, not smaller. The cgroup cap models RAM pressure; a real

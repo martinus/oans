@@ -28,8 +28,6 @@
  *   - scan_file()'s realpath() on a scan root (src/file_scan.c): a root's own
  *     absolute path must fit PATH_MAX. Everything *below* it may be any depth.
  *     Reported with an explicit message; see NOTES in docs/man/oans.md.
- *   - collect_dir() in src/autotune.c: the --autotune sampler feeds paths back
- *     as roots, so it inherits the same limit and counts what it skips.
  *   - the hashfile, /proc, and device nodes, which are never scan targets.
  *
  * Covered by tests/integration/test_long_path.py (scan, dedupe, rescan, prune,

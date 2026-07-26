@@ -47,7 +47,6 @@
 #include "find_dupes.h"
 #include "run_dedupe.h"
 #include "storage.h"
-#include "autotune.h"
 
 #include "opt.h"
 
@@ -59,7 +58,6 @@ static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
 static unsigned int history_only_opt = 0;
 static unsigned int json_only_opt = 0;
-static unsigned int autotune_opt = 0;
 static int opt_no_color = 0;
 
 /* User-supplied --exclude patterns, captured for the self-describing hashfile
@@ -626,7 +624,6 @@ enum {
 	STATS_OPTION,
 	HISTORY_OPTION,
 	JSON_OPTION,
-	AUTOTUNE_OPTION,
 	PROGRESS_OPTION,
 };
 
@@ -706,7 +703,6 @@ static void help(void)
 "      --json                  print hashfile metrics as JSON\n"
 "  -L                          list files tracked in the hashfile\n"
 "  -R <file>...                remove the named paths from the hashfile\n"
-"      --autotune              measure the fastest --io-threads for this machine\n"
 "\n"
 "Other:\n"
 "  -q, --quiet                 print only errors and a one-line summary\n"
@@ -745,7 +741,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "stats", 0, NULL, STATS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
 		{ "json", 0, NULL, JSON_OPTION },
-		{ "autotune", 0, NULL, AUTOTUNE_OPTION },
 		{ "progress", 1, NULL, PROGRESS_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
@@ -827,9 +822,6 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case JSON_OPTION:
 			json_only_opt = 1;
 			break;
-		case AUTOTUNE_OPTION:
-			autotune_opt = 1;
-			break;
 		case PROGRESS_OPTION:
 			if (strcmp(optarg, "json") != 0) {
 				eprintf("Error: --progress only supports 'json', "
@@ -902,24 +894,15 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	/* -L/-R/--stats/--history/--json are exclusive read-only report modes;
-	 * --autotune is exclusive with them too. */
+	/* -L/-R/--stats/--history/--json are mutually exclusive report modes. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
 				  + history_only_opt + json_only_opt;
 	/* Every report mode but -R takes no file list. */
 	bool nofile_report = report_count && !rm_only_opt;
 
-	if (report_count + autotune_opt > 1) {
+	if (report_count > 1) {
 		eprintf("Error: use only one of '-L', '-R', '--stats', "
-			"'--history', '--json', '--autotune'.\n");
-		return 1;
-	}
-
-	/* --autotune measures a live tree, so it needs a file list (the hashfile
-	 * is optional - it is only used to persist the result). */
-	if (autotune_opt && numfiles == 0) {
-		eprintf("Error: --autotune needs a file or directory to "
-			"measure against.\n");
+			"'--history', '--json'.\n");
 		return 1;
 	}
 
@@ -1475,21 +1458,22 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 }
 
 /*
- * Refine the auto-detected io-threads default from the backing storage of the
- * first scan target. Spinning disks are seek-bound and want fewer concurrent
- * readers than SSDs; a multi-device btrfs pool scales with its spindle count.
- * A user-supplied --io-threads is always respected. `--autotune` measures the
- * real optimum; this only picks a sensible starting point with no extra I/O.
+ * Apply the storage-derived defaults from the backing storage of the first scan
+ * target: the scan-ETA rotational weight, and (unless the user passed
+ * --io-threads) the io-threads default. Spinning disks are seek-bound and want
+ * fewer concurrent readers than SSDs; a multi-device btrfs pool scales with its
+ * spindle count. One storage_detect() serves both, so the weight is set before
+ * the io-threads early return.
  */
-static void auto_tune_io_threads(const char *root)
+static void apply_storage_defaults(const char *root)
 {
 	struct storage_profile p = {0};
 
 	/*
 	 * Detect the backing storage once: it sizes both the io-threads default
 	 * and the scan-ETA per-file weight. The weight must be set even when
-	 * io-threads is fixed below (an explicit flag, or a stored --autotune
-	 * result), so a NAS/HDD still gets the rotational weight.
+	 * io-threads is fixed below by an explicit flag, so a NAS/HDD still gets
+	 * the rotational weight.
 	 */
 	if (root)
 		storage_detect(root, &p);
@@ -1497,15 +1481,6 @@ static void auto_tune_io_threads(const char *root)
 
 	if (options.io_threads)		/* explicit --io-threads (0 == auto) */
 		return;
-
-	/* A prior --autotune result stored in the hashfile wins over the guess. */
-	if (dbfile_cfg.autotune_io_threads) {
-		options.io_threads = dbfile_cfg.autotune_io_threads;
-		vprintf("Using autotuned --io-threads=%u from the hashfile "
-			"(override to change, re-run --autotune to update)\n",
-			options.io_threads);
-		return;
-	}
 
 	/*
 	 * storage_recommend_io_threads() returns the plain CPU-count default for
@@ -1544,7 +1519,7 @@ int main(int argc, char **argv)
 	 * we mostly add lock contention and a wall of progress lines. An explicit
 	 * --cpu-threads (parsed below) overrides. io_threads stays 0 (== auto)
 	 * and is resolved from the scan target's storage once the roots are
-	 * known, in auto_tune_io_threads().
+	 * known, in apply_storage_defaults().
 	 */
 	options.cpu_threads = get_num_cpus();
 	if (options.cpu_threads > AUTO_THREADS_CAP)
@@ -1578,25 +1553,6 @@ int main(int argc, char **argv)
 		return print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
 		return print_metrics_json(options.hashfile);
-	else if (autotune_opt) {
-		int nroots = argc - filelist_idx;
-
-		ret = autotune_run(&argv[filelist_idx], nroots);
-		/*
-		 * Record the scan config too, so autotune doubles as setup: a
-		 * later bare `oans --hashfile=X` (or the systemd timer) replays
-		 * these paths and options. Uses whatever -d/-r/... were passed.
-		 */
-		if (ret == 0 && options.hashfile && nroots > 0) {
-			struct dbhandle *adb = dbfile_open_handle(options.hashfile);
-
-			if (adb) {
-				persist_scan_config(adb, &argv[filelist_idx], nroots);
-				dbfile_close_handle(adb);
-			}
-		}
-		return ret;
-	}
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
@@ -1649,7 +1605,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	auto_tune_io_threads(roots[0]);
+	apply_storage_defaults(roots[0]);
 
 	print_header();
 

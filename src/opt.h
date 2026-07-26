@@ -22,7 +22,7 @@ struct options {
 	bool recurse_dirs : 1;
 	/*
 	 * Worker-thread counts. cpu_threads is defaulted before option parsing;
-	 * io_threads stays 0 (== auto) until auto_tune_io_threads() resolves it
+	 * io_threads stays 0 (== auto) until apply_storage_defaults() resolves it
 	 * from the scan target's storage once the roots are known. A non-zero
 	 * value here means the user set it explicitly and auto-tuning is skipped.
 	 */

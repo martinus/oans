@@ -18,7 +18,6 @@ deduplication ioctl.
 | **oans** **\--hashfile**=*FILE*
 | **oans** {**\--stats** | **\--history** | **\--json** | **-L**} **\--hashfile**=*FILE*
 | **oans** **-R** **\--hashfile**=*FILE* *file*...
-| **oans** **\--autotune** *file*...
 
 # DESCRIPTION
 
@@ -64,10 +63,10 @@ skipped, so repeated runs over a mostly-stable tree are cheap. A summary of the
 space reclaimed is printed at the end (see *OUTPUT*).
 
 **Report and maintenance modes.**
-**\--stats**, **\--history**, **\--json**, **-L**, **-R**, and **\--autotune**
-each inspect or maintain a hashfile and then exit without scanning for dupes.
-The first four open the hashfile **read-only**; see *NOTES* for running them
-alongside an active `oans`.
+**\--stats**, **\--history**, **\--json**, **-L**, and **-R** each inspect or
+maintain a hashfile and then exit without scanning for dupes. All but **-R**
+open the hashfile **read-only**; see *NOTES* for running them alongside an
+active `oans`.
 
 # OPTIONS
 
@@ -174,9 +173,8 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     non-rotational disks (SSD/NVMe) or unknown media; fewer for a single
     spinning disk (seek-bound); and roughly two per device for a multi-device
     btrfs pool, still capped at 8. Run with **-v** to see the detected storage
-    and the value chosen. A stored **\--autotune** result, if present, is used
-    in preference to the heuristic. Passing *N* explicitly disables all of this
-    and uses *N* verbatim.
+    and the value chosen. Passing *N* explicitly disables all of this and uses
+    *N* verbatim.
 
 **\--cpu-threads**=*N*
   ~ Number of threads for the CPU-bound duplicate-extent-finding stage. Default
@@ -217,20 +215,6 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     list from standard input. Requires **\--hashfile**. (Deleted files are also
     pruned automatically on the next scan; **-R** is for removing paths that
     still exist.)
-
-**\--autotune**
-  ~ Measure the fastest **\--io-threads** for this machine and exit. `oans`
-    reads and hashes a bounded sample of the given tree at several thread
-    counts, dropping the page cache between trials (run as **root** for
-    meaningful cold-read numbers on spinning disks), and prints a throughput
-    table with the winner. Directories are always sampled recursively — the
-    sample is about the storage, not the **-r** flag. With **\--hashfile** the
-    winning value *and* the scan configuration are stored, so `--autotune`
-    doubles as one-time setup: a later bare `oans --hashfile=FILE` replays it,
-    using the tuned thread count unless you pass an explicit **\--io-threads**.
-    This is the hardware-measured counterpart to the storage heuristic and the
-    reliable way to tune a NAS or disk array. Sample bounds are controlled by
-    the `DUPEREMOVE_AUTOTUNE_*` variables (see *ENVIRONMENT*).
 
 ## Output and information
 
@@ -369,13 +353,6 @@ oans --history --hashfile=foo.hash
 oans --json    --hashfile=foo.hash | jq .reclaimed_total_bytes
 ```
 
-Measure the best thread count for a NAS array (as root), storing it for later
-runs:
-
-```
-sudo oans --autotune --hashfile=media.hash /srv/media
-```
-
 ## Scheduled deduplication
 
 Because the hashfile is self-describing, a scheduled run only needs to name it.
@@ -403,10 +380,6 @@ check the *Not deduped* line, or run with **-v**, to detect them.
 
 **NO_COLOR**
   ~ If set (to any value), disables colored output, as **\--no-color** does.
-
-**DUPEREMOVE_AUTOTUNE_MAX_FILES**, **DUPEREMOVE_AUTOTUNE_MAX_BYTES**, **DUPEREMOVE_AUTOTUNE_ROUNDS**
-  ~ Bound the sample **\--autotune** reads (file count, total bytes, and number
-    of interleaved measurement rounds).
 
 # FILES
 
