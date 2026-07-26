@@ -267,6 +267,10 @@ commands and comparison binary are documented in the
   weekly, idle-priority dedupe, with a **[NAS quick-start guide](docs/nas-quickstart.md)**.
 - **Storage-aware thread defaults:** `--io-threads` is sized from the detected
   backing storage (SSD vs single spinning disk vs multi-device pool).
+- **`--exclude` takes `.gitignore`-style patterns** (as git, ripgrep and fd do):
+  a bare name like `@eaDir` or `node_modules` matches at any depth, `**` crosses
+  directories, a trailing `/` means directories only. Patterns that match
+  nothing are reported instead of failing silently.
 - **`--min-filesize`**, **`--cpu-threads`**, **`--no-color`** and **`-q`** added;
   the legacy `--fdupes` mode and other dead/testing options removed.
 - **Automatic housekeeping:** prune deleted files from the hashfile after a scan

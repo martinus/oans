@@ -846,14 +846,18 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			}
 			break;
 		case EXCLUDE_OPTION:
-			if (add_exclude_pattern(optarg)) {
-				eprintf("Error: cannot exclude %s\n", optarg);
-			} else {
-				user_excludes = realloc(user_excludes,
-					(n_user_excludes + 1) * sizeof(*user_excludes));
-				abort_on(!user_excludes);
-				user_excludes[n_user_excludes++] = strdup(optarg);
-			}
+			/*
+			 * A rejected pattern is a typo in the command line, and
+			 * carrying on would scan a wider tree than asked for -
+			 * silently, since the run would still exit 0.
+			 * add_exclude_pattern() has already said what is wrong.
+			 */
+			if (add_exclude_pattern(optarg))
+				return EINVAL;
+			user_excludes = realloc(user_excludes,
+				(n_user_excludes + 1) * sizeof(*user_excludes));
+			abort_on(!user_excludes);
+			user_excludes[n_user_excludes++] = strdup(optarg);
 			break;
 		case BATCH_SIZE_OPTION:
 		case 'B':
@@ -883,11 +887,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	 */
 	if (options.hashfile != NULL) {
 		char tmp[PATH_MAX + 10 ] = {0,};
-		add_exclude_pattern(options.hashfile);
+		add_exclude_path(options.hashfile);
 		snprintf(tmp, PATH_MAX + 9, "%s-wal", options.hashfile);
-		add_exclude_pattern(tmp);
+		add_exclude_path(tmp);
 		snprintf(tmp, PATH_MAX + 9, "%s-shm", options.hashfile);
-		add_exclude_pattern(tmp);
+		add_exclude_path(tmp);
 	}
 
 	*filelist_idx = optind;
@@ -1314,6 +1318,11 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		ret = 1;
 	}
 
+	/* Only once the walk actually ran: after a failure every pattern would
+	 * trivially have "matched nothing" and would bury the real error. */
+	if (!ret)
+		filescan_report_excludes();
+
 	pscan_finish_listing();
 	filescan_free();
 	if (want_progress) {
@@ -1358,7 +1367,7 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 }
 
 /* Apply a replayed scan config to the global options (see scan_config). */
-static void apply_scan_config(const struct scan_config *sc)
+static int apply_scan_config(const struct scan_config *sc)
 {
 	int i;
 
@@ -1370,8 +1379,22 @@ static void apply_scan_config(const struct scan_config *sc)
 	options.dedupe_same_file = sc->dedupe_same_file;
 	options.min_filesize = sc->min_filesize;
 
-	for (i = 0; i < sc->nexcludes; i++)
-		add_exclude_pattern(sc->excludes[i]);
+	/*
+	 * A stored pattern that no longer parses must stop the run, for the
+	 * same reason a bad one on the command line does: carrying on scans a
+	 * wider tree than the job was set up for, and this is the *unattended*
+	 * path, so nobody would see it. Reachable since 1.6.0 - fnmatch
+	 * tolerated syntax the glob parser rejects.
+	 */
+	for (i = 0; i < sc->nexcludes; i++) {
+		if (add_exclude_pattern(sc->excludes[i])) {
+			eprintf("Error: stored --exclude pattern from a "
+				"previous run is no longer valid; re-run with "
+				"the paths and options to update it.\n");
+			return 1;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -1590,7 +1613,10 @@ int main(int argc, char **argv)
 			goto out;
 		}
 
-		apply_scan_config(&replay);
+		if (apply_scan_config(&replay)) {
+			ret = 1;
+			goto out;
+		}
 		numfiles = drop_missing_roots(&replay);
 		if (numfiles == 0) {
 			eprintf("Error: none of the stored paths exist; refusing "

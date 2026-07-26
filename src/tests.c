@@ -22,6 +22,7 @@
 #include "progress.c"
 #include "storage.c"
 #include "longpath.c"
+#include "glob.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -667,6 +668,146 @@ MU_TEST(test_longpath) {
 	mu_check(rc == 0);
 }
 
+
+/* --- gitignore-style --exclude matching (glob.c) --- */
+
+/*
+ * Match one path against one pattern. A pattern that fails to compile aborts
+ * rather than returning false: laundering it into "no match" would let every
+ * negative assertion below pass vacuously.
+ */
+static bool gs_hit(const char *pattern, const char *path, bool is_dir)
+{
+	char *err = NULL;
+	struct glob_set *gs = glob_set_new();
+	bool r;
+
+	if (glob_set_add(gs, pattern, &err) || glob_set_compile(gs, &err)) {
+		fprintf(stderr, "glob pattern \"%s\" rejected: %s\n", pattern, err);
+		abort();
+	}
+	r = glob_set_match(gs, path, is_dir, NULL);
+	glob_set_free(gs);
+	return r;
+}
+
+MU_TEST(test_glob_basename) {
+	/* The #147 case: a bare name matches at any depth. Under the old
+	 * full-path fnmatch these all silently matched nothing. */
+	mu_check(gs_hit("@eaDir", "/srv/media/@eaDir", true));
+	mu_check(gs_hit("@eaDir", "/srv/a/b/c/@eaDir", true));
+	mu_check(gs_hit("node_modules", "/home/u/p/node_modules", true));
+	/* ...but only whole components. */
+	mu_check(!gs_hit("@eaDir", "/srv/media/@eaDirectory", true));
+	mu_check(!gs_hit("@eaDir", "/srv/media/x@eaDir", true));
+	mu_check(!gs_hit("node_modules", "/home/u/node_modules_old", true));
+
+	mu_check(gs_hit("*.iso", "/data/img/x.iso", false));
+	mu_check(!gs_hit("*.iso", "/data/img/x.iso.part", false));
+}
+
+MU_TEST(test_glob_anchored_vs_any_depth) {
+	/* Leading '/' anchors at the filesystem root. */
+	mu_check(gs_hit("/srv/media/cache*", "/srv/media/cache1", false));
+	mu_check(!gs_hit("/srv/media/cache*", "/other/srv/media/cache1", false));
+
+	/* An interior '/' matches at any depth. */
+	mu_check(gs_hit("Steam/temp", "/data/Steam/temp", true));
+	mu_check(gs_hit("Steam/temp", "/home/u/games/Steam/temp", true));
+	mu_check(!gs_hit("Steam/temp", "/data/Steamx/temp", true));
+}
+
+MU_TEST(test_glob_wildcards_respect_separators) {
+	/* '*' must not cross a '/'. */
+	mu_check(gs_hit("/a/*", "/a/b", false));
+	mu_check(!gs_hit("/a/*", "/a/b/c", false));
+
+	/* '**' does cross. */
+	mu_check(gs_hit("/a/**/t", "/a/t", false));
+	mu_check(gs_hit("/a/**/t", "/a/b/t", false));
+	mu_check(gs_hit("/a/**/t", "/a/b/c/d/t", false));
+
+	/* '?' is exactly one non-separator. */
+	mu_check(gs_hit("a?.txt", "/x/ab.txt", false));
+	mu_check(!gs_hit("a?.txt", "/x/abc.txt", false));
+	mu_check(!gs_hit("a?.txt", "/x/a/.txt", false));
+}
+
+MU_TEST(test_glob_character_classes) {
+	mu_check(gs_hit("f[0-9].log", "/x/f3.log", false));
+	mu_check(!gs_hit("f[0-9].log", "/x/fx.log", false));
+	mu_check(gs_hit("f[!0-9].log", "/x/fx.log", false));
+	mu_check(!gs_hit("f[!0-9].log", "/x/f3.log", false));
+	mu_check(gs_hit("f[abc].log", "/x/fb.log", false));
+
+	/* A '.' in the pattern is a literal, not "any character". */
+	mu_check(!gs_hit("a.txt", "/x/axtxt", false));
+}
+
+MU_TEST(test_glob_directory_only) {
+	/* A trailing '/' restricts the pattern to directories. */
+	mu_check(gs_hit("cache/", "/a/cache", true));
+	mu_check(!gs_hit("cache/", "/a/cache", false));
+	/* Without it, either kind matches. */
+	mu_check(gs_hit("cache", "/a/cache", true));
+	mu_check(gs_hit("cache", "/a/cache", false));
+}
+
+MU_TEST(test_glob_literal_paths_are_not_globs) {
+	/* An exact path oans excludes on the user's behalf must match itself
+	 * even when it contains regex/glob metacharacters. */
+	char *err = NULL;
+	struct glob_set *gs = glob_set_new();
+
+	glob_set_add_literal(gs, "/tmp/h[1].db");
+	mu_check(glob_set_compile(gs, &err) == 0);
+	mu_check(glob_set_match(gs, "/tmp/h[1].db", false, NULL));
+	mu_check(!glob_set_match(gs, "/tmp/h1.db", false, NULL));
+	glob_set_free(gs);
+}
+
+MU_TEST(test_glob_reports_matching_pattern_and_counts) {
+	char *err = NULL;
+	struct glob_set *gs = glob_set_new();
+	const char *which = NULL, *pat = NULL;
+	bool matched = false;
+
+	mu_check(glob_set_add(gs, "*.log", &err) == 0);
+	mu_check(glob_set_add(gs, "@eaDir", &err) == 0);
+	mu_check(glob_set_compile(gs, &err) == 0);
+
+	mu_check(glob_set_match(gs, "/a/b/x.log", false, &which));
+	mu_check(which && strcmp(which, "*.log") == 0);
+
+	mu_check(glob_set_match(gs, "/a/@eaDir", true, &which));
+	mu_check(which && strcmp(which, "@eaDir") == 0);
+
+	/* Per-pattern flags back the "matched nothing" warning (#147). */
+	mu_check(glob_set_stat(gs, 0, &pat, &matched) && matched);
+	mu_check(glob_set_stat(gs, 1, &pat, &matched) && matched);
+	mu_check(!glob_set_stat(gs, 2, &pat, &matched));
+	glob_set_free(gs);
+}
+
+MU_TEST(test_glob_rejects_malformed) {
+	char *err = NULL;
+	struct glob_set *gs = glob_set_new();
+
+	mu_check(glob_set_add(gs, "f[abc", &err) != 0);
+	mu_check(err != NULL);
+	g_free(err);
+	glob_set_free(gs);
+}
+
+MU_TEST(test_glob_empty_set_matches_nothing) {
+	char *err = NULL;
+	struct glob_set *gs = glob_set_new();
+
+	mu_check(glob_set_compile(gs, &err) == 0);
+	mu_check(!glob_set_match(gs, "/anything", false, NULL));
+	glob_set_free(gs);
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -683,6 +824,15 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
 	MU_RUN_TEST(test_longpath);
+	MU_RUN_TEST(test_glob_basename);
+	MU_RUN_TEST(test_glob_anchored_vs_any_depth);
+	MU_RUN_TEST(test_glob_wildcards_respect_separators);
+	MU_RUN_TEST(test_glob_character_classes);
+	MU_RUN_TEST(test_glob_directory_only);
+	MU_RUN_TEST(test_glob_literal_paths_are_not_globs);
+	MU_RUN_TEST(test_glob_reports_matching_pattern_and_counts);
+	MU_RUN_TEST(test_glob_rejects_malformed);
+	MU_RUN_TEST(test_glob_empty_set_matches_nothing);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

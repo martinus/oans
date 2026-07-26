@@ -75,6 +75,10 @@ struct file_to_scan {
 };
 
 int add_exclude_pattern(const char *pattern);
+/* An exact path to skip, matched literally (the hashfile and its sidecars). */
+void add_exclude_path(const char *path);
+/* Warn about --exclude patterns that matched nothing; call after the walk. */
+void filescan_report_excludes(void);
 
 void filescan_init(void);
 void filescan_free(void);

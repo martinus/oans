@@ -168,12 +168,55 @@ deduplicating runs of zeroes.
 .TP
 \f[B]\-\-exclude\f[R]=\f[I]PATTERN\f[R]
 Exclude matching files and directories from the scan \[em] handy for
-skipping snapshot mounts or caches.
-A \f[I]PATTERN\f[R] without a leading \f[CR]/\f[R] is matched relative
-to the current directory.
-Because the shell also expands globs, quote the pattern,
-e.g.\ \f[CR]oans \-\-exclude \[dq]/srv/media/tmp/*\[dq] /srv/media\f[R].
+skipping snapshot mounts, caches and download staging areas.
 May be given multiple times.
+Because the shell also expands globs, \f[B]quote the pattern\f[R].
+.RS
+.PP
+\f[I]PATTERN\f[R] uses the same syntax as \f[CR].gitignore\f[R] (and
+\f[CR]ripgrep\f[R], \f[CR]fd\f[R]):
+.IP \[bu] 2
+A pattern with \f[B]no \f[CB]/\f[B]\f[R] matches the \f[B]file or
+directory name at any depth\f[R]:
+\f[CR]\-\-exclude \[aq]\[at]eaDir\[aq]\f[R] skips every
+\f[CR]\[at]eaDir\f[R] in the tree, and
+\f[CR]\-\-exclude \[aq]*.iso\[aq]\f[R] every \f[CR].iso\f[R] file.
+.IP \[bu] 2
+A pattern \f[B]starting with \f[CB]/\f[B]\f[R] is an absolute path,
+anchored at the filesystem root:
+\f[CR]\-\-exclude \[aq]/srv/media/cache*\[aq]\f[R].
+.IP \[bu] 2
+A pattern with a \f[B]\f[CB]/\f[B] elsewhere\f[R] matches at any depth,
+so \f[CR]\-\-exclude \[aq]Steam/temp\[aq]\f[R] skips
+\f[CR]/data/Steam/temp\f[R] and \f[CR]/home/u/Steam/temp\f[R] alike.
+Write a leading \f[CR]/\f[R] to anchor it instead.
+.IP \[bu] 2
+A \f[B]trailing \f[CB]/\f[B]\f[R] restricts the pattern to directories,
+so \f[CR]\-\-exclude \[aq]cache/\[aq]\f[R] skips directories named
+\f[CR]cache\f[R] but keeps files of that name.
+.IP \[bu] 2
+\f[CR]*\f[R] matches any run of characters \f[B]except
+\f[CB]/\f[B]\f[R], \f[CR]?\f[R] matches one non\-\f[CR]/\f[R] character,
+\f[CR][a\-z]\f[R] and \f[CR][!a\-z]\f[R] are character classes, and
+\f[CR]**\f[R] crosses directory boundaries.
+.PP
+Excluding a directory prunes the walk there, so naming a directory also
+skips everything inside it \[em] there is no need to add a wildcard for
+its contents.
+Negation (\f[CR]!\f[R]) is not supported.
+.PP
+A pattern that matches nothing during the scan is reported as a warning;
+a malformed one (an unterminated \f[CR][\f[R]) is an error and
+\f[CR]oans\f[R] refuses to run.
+.PP
+\f[B]Changed in 1.6.0.\f[R] Patterns used to be matched with
+\f[CR]fnmatch()\f[R] against the whole path, and a pattern without a
+leading \f[CR]/\f[R] was resolved against the current directory.
+\f[CR]\-\-exclude node_modules\f[R] therefore matched at most one
+literal directory, and usually nothing at all, silently.
+If you have stored patterns in a hashfile from an earlier release, check
+them with a scan before relying on the next scheduled run.
+.RE
 .TP
 \f[B]\-\-dedupe\-options\f[R]=\f[I]opt\f[R][,\f[I]opt\f[R]\&...]
 Comma\-separated switches that alter \f[I]what\f[R] gets deduplicated.
@@ -399,11 +442,12 @@ Preview what a run would dedupe, without changing anything (omit
 oans \-r foo/
 .EE
 .PP
-Skip tiny files and a snapshot directory on a media server:
+Skip tiny files, and every snapshot or NAS metadata directory anywhere
+in the tree (the bare names match at any depth):
 .IP
 .EX
 oans \-dr \-\-hashfile=media.hash \-\-min\-filesize=1M \[rs]
-     \-\-exclude \[dq]/srv/media/.snapshots/*\[dq] /srv/media
+     \-\-exclude \[aq].snapshots\[aq] \-\-exclude \[aq]\[at]eaDir\[aq] /srv/media
 .EE
 .PP
 Inspect a hashfile, watch savings over time, and export metrics:

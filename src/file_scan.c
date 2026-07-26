@@ -36,13 +36,11 @@
 #include <inttypes.h>
 #include <linux/magic.h>
 #include <sys/statfs.h>
-#include <fnmatch.h>
 #include <blkid/blkid.h>
 #include <libmount/libmount.h>
 #include <sys/sysmacros.h>
 #include <uuid/uuid.h>
 #include <stdatomic.h>
-#include <bsd/sys/queue.h>
 
 #include <glib.h>
 
@@ -60,19 +58,20 @@
 #include "fiemap.h"
 #include "progress.h"
 #include "longpath.h"
+#include "glob.h"
 
 /* This is not in linux/magic.h */
 #ifndef	XFS_SB_MAGIC
 #define	XFS_SB_MAGIC		0x58465342	/* 'XFSB' */
 #endif
 
-struct exclude_file {
-	char *pattern;
-	bool is_glob;	/* pattern has fnmatch metacharacters */
-	SLIST_ENTRY(exclude_file) list;
-};
-
-SLIST_HEAD(exclude_list, exclude_file) exclude_head = SLIST_HEAD_INITIALIZER(exclude_head);
+/*
+ * --exclude patterns, gitignore-style (see glob.h). Built up by
+ * add_exclude_pattern() during option parsing and hashfile replay, compiled
+ * once in filescan_init() before any walker thread exists, then read-only for
+ * the rest of the run.
+ */
+static struct glob_set *excludes;
 
 static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
 static bool seen_inode(uint64_t ino, uint64_t subvol);
@@ -479,27 +478,15 @@ static void free_scan_ctxt(struct scan_ctxt *ctxt)
 		finish_running_checksum(ctxt->extent_csum, NULL);
 }
 
-static int is_excluded(const char *name)
+static int is_excluded(const char *name, bool is_dir)
 {
-	struct exclude_file *exclude;
+	const char *which = NULL;
 
-	SLIST_FOREACH(exclude, &exclude_head, list) {
-		/*
-		 * Patterns without metacharacters (e.g. the hashfile paths we
-		 * always exclude) match exactly, so skip fnmatch's much more
-		 * expensive char-by-char loop - this runs for every file.
-		 */
-		bool match = exclude->is_glob ?
-			(fnmatch(exclude->pattern, name, 0) == 0) :
-			(strcmp(exclude->pattern, name) == 0);
-		if (match) {
-			vprintf("Excluding: %s (matches %s)\n", name,
-				exclude->pattern);
-			return 1;
-		}
-	}
+	if (!excludes || !glob_set_match(excludes, name, is_dir, &which))
+		return 0;
 
-	return 0;
+	vprintf("Excluding: %s (matches %s)\n", name, which);
+	return 1;
 }
 
 static inline void mnt_unref_table_cleanup(struct libmnt_table **tb)
@@ -753,7 +740,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	struct fs_probe probe = {0,};
 	dev_t dev;
 
-	if (is_excluded(path))
+	if (is_excluded(path, S_ISDIR(st->stx_mode)))
 		return false;
 
 	if (!S_ISREG(st->stx_mode) && !S_ISDIR(st->stx_mode)) {
@@ -1015,9 +1002,17 @@ static void process_dir(const char *path, struct dbhandle *db)
 	 * by NAME_MAX) instead of a fixed PATH_MAX. The absolute string is only
 	 * built for exclude matching, queueing and messages; children are
 	 * reached with dir-fd-relative syscalls below.
+	 *
+	 * calloc, not malloc: each entry writes only up to its own terminator,
+	 * so with malloc the tail past it stays uninitialised for the life of
+	 * the buffer. PCRE2's JIT matches a word at a time and reads those
+	 * bytes - harmlessly, they are inside the allocation, but memcheck
+	 * rightly flags the branch on them. Zeroing once per directory (not per
+	 * entry) makes every byte defined; the cost is nothing next to the
+	 * opendir/readdir/statx this loop is about to do.
 	 */
 	dirlen = strlen(path);
-	child = malloc(dirlen + 1 + NAME_MAX + 1);
+	child = calloc(1, dirlen + 1 + NAME_MAX + 1);
 	if (child == NULL) {
 		eprintf("Out of memory while scanning directory %s\n", path);
 		return;
@@ -1351,7 +1346,15 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 int scan_file(char *in_path, struct dbhandle *db)
 {
 	struct statx st;
-	char path[PATH_MAX];
+	/*
+	 * Zeroed, not just realpath'd into: realpath() writes up to the
+	 * terminator and leaves the rest of the buffer as whatever was on the
+	 * stack, and this path is then handed to the exclude matcher, whose
+	 * PCRE2 JIT reads a word at a time past the end of the string. The read
+	 * is harmless but the branch on undefined bytes is not something to
+	 * leave in place. Once per scan root, so the memset costs nothing.
+	 */
+	char path[PATH_MAX] = {0};
 	int ret;
 
 	/*
@@ -2214,47 +2217,67 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
 }
 
+static struct glob_set *excludes_get(void)
+{
+	if (!excludes)
+		excludes = glob_set_new();
+	return excludes;
+}
+
 /*
- * An exclude pattern is only ever matched with fnmatch()/strcmp() against a
- * path -- it is never handed to a syscall -- so nothing here needs to fit
- * PATH_MAX. It used to, which meant a relative --exclude naming a deep subtree
- * was rejected with "cannot prepend cwd to ...": you could not exclude the very
- * trees #117 made scannable. Build the expansion on the heap instead.
+ * A pattern is only ever matched against a path string -- never handed to a
+ * syscall -- so nothing here is bounded by PATH_MAX; a pattern may name a
+ * subtree deeper than that (#117).
+ *
+ * Patterns are NOT resolved against the cwd. A relative pattern matches at any
+ * depth, which is the whole point of the gitignore syntax: `--exclude @eaDir`
+ * means "any directory called @eaDir", not "$PWD/@eaDir".
  */
 int add_exclude_pattern(const char *pattern)
 {
-	struct exclude_file *exclude = malloc(sizeof(*exclude));
+	char *err = NULL;
 
-	if (!exclude)
-		return 1;
-
-	if (pattern[0] == '/') {
-		exclude->pattern = strdup(pattern);
-	} else {
-		_cleanup_(freep) char *cwd = get_current_dir_name();
-
-		if (!cwd) {
-			eprintf("Error: cannot read cwd for pattern %s\n", pattern);
-			free(exclude);
-			return 1;
-		}
-		if (asprintf(&exclude->pattern, "%s/%s", cwd, pattern) < 0)
-			exclude->pattern = NULL;
-	}
-
-	if (!exclude->pattern) {
-		eprintf("Error: out of memory adding exclude pattern %s\n",
-			pattern);
-		free(exclude);
+	if (glob_set_add(excludes_get(), pattern, &err)) {
+		eprintf("Error: %s\n", err);
+		g_free(err);
 		return 1;
 	}
 
-	exclude->is_glob = strpbrk(exclude->pattern, "*?[\\") != NULL;
-
-	vprintf("Adding exclude pattern: %s\n", exclude->pattern);
-
-	SLIST_INSERT_HEAD(&exclude_head, exclude, list);
+	vprintf("Adding exclude pattern: %s\n", pattern);
 	return 0;
+}
+
+/*
+ * A path oans excludes on the user's behalf (the hashfile and its WAL
+ * sidecars). Matched literally, so a '*' or '[' in the hashfile's own path
+ * cannot turn into a wildcard and silently drop unrelated files.
+ */
+void add_exclude_path(const char *path)
+{
+	glob_set_add_literal(excludes_get(), path);
+}
+
+/*
+ * Warn about patterns that matched nothing -- almost always a typo or the wrong
+ * syntax, and silent until now (#147). Called by the caller once the walk has
+ * finished, not from filescan_free(): after a walk that failed outright every
+ * pattern would trivially have matched nothing, and saying so would bury the
+ * real error.
+ */
+void filescan_report_excludes(void)
+{
+	const char *pattern;
+	bool matched;
+
+	if (!excludes)
+		return;
+
+	for (unsigned int i = 0; glob_set_stat(excludes, i, &pattern, &matched); i++) {
+		if (matched)
+			continue;
+		eprintf("WARNING: --exclude pattern \"%s\" matched nothing.\n",
+			pattern);
+	}
 }
 
 /*
@@ -2473,6 +2496,23 @@ void filescan_init(void)
 	abort_on(scan_workq.workers);
 	abort_on(scan_writer_open());
 	seen_inodes_init();
+
+	/*
+	 * Compile the exclude set here: this runs once, on the main thread,
+	 * before any walker exists, and every add_exclude_pattern() caller
+	 * (option parsing, then hashfile replay) has already run. After this
+	 * the set is read-only, so the walkers need no lock.
+	 */
+	if (excludes) {
+		char *err = NULL;
+
+		if (glob_set_compile(excludes, &err)) {
+			eprintf("Error: %s\n", err);
+			g_free(err);
+			abort_on(1);
+		}
+	}
+
 	scan_workq_start(options.io_threads);
 }
 
@@ -2485,4 +2525,6 @@ void filescan_free(void)
 	subvol_cache_free();
 	verified_dev_free();
 	seen_inodes_free();
+
+	g_clear_pointer(&excludes, glob_set_free);
 }
