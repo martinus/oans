@@ -2109,8 +2109,18 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			break;
 	}
 
+	/*
+	 * The size moved under us while we were reading, so the digest we just
+	 * computed describes a state that no longer exists. Drop it rather than
+	 * store a hash that matches nothing. Routinely hit on files that are
+	 * still being written (downloads, torrents, logs, VM images), so say so
+	 * and say that it resolves itself - "changed" alone reads like damage.
+	 */
 	if (ctxt.off != ctxt.filesize) {
-		eprintf("file %s changed\n", file->path);
+		eprintf("%s: size changed while hashing (read %"PRIu64" bytes, "
+			"expected %"PRIu64"). Skipped - it is probably still "
+			"being written; the next run will hash it.\n",
+			file->path, (uint64_t)ctxt.off, (uint64_t)ctxt.filesize);
 		return;
 	}
 
