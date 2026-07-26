@@ -1547,7 +1547,19 @@ static size_t hole_run_length(struct scan_ctxt *ctxt)
 	if (!block_is_hole(e, ctxt->off))
 		return 0;			/* block holds some data */
 
-	next_data = e ? e->fe_logical : ctxt->filesize;
+	/*
+	 * A trailing hole (no extent follows) runs to EOF, which need not be
+	 * block-aligned. Flooring here would leave the final partial block
+	 * unconsumed: nothing can read it (it maps no data, so fill_buffer caps
+	 * the read at zero bytes), the loop would exit with off < filesize, and
+	 * the caller would report the file as "changed while hashing" and skip
+	 * it - permanently, on every run. Only an *interior* hole floors, so
+	 * that the block holding the first data byte is read whole.
+	 */
+	if (!e)
+		return ctxt->filesize - ctxt->off;
+
+	next_data = e->fe_logical;
 	/* Stop at the block that first contains data (floor to block size). */
 	return (next_data / blocksize) * blocksize - ctxt->off;
 }
