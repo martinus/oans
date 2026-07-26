@@ -76,6 +76,20 @@ class ExcludeTest(DuperemoveTest):
 
     # --- gitignore semantics ---
 
+    def assert_kept(self, files, pattern, kept, msg=None):
+        """Create `files`, scan with one --exclude, assert how many survive.
+
+        Seven of the cases below differ only in those three values; the pattern
+        semantics themselves are pinned in src/tests.c, so what these add is
+        that the walk really prunes on them.
+        """
+        for f in files:
+            self.mkrand(f, 4000)
+        self.scan(self.path("tree"), "--exclude=" + pattern)
+        self.assertDmOk()
+        self.assertEqual(kept, self.hf_count("files"), msg)
+
+
     def test_bare_name_matches_at_any_depth(self):
         """The #147 case: `--exclude node_modules` used to match nothing.
 
@@ -84,62 +98,45 @@ class ExcludeTest(DuperemoveTest):
         literal directory. Every NAS user's first instinct -- @eaDir,
         .snapshots, node_modules -- was a silent no-op.
         """
-        self.mkrand("tree/keep.bin", 4000)
-        self.mkrand("tree/node_modules/a.bin", 4000)
-        self.mkrand("tree/deep/nested/node_modules/b.bin", 4000)
-        self.scan(self.path("tree"), "--exclude=node_modules")
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"),
-                         "every node_modules at any depth is pruned")
+        self.assert_kept(
+            ["tree/keep.bin", "tree/node_modules/a.bin",
+             "tree/deep/nested/node_modules/b.bin"],
+            "node_modules", 1, "every node_modules at any depth is pruned")
         self.assertNotIn("matched nothing", self.out)
 
     def test_bare_name_matches_whole_components_only(self):
-        self.mkrand("tree/node_modules/a.bin", 4000)
-        self.mkrand("tree/node_modules_old/b.bin", 4000)
-        self.mkrand("tree/xnode_modules/c.bin", 4000)
-        self.scan(self.path("tree"), "--exclude=node_modules")
-        self.assertDmOk()
-        self.assertEqual(2, self.hf_count("files"),
-                         "a substring of a component is not a match")
+        self.assert_kept(
+            ["tree/node_modules/a.bin", "tree/node_modules_old/b.bin",
+             "tree/xnode_modules/c.bin"],
+            "node_modules", 2, "a substring of a component is not a match")
 
     def test_leading_slash_anchors_absolute(self):
-        self.mkrand("tree/cache/a.bin", 4000)
-        self.mkrand("tree/sub/cache/b.bin", 4000)
-        self.scan(self.path("tree"), "--exclude=" + self.path("tree/cache"))
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"),
-                         "an absolute pattern anchors, so the nested cache stays")
+        self.assert_kept(
+            ["tree/cache/a.bin", "tree/sub/cache/b.bin"],
+            self.path("tree/cache"), 1,
+            "an absolute pattern anchors, so the nested cache stays")
 
     def test_interior_slash_matches_any_depth(self):
-        self.mkrand("tree/keep.bin", 4000)
-        self.mkrand("tree/Steam/temp/a.bin", 4000)
-        self.mkrand("tree/deep/Steam/temp/b.bin", 4000)
-        self.scan(self.path("tree"), "--exclude=Steam/temp")
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"))
+        self.assert_kept(
+            ["tree/keep.bin", "tree/Steam/temp/a.bin",
+             "tree/deep/Steam/temp/b.bin"],
+            "Steam/temp", 1)
 
     def test_double_star_crosses_directories(self):
-        self.mkrand("tree/a/t.bin", 4000)
-        self.mkrand("tree/a/b/c/t.bin", 4000)
-        self.mkrand("tree/a/keep.txt", 4000)
-        self.scan(self.path("tree"), "--exclude=a/**/t.bin")
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"), "only keep.txt survives")
+        self.assert_kept(
+            ["tree/a/t.bin", "tree/a/b/c/t.bin", "tree/a/keep.txt"],
+            "a/**/t.bin", 1, "only keep.txt survives")
 
     def test_single_star_does_not_cross_directories(self):
-        self.mkrand("tree/a/x.bin", 4000)
-        self.mkrand("tree/a/b/y.bin", 4000)
-        self.scan(self.path("tree"), "--exclude=" + self.path("tree/a/*.bin"))
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"),
-                         "'*' stops at '/', so the nested file is kept")
+        self.assert_kept(
+            ["tree/a/x.bin", "tree/a/b/y.bin"],
+            self.path("tree/a/*.bin"), 1,
+            "'*' stops at '/', so the nested file is kept")
 
     def test_character_class(self):
-        for n in ("f1.log", "f2.log", "fx.log"):
-            self.mkrand("tree/" + n, 4000)
-        self.scan(self.path("tree"), "--exclude=f[0-9].log")
-        self.assertDmOk()
-        self.assertEqual(1, self.hf_count("files"), "only fx.log survives")
+        self.assert_kept(
+            ["tree/f1.log", "tree/f2.log", "tree/fx.log"],
+            "f[0-9].log", 1, "only fx.log survives")
 
     def test_trailing_slash_matches_directories_only(self):
         self.mkrand("tree/cache/a.bin", 4000)      # a directory named cache

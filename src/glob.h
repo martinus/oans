@@ -48,27 +48,27 @@ struct glob_set *glob_set_new(void);
 
 /*
  * Add a gitignore-style pattern. Returns 0 on success, non-zero if the pattern
- * is malformed (an unterminated character class) or on allocation failure; on
- * failure *err is set to a message the caller owns and must free.
+ * is malformed (an unterminated character class); on failure *err is set to a
+ * message the caller owns and must release with g_free().
  */
 int glob_set_add(struct glob_set *gs, const char *pattern, char **err);
 
 /*
  * Add a path that must match exactly, with no metacharacter interpretation.
  * For paths oans excludes on the user's behalf (the hashfile and its WAL
- * sidecars), which may legitimately contain '*' or '['.
+ * sidecars), which may legitimately contain '*' or '['. Such entries are left
+ * out of glob_set_stat(), since they are not the user's to be warned about.
  */
-int glob_set_add_literal(struct glob_set *gs, const char *path);
+void glob_set_add_literal(struct glob_set *gs, const char *path);
 
 /*
  * Compile the added patterns into the matching automaton. Must be called after
- * the last add and before the first match. Returns 0 on success; on failure
- * *err is set to a message the caller owns and must free.
+ * the last add and before the first match. After it returns the set is
+ * read-only apart from the internal match flags, which are atomic, so the
+ * concurrent walker threads need no lock. Returns 0 on success; on failure
+ * *err is set to a message the caller owns and must release with g_free().
  */
 int glob_set_compile(struct glob_set *gs, char **err);
-
-/* True when no pattern has been added (match always returns false). */
-bool glob_set_empty(const struct glob_set *gs);
 
 /*
  * True if `path` (absolute) is matched. `is_dir` selects whether trailing-'/'
@@ -79,13 +79,13 @@ bool glob_set_match(struct glob_set *gs, const char *path, bool is_dir,
 		    const char **which);
 
 /*
- * Number of paths a pattern has matched so far, indexed over the *user's*
- * patterns in add order, so callers can report a pattern that never matched
- * anything. Entries added via glob_set_add_literal() are oans's own and are
- * skipped. Returns false once `i` runs past the end.
+ * Whether a pattern has matched anything, indexed over the *user's* patterns in
+ * add order, so callers can report one that never matched. Entries added via
+ * glob_set_add_literal() are oans's own and are skipped. Returns false once `i`
+ * runs past the end.
  */
 bool glob_set_stat(const struct glob_set *gs, unsigned int i,
-		   const char **pattern, unsigned long *matches);
+		   const char **pattern, bool *matched);
 
 void glob_set_free(struct glob_set *gs);
 

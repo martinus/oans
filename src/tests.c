@@ -671,29 +671,21 @@ MU_TEST(test_longpath) {
 
 /* --- gitignore-style --exclude matching (glob.c) --- */
 
-/* Build a set from one pattern; aborts the test if the pattern is rejected. */
-static struct glob_set *gs_one(const char *pattern)
+/*
+ * Match one path against one pattern. A pattern that fails to compile aborts
+ * rather than returning false: laundering it into "no match" would let every
+ * negative assertion below pass vacuously.
+ */
+static bool gs_hit(const char *pattern, const char *path, bool is_dir)
 {
 	char *err = NULL;
 	struct glob_set *gs = glob_set_new();
-
-	if (glob_set_add(gs, pattern, &err) || glob_set_compile(gs, &err)) {
-		fprintf(stderr, "glob_set_add(\"%s\"): %s\n", pattern,
-			err ? err : "?");
-		g_free(err);
-		glob_set_free(gs);
-		return NULL;
-	}
-	return gs;
-}
-
-static bool gs_hit(const char *pattern, const char *path, bool is_dir)
-{
-	struct glob_set *gs = gs_one(pattern);
 	bool r;
 
-	if (!gs)
-		return false;
+	if (glob_set_add(gs, pattern, &err) || glob_set_compile(gs, &err)) {
+		fprintf(stderr, "glob pattern \"%s\" rejected: %s\n", pattern, err);
+		abort();
+	}
 	r = glob_set_match(gs, path, is_dir, NULL);
 	glob_set_free(gs);
 	return r;
@@ -767,7 +759,7 @@ MU_TEST(test_glob_literal_paths_are_not_globs) {
 	char *err = NULL;
 	struct glob_set *gs = glob_set_new();
 
-	mu_check(glob_set_add_literal(gs, "/tmp/h[1].db") == 0);
+	glob_set_add_literal(gs, "/tmp/h[1].db");
 	mu_check(glob_set_compile(gs, &err) == 0);
 	mu_check(glob_set_match(gs, "/tmp/h[1].db", false, NULL));
 	mu_check(!glob_set_match(gs, "/tmp/h1.db", false, NULL));
@@ -778,7 +770,7 @@ MU_TEST(test_glob_reports_matching_pattern_and_counts) {
 	char *err = NULL;
 	struct glob_set *gs = glob_set_new();
 	const char *which = NULL, *pat = NULL;
-	unsigned long n = 0;
+	bool matched = false;
 
 	mu_check(glob_set_add(gs, "*.log", &err) == 0);
 	mu_check(glob_set_add(gs, "@eaDir", &err) == 0);
@@ -790,10 +782,10 @@ MU_TEST(test_glob_reports_matching_pattern_and_counts) {
 	mu_check(glob_set_match(gs, "/a/@eaDir", true, &which));
 	mu_check(which && strcmp(which, "@eaDir") == 0);
 
-	/* Per-pattern counts back the "matched nothing" warning (#147). */
-	mu_check(glob_set_stat(gs, 0, &pat, &n) && n == 1);
-	mu_check(glob_set_stat(gs, 1, &pat, &n) && n == 1);
-	mu_check(!glob_set_stat(gs, 2, &pat, &n));
+	/* Per-pattern flags back the "matched nothing" warning (#147). */
+	mu_check(glob_set_stat(gs, 0, &pat, &matched) && matched);
+	mu_check(glob_set_stat(gs, 1, &pat, &matched) && matched);
+	mu_check(!glob_set_stat(gs, 2, &pat, &matched));
 	glob_set_free(gs);
 }
 
@@ -812,7 +804,6 @@ MU_TEST(test_glob_empty_set_matches_nothing) {
 	struct glob_set *gs = glob_set_new();
 
 	mu_check(glob_set_compile(gs, &err) == 0);
-	mu_check(glob_set_empty(gs));
 	mu_check(!glob_set_match(gs, "/anything", false, NULL));
 	glob_set_free(gs);
 }

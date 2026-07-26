@@ -8,10 +8,10 @@
  * patterns there are. Exact paths (the hashfile and its sidecars, which oans
  * excludes on the user's behalf) skip the regex entirely via a hash lookup.
  *
- * The per-pattern regexes are kept as well, but only to attribute a hit to the
- * pattern that caused it for the -v message. That runs only when the combined
- * regex already matched, i.e. on a path we are about to skip anyway - never on
- * the hot negative path.
+ * The per-pattern regexes are kept as well, but only to work out *which*
+ * pattern caused a hit - for the -v message, and to apply the directory-only
+ * rule. That scan runs only when the combined regex already matched, i.e. on a
+ * path we are about to skip anyway, never on the hot negative path.
  *
  * GRegex is PCRE2 underneath and GLib is already linked, so this adds no
  * dependency.
@@ -26,6 +26,7 @@
  * General Public License for more details.
  */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -34,30 +35,32 @@
 #include "glob.h"
 
 struct glob_pat {
-	char		*pattern;	/* as written, for diagnostics */
-	char		*literal;	/* exact-match entries only */
-	GRegex		*re;		/* glob entries only */
+	char		*pattern;	/* as written; also the literal hash key */
+	GRegex		*re;		/* NULL for exact-match entries */
 	bool		dir_only;
 	bool		internal;	/* added by oans, not by the user */
-	unsigned long	matches;
+	/*
+	 * Set from the walker threads, which run concurrently. Only ever
+	 * flipped false->true, and only its final value is read (after the
+	 * walk, to report patterns that matched nothing), so a relaxed atomic
+	 * is enough - and writing it only on the first hit keeps the shared
+	 * cache line off the hot path.
+	 */
+	_Atomic bool	matched;
 };
 
 struct glob_set {
 	GPtrArray	*pats;		/* struct glob_pat *, in add order */
-	GHashTable	*literals;	/* literal -> struct glob_pat * */
-	GRegex		*any;		/* combined, patterns matching any path */
-	GRegex		*dir;		/* combined, directory-only patterns */
-	bool		compiled;
+	GHashTable	*literals;	/* pattern -> struct glob_pat * */
+	GRegex		*re;		/* every glob fragment, one alternation */
 };
 
 static void glob_pat_free(gpointer p)
 {
 	struct glob_pat *gp = p;
 
-	if (gp->re)
-		g_regex_unref(gp->re);
+	g_clear_pointer(&gp->re, g_regex_unref);
 	g_free(gp->pattern);
-	g_free(gp->literal);
 	g_free(gp);
 }
 
@@ -74,72 +77,50 @@ void glob_set_free(struct glob_set *gs)
 {
 	if (!gs)
 		return;
-	if (gs->any)
-		g_regex_unref(gs->any);
-	if (gs->dir)
-		g_regex_unref(gs->dir);
+	g_clear_pointer(&gs->re, g_regex_unref);
 	g_hash_table_destroy(gs->literals);
 	g_ptr_array_free(gs->pats, TRUE);
 	g_free(gs);
 }
 
-bool glob_set_empty(const struct glob_set *gs)
-{
-	return gs->pats->len == 0;
-}
-
-/* Characters PCRE2 treats specially, which a literal glob byte must escape. */
-static void append_literal_char(GString *out, char c)
-{
-	if (strchr("\\^$.[]|()*+?{}", c))
-		g_string_append_c(out, '\\');
-	g_string_append_c(out, c);
-}
-
 /*
  * Translate a glob character class starting at pat[*i] == '['. On success
  * advances *i to the closing ']' (the caller's loop steps past it) and returns
- * true; returns false if the class is unterminated.
+ * true; on an unterminated class rolls `out` back and returns false.
  */
 static bool append_class(GString *out, const char *pat, size_t len, size_t *i)
 {
-	GString *cls = g_string_new("[");
+	size_t mark = out->len;
 	size_t j = *i + 1;
-	bool closed = false;
+
+	g_string_append_c(out, '[');
 
 	/* Both spellings of negation; PCRE2 only knows '^'. */
 	if (j < len && (pat[j] == '!' || pat[j] == '^')) {
-		g_string_append_c(cls, '^');
+		g_string_append_c(out, '^');
 		j++;
 	}
 	/* A ']' immediately after the (possibly negated) open bracket is data. */
 	if (j < len && pat[j] == ']') {
-		g_string_append(cls, "\\]");
+		g_string_append(out, "\\]");
 		j++;
 	}
 
 	for (; j < len; j++) {
 		if (pat[j] == ']') {
-			closed = true;
-			break;
+			g_string_append_c(out, ']');
+			*i = j;
+			return true;
 		}
 		/* '-' and ranges pass through; only these two would change
 		 * meaning inside a PCRE2 class. */
 		if (pat[j] == '\\' || pat[j] == '[')
-			g_string_append_c(cls, '\\');
-		g_string_append_c(cls, pat[j]);
+			g_string_append_c(out, '\\');
+		g_string_append_c(out, pat[j]);
 	}
 
-	if (!closed) {
-		g_string_free(cls, TRUE);
-		return false;
-	}
-
-	g_string_append_c(cls, ']');
-	g_string_append(out, cls->str);
-	g_string_free(cls, TRUE);
-	*i = j;
-	return true;
+	g_string_truncate(out, mark);
+	return false;
 }
 
 /*
@@ -149,7 +130,6 @@ static bool append_class(GString *out, const char *pat, size_t len, size_t *i)
 static char *glob_to_regex(const char *pat, bool *dir_only, char **err)
 {
 	size_t len = strlen(pat);
-	bool has_slash = false;
 	GString *re;
 
 	*dir_only = false;
@@ -162,17 +142,10 @@ static char *glob_to_regex(const char *pat, bool *dir_only, char **err)
 		return NULL;
 	}
 
-	for (size_t i = 0; i < len; i++) {
-		if (pat[i] == '/') {
-			has_slash = true;
-			break;
-		}
-	}
-
 	re = g_string_new(NULL);
 	if (pat[0] == '/')
 		g_string_append_c(re, '^');		/* absolute */
-	else if (has_slash)
+	else if (memchr(pat, '/', len))
 		g_string_append(re, "^(?:.*/)?");	/* any depth */
 	else
 		g_string_append(re, "(?:^|/)");		/* basename */
@@ -181,17 +154,19 @@ static char *glob_to_regex(const char *pat, bool *dir_only, char **err)
 		char c = pat[i];
 
 		if (c == '*') {
-			if (i + 1 < len && pat[i + 1] == '*') {
-				i++;
-				if (i + 1 < len && pat[i + 1] == '/') {
-					/* '**' then '/': zero or more dirs */
-					g_string_append(re, "(?:.*/)?");
-					i++;
-				} else {
-					g_string_append(re, ".*");
-				}
-			} else {
+			size_t stars = 0;
+
+			while (i + stars < len && pat[i + stars] == '*')
+				stars++;
+			if (stars == 1) {
 				g_string_append(re, "[^/]*");
+			} else if (i + stars < len && pat[i + stars] == '/') {
+				/* '**' then a separator: zero or more dirs */
+				g_string_append(re, "(?:.*/)?");
+				i += stars;
+			} else {
+				g_string_append(re, ".*");
+				i += stars - 1;
 			}
 		} else if (c == '?') {
 			g_string_append(re, "[^/]");
@@ -203,10 +178,14 @@ static char *glob_to_regex(const char *pat, bool *dir_only, char **err)
 				g_string_free(re, TRUE);
 				return NULL;
 			}
-		} else if (c == '\\' && i + 1 < len) {
-			append_literal_char(re, pat[++i]);
 		} else {
-			append_literal_char(re, c);
+			/* Escape via GLib rather than a hand-kept metacharacter
+			 * list, which could drift from PCRE2's. */
+			char one[2] = { (c == '\\' && i + 1 < len) ? pat[++i] : c, 0 };
+			char *esc = g_regex_escape_string(one, 1);
+
+			g_string_append(re, esc);
+			g_free(esc);
 		}
 	}
 	g_string_append_c(re, '$');
@@ -214,10 +193,15 @@ static char *glob_to_regex(const char *pat, bool *dir_only, char **err)
 	return g_string_free(re, FALSE);
 }
 
-/* True if the pattern has no metacharacter, so it can go in the literal set. */
+/*
+ * An absolute path with no metacharacter needs no regex at all, so it can go
+ * in the literal set: a hash lookup, and no chance of a stray '*' in someone's
+ * hashfile path behaving as a wildcard.
+ */
 static bool is_plain_path(const char *pat)
 {
-	return pat[0] == '/' && !strpbrk(pat, "*?[\\");
+	return pat[0] == '/' && !strpbrk(pat, "*?[\\") &&
+	       !g_str_has_suffix(pat, "/");
 }
 
 static struct glob_pat *pat_new(struct glob_set *gs, const char *pattern)
@@ -229,20 +213,17 @@ static struct glob_pat *pat_new(struct glob_set *gs, const char *pattern)
 	return gp;
 }
 
-static int add_literal(struct glob_set *gs, const char *path, bool internal)
+static void add_literal(struct glob_set *gs, const char *path, bool internal)
 {
 	struct glob_pat *gp = pat_new(gs, path);
 
-	gp->literal = g_strdup(path);
 	gp->internal = internal;
-	g_hash_table_insert(gs->literals, gp->literal, gp);
-	gs->compiled = false;
-	return 0;
+	g_hash_table_insert(gs->literals, gp->pattern, gp);
 }
 
-int glob_set_add_literal(struct glob_set *gs, const char *path)
+void glob_set_add_literal(struct glob_set *gs, const char *path)
 {
-	return add_literal(gs, path, true);
+	add_literal(gs, path, true);
 }
 
 int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
@@ -252,15 +233,10 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 	char *frag;
 	GError *gerr = NULL;
 
-	*err = NULL;
-
-	/*
-	 * An absolute path with no metacharacters is the common case for the
-	 * excludes oans adds itself and for a user naming one directory; a hash
-	 * lookup beats the regex.
-	 */
-	if (is_plain_path(pattern) && pattern[strlen(pattern) - 1] != '/')
-		return add_literal(gs, pattern, false);
+	if (is_plain_path(pattern)) {
+		add_literal(gs, pattern, false);
+		return 0;
+	}
 
 	frag = glob_to_regex(pattern, &dir_only, err);
 	if (!frag)
@@ -268,7 +244,12 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 
 	gp = pat_new(gs, pattern);
 	gp->dir_only = dir_only;
-	gp->re = g_regex_new(frag, 0, 0, &gerr);
+	/*
+	 * G_REGEX_OPTIMIZE turns on PCRE2's JIT. It is not optional here: this
+	 * runs once per directory entry on every walker thread, and matching
+	 * measured ~12x slower without it.
+	 */
+	gp->re = g_regex_new(frag, G_REGEX_OPTIMIZE, 0, &gerr);
 	g_free(frag);
 	if (!gp->re) {
 		*err = g_strdup_printf("bad exclude pattern \"%s\": %s",
@@ -276,69 +257,47 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 		g_error_free(gerr);
 		return 1;
 	}
-	gs->compiled = false;
 	return 0;
-}
-
-/* Join every fragment of one flavour into a single alternation. */
-static GRegex *compile_combined(struct glob_set *gs, bool dir_only, char **err)
-{
-	GString *all = g_string_new(NULL);
-	GRegex *re = NULL;
-	GError *gerr = NULL;
-	unsigned int n = 0;
-
-	for (unsigned int i = 0; i < gs->pats->len; i++) {
-		struct glob_pat *gp = g_ptr_array_index(gs->pats, i);
-		const gchar *frag;
-
-		if (!gp->re || gp->dir_only != dir_only)
-			continue;
-		frag = g_regex_get_pattern(gp->re);
-		if (n++)
-			g_string_append_c(all, '|');
-		g_string_append_printf(all, "(?:%s)", frag);
-	}
-
-	if (n) {
-		re = g_regex_new(all->str, 0, 0, &gerr);
-		if (!re) {
-			*err = g_strdup_printf("combining exclude patterns: %s",
-					       gerr->message);
-			g_error_free(gerr);
-		}
-	}
-	g_string_free(all, TRUE);
-	return re;
 }
 
 int glob_set_compile(struct glob_set *gs, char **err)
 {
-	*err = NULL;
+	GString *all = g_string_new(NULL);
+	GError *gerr = NULL;
+	unsigned int n = 0;
+	int ret = 0;
 
-	if (gs->any) {
-		g_regex_unref(gs->any);
-		gs->any = NULL;
+	g_clear_pointer(&gs->re, g_regex_unref);
+
+	for (unsigned int i = 0; i < gs->pats->len; i++) {
+		struct glob_pat *gp = g_ptr_array_index(gs->pats, i);
+
+		if (!gp->re)
+			continue;
+		if (n++)
+			g_string_append_c(all, '|');
+		g_string_append_printf(all, "(?:%s)",
+				       g_regex_get_pattern(gp->re));
 	}
-	if (gs->dir) {
-		g_regex_unref(gs->dir);
-		gs->dir = NULL;
+
+	if (n) {
+		gs->re = g_regex_new(all->str, G_REGEX_OPTIMIZE, 0, &gerr);
+		if (!gs->re) {
+			*err = g_strdup_printf("combining exclude patterns: %s",
+					       gerr->message);
+			g_error_free(gerr);
+			ret = 1;
+		}
 	}
-
-	gs->any = compile_combined(gs, false, err);
-	if (*err)
-		return 1;
-	gs->dir = compile_combined(gs, true, err);
-	if (*err)
-		return 1;
-
-	gs->compiled = true;
-	return 0;
+	g_string_free(all, TRUE);
+	return ret;
 }
 
 /*
- * Which pattern matched? Only called once the combined regex has already said
- * yes, so the linear scan runs at most once per excluded path.
+ * Which pattern matched? Only reached once the combined regex has already said
+ * yes, so this linear scan runs at most once per excluded path - and it is
+ * also where the directory-only rule is applied, since the combined regex does
+ * not distinguish.
  */
 static struct glob_pat *attribute(struct glob_set *gs, const char *path,
 				  bool is_dir)
@@ -357,32 +316,27 @@ static struct glob_pat *attribute(struct glob_set *gs, const char *path,
 bool glob_set_match(struct glob_set *gs, const char *path, bool is_dir,
 		    const char **which)
 {
-	struct glob_pat *gp;
+	struct glob_pat *gp = g_hash_table_lookup(gs->literals, path);
 
-	if (gs->pats->len == 0)
-		return false;
-
-	gp = g_hash_table_lookup(gs->literals, path);
 	if (!gp) {
-		bool hit = (gs->any && g_regex_match(gs->any, path, 0, NULL)) ||
-			   (is_dir && gs->dir &&
-			    g_regex_match(gs->dir, path, 0, NULL));
-
-		if (!hit)
+		if (!gs->re || !g_regex_match(gs->re, path, 0, NULL))
 			return false;
+		/* A directory-only pattern can match the combined regex on a
+		 * plain file; attribute() is what rejects it. */
 		gp = attribute(gs, path, is_dir);
+		if (!gp)
+			return false;
 	}
 
-	if (gp) {
-		gp->matches++;
-		if (which)
-			*which = gp->pattern;
-	}
+	if (!atomic_load_explicit(&gp->matched, memory_order_relaxed))
+		atomic_store_explicit(&gp->matched, true, memory_order_relaxed);
+	if (which)
+		*which = gp->pattern;
 	return true;
 }
 
 bool glob_set_stat(const struct glob_set *gs, unsigned int i,
-		   const char **pattern, unsigned long *matches)
+		   const char **pattern, bool *matched)
 {
 	unsigned int seen = 0;
 
@@ -394,7 +348,8 @@ bool glob_set_stat(const struct glob_set *gs, unsigned int i,
 		if (seen++ != i)
 			continue;
 		*pattern = gp->pattern;
-		*matches = gp->matches;
+		*matched = atomic_load_explicit(&gp->matched,
+						memory_order_relaxed);
 		return true;
 	}
 	return false;

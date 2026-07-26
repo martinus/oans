@@ -41,7 +41,6 @@
 #include <sys/sysmacros.h>
 #include <uuid/uuid.h>
 #include <stdatomic.h>
-#include <bsd/sys/queue.h>
 
 #include <glib.h>
 
@@ -486,7 +485,7 @@ static int is_excluded(const char *name, bool is_dir)
 	if (!excludes || !glob_set_match(excludes, name, is_dir, &which))
 		return 0;
 
-	vprintf("Excluding: %s (matches %s)\n", name, which ? which : "?");
+	vprintf("Excluding: %s (matches %s)\n", name, which);
 	return 1;
 }
 
@@ -2223,7 +2222,7 @@ int add_exclude_pattern(const char *pattern)
 	char *err = NULL;
 
 	if (glob_set_add(excludes_get(), pattern, &err)) {
-		eprintf("Error: %s\n", err ? err : "bad --exclude pattern");
+		eprintf("Error: %s\n", err);
 		g_free(err);
 		return 1;
 	}
@@ -2237,20 +2236,28 @@ int add_exclude_pattern(const char *pattern)
  * sidecars). Matched literally, so a '*' or '[' in the hashfile's own path
  * cannot turn into a wildcard and silently drop unrelated files.
  */
-int add_exclude_path(const char *path)
+void add_exclude_path(const char *path)
 {
-	return glob_set_add_literal(excludes_get(), path);
+	glob_set_add_literal(excludes_get(), path);
 }
 
-/* Warn about patterns that matched nothing -- almost always a typo or the
- * wrong syntax, and silent until now (#147). */
-static void excludes_report_unmatched(void)
+/*
+ * Warn about patterns that matched nothing -- almost always a typo or the wrong
+ * syntax, and silent until now (#147). Called by the caller once the walk has
+ * finished, not from filescan_free(): after a walk that failed outright every
+ * pattern would trivially have matched nothing, and saying so would bury the
+ * real error.
+ */
+void filescan_report_excludes(void)
 {
 	const char *pattern;
-	unsigned long matches;
+	bool matched;
 
-	for (unsigned int i = 0; glob_set_stat(excludes, i, &pattern, &matches); i++) {
-		if (matches)
+	if (!excludes)
+		return;
+
+	for (unsigned int i = 0; glob_set_stat(excludes, i, &pattern, &matched); i++) {
+		if (matched)
 			continue;
 		eprintf("WARNING: --exclude pattern \"%s\" matched nothing.\n",
 			pattern);
@@ -2484,7 +2491,7 @@ void filescan_init(void)
 		char *err = NULL;
 
 		if (glob_set_compile(excludes, &err)) {
-			eprintf("Error: %s\n", err ? err : "bad --exclude set");
+			eprintf("Error: %s\n", err);
 			g_free(err);
 			abort_on(1);
 		}
@@ -2503,9 +2510,5 @@ void filescan_free(void)
 	verified_dev_free();
 	seen_inodes_free();
 
-	if (excludes) {
-		excludes_report_unmatched();
-		glob_set_free(excludes);
-		excludes = NULL;
-	}
+	g_clear_pointer(&excludes, glob_set_free);
 }
