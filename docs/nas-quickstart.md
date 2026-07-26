@@ -1,9 +1,8 @@
 # oans on a NAS — quick start
 
 A practical, copy-pasteable path to running oans as a scheduled deduplication
-job on a NAS or home server. It uses two features that make this painless: the
-**self-describing hashfile** (a run remembers its own options and paths) and
-**`--autotune`** (measures the fastest thread count for your disks).
+job on a NAS or home server. It leans on the **self-describing hashfile**: a run remembers its own options
+and paths, so everything after the first run needs no arguments.
 
 Throughout, replace `/srv/media` with your data directory and `media` with a
 short name for the job.
@@ -48,48 +47,31 @@ sudo make install            # installs the oans binary (+ duperemove symlink)
 sudo make install-systemd    # installs the oans@ timer/service templates
 ```
 
-## Step 2 — Autotune the thread count for your disks
+## Step 2 — The first run (the slow one)
 
-Give the job a name and tune into the hashfile the timer will later use
-(`/var/cache/oans/<name>.hash`). Pass the same `-dr` and path you'll dedupe
-with — autotune records them too, so this one command both measures the
-threads **and** sets up the job:
+Give the job a name — the hashfile the timer will later use is
+`/var/cache/oans/<name>.hash`:
 
 ```sh
 sudo install -d -m 0755 /var/cache/oans
-sudo oans --autotune -dr --hashfile=/var/cache/oans/media.hash /srv/media
-```
-
-Run it **as root** — autotune drops the page cache between trials to get honest
-cold-read numbers, which matters a lot on spinning disks and RAID. It reads only
-a bounded sample (quick relative to a full scan, though on a big cold tree the
-trials still take a few minutes; it prints each one as it goes), then prints a
-throughput-vs-threads table and stores the winning `--io-threads` value plus the
-scan configuration in the hashfile. This is the reliable way to size threads for
-a NAS; without it, oans falls back to a storage-type heuristic whose HDD/RAID
-numbers are only educated guesses.
-
-## Step 3 — The first run (the slow one)
-
-```sh
 sudo oans -dr --hashfile=/var/cache/oans/media.hash /srv/media
 ```
 
 This is the expensive pass: it hashes everything and deduplicates. It
 
-- reuses the thread count autotune stored in Step 2,
-- re-confirms the stored options and paths (already recorded by Step 2), and
+- records the options and paths, so later runs need no arguments,
+- sizes its I/O threads from the detected backing storage (run with **-v** to
+  see what it picked; pass `--io-threads=N` to override), and
 - is safe to interrupt — the kernel does each dedupe atomically and
   byte-verified, so Ctrl+C can only waste work, never corrupt data.
 
-Add `-v` once if you want to see the detected storage and the chosen thread
-count. Check the result:
+Check the result:
 
 ```sh
 oans --stats --hashfile=/var/cache/oans/media.hash
 ```
 
-## Step 4 — Schedule it
+## Step 3 — Schedule it
 
 ```sh
 sudo systemctl enable --now oans@media.timer
@@ -97,7 +79,7 @@ sudo systemctl enable --now oans@media.timer
 
 The name after `@` is the **basename of your hashfile** in `/var/cache/oans/`:
 `oans@media` runs `--hashfile=/var/cache/oans/media.hash`. So match it to the
-hashfile you created in Steps 2–3 — if yours is
+hashfile you created in Step 2 — if yours is
 `/var/cache/oans/data.hash`, enable `oans@data.timer` instead. (The unit skips
 cleanly until that hashfile exists, so set it up first.)
 
@@ -109,7 +91,7 @@ To change the frequency, override `OnCalendar=`:
 sudo systemctl edit oans@media.timer     # e.g. OnCalendar=daily
 ```
 
-## Step 5 — Monitor
+## Step 4 — Monitor
 
 ```sh
 systemctl list-timers 'oans@*'                          # when it next runs
@@ -136,7 +118,7 @@ stream to parse.
 ## Notes for NAS users
 
 - **Run as root** so oans can read and re-extent every file in the tree.
-- **Multiple datasets:** repeat Steps 2–4 with different names (`oans@photos`,
+- **Multiple datasets:** repeat Steps 2–3 with different names (`oans@photos`,
   `oans@backups`, …). Each is an independent timer you can schedule separately.
 - **Report-only mode:** set the job up with `-r` instead of `-dr` and the
   scheduled runs will only refresh hashes and report, never change data.

@@ -42,9 +42,9 @@ sys.path.insert(0, INTEGRATION_DIR)
 
 import harness  # noqa: E402  (needs the sys.path insert above)
 
-# The suite is I/O-bound, not CPU-bound: workers sit in subprocess.run(), sync()
-# and autotune's cache drop, so total CPU is flat across job counts and nproc
-# alone under-subscribes badly. Measured on a 4-core box over XFS: j=4 6.9s,
+# The suite is I/O-bound, not CPU-bound: workers sit in subprocess.run() and
+# sync(), so total CPU is flat across job counts and nproc alone
+# under-subscribes badly. Measured on a 4-core box over XFS: j=4 6.9s,
 # j=8 4.4s, j=12 3.6s, j=16 3.6s. Hence 2x nproc, and a ceiling because a worker
 # is not always a plain oans - under valgrind or ASAN each one costs far more
 # memory, and the scratch filesystem is shared. 8 is a deliberate compromise

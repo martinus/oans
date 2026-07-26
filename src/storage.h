@@ -54,7 +54,7 @@ int storage_detect(const char *path, struct storage_profile *p);
 /*
  * Recommend a default --io-threads for this profile and CPU count. Pure, so
  * it is unit-tested directly (see tests.c). The heuristic is deliberately
- * conservative; `--autotune` measures the real optimum on the target hardware.
+ * conservative: it picks a safe default with no extra I/O.
  */
 unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 					  unsigned int ncpus);

@@ -101,8 +101,7 @@ sudo systemctl enable --now oans@data.timer
 
 📖 **Setting this up on a NAS or home server?** Follow the
 **[NAS quick-start guide](docs/nas-quickstart.md)** — a complete walkthrough
-from first scan to scheduled, monitored dedupe (including `--autotune` to pick
-the fastest I/O settings for your disks).
+from first scan to scheduled, monitored dedupe.
 
 ## Watching it work
 
@@ -266,8 +265,8 @@ commands and comparison binary are documented in the
   for zero-config scheduling.
 - **systemd `oans@` service/timer templates** (`make install-systemd`) for
   weekly, idle-priority dedupe, with a **[NAS quick-start guide](docs/nas-quickstart.md)**.
-- **`--autotune`** empirically picks the fastest `--io-threads` for the backing
-  storage (and a device-type heuristic sizes the default for HDD/RAID pools).
+- **Storage-aware thread defaults:** `--io-threads` is sized from the detected
+  backing storage (SSD vs single spinning disk vs multi-device pool).
 - **`--min-filesize`**, **`--cpu-threads`**, **`--no-color`** and **`-q`** added;
   the legacy `--fdupes` mode and other dead/testing options removed.
 - **Automatic housekeeping:** prune deleted files from the hashfile after a scan
@@ -326,8 +325,8 @@ Differences to know about:
   SQLite `application_id`; oans and duperemove will each rebuild rather than
   read the other's. Hashfiles are only caches, so nothing is lost.
 - **CLI**: a few additions (`--stats`, `--history`, `--json`, `--progress=json`,
-  `--autotune`, `--min-filesize`, `--cpu-threads`, `--no-color`, `-q`), a few
-  legacy/testing options removed.
+  `--min-filesize`, `--cpu-threads`, `--no-color`, `-q`), a few legacy/testing
+  options removed.
 - Scripts that expect the `duperemove` binary keep working via the installed
   compatibility symlink, including the stable
   `net change in shared extents` output line.

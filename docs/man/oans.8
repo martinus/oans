@@ -27,10 +27,6 @@ kernel\[cq]s deduplication ioctl.
 .PD
 \f[B]oans\f[R] \f[B]\-R\f[R] \f[B]\-\-hashfile\f[R]=\f[I]FILE\f[R]
 \f[I]file\f[R]\&...
-.PD 0
-.P
-.PD
-\f[B]oans\f[R] \f[B]\-\-autotune\f[R] \f[I]file\f[R]\&...
 .SH DESCRIPTION
 \f[CR]oans\f[R] finds regions of identical data across a set of files
 and, on request, asks the kernel to make them share storage \[em]
@@ -84,10 +80,10 @@ A summary of the space reclaimed is printed at the end (see
 \f[I]OUTPUT\f[R]).
 .PP
 \f[B]Report and maintenance modes.\f[R] \f[B]\-\-stats\f[R],
-\f[B]\-\-history\f[R], \f[B]\-\-json\f[R], \f[B]\-L\f[R], \f[B]\-R\f[R],
-and \f[B]\-\-autotune\f[R] each inspect or maintain a hashfile and then
-exit without scanning for dupes.
-The first four open the hashfile \f[B]read\-only\f[R]; see
+\f[B]\-\-history\f[R], \f[B]\-\-json\f[R], \f[B]\-L\f[R], and
+\f[B]\-R\f[R] each inspect or maintain a hashfile and then exit without
+scanning for dupes.
+All but \f[B]\-R\f[R] open the hashfile \f[B]read\-only\f[R]; see
 \f[I]NOTES\f[R] for running them alongside an active \f[CR]oans\f[R].
 .SH OPTIONS
 The non\-option arguments are the \f[I]files\f[R] and
@@ -214,8 +210,6 @@ storage and chooses automatically: the host CPU count capped at
 for a single spinning disk (seek\-bound); and roughly two per device for
 a multi\-device btrfs pool, still capped at 8.
 Run with \f[B]\-v\f[R] to see the detected storage and the value chosen.
-A stored \f[B]\-\-autotune\f[R] result, if present, is used in
-preference to the heuristic.
 Passing \f[I]N\f[R] explicitly disables all of this and uses \f[I]N\f[R]
 verbatim.
 .TP
@@ -265,24 +259,6 @@ reads the list from standard input.
 Requires \f[B]\-\-hashfile\f[R].
 (Deleted files are also pruned automatically on the next scan;
 \f[B]\-R\f[R] is for removing paths that still exist.)
-.TP
-\f[B]\-\-autotune\f[R]
-Measure the fastest \f[B]\-\-io\-threads\f[R] for this machine and exit.
-\f[CR]oans\f[R] reads and hashes a bounded sample of the given tree at
-several thread counts, dropping the page cache between trials (run as
-\f[B]root\f[R] for meaningful cold\-read numbers on spinning disks), and
-prints a throughput table with the winner.
-Directories are always sampled recursively \[em] the sample is about the
-storage, not the \f[B]\-r\f[R] flag.
-With \f[B]\-\-hashfile\f[R] the winning value \f[I]and\f[R] the scan
-configuration are stored, so \f[CR]\-\-autotune\f[R] doubles as
-one\-time setup: a later bare \f[CR]oans \-\-hashfile=FILE\f[R] replays
-it, using the tuned thread count unless you pass an explicit
-\f[B]\-\-io\-threads\f[R].
-This is the hardware\-measured counterpart to the storage heuristic and
-the reliable way to tune a NAS or disk array.
-Sample bounds are controlled by the \f[CR]DUPEREMOVE_AUTOTUNE_*\f[R]
-variables (see \f[I]ENVIRONMENT\f[R]).
 .SS Output and information
 .TP
 \f[B]\-q\f[R], \f[B]\-\-quiet\f[R]
@@ -437,13 +413,6 @@ oans \-\-stats   \-\-hashfile=foo.hash
 oans \-\-history \-\-hashfile=foo.hash
 oans \-\-json    \-\-hashfile=foo.hash | jq .reclaimed_total_bytes
 .EE
-.PP
-Measure the best thread count for a NAS array (as root), storing it for
-later runs:
-.IP
-.EX
-sudo oans \-\-autotune \-\-hashfile=media.hash /srv/media
-.EE
 .SS Scheduled deduplication
 Because the hashfile is self\-describing, a scheduled run only needs to
 name it.
@@ -475,10 +444,6 @@ deduped\f[R] line, or run with \f[B]\-v\f[R], to detect them.
 \f[B]NO_COLOR\f[R]
 If set (to any value), disables colored output, as
 \f[B]\-\-no\-color\f[R] does.
-.TP
-\f[B]DUPEREMOVE_AUTOTUNE_MAX_FILES\f[R], \f[B]DUPEREMOVE_AUTOTUNE_MAX_BYTES\f[R], \f[B]DUPEREMOVE_AUTOTUNE_ROUNDS\f[R]
-Bound the sample \f[B]\-\-autotune\f[R] reads (file count, total bytes,
-and number of interleaved measurement rounds).
 .SH FILES
 .TP
 \f[I]hashfile\f[R]
