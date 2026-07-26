@@ -894,7 +894,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
 
-	/* -L/-R/--stats/--history/--json are exclusive read-only report modes. */
+	/* -L/-R/--stats/--history/--json are mutually exclusive report modes. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
 				  + history_only_opt + json_only_opt;
 	/* Every report mode but -R takes no file list. */
@@ -1458,13 +1458,14 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 }
 
 /*
- * Refine the auto-detected io-threads default from the backing storage of the
- * first scan target. Spinning disks are seek-bound and want fewer concurrent
- * readers than SSDs; a multi-device btrfs pool scales with its spindle count.
- * A user-supplied --io-threads is always respected; this only picks a sensible
- * default with no extra I/O.
+ * Apply the storage-derived defaults from the backing storage of the first scan
+ * target: the scan-ETA rotational weight, and (unless the user passed
+ * --io-threads) the io-threads default. Spinning disks are seek-bound and want
+ * fewer concurrent readers than SSDs; a multi-device btrfs pool scales with its
+ * spindle count. One storage_detect() serves both, so the weight is set before
+ * the io-threads early return.
  */
-static void auto_tune_io_threads(const char *root)
+static void apply_storage_defaults(const char *root)
 {
 	struct storage_profile p = {0};
 
@@ -1518,7 +1519,7 @@ int main(int argc, char **argv)
 	 * we mostly add lock contention and a wall of progress lines. An explicit
 	 * --cpu-threads (parsed below) overrides. io_threads stays 0 (== auto)
 	 * and is resolved from the scan target's storage once the roots are
-	 * known, in auto_tune_io_threads().
+	 * known, in apply_storage_defaults().
 	 */
 	options.cpu_threads = get_num_cpus();
 	if (options.cpu_threads > AUTO_THREADS_CAP)
@@ -1604,7 +1605,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	auto_tune_io_threads(roots[0]);
+	apply_storage_defaults(roots[0]);
 
 	print_header();
 

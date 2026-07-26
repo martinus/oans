@@ -1,8 +1,9 @@
 # oans on a NAS — quick start
 
 A practical, copy-pasteable path to running oans as a scheduled deduplication
-job on a NAS or home server. It leans on the **self-describing hashfile**: a run remembers its own options
-and paths, so everything after the first run needs no arguments.
+job on a NAS or home server. It leans on the **self-describing hashfile**: a
+run remembers its own options and paths, so everything after the first run
+needs no arguments.
 
 Throughout, replace `/srv/media` with your data directory and `media` with a
 short name for the job.

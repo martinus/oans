@@ -232,30 +232,33 @@ walkers.**
 - Cold-walk cost is fundamental btrfs metadata I/O (`statx→btrfs_iget→btree`);
   SQLite is <2%, so parallelizing the consumer wouldn't help.
 
-## io-threads auto-tuning (--autotune)
+## io-threads default (storage heuristic)
 
-`--io-threads` sizes three pools (walkers, csum/read, dedupe). Two mechanisms
-refine its default, both **only when the user didn't pass `--io-threads`**
-(`options.io_threads_set`) and both resolved on the main thread after the roots
-are known (`auto_tune_io_threads()` in `oans.c`).
+`--io-threads` sizes three pools (walkers, csum/read, dedupe). One mechanism
+refines its default, **only when the user didn't pass `--io-threads`** (the
+sentinel is `options.io_threads == 0`), resolved on the main thread after the
+roots are known (`apply_storage_defaults()` in `oans.c`).
 
 - **`src/storage.{c,h}` — heuristic from device type.** `storage_detect()`
   reports rotational-ness + device count (btrfs pools enumerated via
   `BTRFS_IOC_FS_INFO`/`DEV_INFO` → `/sys/.../queue/rotational`).
   `storage_recommend_io_threads()` is pure and unit-tested: SSD/unknown keep
-  `min(nproc,8)` (the validated path, unchanged); single HDD ≤4; HDD pool
-  ~2/device capped at 8. **The HDD constants are unmeasured guesses** — treat
-  `--autotune` as authoritative.
-- **`src/autotune.{c,h}` — empirical (`--autotune`).** Re-execs oans on a bounded
-  sample (`-` file list, no hashfile → pure in-memory read+hash) at each thread
-  count, interleaved, keeping each candidate's fastest run. Drops the page cache
-  between trials (`drop_caches`, needs root). Bounds:
-  `DUPEREMOVE_AUTOTUNE_{MAX_FILES,MAX_BYTES,ROUNDS}`. With `--hashfile` it stores
-  the winner (config key `autotune_io_threads`); a later plain run reads it back
-  (an explicit `--io-threads` still overrides). Pinned by `test_autotune.py`.
-- **Measuring autotune on the dev box is misleading:** on an unsupported fs
-  (ext) trials read 0 bytes and the numbers are startup noise; needs a btrfs/xfs
-  target.
+  `min(nproc,8)` (the validated path); single HDD ≤4; HDD pool ~2/device capped
+  at 8.
+- **The HDD/pool constants are unmeasured guesses** and there is now no in-tree
+  way to validate them — we have no spinning-disk target. The SSD/unknown path
+  is the measured one (see the walker plateau in *Scan parallelism*). If you get
+  access to real rotational storage, measure with `scripts/bench.py
+  --walk-threads 4,8,16,32` and fix the constants; don't guess again.
+- **`--autotune` was removed** (#153) — it measured warm-cache throughput
+  whenever it couldn't drop caches (i.e. without root), recommended and
+  *persisted* a thread count above the measured btrfs plateau, and the stored
+  value then won over the heuristic on every later run. Don't reintroduce a
+  self-measuring mode that writes to the hashfile. `scripts/bench.py` answers
+  the same question properly, as a dev tool.
+- The same `storage_detect()` call also feeds the scan-ETA rotational weight
+  (`pscan_set_storage_rotational()`), which must be set **even when io-threads
+  is fixed** by an explicit flag — hence the ordering in that function.
 
 ## Self-describing hashfile, history & scheduling (fork features)
 
@@ -276,9 +279,10 @@ are known (`auto_tune_io_threads()` in `oans.c`).
   reuses the progress counters, so a later read is 0. (Not `files_examined`,
   which counts every file the walk *visited*, up-to-date ones included, not just
   those hashed.) Pinned by `test_history_metrics.py`.
-- **Report modes** `-L`/`-R`/`--stats`/`--history`/`--json`/`--autotune` are
-  mutually exclusive (one `report_count` check in `parse_options`): `--stats` =
-  hashfile report, `-L` lists files, `-R` removes paths.
+- **Report modes** `-L`/`-R`/`--stats`/`--history`/`--json` are mutually
+  exclusive (one `report_count` check in `parse_options`): `--stats` = hashfile
+  report, `-L` lists files, `-R` removes paths. All but `-R` open the hashfile
+  read-only.
 - **Scheduling.** `systemd/oans@.{service,timer}` (via `make install-systemd`,
   kept out of `make install`) run `oans --hashfile=/var/cache/oans/%i.hash` on a
   timer, replaying the stored config. Guide: `docs/nas-quickstart.md`.
@@ -480,8 +484,9 @@ check unlinks and recreates (it's only a cache).
   file (a full re-scan). Do **not** bump for purely *additive* changes (a new
   `CREATE TABLE IF NOT EXISTS`, or an optional `config` key): `create_tables()`
   runs every open, so additive tables appear on old files and old binaries ignore
-  the extras. Self-describing, run-history and autotune were all added this way,
-  left at `5.0`.
+  the extras. Self-describing and run-history were both added this way, left at
+  `5.0`. Removing a key is equally safe: `--autotune`'s orphaned
+  `autotune_io_threads` row is simply never read again (no bump, no migration).
 - A from-scratch build sets `hashfile_rebuilt` → `dbfile_maybe_vacuum()` forces a
   one-off `VACUUM` (a fresh build is at insert density, ~15-20% larger
   un-vacuumed). Incremental runs only VACUUM at ≥25% free.
