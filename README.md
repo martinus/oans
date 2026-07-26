@@ -142,18 +142,21 @@ tree is larger than RAM, an upstream data-loss-adjacent hashfile bug is fixed, a
 you get real observability (`--stats`, `--history`, `--json`, `--progress=json`)
 plus set-and-forget scheduling.
 
-The headline speedups, benchmarked on real btrfs data (2.07M files, ~230 GiB);
-your mileage depends on your data and filesystem, and the exact tree, commands
-and comparison binary are documented in the
+The headline speedups come from two benchmarks: a **warm re-run** on a real btrfs
+tree (2.07M files, ~230 GiB), and a **larger-than-RAM** dedupe (a ~10.5 GiB tree
+with the page cache capped to 4 GiB — the normal case for a NAS or backup
+target). Your mileage depends on your data and filesystem; the exact trees,
+commands and comparison binary are documented in the
 **[benchmark methodology](docs/benchmarks.md)**:
 
 | Change | Effect |
 |---|---|
 | Skip already-shared files up front | Warm re-run **~11 min → ~92 s** vs upstream (best case; cold first runs gain less) |
+| Streaming dedupe pipeline + page-cache prefetch | Larger-than-RAM dedupe **179.7 s → 13.8 s (~13×)** at **~2× lower peak RSS**, doing byte-for-byte identical work — [details](docs/benchmarks.md#larger-than-ram-dedupe) |
 | No cross-generation reprocessing of duplicate groups | Dedupe phase **~294 s → ~188 s (~36 %)**, kernel dedupe traffic halved, accurate accounting |
 | Batched SQLite transactions (~10 s cadence) | **~24 % faster rescans**; hundreds of thousands of file-lock syscalls collapsed to a few hundred |
 | Parallel directory walk (`--io-threads`) | Faster listing on large trees, capped where btrfs metadata contention plateaus |
-| Compact 64-bit path-hash index | Smaller hashfile (**41 vs 73 MiB** on the benchmark tree), faster path lookups |
+| Compact 64-bit path-hash index | Smaller hashfile (**39.7 vs 70.9 MiB** on the larger-than-RAM tree), faster path lookups |
 | Skip post-dedupe extent measurement on interactive runs | An open + 2 `FIEMAP` ioctls saved per group member |
 
 <details>
@@ -165,15 +168,21 @@ and comparison binary are documented in the
   `UNIQUE(ino, subvol)` could cascade-delete rows for other links to an inode and
   silently empty the hashfile while exiting 0; an in-memory `seen_inodes` guard
   and a regression test pin it.
+- **Files whose absolute path exceeds `PATH_MAX`** (4096 bytes) are hashed and
+  deduped instead of skipped — the kernel rejects any single over-long path
+  argument, so oans walks the tree in bounded segments.
 - **Use-after-free & leak fixed** when a rejected hashfile is recreated (a closed
   handle was handed back to the caller); found by running the whole suite under
   valgrind, which is now a CI job.
+- **Two dedupe-phase races fixed**, both caught by tooling now wired into CI: a
+  use-after-free between the block-hash search and batch teardown, and one found
+  by ThreadSanitizer in the thread-pool lifetime handling.
 - **Dedupe robustness:** stop spinning when a round makes no progress
   (upstream #396/#407), clamp the source range to file size to avoid `EINVAL`,
-  fix the infinite loop on NoCOW files (#376), and skip members whose size
-  changed since the scan.
-- **Sparse-file fixes:** handle files with a trailing hole (#374); hash the
-  actual block, not a stale zero check.
+  fix the infinite loop on NoCOW files (upstream #376), and skip members whose
+  size changed since the scan.
+- **Sparse-file fixes:** handle files with a trailing hole (upstream #374); hash
+  the actual block, not a stale zero check.
 - **Uninitialised-memory fix** in UUID config load, with a committed valgrind
   suppressions file for the one library false-positive.
 - **In-memory (no `--hashfile`) “database table is locked” fixed** (shared-cache
@@ -185,13 +194,21 @@ and comparison binary are documented in the
   are safe to run while a scan or dedupe is in progress.
 - **Refuse unsupported-fs roots up front** instead of silently storing 0 files;
   hint at permissions when a hashfile can't be opened; report a version even when
-  built outside a git checkout (#387).
+  built outside a git checkout (upstream #387).
 
 #### ⚡ Performance & memory
 
-- **Skip already-shared files up front** (#331) — the headline warm-rescan win.
+- **Skip already-shared files up front** (upstream #331) — the headline
+  warm-rescan win.
+- **Streaming dedupe pipeline:** one persistent worker pool for the whole dedupe
+  phase, with the next batch of duplicate groups loaded while the current one
+  dedupes — no pool drain between batches or passes, and Ctrl+C still resumes
+  exactly where it left off.
 - **No cross-generation reprocessing** of duplicate groups that span passes
   (halves kernel dedupe traffic, fixes accounting).
+- **Fixed an O(extents²) scan on fragmented files** — it was 49 % of all CPU on a
+  heavily fragmented tree, the shape a long-lived dedupe target degrades into
+  since dedupe fragments what it shares.
 - **Fast dedupe on trees larger than RAM:** keep just-hashed data in the page
   cache for the dedupe phase and prefetch each `FIDEDUPERANGE` round, so the
   kernel byte-compares from RAM instead of a slow cold re-read — **~13× faster**
@@ -235,10 +252,11 @@ and comparison binary are documented in the
   a `mapping:` pre-read phase, and a summary block.
 - **Honest reporting:** the summary reports disk space *actually freed*
   (one physical copy kept per group), not an inflated shared-extents figure.
-- **Progress polish:** ellipsize the path middle so the numbers stay visible,
-  always-human sizes, no bar pinned at 100 %, no live-block drift, files-examined
-  shown during listing, quieter per-file errors, and “Skipping dedupe” no longer
-  collides with the status bar.
+- **Progress polish:** hashing throughput shown during the scan phase, workers
+  marked idle when the queue starves, ellipsized path middles so the numbers stay
+  visible, always-human sizes, no bar pinned at 100 %, no live-block drift,
+  files-examined shown during listing, quieter per-file errors, and “Skipping
+  dedupe” no longer collides with the status bar.
 - **Self-contained `--help`/usage** instead of shelling out to `man`.
 
 #### ⏰ Operations, packaging & compatibility
@@ -250,8 +268,8 @@ and comparison binary are documented in the
   weekly, idle-priority dedupe, with a **[NAS quick-start guide](docs/nas-quickstart.md)**.
 - **`--autotune`** empirically picks the fastest `--io-threads` for the backing
   storage (and a device-type heuristic sizes the default for HDD/RAID pools).
-- **`--min-filesize`**, **`--no-color`** and **`-q`** added; the legacy
-  `--fdupes` mode and other dead/testing options removed.
+- **`--min-filesize`**, **`--cpu-threads`**, **`--no-color`** and **`-q`** added;
+  the legacy `--fdupes` mode and other dead/testing options removed.
 - **Automatic housekeeping:** prune deleted files from the hashfile after a scan
   (stat-based), then VACUUM when a build or prune left it worth it.
 - **Branded hashfile** (SQLite `application_id`, format 5.0) so oans and
@@ -261,24 +279,14 @@ and comparison binary are documented in the
 - **Packaging & release:** prebuilt x86_64 tarball attached to each GitHub
   release (`scripts/release.sh`), AUR `PKGBUILD`s, and a hand-drawn logo +
   scripted demo GIF.
-- **Build & CI hardening:** `src/` layout, `-Wextra`/hardened flags, reproducible
-  builds, and CI running the unit + integration suites (and a valgrind pass)
-  against real btrfs *and* XFS.
+- **Build & CI hardening:** `src/` layout, `-Wextra`/hardened flags with warnings
+  as errors, reproducible builds, and CI running the unit + integration suites
+  against real btrfs *and* XFS — plus a valgrind pass and clang
+  ASAN/UBSAN/TSAN legs. `make check-all` runs every CI leg locally.
 
 </details>
 
 Full reference — every option, FAQ, examples: **[oans man page](docs/man/oans.md)** (`man 8 oans` once installed).
-
-> [!NOTE]
-> **On a dataset larger than RAM** — the normal case for a NAS / backup / build
-> tree — oans deduplicates **~13× faster than upstream duperemove** (median
-> **13.8 s vs 179.7 s** on an ~10.5 GiB tree with the page cache capped to 4 GiB),
-> uses roughly half the peak RSS, and writes a ~1.8× smaller hashfile — doing
-> byte-for-byte identical dedupe. This is where the dedupe-phase design pays off:
-> when the working set doesn't fit in cache, the kernel's `FIDEDUPERANGE` re-read
-> is slow cold, and oans prefetches it while upstream doesn't. Full methodology,
-> parameters and per-round tables:
-> **[larger-than-RAM benchmark](docs/benchmarks.md#larger-than-ram-dedupe)**.
 
 ## How it compares
 
@@ -318,8 +326,8 @@ Differences to know about:
   SQLite `application_id`; oans and duperemove will each rebuild rather than
   read the other's. Hashfiles are only caches, so nothing is lost.
 - **CLI**: a few additions (`--stats`, `--history`, `--json`, `--progress=json`,
-  `--autotune`, `--min-filesize`, `--no-color`, `-q`), a few legacy/testing
-  options removed.
+  `--autotune`, `--min-filesize`, `--cpu-threads`, `--no-color`, `-q`), a few
+  legacy/testing options removed.
 - Scripts that expect the `duperemove` binary keep working via the installed
   compatibility symlink, including the stable
   `net change in shared extents` output line.
