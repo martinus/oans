@@ -302,9 +302,10 @@ class DuperemoveTest(unittest.TestCase):
         """`(size_str, groups)` from the human 'Reclaimed' summary line, or None.
 
         size_str is the rendered human figure (e.g. '1.0 MiB') — the honest
-        disk-freed amount, one physical copy kept per group. oans omits the
-        whole summary block under -q or when there was nothing to dedupe. For
-        exact byte assertions use the --json `reclaimed_total_bytes` field.
+        disk-freed amount, one physical copy kept per group. Matches both the
+        full Summary block and the -q one-liner (#148); returns None when there
+        was nothing to dedupe. For exact byte assertions use the --json
+        `reclaimed_total_bytes` field.
         """
         m = _RECLAIMED_RE.search(self.out)
         return (m.group(1), int(m.group(2))) if m else None

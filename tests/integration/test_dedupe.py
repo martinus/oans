@@ -36,7 +36,7 @@ class DedupeTest(DuperemoveTest):
         # not the 2 MiB fiemap "net change in shared extents".
         self.mkdup("tree/a", "tree/b", MiB)
         self.sync()
-        self.dm("-rd", self.path("tree"), quiet=False)  # -q hides the summary
+        self.dm("-rd", self.path("tree"), quiet=False)  # full Summary block
         self.assertDmOk()
         self.assertReclaimed("1.0 MiB", 1)
 

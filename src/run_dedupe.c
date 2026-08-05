@@ -131,12 +131,12 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 	else
 		kind = "extents";
 
+	if (quiet || res->num_dupes == 0)
+		return;
+
 	printf("Simple read and compare of file data found %u instances of "
 	       "%s that might benefit from deduplication.\n",
 	       res->num_dupes, kind);
-
-	if (quiet || res->num_dupes == 0)
-		return;
 
 	while (1) {
 		if (node == NULL)
@@ -1119,7 +1119,10 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	GError *err = NULL;
 
 	batch_complete_cb = on_complete;
-	report_net_shared = !isatty(STDOUT_FILENO) || quiet;
+	/* Kept in step with the print condition in dedupe_phase_end(): this
+	 * gates the fiemap work that produces net_shared, so reporting it
+	 * without computing it would print a hard 0. */
+	report_net_shared = !isatty(STDOUT_FILENO);
 	curr_dedupe_pass = 0;
 	total_dedupe_passes = 0;
 	inflight_count = 0;
@@ -1181,7 +1184,56 @@ void dedupe_phase_end(void)
 	pdedupe_end();
 	pdedupe_counters(&groups, &reclaimed, &net_shared);
 
-	/* Human summary: skipped by -q. */
+	/*
+	 * Name only the causes that actually occurred: three numbers where two
+	 * are usually 0 reads as noise and buries the one that matters. Built
+	 * before the quiet split because both forms of the summary report it -
+	 * "print only errors and a one-line summary" makes these the half of
+	 * -q's contract that must survive (#148).
+	 */
+	const struct {
+		uint64_t n;
+		const char *what;
+	} causes[] = {
+		{ dedupe_dest_changed, "changed since scan" },
+		{ dedupe_dest_differs, "content mismatch" },
+		{ dedupe_dest_errors,  "failed" },
+	};
+	uint64_t not_deduped = 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++)
+		not_deduped += causes[i].n;
+
+	/*
+	 * -q is the mode the shipped systemd unit runs, so it gets one honest
+	 * line: the same Reclaimed figure the full block reports, not the
+	 * fiemap net-change diagnostic (which counts the surviving copy too,
+	 * ~2x for pairs) that used to be the only thing -q printed.
+	 */
+	if (quiet) {
+		if (groups == 0)
+			printf("Nothing to deduplicate (%.1fs)\n",
+			       elapsed_seconds());
+		else
+			printf("Reclaimed %s across %lu group%s in %.1fs\n",
+			       human_size(reclaimed), groups,
+			       groups == 1 ? "" : "s", elapsed_seconds());
+
+		if (not_deduped) {
+			const char *sep = "";
+
+			printf("Not deduped: ");
+			for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++) {
+				if (!causes[i].n)
+					continue;
+				printf("%s%"PRIu64" %s", sep, causes[i].n,
+				       causes[i].what);
+				sep = ", ";
+			}
+			printf(" (rerun with -v for detail)\n");
+		}
+	}
+
 	if (!quiet) {
 		if (groups == 0) {
 			printf("%sNothing to deduplicate.%s\n", col_dim, col_reset);
@@ -1194,24 +1246,6 @@ void dedupe_phase_end(void)
 			printf("  %sElapsed%s        %.1fs\n",
 			       col_dim, col_reset, elapsed_seconds());
 		}
-		/*
-		 * Name only the causes that actually occurred: three numbers
-		 * where two are usually 0 reads as noise and buries the one
-		 * that matters.
-		 */
-		const struct {
-			uint64_t n;
-			const char *what;
-		} causes[] = {
-			{ dedupe_dest_changed, "changed since scan" },
-			{ dedupe_dest_differs, "content mismatch" },
-			{ dedupe_dest_errors,  "failed" },
-		};
-		uint64_t not_deduped = 0;
-
-		for (unsigned int i = 0; i < ARRAY_SIZE(causes); i++)
-			not_deduped += causes[i].n;
-
 		if (not_deduped) {
 			const char *sep = "";
 
@@ -1234,11 +1268,16 @@ void dedupe_phase_end(void)
 	}
 
 	/*
-	 * Stable, exact machine-readable line for scripts. Printed whenever the
-	 * output is not an interactive summary - i.e. piped/redirected, or under
-	 * -q (scripts commonly do `oans -qd ... | grep 'net change'`).
+	 * Stable, exact machine-readable line for scripts: printed whenever the
+	 * output is piped/redirected, which is what `oans -qd ... | grep 'net
+	 * change'` and a journal capture both are - so those keep working.
+	 *
+	 * No longer printed for -q on a terminal: there the honest Reclaimed
+	 * one-liner above is what a human wants, and this figure counts the
+	 * surviving copy too (#148). Must stay in step with report_net_shared,
+	 * which gates whether net_shared is computed at all.
 	 */
-	if (!isatty(STDOUT_FILENO) || quiet)
+	if (!isatty(STDOUT_FILENO))
 		printf("Comparison of extent info shows a net change in "
 		       "shared extents of: %s\n", pretty_size(net_shared));
 }
