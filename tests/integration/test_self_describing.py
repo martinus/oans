@@ -98,7 +98,10 @@ class SelfDescribingConfigTest(DuperemoveTest):
 
         shutil.rmtree(self.path("one"))     # one of two roots vanishes
         self.dm()
-        self.assertEqual(self.rc, 0)
+        # Exit 2 = "completed, but covered less than asked" (#146). Asserting
+        # the exact code rather than just non-zero keeps this a crash
+        # regression too: a double-free would show up as a signal, not as 2.
+        self.assertEqual(self.rc, 2)
         self.assertIn("no longer exists", self.out)
         # A replay does not rewrite the stored config, so the temporarily
         # missing root is kept and retried next time (e.g. an unmounted drive),

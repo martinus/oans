@@ -26,6 +26,13 @@ CacheDirectory=oans
 # to a short summary. Runs as root so it can read and re-extent the configured
 # tree wherever it lives.
 ExecStart=/usr/bin/oans --quiet --hashfile=/var/cache/oans/%i.hash
+# Exit 2 means the run completed but covered less than its stored config asked
+# for - typically a root that no longer exists because a drive is unmounted or
+# a share was renamed. It is deliberately NOT listed in SuccessExitStatus=, so
+# the unit fails and any OnFailure= you add fires. Add one to be told:
+#     OnFailure=status-email@%i.service
+# (Losing *every* stored root exits 1 and refuses to run, so the stat-based
+# prune can never empty the hashfile.)
 # Deduplication only ever rewrites extent sharing via the byte-verified
 # FIDEDUPERANGE ioctl, so an interrupted run is safe; allow a clean stop.
 TimeoutStopSec=30

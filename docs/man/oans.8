@@ -554,13 +554,40 @@ only what changed.
 See \f[CR]docs/nas\-quickstart.md\f[R] in the source tree for the full
 walkthrough.
 .SH EXIT STATUS
-\f[CR]oans\f[R] exits \f[B]0\f[R] on success.
-A non\-zero status indicates a fatal error, such as invalid options or a
-hashfile that could not be opened.
-Note that individual per\-file dedupe failures (e.g.\ a file that
-changed between scan and dedupe) are reported in the summary but do
-\f[B]not\f[R] by themselves change the exit status; check the \f[I]Not
-deduped\f[R] line, or run with \f[B]\-v\f[R], to detect them.
+.TP
+\f[B]0\f[R]
+Success.
+.TP
+\f[B]1\f[R]
+A fatal error: invalid options, a hashfile that could not be opened, or
+a replay in which \f[I]none\f[R] of the stored paths still exist
+(\f[CR]oans\f[R] refuses that rather than let the prune empty the
+hashfile).
+.TP
+\f[B]2\f[R]
+The run completed, but covered \f[B]less than it was asked to\f[R]: a
+path named on the command line could not be resolved or stat\(cqed, or a
+replayed configuration had lost one of its stored roots.
+Everything else was still scanned and deduplicated.
+Typical causes are a typo, an unmounted path, a renamed share, or a
+shell glob that was quoted by accident.
+.RS
+.PP
+This is the status an unattended job should alarm on \(em the run looks
+healthy otherwise, and would previously have exited \f[B]0\f[R].
+See \f[I]EXAMPLES\f[R] for an \f[CR]OnFailure=\f[R] setup.
+.RE
+.PP
+Skips the user asked for do \f[B]not\f[R] affect the exit status:
+\f[B]\-\-exclude\f[R] matches, files under \f[B]\-\-min\-filesize\f[R],
+non\-regular files, and read\-only subvolumes are all reported but are
+not failures.
+Neither are files met during the walk that could not be read \(em a
+large tree routinely holds a few \(em nor individual per\-file dedupe
+failures (e.g.\ a file that changed between scan and dedupe).
+Those are counted in the \f[I]Skipped\f[R] and \f[I]Not deduped\f[R]
+summary lines and exported by \f[B]\-\-json\f[R]; use those, or
+\f[B]\-v\f[R], to detect them.
 .SH ENVIRONMENT
 .TP
 \f[B]NO_COLOR\f[R]

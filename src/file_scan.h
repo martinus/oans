@@ -47,6 +47,15 @@ void fs_get_locked_uuid(uuid_t *uuid);
 bool filescan_seed_failed(void);
 
 /*
+ * How many scan roots named on the command line (or in a "-" stdin list) could
+ * not be resolved or stat()ed (#146). A typo, an unmounted path, a renamed
+ * share or an accidentally-quoted glob all land here, and each means the run
+ * covered less than it was asked to - so the caller reports it in the exit
+ * status instead of exiting 0. Config-driven skips are deliberately excluded.
+ */
+unsigned int filescan_roots_unusable(void);
+
+/*
  * Scan-phase skip accounting (#145).
  *
  * Every "I skipped this" path in the walk used to write a line to stderr and be

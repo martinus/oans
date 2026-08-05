@@ -101,6 +101,28 @@ oans --history --hashfile=/var/cache/oans/media.hash    # reclaimed over time
 oans --json    --hashfile=/var/cache/oans/media.hash    # metrics for a dashboard
 ```
 
+**Get told when a run covers less than you asked for.** oans exits **2** when
+it completed but could not use one of its stored roots — an unmounted drive, a
+renamed share, a deleted directory. The run still deduplicates everything else
+and otherwise looks perfectly healthy, so this is the case worth alarming on:
+
+```sh
+systemctl is-failed oans@media.service     # 'failed' after an exit-2 run
+journalctl -u oans@media.service | grep -i 'no longer exists'
+```
+
+`oans@.service` deliberately does not whitelist 2 in `SuccessExitStatus=`, so
+the unit fails and an `OnFailure=` of your own fires:
+
+```sh
+sudo systemctl edit oans@media.service     # add: [Unit] / OnFailure=...
+```
+
+Exit **1** means it refused to run at all — usually because *every* stored path
+is gone, which oans treats as "the drive is not mounted" rather than "delete
+every hash". Skips you configured (`--exclude`, `--min-filesize`, snapshots)
+never change the exit status; they are reported in the summary and in `--json`.
+
 For **live** progress of a run in flight — to feed a dashboard or a health
 check rather than watch the terminal — run it with `--progress=json`. oans then
 streams one JSON object per phase (about once a second) to **stderr**, ending
