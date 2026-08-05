@@ -63,8 +63,9 @@ skipped, so repeated runs over a mostly-stable tree are cheap. A summary of the
 space reclaimed is printed at the end (see *OUTPUT*).
 
 **Report and maintenance modes.**
-**\--stats**, **\--history**, **\--json**, **-L**, and **-R** each inspect or
-maintain a hashfile and then exit without scanning for dupes. All but **-R**
+**\--stats**, **\--history**, **\--json**, **-L**, **-R** and
+**\--prune-block-hashes** each inspect or maintain a hashfile and then exit
+without scanning for dupes. All but **-R** and **\--prune-block-hashes**
 open the hashfile **read-only**; see *NOTES* for running them alongside an
 active `oans`.
 
@@ -254,6 +255,25 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 **-L**
   ~ List every file tracked in the hashfile and exit; **-v** adds per-file
     detail. Requires **\--hashfile**.
+
+**\--prune-block-hashes**
+
+  ~ Delete every stored **block** hash from the hashfile, compact it, and exit.
+    Requires **\--hashfile**.
+
+    Block hashes exist only to serve **\--dedupe-options=partial**, which is
+    off by default — an ordinary scan stores none, whatever **-b** is set to.
+    But once written they are removed only when a file is *re-hashed*, and the
+    point of a hashfile is that unchanged files are not re-hashed. A hashfile
+    that ran **partial** once therefore keeps them indefinitely on a stable
+    tree, where they are typically the bulk of the file: a fully-mapped 1 TiB
+    at **-b 4K** stores roughly 8 GiB of block digests.
+
+    **\--stats** flags them when the stored scan configuration no longer uses
+    partial matching. Pruning is explicit rather than automatic because a later
+    **\--dedupe-options=partial** run must re-hash the tree to rebuild them.
+
+<!-- -->
 
 **-R** *file*...
   ~ Remove the named paths from the hashfile and exit; a single **-** reads the

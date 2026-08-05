@@ -233,6 +233,19 @@ uint64_t dbfile_query_u64(sqlite3 *db, const char *sql);
 /* VACUUM the hashfile, but only when enough of it is free to be worth it. */
 void dbfile_maybe_vacuum(struct dbhandle *db);
 
+/*
+ * Drop every row from the blocks table. Block hashes exist only to serve
+ * --dedupe-options=partial; a hashfile that has stopped using it carries them
+ * as dead weight, and they are only reclaimed incidentally, when a file
+ * happens to be re-hashed (#160).
+ *
+ * Returns the number of rows deleted, or -1 on error.
+ */
+int64_t dbfile_drop_block_hashes(struct dbhandle *db);
+
+/* Unconditional VACUUM, for a maintenance action that just freed a lot. */
+int dbfile_vacuum(struct dbhandle *db);
+
 struct hash_tree;
 
 /*

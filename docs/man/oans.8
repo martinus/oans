@@ -80,11 +80,12 @@ A summary of the space reclaimed is printed at the end (see
 \f[I]OUTPUT\f[R]).
 .PP
 \f[B]Report and maintenance modes.\f[R] \f[B]\-\-stats\f[R],
-\f[B]\-\-history\f[R], \f[B]\-\-json\f[R], \f[B]\-L\f[R], and
-\f[B]\-R\f[R] each inspect or maintain a hashfile and then exit without
-scanning for dupes.
-All but \f[B]\-R\f[R] open the hashfile \f[B]read\-only\f[R]; see
-\f[I]NOTES\f[R] for running them alongside an active \f[CR]oans\f[R].
+\f[B]\-\-history\f[R], \f[B]\-\-json\f[R], \f[B]\-L\f[R], \f[B]\-R\f[R]
+and \f[B]\-\-prune\-block\-hashes\f[R] each inspect or maintain a
+hashfile and then exit without scanning for dupes.
+All but \f[B]\-R\f[R] and \f[B]\-\-prune\-block\-hashes\f[R] open the
+hashfile \f[B]read\-only\f[R]; see \f[I]NOTES\f[R] for running them
+alongside an active \f[CR]oans\f[R].
 .SH OPTIONS
 The non\-option arguments are the \f[I]files\f[R] and
 \f[I]directories\f[R] to scan, or a single hyphen (\f[B]\-\f[R]) to read
@@ -308,6 +309,30 @@ here.
 List every file tracked in the hashfile and exit; \f[B]\-v\f[R] adds
 per\-file detail.
 Requires \f[B]\-\-hashfile\f[R].
+.TP
+\f[B]\-\-prune\-block\-hashes\f[R]
+Delete every stored \f[B]block\f[R] hash from the hashfile, compact it,
+and exit.
+Requires \f[B]\-\-hashfile\f[R].
+.RS
+.PP
+Block hashes exist only to serve \f[B]\-\-dedupe\-options=partial\f[R],
+which is off by default \(em an ordinary scan stores none, whatever
+\f[B]\-b\f[R] is set to.
+But once written they are removed only when a file is
+\f[I]re\-hashed\f[R], and the point of a hashfile is that unchanged
+files are not re\-hashed.
+A hashfile that ran \f[B]partial\f[R] once therefore keeps them
+indefinitely on a stable tree, where they are typically the bulk of the
+file: a fully\-mapped 1 TiB at \f[B]\-b 4K\f[R] stores roughly 8 GiB of
+block digests.
+.PP
+\f[B]\-\-stats\f[R] flags them when the stored scan configuration no
+longer uses partial matching.
+Pruning is explicit rather than automatic because a later
+\f[B]\-\-dedupe\-options=partial\f[R] run must re\-hash the tree to
+rebuild them.
+.RE
 .TP
 \f[B]\-R\f[R] \f[I]file\f[R]\&...
 Remove the named paths from the hashfile and exit; a single \f[B]\-\f[R]

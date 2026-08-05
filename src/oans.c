@@ -56,6 +56,7 @@ static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
+static unsigned int prune_blocks_opt = 0;
 static unsigned int history_only_opt = 0;
 static unsigned int json_only_opt = 0;
 static int opt_no_color = 0;
@@ -327,7 +328,25 @@ static int print_hashfile_stats(char *filename)
 		printf("  %sunread%s          %"PRIu64"   %s(unique size, whole-file mode)%s\n",
 		       col_dim, col_reset, unhashed, col_dim, col_reset);
 	printf("  %sextent hashes%s   %"PRIu64"\n", col_dim, col_reset, st.num_e_hashes);
-	printf("  %sblock hashes%s    %"PRIu64"\n", col_dim, col_reset, st.num_b_hashes);
+	printf("  %sblock hashes%s    %"PRIu64, col_dim, col_reset, st.num_b_hashes);
+	/*
+	 * Block hashes only serve --dedupe-options=partial. If the stored scan
+	 * config no longer uses it they are dead weight that no future run will
+	 * read, and nothing reclaims them: they are dropped per file only when a
+	 * file is re-hashed, which on a stable tree never happens (#160). Say so
+	 * here, where the user is already looking at what the hashfile costs.
+	 */
+	if (st.num_b_hashes) {
+		struct scan_config sc = {0};
+
+		/* >0 means a config was loaded; 0 means none is stored. */
+		if (dbfile_load_scan_config(db, &sc) > 0 && !sc.do_block_hash)
+			printf("   %s(unused by the stored config; "
+			       "--prune-block-hashes reclaims them)%s",
+			       col_yellow, col_reset);
+		scan_config_free(&sc);
+	}
+	printf("\n");
 	printf("  %slogical data%s    %s\n", col_dim, col_reset, human_size(logical));
 	printf("  %sfile sizes%s      avg %s", col_dim, col_reset,
 	       human_size(files ? logical / files : 0));
@@ -511,6 +530,83 @@ static int print_metrics_json(char *filename)
 	return 0;
 }
 
+/*
+ * --prune-block-hashes: drop the blocks table and compact (#160).
+ *
+ * Block hashes serve only --dedupe-options=partial. They are removed per file
+ * by dbfile_remove_hashes() when a file is re-hashed, but a hashfile's whole
+ * point is that unchanged files are *not* re-hashed - so on a stable tree, a
+ * user who ran partial once carries those rows forever, and they can be the
+ * bulk of the file (a fully-mapped 1 TiB at -b 4K stores ~8 GiB of digests).
+ *
+ * Explicit rather than automatic: dropping them silently on any non-partial run
+ * would make the next partial run re-hash the whole tree, which is exactly the
+ * kind of invisible cost the hashfile exists to avoid.
+ */
+static int prune_block_hashes(char *filename)
+{
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+	struct stat sb;
+	uint64_t before_bytes = 0, after_bytes = 0;
+	int64_t dropped;
+
+	db = dbfile_open_handle(filename);
+	if (!db) {
+		eprintf("Error: Could not open \"%s\"\n", filename);
+		return -1;
+	}
+
+	/* longpath-ok: the hashfile, named by the user, never scanned. */
+	if (stat(filename, &sb) == 0)
+		before_bytes = sb.st_size;
+
+	dropped = dbfile_drop_block_hashes(db);
+	if (dropped < 0)
+		return -1;
+
+	if (dropped == 0) {
+		printf("No block hashes stored; nothing to prune.\n");
+		return 0;
+	}
+
+	/*
+	 * Unconditional, unlike the scan path's dbfile_maybe_vacuum(): we just
+	 * freed the pages the user asked us to reclaim, so deferring compaction
+	 * behind a 25%-free threshold would report a saving that has not
+	 * happened yet.
+	 */
+	printf("Dropped %"PRId64" block hash%s; compacting ... ", dropped,
+	       dropped == 1 ? "" : "es");
+	fflush(stdout);
+	if (dbfile_vacuum(db)) {
+		printf("\n");
+		return -1;
+	}
+	printf("done\n");
+
+	/*
+	 * Close before measuring: in WAL mode VACUUM writes through the WAL and
+	 * the main database file does not shrink until the checkpoint that
+	 * closing performs. stat()ing here instead reports the pre-VACUUM size
+	 * and cheerfully claims "0 B freed" after reclaiming most of the file.
+	 */
+	dbfile_close_handle(db);
+	db = NULL;
+
+	/* longpath-ok: the hashfile, named by the user, never scanned. */
+	if (stat(filename, &sb) == 0)
+		after_bytes = sb.st_size;
+
+	if (before_bytes && after_bytes && after_bytes <= before_bytes)
+		printf("Hashfile %s -> %s (%s freed)\n",
+		       human_size(before_bytes), human_size(after_bytes),
+		       human_size(before_bytes - after_bytes));
+
+	printf("Note: a later --dedupe-options=partial run will re-hash the "
+	       "tree to rebuild them.\n");
+	return 0;
+}
+
 static int list_db_files(char *filename)
 {
 	int ret;
@@ -658,6 +754,7 @@ enum {
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
 	STATS_OPTION,
+	PRUNE_BLOCKS_OPTION,
 	HISTORY_OPTION,
 	JSON_OPTION,
 	PROGRESS_OPTION,
@@ -739,6 +836,8 @@ static void help(void)
 "      --json                  print hashfile metrics as JSON\n"
 "  -L                          list files tracked in the hashfile\n"
 "  -R <file>...                remove the named paths from the hashfile\n"
+"      --prune-block-hashes    drop stored block hashes and compact the\n"
+"                              hashfile (only used by --dedupe-options=partial)\n"
 "\n"
 "Other:\n"
 "  -q, --quiet                 print only errors and a one-line summary\n"
@@ -780,6 +879,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
 		{ "stats", 0, NULL, STATS_OPTION },
+		{ "prune-block-hashes", 0, NULL, PRUNE_BLOCKS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
 		{ "json", 0, NULL, JSON_OPTION },
 		{ "progress", 1, NULL, PROGRESS_OPTION },
@@ -859,6 +959,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case 'R':
 			rm_only_opt = 1;
+			break;
+		case PRUNE_BLOCKS_OPTION:
+			prune_blocks_opt = 1;
 			break;
 		case STATS_OPTION:
 			stats_only_opt = 1;
@@ -947,25 +1050,28 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 
 	/* -L/-R/--stats/--history/--json are mutually exclusive report modes. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
-				  + history_only_opt + json_only_opt;
+				  + history_only_opt + json_only_opt
+				  + prune_blocks_opt;
 	/* Every report mode but -R takes no file list. */
 	bool nofile_report = report_count && !rm_only_opt;
 
 	if (report_count > 1) {
 		eprintf("Error: use only one of '-L', '-R', '--stats', "
-			"'--history', '--json'.\n");
+			"'--history', '--json', '--prune-block-hashes'.\n");
 		return 1;
 	}
 
 	if (report_count) {
 		if (!options.hashfile) {
 			eprintf("Error: --hashfile= option is required with "
-				"'-L', '-R', '--stats', '--history' or '--json'.\n");
+				"'-L', '-R', '--stats', '--history', '--json' "
+				"or '--prune-block-hashes'.\n");
 			return 1;
 		}
 		if (nofile_report && numfiles) {
-			eprintf("Error: -L/--stats/--history/--json do not take "
-				"a file list argument\n");
+			eprintf("Error: -L/--stats/--history/--json/"
+				"--prune-block-hashes do not take a file list "
+				"argument\n");
 			return 1;
 		}
 	}
@@ -1694,6 +1800,8 @@ int main(int argc, char **argv)
 		return print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
 		return print_metrics_json(options.hashfile);
+	else if (prune_blocks_opt)
+		return prune_block_hashes(options.hashfile);
 
 	db = dbfile_open_handle(options.hashfile);
 	if (!db)
