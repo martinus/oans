@@ -290,6 +290,19 @@ a node_exporter textfile).
 \f[CR]reclaimable_logical_bytes\f[R] is a logical upper bound; real disk
 freed is smaller on a compressed filesystem.
 Requires \f[B]\-\-hashfile\f[R].
+.RS
+.PP
+\f[CR]scan_skipped_last_run\f[R] reports what the most recent scan could
+\f[B]not\f[R] read, bucketed by cause (\f[CR]permission\f[R],
+\f[CR]unreadable\f[R], \f[CR]path_too_long\f[R],
+\f[CR]unsupported_fs\f[R]), and \f[CR]scan_skipped_errors_total\f[R] is
+the lifetime sum.
+Alarm on the former: a lifetime total only grows, so it cannot tell last
+night\(cqs lost subtree from one lost months ago.
+Skips the user asked for (\f[B]\-\-exclude\f[R],
+\f[B]\-\-min\-filesize\f[R]) are deliberately \f[I]not\f[R] counted
+here.
+.RE
 .TP
 \f[B]\-L\f[R]
 List every file tracked in the hashfile and exit; \f[B]\-v\f[R] adds

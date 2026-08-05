@@ -416,18 +416,30 @@ static int print_hashfile_history(char *filename)
 	printf("\n  %srecent%s   %sdate · reclaimed · elapsed · files · mode%s\n",
 	       col_dim, col_reset, col_dim, col_reset);
 	if (sqlite3_prepare_v2(db->db,
-		"select ts, reclaimed, duration_ms, files_scanned, deduped "
+		"select ts, reclaimed, duration_ms, files_scanned, deduped, "
+		"skip_permission + skip_unreadable + skip_path_too_long "
+		"+ skip_unsupported_fs "
 		"from run_history order by ts desc limit 20", -1, &stmt, NULL) == SQLITE_OK) {
 		while (sqlite3_step(stmt) == SQLITE_ROW) {
 			char when[32];
+			int64_t skipped = sqlite3_column_int64(stmt, 5);
 
 			fmt_localtime(sqlite3_column_int64(stmt, 0), "%Y-%m-%d %H:%M",
 				      when, sizeof(when));
-			printf("    %s  %10s  %7.1fs  %9"PRIu64"  %s\n", when,
+			printf("    %s  %10s  %7.1fs  %9"PRIu64"  %s", when,
 			       human_size(sqlite3_column_int64(stmt, 1)),
 			       sqlite3_column_int64(stmt, 2) / 1000.0,
 			       (uint64_t)sqlite3_column_int64(stmt, 3),
 			       sqlite3_column_int(stmt, 4) ? "dedupe" : "scan");
+			/*
+			 * A degraded run must be visible in the timeline, not
+			 * only in --json: "0 B reclaimed" looks identical to a
+			 * healthy run on a clean tree (#145).
+			 */
+			if (skipped)
+				printf("  %s(%"PRId64" skipped)%s",
+				       col_yellow, skipped, col_reset);
+			printf("\n");
 		}
 	}
 	return 0;
@@ -472,6 +484,18 @@ static int print_metrics_json(char *filename)
 	printf("  \"reclaimable_logical_bytes\": %"PRIu64",\n", reclaimable);
 	printf("  \"runs\": %"PRIu64",\n", sum.runs);
 	printf("  \"reclaimed_total_bytes\": %"PRIu64",\n", sum.total_reclaimed);
+	/*
+	 * Split so a dashboard can alarm on the latest run rather than on a
+	 * lifetime total, which only ever grows and so cannot distinguish "last
+	 * night lost a subtree" from "one run did, months ago" (#145).
+	 */
+	printf("  \"scan_skipped_last_run\": {\n");
+	printf("    \"permission\": %"PRIu64",\n", sum.last_skip_permission);
+	printf("    \"unreadable\": %"PRIu64",\n", sum.last_skip_unreadable);
+	printf("    \"path_too_long\": %"PRIu64",\n", sum.last_skip_path_too_long);
+	printf("    \"unsupported_fs\": %"PRIu64"\n", sum.last_skip_unsupported_fs);
+	printf("  },\n");
+	printf("  \"scan_skipped_errors_total\": %"PRIu64",\n", sum.total_skip_errors);
 	printf("  \"last_run_ts\": %"PRId64"\n", sum.last_ts);
 	printf("}\n");
 	return 0;
@@ -1281,8 +1305,55 @@ static void report_scan_stats(void)
 	}
 }
 
+/*
+ * Report the walk's skip counters (#145).
+ *
+ * Printed even under -q: quiet's contract is "errors and a one-line summary",
+ * and an unattended run that lost a whole subtree to a permissions change is
+ * exactly the error a journal must carry. The config-driven buckets are
+ * verbose-only - they are the user's own --exclude and --min-filesize doing
+ * their job, and 812 of them read as alarming next to the one that matters.
+ */
+static void report_scan_skips(const uint64_t *skips)
+{
+	const char *sep = "";
+	uint64_t errors = 0;
+	unsigned int i;
+
+	for (i = 0; i < SCAN_SKIP__COUNT; i++)
+		if (scan_skip_is_error(i))
+			errors += skips[i];
+
+	if (errors) {
+		printf("  %sSkipped%s        ", col_dim, col_reset);
+		for (i = 0; i < SCAN_SKIP__COUNT; i++) {
+			if (!skips[i] || !scan_skip_is_error(i))
+				continue;
+			printf("%s%"PRIu64" %s", sep, skips[i],
+			       scan_skip_desc(i));
+			sep = ", ";
+		}
+		printf(" %s(rerun with -v for detail)%s\n", col_dim, col_reset);
+	}
+
+	if (!verbose)
+		return;
+
+	sep = "";
+	for (i = 0; i < SCAN_SKIP__COUNT; i++) {
+		if (!skips[i] || scan_skip_is_error(i))
+			continue;
+		if (!*sep)
+			printf("  %sNot scanned%s    ", col_dim, col_reset);
+		printf("%s%"PRIu64" %s", sep, skips[i], scan_skip_desc(i));
+		sep = ", ";
+	}
+	if (*sep)
+		printf("\n");
+}
+
 static int scan_files(char **roots, int nroots, struct dbhandle *db,
-		      uint64_t *files_scanned)
+		      uint64_t *files_scanned, uint64_t *skips)
 {
 	int ret;
 	/* Run the progress thread whenever there's an output to feed - the live
@@ -1345,6 +1416,13 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	 */
 	if (files_scanned)
 		*files_scanned = pscan_files_scanned();
+
+	/*
+	 * Same latch point, same reason (#145): read the walk's skip counters
+	 * here, while the scan still owns them.
+	 */
+	if (skips)
+		filescan_get_skips(skips);
 
 	report_scan_stats();
 
@@ -1528,6 +1606,7 @@ int main(int argc, char **argv)
 	char **roots;
 	bool replaying = false;
 	uint64_t files_scanned = 0;
+	uint64_t scan_skips[SCAN_SKIP__COUNT] = {0};
 	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
@@ -1641,9 +1720,11 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	ret = scan_files(roots, numfiles, db, &files_scanned);
+	ret = scan_files(roots, numfiles, db, &files_scanned, scan_skips);
 	if (ret)
 		goto out;
+
+	report_scan_skips(scan_skips);
 
 	/* Remember this run so a later bare `oans --hashfile=X` replays it. */
 	if (!replaying && !stdin_filelist && options.hashfile)
@@ -1674,6 +1755,10 @@ int main(int argc, char **argv)
 				.reclaimed = reclaimed,
 				.groups = groups,
 				.deduped = options.run_dedupe,
+				.skip_permission = scan_skips[SCAN_SKIP_PERMISSION],
+				.skip_unreadable = scan_skips[SCAN_SKIP_UNREADABLE],
+				.skip_path_too_long = scan_skips[SCAN_SKIP_PATH_TOO_LONG],
+				.skip_unsupported_fs = scan_skips[SCAN_SKIP_UNSUPPORTED_FS],
 			};
 			dbfile_record_run(db, &rec);
 		}

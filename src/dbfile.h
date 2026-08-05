@@ -180,6 +180,18 @@ struct run_record {
 	uint64_t	reclaimed;	/* bytes: space reclaimed (kernel-deduped) */
 	uint64_t	groups;
 	int		deduped;	/* 1 if -d, 0 for a scan-only run */
+	/*
+	 * Scan-phase skips that indicate a problem (#145). Named rather than
+	 * indexed by enum scan_skip_bucket: file_scan.h already includes this
+	 * header, so the dependency cannot run the other way. The
+	 * config-driven buckets (excluded / too_small / not_regular) are a
+	 * property of the run's arguments, not of its health, and are reported
+	 * live rather than persisted.
+	 */
+	uint64_t	skip_permission;
+	uint64_t	skip_unreadable;
+	uint64_t	skip_path_too_long;
+	uint64_t	skip_unsupported_fs;
 };
 int dbfile_record_run(struct dbhandle *db, const struct run_record *r);
 
@@ -190,6 +202,13 @@ struct run_summary {
 	uint64_t	total_files;
 	int64_t		first_ts;
 	int64_t		last_ts;
+	/* Error-skip buckets of the most recent run, for alarming (#145). */
+	uint64_t	last_skip_permission;
+	uint64_t	last_skip_unreadable;
+	uint64_t	last_skip_path_too_long;
+	uint64_t	last_skip_unsupported_fs;
+	/* Lifetime sum of all four, so a total stays honest. */
+	uint64_t	total_skip_errors;
 };
 int dbfile_get_run_summary(struct dbhandle *db, struct run_summary *s);
 
