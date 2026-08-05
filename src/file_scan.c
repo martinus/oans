@@ -388,6 +388,34 @@ struct buffer {
  * extents_count and blocks_count are the size of the allocated arrays
  * extents_index and blocks_index are the index of the next free entries
  */
+/*
+ * Cap on the block digests held in memory for one file (#161).
+ *
+ * Block hashes are write-only while a file is being scanned: each is filled
+ * once, in file order, and then only serialized to the database. Holding all of
+ * them meant one 8 TiB file at -b 4K needed ~48 GiB of anonymous memory
+ * (2^31 blocks x 24 bytes) purely as a staging buffer, which is an OOM rather
+ * than a slowdown.
+ *
+ * So the array is a bounded ring: once it fills, the batch is flushed to the
+ * hashfile and reused. 64Ki entries is 1.5 MiB of struct block_csum, and even
+ * at the 4K minimum blocksize that is 256 MiB of file data per flush - rare
+ * enough that the extra lock acquisitions do not matter, while the memory is
+ * now flat in file size instead of linear.
+ *
+ * Only reached with --dedupe-options=partial; block hashing is off by default.
+ */
+#define BLOCK_BATCH_MAX		(64U * 1024)
+
+/*
+ * Test hook only: DUPEREMOVE_BLOCK_BATCH lowers the cap so the flush path is
+ * reachable without writing a multi-hundred-GB file. Read once, on the main
+ * thread in filescan_init(), before any worker exists - so the workers see a
+ * constant and need no synchronisation. Unset (the default) is unchanged
+ * behaviour.
+ */
+static unsigned int block_batch_max = BLOCK_BATCH_MAX;
+
 struct hashes {
 	unsigned int extents_count;
 	unsigned int extents_index;
@@ -396,6 +424,16 @@ struct hashes {
 	unsigned int blocks_count;
 	unsigned int blocks_index;
 	struct block_csum *blocks;
+	/*
+	 * Batches already written to the hashfile. Only ever non-zero for a
+	 * file large enough to overflow BLOCK_BATCH_MAX, and used solely to
+	 * assert that an early flush and the inlined-file check cannot both
+	 * apply to the same file.
+	 */
+	uint64_t blocks_flushed;
+	/* Where an early flush writes to; NULL until csum_whole_file sets it. */
+	struct dbhandle *db;
+	int64_t fileid;
 };
 
 struct scan_ctxt {
@@ -476,6 +514,14 @@ static bool allocate_hashes(struct hashes *hashes, struct scan_ctxt *ctxt)
 	size_t max_blocks = ctxt->filesize / blocksize + 1;
 	if (mapped_blocks > max_blocks)
 		mapped_blocks = max_blocks;
+
+	/*
+	 * Never allocate beyond one batch: past that the array is recycled, so
+	 * a huge file no longer sizes its staging buffer from its own length
+	 * (#161).
+	 */
+	if (mapped_blocks > block_batch_max)
+		mapped_blocks = block_batch_max;
 
 	hashes->blocks_count = mapped_blocks + 1;
 	hashes->blocks = calloc(hashes->blocks_count, sizeof(struct block_csum));
@@ -1658,13 +1704,63 @@ static int ensure_hash_capacity(void **arr, unsigned int *count,
 	return 0;
 }
 
+/*
+ * Write the block digests gathered so far to the hashfile and reset the batch.
+ *
+ * Takes the write lock itself: unlike the end-of-file store this runs in the
+ * middle of the read+hash loop, with no lock held. Uses the same batched-writer
+ * bracket as everything else on the scan path, so the rows join the current
+ * transaction rather than forcing a commit of their own.
+ */
+static int flush_block_hashes(struct hashes *hashes)
+{
+	int ret;
+
+	if (!hashes->blocks_index)
+		return 0;
+
+	dbfile_lock();
+	ret = scan_write_begin();
+	if (ret) {
+		dbfile_unlock();
+		return ret;
+	}
+
+	ret = dbfile_store_block_hashes(hashes->db, hashes->fileid,
+					hashes->blocks_index, hashes->blocks);
+	if (ret)
+		scan_write_abort();
+	else
+		ret = scan_write_end();
+	dbfile_unlock();
+
+	if (ret)
+		return ret;
+
+	hashes->blocks_flushed += hashes->blocks_index;
+	hashes->blocks_index = 0;
+	return 0;
+}
+
 static int add_block_hash(struct hashes *hashes,
 			  uint64_t loff, unsigned char *digest)
 {
-	int ret = ensure_hash_capacity((void **)&hashes->blocks,
-				       &hashes->blocks_count,
-				       hashes->blocks_index,
-				       sizeof(struct block_csum));
+	int ret;
+
+	/*
+	 * Full batch: drain it before adding, so the array never grows past
+	 * BLOCK_BATCH_MAX no matter how large the file is (#161).
+	 */
+	if (hashes->blocks_index >= block_batch_max) {
+		ret = flush_block_hashes(hashes);
+		if (ret)
+			return ret;
+	}
+
+	ret = ensure_hash_capacity((void **)&hashes->blocks,
+				   &hashes->blocks_count,
+				   hashes->blocks_index,
+				   sizeof(struct block_csum));
 	if (ret)
 		return ret;
 
@@ -2194,6 +2290,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	/* Prevent close on fd 0 if, somehow, an error occurs before we open */
 	ctxt.fd = -1;
 
+	/* Where an over-full block batch drains to, mid-file (#161). */
+	hashes.db = db;
+	hashes.fileid = file->fileid;
+
 	uint64_t t_start = mono_ns(), t_hash = 0, t_done = 0;	/* calibration */
 
 	if (!(buffer->buf)) {
@@ -2377,7 +2477,16 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		return;
 	}
 
-	/* Do not store the blocks if the file is inlined */
+	/*
+	 * Do not store the blocks if the file is inlined.
+	 *
+	 * An inlined extent is at most a page, so such a file can never have
+	 * reached block_batch_max and flushed early - if it had, this check
+	 * would be skipping only the tail while earlier batches were already
+	 * committed. Assert the invariant rather than trust the arithmetic.
+	 */
+	abort_on(inlined && hashes.blocks_flushed != 0);
+
 	if (hashes.blocks_index != 0 && !inlined) {
 		ret = dbfile_store_block_hashes(db, file->fileid,
 						hashes.blocks_index, hashes.blocks);
@@ -2703,6 +2812,15 @@ void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
 
 void filescan_init(void)
 {
+	const char *batch_env = getenv("DUPEREMOVE_BLOCK_BATCH");
+
+	if (batch_env) {
+		unsigned long v = strtoul(batch_env, NULL, 10);
+
+		if (v > 0 && v <= BLOCK_BATCH_MAX)
+			block_batch_max = (unsigned int)v;
+	}
+
 	abort_on(scan_workq.workers);
 	abort_on(scan_writer_open());
 	seen_inodes_init();
