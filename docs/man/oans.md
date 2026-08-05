@@ -256,8 +256,21 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 ## Output and information
 
 **-q**, **\--quiet**
+
   ~ Quiet: print only errors and a one-line dedupe summary. Suppresses the live
-    progress display and the human summary block.
+    progress display, the multi-line summary block, and the per-pass "Simple
+    read and compare" report headers.
+
+    The one line is the same **Reclaimed** figure the full summary reports --
+    the honest bytes freed -- followed by a **Not deduped:** line if any group
+    could not be deduplicated. This is the recommended mode for a scheduled
+    job: see *systemd/oans@.service*.
+
+    When output is piped or redirected, the machine-readable
+    "net change in shared extents" line is still printed as well. That figure
+    is a **fiemap** diagnostic which counts the surviving copy too, so it runs
+    roughly twice **Reclaimed** for a pair of duplicates; prefer
+    **Reclaimed**, or **\--json**, for reporting.
 
 **-v**
   ~ Verbose: restore the per-group dedupe listing that is hidden by default in
