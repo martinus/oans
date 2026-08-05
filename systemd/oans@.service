@@ -8,6 +8,10 @@
 #
 # Example: `systemctl start oans@media` deduplicates using
 # /var/cache/oans/media.hash.
+#
+# That first run must include -d: this unit replays what it recorded, so a
+# hashfile seeded by a read-only preview yields a job that hashes every week and
+# never deduplicates. oans warns on such a replay and prints the fix.
 
 [Unit]
 Description=oans deduplication (%i)

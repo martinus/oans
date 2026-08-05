@@ -58,6 +58,13 @@ sudo install -d -m 0755 /var/cache/oans
 sudo oans -dr --hashfile=/var/cache/oans/media.hash /srv/media
 ```
 
+> **The `-d` here is load-bearing.** Every later scheduled run replays this
+> one, so if you seed the hashfile with a preview run (no `-d`), the timer
+> inherits it and will hash forever without ever deduplicating — exiting 0 and
+> reporting `0 B` reclaimed each time, which looks exactly like a healthy job on
+> an already-deduped tree. A replay in that state warns and prints the command
+> to fix it; `oans --json` reports `"scan_configured_dedupe": false`.
+
 This is the expensive pass: it hashes everything and deduplicates. It
 
 - records the options and paths, so later runs need no arguments,

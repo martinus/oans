@@ -39,6 +39,11 @@ sudo install -d -m 0755 /var/cache/oans
 sudo oans -dr --hashfile=/var/cache/oans/media.hash /srv/media
 ```
 
+**Include `-d` in this run.** The timer replays whatever this one recorded, so
+seeding with a read-only preview gives you a job that hashes weekly and never
+deduplicates — exit 0, `0 B` reclaimed, indistinguishable from a healthy run.
+A replay in that state warns and prints the command that fixes it.
+
 Then enable the timer for that job:
 
 ```sh
