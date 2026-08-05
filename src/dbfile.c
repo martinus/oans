@@ -358,8 +358,35 @@ static int create_tables(sqlite3 *db)
 "ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, "			\
 "files_scanned INTEGER NOT NULL, reclaimed INTEGER NOT NULL, "		\
 "groups INTEGER NOT NULL, kernel_bytes INTEGER NOT NULL, "		\
-"deduped INTEGER NOT NULL);"
+"deduped INTEGER NOT NULL, "						\
+"skip_permission INTEGER NOT NULL DEFAULT 0, "				\
+"skip_unreadable INTEGER NOT NULL DEFAULT 0, "				\
+"skip_path_too_long INTEGER NOT NULL DEFAULT 0, "			\
+"skip_unsupported_fs INTEGER NOT NULL DEFAULT 0);"
 	ret = sqlite3_exec(db, CREATE_TABLE_RUN_HISTORY, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	/*
+	 * Bring a run_history created before the skip columns existed (#145) up
+	 * to date. Purely additive, so per CLAUDE.md this must NOT bump
+	 * DB_FILE_MINOR: a bump would discard every existing hashfile and force
+	 * a full re-scan for what is only a reporting change, and an older
+	 * binary simply never selects these columns.
+	 *
+	 * "duplicate column name" is the expected steady state - every open
+	 * after the first hits it - so the error is discarded rather than
+	 * probed for with a PRAGMA table_info round-trip.
+	 */
+	static const char * const run_history_adds[] = {
+		"ALTER TABLE run_history ADD COLUMN skip_permission INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE run_history ADD COLUMN skip_unreadable INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE run_history ADD COLUMN skip_path_too_long INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE run_history ADD COLUMN skip_unsupported_fs INTEGER NOT NULL DEFAULT 0",
+	};
+	for (unsigned int i = 0; i < ARRAY_SIZE(run_history_adds); i++)
+		sqlite3_exec(db, run_history_adds[i], NULL, NULL, NULL);
+	ret = SQLITE_OK;
 
 out:
 	if (ret)
@@ -1294,8 +1321,10 @@ int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
 
 	ret = sqlite3_prepare_v2(dbh->db,
 		"insert into run_history(ts, duration_ms, files_scanned, "
-		"reclaimed, groups, kernel_bytes, deduped) "
-		"values (?1, ?2, ?3, ?4, ?5, ?6, ?7)", -1, &stmt, NULL);
+		"reclaimed, groups, kernel_bytes, deduped, skip_permission, "
+		"skip_unreadable, skip_path_too_long, skip_unsupported_fs) "
+		"values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+		-1, &stmt, NULL);
 	if (ret)
 		goto out;
 
@@ -1307,6 +1336,10 @@ int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
 	/* Legacy NOT NULL column, no longer read; mirror reclaimed to satisfy it. */
 	sqlite3_bind_int64(stmt, 6, r->reclaimed);
 	sqlite3_bind_int64(stmt, 7, r->deduped);
+	sqlite3_bind_int64(stmt, 8, r->skip_permission);
+	sqlite3_bind_int64(stmt, 9, r->skip_unreadable);
+	sqlite3_bind_int64(stmt, 10, r->skip_path_too_long);
+	sqlite3_bind_int64(stmt, 11, r->skip_unsupported_fs);
 
 	if (sqlite3_step(stmt) != SQLITE_DONE)
 		ret = -1;
@@ -1325,7 +1358,9 @@ int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
 	ret = sqlite3_prepare_v2(dbh->db,
 		"select count(*), ifnull(sum(reclaimed),0), "
 		"ifnull(sum(files_scanned),0), ifnull(min(ts),0), "
-		"ifnull(max(ts),0) from run_history", -1, &stmt, NULL);
+		"ifnull(max(ts),0), ifnull(sum(skip_permission "
+		"+ skip_unreadable + skip_path_too_long "
+		"+ skip_unsupported_fs),0) from run_history", -1, &stmt, NULL);
 	if (ret) {
 		perror_sqlite(ret, "reading run summary");
 		return ret;
@@ -1336,6 +1371,29 @@ int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
 		s->total_files = sqlite3_column_int64(stmt, 2);
 		s->first_ts = sqlite3_column_int64(stmt, 3);
 		s->last_ts = sqlite3_column_int64(stmt, 4);
+		s->total_skip_errors = sqlite3_column_int64(stmt, 5);
+	}
+
+	/*
+	 * The most recent run's buckets, separately: a lifetime total only ever
+	 * grows, so it cannot tell "last night's run lost a subtree" from "one
+	 * run did, months ago". The alarm belongs on the latest row.
+	 */
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+	ret = sqlite3_prepare_v2(dbh->db,
+		"select skip_permission, skip_unreadable, skip_path_too_long, "
+		"skip_unsupported_fs from run_history order by ts desc limit 1",
+		-1, &stmt, NULL);
+	if (ret) {
+		perror_sqlite(ret, "reading last run skips");
+		return ret;
+	}
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		s->last_skip_permission = sqlite3_column_int64(stmt, 0);
+		s->last_skip_unreadable = sqlite3_column_int64(stmt, 1);
+		s->last_skip_path_too_long = sqlite3_column_int64(stmt, 2);
+		s->last_skip_unsupported_fs = sqlite3_column_int64(stmt, 3);
 	}
 	return 0;
 }

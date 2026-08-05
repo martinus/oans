@@ -46,6 +46,48 @@ void fs_get_locked_uuid(uuid_t *uuid);
  */
 bool filescan_seed_failed(void);
 
+/*
+ * Scan-phase skip accounting (#145).
+ *
+ * Every "I skipped this" path in the walk used to write a line to stderr and be
+ * forgotten: nothing counted them, so an unattended run that lost a whole
+ * subtree to a permissions change looked identical to a healthy one in --json,
+ * --history and the summary.
+ *
+ * Bucketed by cause, chosen so each maps to a distinct operator action. The
+ * first four are problems; the last three are the user's own configuration
+ * doing its job and must be reported apart from them, or "812 skipped" reads
+ * as alarming when 812 of them are --exclude hits.
+ */
+enum scan_skip_bucket {
+	SCAN_SKIP_PERMISSION = 0,	/* EACCES/EPERM from opendir/open/statx */
+	SCAN_SKIP_UNREADABLE,		/* any other errno on the same paths */
+	SCAN_SKIP_PATH_TOO_LONG,	/* over PATH_MAX, or a name over NAME_MAX */
+	SCAN_SKIP_UNSUPPORTED_FS,	/* not btrfs/XFS, or a foreign fs */
+	SCAN_SKIP_EXCLUDED,		/* --exclude matched */
+	SCAN_SKIP_TOO_SMALL,		/* below --min-filesize */
+	SCAN_SKIP_NOT_REGULAR,		/* neither a regular file nor a directory */
+	SCAN_SKIP__COUNT
+};
+
+/* True for the buckets that indicate a problem rather than a config choice. */
+bool scan_skip_is_error(enum scan_skip_bucket b);
+/* Stable snake_case key for --json and the run_history columns. */
+const char *scan_skip_key(enum scan_skip_bucket b);
+/* Human phrase for the summary line, e.g. "unreadable (permission denied)". */
+const char *scan_skip_desc(enum scan_skip_bucket b);
+
+void filescan_count_skip(enum scan_skip_bucket b);
+/* EACCES/EPERM land in PERMISSION, everything else in UNREADABLE. */
+void filescan_count_errno_skip(int err);
+
+/*
+ * Snapshot the counters. Like pscan_files_scanned(), this must be read while
+ * still inside scan_files(): the dedupe phase reuses the progress counters, and
+ * keeping the two reads in one place stops the same trap being re-learned.
+ */
+void filescan_get_skips(uint64_t out[SCAN_SKIP__COUNT]);
+
 /* For dbfile.c */
 struct block_csum {
 	uint64_t	loff;

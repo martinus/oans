@@ -236,12 +236,20 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     **\--hashfile**.
 
 **\--json**
+
   ~ Print the hashfile's current metrics as a flat JSON object — files, hashes,
     logical bytes, duplicate groups, reclaimable bytes, plus lifetime
     run-history totals — then exit. Intended for scripting and dashboards (pipe
     to `jq`, Telegraf, a node_exporter textfile). `reclaimable_logical_bytes` is
     a logical upper bound; real disk freed is smaller on a compressed
     filesystem. Requires **\--hashfile**.
+
+    `scan_skipped_last_run` reports what the most recent scan could **not**
+    read, bucketed by cause (`permission`, `unreadable`, `path_too_long`,
+    `unsupported_fs`), and `scan_skipped_errors_total` is the lifetime sum.
+    Alarm on the former: a lifetime total only grows, so it cannot tell last
+    night's lost subtree from one lost months ago. Skips the user asked for
+    (**\--exclude**, **\--min-filesize**) are deliberately *not* counted here.
 
 **-L**
   ~ List every file tracked in the hashfile and exit; **-v** adds per-file
