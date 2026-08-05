@@ -174,6 +174,58 @@ void filescan_get_eta_calibration(uint64_t *overhead_ns, uint64_t *hash_ns,
 	*bytes = atomic_load(&scan_hashed_bytes);
 }
 
+/*
+ * Scan-phase skip accounting (#145). Relaxed ordering is fine: the walkers only
+ * ever increment, and the totals are read once, after the walk has joined.
+ */
+static _Atomic uint64_t scan_skips[SCAN_SKIP__COUNT];
+
+static const struct {
+	const char *key;
+	const char *desc;
+	bool is_error;
+} skip_info[SCAN_SKIP__COUNT] = {
+	[SCAN_SKIP_PERMISSION]	  = { "permission",	"permission denied",	true  },
+	[SCAN_SKIP_UNREADABLE]	  = { "unreadable",	"unreadable",		true  },
+	[SCAN_SKIP_PATH_TOO_LONG] = { "path_too_long",	"path too long",	true  },
+	[SCAN_SKIP_UNSUPPORTED_FS]= { "unsupported_fs",	"unsupported filesystem", true },
+	[SCAN_SKIP_EXCLUDED]	  = { "excluded",	"excluded",		false },
+	[SCAN_SKIP_TOO_SMALL]	  = { "too_small",	"below --min-filesize",	false },
+	[SCAN_SKIP_NOT_REGULAR]	  = { "not_regular",	"not a regular file",	false },
+};
+
+bool scan_skip_is_error(enum scan_skip_bucket b)
+{
+	return skip_info[b].is_error;
+}
+
+const char *scan_skip_key(enum scan_skip_bucket b)
+{
+	return skip_info[b].key;
+}
+
+const char *scan_skip_desc(enum scan_skip_bucket b)
+{
+	return skip_info[b].desc;
+}
+
+void filescan_count_skip(enum scan_skip_bucket b)
+{
+	atomic_fetch_add_explicit(&scan_skips[b], 1, memory_order_relaxed);
+}
+
+void filescan_count_errno_skip(int err)
+{
+	filescan_count_skip((err == EACCES || err == EPERM)
+			    ? SCAN_SKIP_PERMISSION : SCAN_SKIP_UNREADABLE);
+}
+
+void filescan_get_skips(uint64_t out[SCAN_SKIP__COUNT])
+{
+	for (unsigned int i = 0; i < SCAN_SKIP__COUNT; i++)
+		out[i] = atomic_load_explicit(&scan_skips[i], memory_order_relaxed);
+}
+
 static void scan_workq_push(struct file_to_scan *file);
 static void scan_workq_start(unsigned int nworkers);
 static void scan_workq_drain(void);
@@ -630,12 +682,14 @@ static int probe_fs(char *path, struct fs_probe *probe)
 
 	if (fd == -1) {
 		eprintf("Cannot open %s: %s\n", path, strerror(errno));
+		filescan_count_errno_skip(errno);
 		return 1;
 	}
 
 	if (fstatfs(fd, &fs)) {
 		eprintf("Error %d: %s while checking fs type on %s\n",
 			errno, strerror(errno), path);
+		filescan_count_errno_skip(errno);
 		return 1;
 	}
 	probe->is_btrfs = fs.f_type == BTRFS_SUPER_MAGIC;
@@ -647,6 +701,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		if (ret) {
 			eprintf("%s: btrfs_get_fsuuid failed\n",
 				path);
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
 	} else {
@@ -673,6 +728,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		if (ret) {
 			eprintf("Failed to stat %s: %s\n",
 					path, strerror(errno));
+			filescan_count_errno_skip(errno);
 			return 1;
 		}
 
@@ -680,12 +736,14 @@ static int probe_fs(char *path, struct fs_probe *probe)
 			dprintf("%s lives on an unsupported filesystem, skipping. "
 				"Please fill a bug if you think this is a mistake.\n",
 					path);
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
 
 		tb = mnt_new_table_from_file("/proc/self/mountinfo");
 		if (!tb) {
 			perror("unable to read and parse /proc/self/mountinfo");
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
 
@@ -693,6 +751,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		if (!dev) {
 			eprintf("%s: unable to find the mount infos\n",
 					path);
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
 
@@ -701,6 +760,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 
 		if (!first_device) {
 			eprintf("Memory allocation failed\n");
+			filescan_count_skip(SCAN_SKIP_UNREADABLE);
 			return 1;
 		}
 
@@ -711,6 +771,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 					"device %s. Run blkid as root to "
 					"populate the cache.\n",
 					mnt_fs_get_source(dev));
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
 
@@ -740,17 +801,21 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	struct fs_probe probe = {0,};
 	dev_t dev;
 
-	if (is_excluded(path, S_ISDIR(st->stx_mode)))
+	if (is_excluded(path, S_ISDIR(st->stx_mode))) {
+		filescan_count_skip(SCAN_SKIP_EXCLUDED);
 		return false;
+	}
 
 	if (!S_ISREG(st->stx_mode) && !S_ISDIR(st->stx_mode)) {
 		vprintf("Skipping non-regular/non-directory file %s\n", path);
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
 		return false;
 	}
 
 	if (S_ISREG(st->stx_mode) && st->stx_size < options.min_filesize) {
 		vprintf("Skipping file below --min-filesize: %s (%llu < %"PRIu64")\n",
 			path, st->stx_size, options.min_filesize);
+		filescan_count_skip(SCAN_SKIP_TOO_SMALL);
 		return false;
 	}
 
@@ -793,6 +858,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		if (!probe.supported) {
 			eprintf("Skipping %s: its filesystem is not btrfs or XFS, "
 				"which oans needs to deduplicate.\n", path);
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return seed_reject(parent_checked);
 		}
 
@@ -818,6 +884,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 			eprintf(" will we are locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
 			eprintf(".\n");
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return seed_reject(parent_checked);
 		}
 
@@ -883,6 +950,7 @@ static int get_dirent_type(struct dirent *entry, int fd, const char *path)
 		eprintf("Error %d: %s while getting type of file %s/%s. "
 			"Skipping.\n",
 			errno, strerror(errno), path, entry->d_name);
+		filescan_count_errno_skip(errno);
 		return DT_UNKNOWN;
 	}
 
@@ -993,6 +1061,7 @@ static void process_dir(const char *path, struct dbhandle *db)
 	if (dirp == NULL) {
 		eprintf("Error %d: %s while opening directory %s\n",
 			errno, strerror(errno), path);
+		filescan_count_errno_skip(errno);
 		return;
 	}
 
@@ -1015,6 +1084,7 @@ static void process_dir(const char *path, struct dbhandle *db)
 	child = calloc(1, dirlen + 1 + NAME_MAX + 1);
 	if (child == NULL) {
 		eprintf("Out of memory while scanning directory %s\n", path);
+		filescan_count_skip(SCAN_SKIP_UNREADABLE);
 		return;
 	}
 
@@ -1029,9 +1099,11 @@ static void process_dir(const char *path, struct dbhandle *db)
 		errno = 0;
 		entry = readdir(dirp);
 		if (!entry) {
-			if (errno)
+			if (errno) {
 				eprintf("Error %d: %s while reading directory %s\n",
 					errno, strerror(errno), path);
+				filescan_count_errno_skip(errno);
+			}
 			break;
 		}
 
@@ -1042,8 +1114,20 @@ static void process_dir(const char *path, struct dbhandle *db)
 		entry->d_type = get_dirent_type(entry, dirfd(dirp), path);
 
 		if (entry->d_type != DT_REG &&
-		    !(options.recurse_dirs && entry->d_type == DT_DIR))
+		    !(options.recurse_dirs && entry->d_type == DT_DIR)) {
+			/*
+			 * Count only entries that are genuinely neither a file
+			 * nor a directory (symlinks, sockets, devices - see
+			 * #126). A directory passed over because --recurse was
+			 * not given is the user's own choice, not a skip worth
+			 * reporting, and DT_UNKNOWN was already counted by
+			 * get_dirent_type() as the errno that produced it.
+			 */
+			if (entry->d_type != DT_DIR &&
+			    entry->d_type != DT_UNKNOWN)
+				filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
 			continue;
+		}
 
 		/* A component is bounded by NAME_MAX; guard defensively so the
 		 * child buffer can never overflow. */
@@ -1051,6 +1135,7 @@ static void process_dir(const char *path, struct dbhandle *db)
 		if (namelen > NAME_MAX) {
 			eprintf("Skipping \"%s/%s\": name length %zu exceeds NAME_MAX (%d)\n",
 				path, entry->d_name, namelen, NAME_MAX);
+			filescan_count_skip(SCAN_SKIP_PATH_TOO_LONG);
 			continue;
 		}
 		/* memcpy, not strcpy: namelen is already known, so this avoids a
@@ -1065,6 +1150,7 @@ static void process_dir(const char *path, struct dbhandle *db)
 		if (statx(dirfd(dirp), entry->d_name, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
 			eprintf("Failed to stat %s: %s\n", child, strerror(errno));
+			filescan_count_errno_skip(errno);
 			continue;
 		}
 
@@ -1220,6 +1306,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		if (fd == -1) {
 			eprintf("Error %d: %s while opening file \"%s\". "
 				"Skipping.\n", errno, strerror(errno), path);
+			filescan_count_errno_skip(errno);
 			return 0;
 		}
 
@@ -1279,6 +1366,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	dbfile.size = st->stx_size;
 	if (file_set_filename(&dbfile, path)) {
 		eprintf("Out of memory storing \"%s\". Skipping.\n", path);
+		filescan_count_skip(SCAN_SKIP_UNREADABLE);
 		return 0;
 	}
 	dbfile.mtime = timestamp_to_nano(st->stx_mtime);
@@ -1384,11 +1472,13 @@ int scan_file(char *in_path, struct dbhandle *db)
 				"only the root itself is limited. Scan a shorter "
 				"ancestor, or bind-mount this directory somewhere "
 				"shorter.\n", in_path, PATH_MAX);
+			filescan_count_skip(SCAN_SKIP_PATH_TOO_LONG);
 			return 0;
 		}
 		eprintf("Error %d: %s while getting path to file %s. "
 			"Skipping.\n",
 			errno, strerror(errno), in_path);
+		filescan_count_errno_skip(errno);
 		return 0;
 	}
 
@@ -1398,6 +1488,7 @@ int scan_file(char *in_path, struct dbhandle *db)
 		eprintf("Error %d: %s while stating file %s. "
 			"Skipping.\n",
 			errno, strerror(errno), path);
+		filescan_count_errno_skip(errno);
 		return 0;
 	}
 
@@ -2014,6 +2105,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (ctxt.fd == -1) {
 		eprintf("csum_whole_file: Error %d: %s while opening file \"%s\". "
 			"Skipping.\n", errno, strerror(errno), file->path);
+		filescan_count_errno_skip(errno);
 		return;
 	}
 
@@ -2074,6 +2166,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			ret = errno;
 			eprintf("Unable to read file %s: %s\n",
 				file->path, strerror(ret));
+			filescan_count_errno_skip(ret);
 			return;
 		}
 
