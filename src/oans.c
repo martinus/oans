@@ -56,6 +56,18 @@ static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int stats_only_opt = 0;
+
+/*
+ * Exit status for a run that completed but covered less than it was asked to:
+ * a root named on the command line could not be resolved or stat()ed (#146).
+ *
+ * Distinct from 1 so a wrapper can tell "degraded" from "broken" without
+ * parsing --json: a typo, an unmounted path or a renamed share leaves the good
+ * roots scanned and deduped, and only the status says something was missed.
+ * Previously this was indistinguishable from success, so a Type=oneshot
+ * systemd unit could never notice it and OnFailure= never fired.
+ */
+#define EXIT_INCOMPLETE		2
 static unsigned int prune_blocks_opt = 0;
 static unsigned int history_only_opt = 0;
 static unsigned int json_only_opt = 0;
@@ -1625,9 +1637,11 @@ static int apply_scan_config(const struct scan_config *sc)
  * survive is the caller's job: scanning zero roots would let the stat-based
  * prune wipe the whole hashfile (e.g. an unmounted drive).
  */
-static int drop_missing_roots(struct scan_config *sc)
+static int drop_missing_roots(struct scan_config *sc, int *dropped)
 {
 	int i, live = 0;
+
+	*dropped = 0;
 
 	for (i = 0; i < sc->nroots; i++) {
 		struct stat st;
@@ -1640,6 +1654,7 @@ static int drop_missing_roots(struct scan_config *sc)
 			eprintf("Warning: stored path \"%s\" no longer exists, "
 				"skipping.\n", sc->roots[i]);
 			free(sc->roots[i]);
+			(*dropped)++;
 		}
 	}
 	/* Shrink the count to the compacted survivors; scan_config_free() then
@@ -1752,6 +1767,7 @@ int main(int argc, char **argv)
 	bool replaying = false;
 	uint64_t files_scanned = 0;
 	uint64_t scan_skips[SCAN_SKIP__COUNT] = {0};
+	int roots_dropped = 0;	/* replayed roots that no longer exist (#146) */
 	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
@@ -1843,7 +1859,7 @@ int main(int argc, char **argv)
 			ret = 1;
 			goto out;
 		}
-		numfiles = drop_missing_roots(&replay);
+		numfiles = drop_missing_roots(&replay, &roots_dropped);
 		if (numfiles == 0) {
 			eprintf("Error: none of the stored paths exist; refusing "
 				"to run (this would prune the whole hashfile).\n");
@@ -1915,6 +1931,20 @@ int main(int argc, char **argv)
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
 	if (options.hashfile)
 		dbfile_maybe_vacuum(db);
+
+	/*
+	 * Report the unusable root only once the run is otherwise complete: the
+	 * remaining roots are still scanned and deduped, exactly as before. An
+	 * existing failure keeps its own status - this must not mask a real one.
+	 */
+	/*
+	 * A replayed root that has vanished counts too, and is the case that
+	 * matters most: a timer whose stored config lost one of three shares to
+	 * an unmount goes on narrowing every run, exiting 0 each time. Losing
+	 * *every* root already fails hard above, before any pruning.
+	 */
+	if (!ret && (filescan_roots_unusable() || roots_dropped))
+		ret = EXIT_INCOMPLETE;
 
 out:
 	scan_config_free(&replay);

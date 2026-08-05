@@ -471,6 +471,24 @@ static bool seed_fs_lock_failed;
 static unsigned int nr_roots_seeded;
 
 /*
+ * Scan roots named explicitly by the user (argv, or a "-" stdin list) that
+ * could not be resolved or stat()ed (#146).
+ *
+ * Distinct from the general skip counters: a root is *user input*, so failing
+ * to use one is always worth an error, where a file met mid-walk that the
+ * scanner cannot open is a routine event on a real NAS tree. Nothing here
+ * counts a root dropped by the user's own configuration - an --exclude match,
+ * --min-filesize, a read-only subvolume - since those are the user asking for
+ * the skip.
+ */
+static unsigned int nr_roots_unusable;
+
+unsigned int filescan_roots_unusable(void)
+{
+	return nr_roots_unusable;
+}
+
+/*
  * Reject a path in check_file(). On a top-level seed (not a child discovered
  * mid-walk) also record that it could not be locked onto a supported fs, so
  * scan_files() can fail loudly instead of silently reporting nothing to do.
@@ -1636,12 +1654,14 @@ int scan_file(char *in_path, struct dbhandle *db)
 				"ancestor, or bind-mount this directory somewhere "
 				"shorter.\n", in_path, PATH_MAX);
 			filescan_count_skip(SCAN_SKIP_PATH_TOO_LONG);
+			nr_roots_unusable++;
 			return 0;
 		}
 		eprintf("Error %d: %s while getting path to file %s. "
 			"Skipping.\n",
 			errno, strerror(errno), in_path);
 		filescan_count_errno_skip(errno);
+		nr_roots_unusable++;
 		return 0;
 	}
 
@@ -1652,6 +1672,7 @@ int scan_file(char *in_path, struct dbhandle *db)
 			"Skipping.\n",
 			errno, strerror(errno), path);
 		filescan_count_errno_skip(errno);
+		nr_roots_unusable++;
 		return 0;
 	}
 

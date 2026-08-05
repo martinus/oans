@@ -469,11 +469,32 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
 
 # EXIT STATUS
 
-`oans` exits **0** on success. A non-zero status indicates a fatal error, such
-as invalid options or a hashfile that could not be opened. Note that individual
-per-file dedupe failures (e.g. a file that changed between scan and dedupe) are
-reported in the summary but do **not** by themselves change the exit status;
-check the *Not deduped* line, or run with **-v**, to detect them.
+**0**
+  ~ Success.
+
+**1**
+  ~ A fatal error: invalid options, a hashfile that could not be opened, or a
+    replay in which *none* of the stored paths still exist (`oans` refuses that
+    rather than let the prune empty the hashfile).
+
+**2**
+  ~ The run completed, but covered **less than it was asked to**: a path named
+    on the command line could not be resolved or stat'ed, or a replayed
+    configuration had lost one of its stored roots. Everything else was still
+    scanned and deduplicated. Typical causes are a typo, an unmounted path, a
+    renamed share, or a shell glob that was quoted by accident.
+
+    This is the status an unattended job should alarm on — the run looks
+    healthy otherwise, and would previously have exited **0**. See *EXAMPLES*
+    for an `OnFailure=` setup.
+
+Skips the user asked for do **not** affect the exit status: **\--exclude**
+matches, files under **\--min-filesize**, non-regular files, and read-only
+subvolumes are all reported but are not failures. Neither are files met during
+the walk that could not be read — a large tree routinely holds a few — nor
+individual per-file dedupe failures (e.g. a file that changed between scan and
+dedupe). Those are counted in the *Skipped* and *Not deduped* summary lines and
+exported by **\--json**; use those, or **-v**, to detect them.
 
 # ENVIRONMENT
 
