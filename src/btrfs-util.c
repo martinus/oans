@@ -25,6 +25,8 @@
 #include <string.h>
 #include <linux/magic.h>
 #include <linux/btrfs.h>
+#include <linux/btrfs_tree.h>
+#include <stdbool.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -74,5 +76,22 @@ int btrfs_get_fsuuid(int fd, uuid_t *uuid)
 		return errno;
 
 	uuid_copy(*uuid, args.metadata_uuid);
+	return 0;
+}
+
+int btrfs_subvol_is_readonly(int fd, bool *rdonly)
+{
+	struct btrfs_ioctl_get_subvol_info_args args;
+	int ret;
+
+	memset(&args, 0, sizeof(args));
+	/*
+	 * < 0, not != 0: this ioctl returns a positive value on success.
+	 */
+	ret = ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, &args);
+	if (ret < 0)
+		return -1;
+
+	*rdonly = !!(args.flags & BTRFS_ROOT_SUBVOL_RDONLY);
 	return 0;
 }

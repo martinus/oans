@@ -317,6 +317,30 @@ Requires \f[B]\-\-hashfile\f[R].
 \f[B]\-R\f[R] is for removing paths that still exist.)
 .SS Output and information
 .TP
+\f[B]\-\-skip\-readonly\-subvols\f[R], \f[B]\-\-no\-skip\-readonly\-subvols\f[R]
+Skip (or include) read\-only btrfs subvolumes \(em snapshots taken with
+\f[CR]btrfs subvolume snapshot \-r\f[R], i.e.\ what snapper, Timeshift
+and Synology create.
+\f[B]On by default when deduplicating\f[R] (\f[B]\-d\f[R]), off
+otherwise.
+.RS
+.PP
+A read\-only subvolume can never be a dedupe \f[I]destination\f[R] \(em
+the kernel refuses \(em so under \f[B]\-d\f[R] every file read and
+hashed in one is provably wasted work.
+The saving scales with snapshot count: 20 snapshots of a 1 TiB tree
+means reading \(ti20 TiB to reclaim nothing from 19 of them.
+Without \f[B]\-d\f[R] they are scanned normally, since \(lqwhat
+duplicates exist inside my snapshots?\(rq is a fair question to ask a
+reporting tool.
+.PP
+Detection is by property (the subvolume\(cqs read\-only flag), not by
+directory name, so it never fires on a writable directory that merely
+happens to be called \f[CR].snapshots\f[R].
+The number skipped is reported in the run summary and in
+\f[B]\-\-json\f[R]; the choice is stored in the hashfile and replayed.
+.RE
+.TP
 \f[B]\-q\f[R], \f[B]\-\-quiet\f[R]
 Quiet: print only errors and a one\-line dedupe summary.
 Suppresses the live progress display, the multi\-line summary block, and

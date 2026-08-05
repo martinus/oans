@@ -19,6 +19,7 @@ struct options options = {
 	.io_threads = 0,
 	.cpu_threads = 0,
 	.skip_zeroes = false,
+	.skip_readonly_subvols = -1,	/* auto: on when deduplicating */
 	.only_whole_files = false,
 	.do_block_hash = false,
 	.dedupe_same_file = true,

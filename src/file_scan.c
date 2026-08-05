@@ -192,6 +192,8 @@ static const struct {
 	[SCAN_SKIP_EXCLUDED]	  = { "excluded",	"excluded",		false },
 	[SCAN_SKIP_TOO_SMALL]	  = { "too_small",	"below --min-filesize",	false },
 	[SCAN_SKIP_NOT_REGULAR]	  = { "not_regular",	"not a regular file",	false },
+	[SCAN_SKIP_READONLY_SUBVOL] = { "readonly_subvol",
+					"read-only subvolume",		false },
 };
 
 bool scan_skip_is_error(enum scan_skip_bucket b)
@@ -633,6 +635,96 @@ static void verified_dev_free(void)
 	g_clear_pointer(&verified_devs, g_hash_table_destroy);
 }
 
+/*
+ * Read-only-subvolume cache (#156).
+ *
+ * btrfs gives every subvolume its own anonymous st_dev, so read-only-ness is a
+ * per-device fact and one ioctl answers it for every file below. Like
+ * verified_devs (and unlike subvol_cache, which is consumer-thread only) this
+ * is read from check_file() on the walker threads, so it is mutex-guarded.
+ *
+ * Detected by property rather than by directory name: a name list would be
+ * silent, would fire on a real directory that merely happens to be called
+ * .snapshots, and -- being an implicit default -- would never reach
+ * scan_excludes, so a replay's scope would depend on the binary version.
+ */
+struct ro_subvol_ent {
+	bool known;
+	bool rdonly;
+};
+static GHashTable *ro_subvols;		/* dev_t -> struct ro_subvol_ent * */
+static GMutex ro_subvol_lock;
+
+static void ro_subvol_free(void)
+{
+	g_clear_pointer(&ro_subvols, g_hash_table_destroy);
+}
+
+/*
+ * True when `path` (on device `dev`) lives in a read-only btrfs subvolume.
+ * One ioctl per device; the answer is cached for every later path on it.
+ */
+static bool dev_is_readonly_subvol(dev_t dev, const char *path)
+{
+	struct ro_subvol_ent *ent;
+	bool rdonly = false;
+	int fd;
+
+	g_mutex_lock(&ro_subvol_lock);
+	if (!ro_subvols)
+		ro_subvols = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+						   NULL, g_free);
+	ent = g_hash_table_lookup(ro_subvols, GSIZE_TO_POINTER((gsize)dev));
+	if (ent && ent->known) {
+		rdonly = ent->rdonly;
+		g_mutex_unlock(&ro_subvol_lock);
+		return rdonly;
+	}
+	g_mutex_unlock(&ro_subvol_lock);
+
+	/*
+	 * Probe outside the lock: the ioctl is the slow part, and a duplicate
+	 * probe from a second walker is harmless (same answer, idempotent
+	 * insert) where holding the lock across it would serialise the walk.
+	 */
+	fd = longpath_open(path, O_RDONLY);
+	if (fd == -1)
+		return false;	/* unreadable is someone else's error to report */
+	if (btrfs_subvol_is_readonly(fd, &rdonly))
+		rdonly = false;	/* not a subvolume, or an old kernel: scan it */
+	close(fd);
+
+	g_mutex_lock(&ro_subvol_lock);
+	ent = g_hash_table_lookup(ro_subvols, GSIZE_TO_POINTER((gsize)dev));
+	if (!ent) {
+		ent = g_malloc0(sizeof(*ent));
+		g_hash_table_insert(ro_subvols, GSIZE_TO_POINTER((gsize)dev), ent);
+	}
+	if (!ent->known) {
+		ent->known = true;
+		ent->rdonly = rdonly;
+		/*
+		 * Count subvolumes, not files: the skip happens at the
+		 * subvolume's root directory and never descends, so this fires
+		 * once per snapshot -- the number the summary should report.
+		 */
+		if (rdonly)
+			filescan_count_skip(SCAN_SKIP_READONLY_SUBVOL);
+	}
+	rdonly = ent->rdonly;
+	g_mutex_unlock(&ro_subvol_lock);
+
+	return rdonly;
+}
+
+/* Whether this run should skip read-only subvolumes (-1 = auto: iff -d). */
+static bool skipping_readonly_subvols(void)
+{
+	if (options.skip_readonly_subvols < 0)
+		return options.run_dedupe;
+	return options.skip_readonly_subvols != 0;
+}
+
 static char *extract_first_device(const char *fs_source)
 {
 	const char *colon;
@@ -816,6 +908,31 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		vprintf("Skipping file below --min-filesize: %s (%llu < %"PRIu64")\n",
 			path, st->stx_size, options.min_filesize);
 		filescan_count_skip(SCAN_SKIP_TOO_SMALL);
+		return false;
+	}
+
+	/*
+	 * Read-only subvolumes (snapshots) are dead weight under -d (#156).
+	 *
+	 * Pointed at the normal shape of a NAS or a snapper/Timeshift desktop,
+	 * the walk descends into every read-only snapshot and reads and hashes
+	 * every file in it. The result is *safe* - the already-shared check
+	 * catches them before any ioctl - but by then all the read and hash I/O
+	 * has been spent, and it scales with snapshot count: 20 snapshots of a
+	 * 1 TiB tree means reading ~20 TiB to reclaim nothing from 19 of them.
+	 *
+	 * The kernel refuses a read-only destination, so under -d this work is
+	 * provably wasted, not merely usually wasted. In report mode it is not:
+	 * asking "what duplicates exist inside my snapshots?" is a reasonable
+	 * thing to ask a reporting tool, so the default keys off -d.
+	 *
+	 * Checked after the config skips so an explicit --exclude still wins,
+	 * and before the locked-fs probe so a snapshot costs one ioctl rather
+	 * than a full probe. Non-btrfs filesystems have no subvolumes at all.
+	 */
+	if (locked_fs.is_btrfs && skipping_readonly_subvols() &&
+	    dev_is_readonly_subvol(stx_to_dev(st), path)) {
+		vprintf("Skipping read-only subvolume: %s\n", path);
 		return false;
 	}
 
@@ -2617,6 +2734,7 @@ void filescan_free(void)
 	scan_writer_close();
 	subvol_cache_free();
 	verified_dev_free();
+	ro_subvol_free();
 	seen_inodes_free();
 
 	g_clear_pointer(&excludes, glob_set_free);
