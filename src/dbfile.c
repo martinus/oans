@@ -1461,6 +1461,33 @@ int dbfile_get_stats(struct dbhandle *db, struct dbfile_stats *stats)
  */
 #define VACUUM_FREE_PCT		25
 
+int64_t dbfile_drop_block_hashes(struct dbhandle *db)
+{
+	int64_t before;
+	int ret;
+
+	before = (int64_t)dbfile_query_u64(db->db, "select count(*) from blocks");
+	if (!before)
+		return 0;
+
+	ret = sqlite3_exec(db->db, "delete from blocks", NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "deleting block hashes");
+		return -1;
+	}
+
+	return before;
+}
+
+int dbfile_vacuum(struct dbhandle *db)
+{
+	int ret = sqlite3_exec(db->db, "VACUUM", NULL, NULL, NULL);
+
+	if (ret)
+		perror_sqlite(ret, "vacuuming hashfile");
+	return ret;
+}
+
 void dbfile_maybe_vacuum(struct dbhandle *db)
 {
 	uint64_t freelist, total;
