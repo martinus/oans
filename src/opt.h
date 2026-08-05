@@ -29,6 +29,14 @@ struct options {
 	unsigned int io_threads;
 	unsigned int cpu_threads;
 	bool skip_zeroes : 1;
+	/*
+	 * Skip read-only btrfs subvolumes (snapshots) when deduplicating. A
+	 * read-only subvolume can never be a dedupe *destination* -- the kernel
+	 * refuses -- so under -d the read and hash of every file in it is
+	 * provably wasted, not merely usually wasted. Tri-state so an explicit
+	 * --[no-]skip-readonly-subvols beats the -d-derived default (#156).
+	 */
+	int skip_readonly_subvols;	/* -1 = auto (on iff -d), 0 = no, 1 = yes */
 	bool only_whole_files : 1;
 	bool do_block_hash : 1;
 	bool dedupe_same_file : 1;

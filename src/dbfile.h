@@ -149,6 +149,7 @@ struct scan_config {
 	int		run_dedupe;
 	int		recurse;
 	int		skip_zeroes;
+	int		skip_readonly_subvols;	/* -1 auto, 0 no, 1 yes (#156) */
 	int		only_whole_files;
 	int		do_block_hash;
 	int		dedupe_same_file;
@@ -192,6 +193,12 @@ struct run_record {
 	uint64_t	skip_unreadable;
 	uint64_t	skip_path_too_long;
 	uint64_t	skip_unsupported_fs;
+	/*
+	 * Read-only subvolumes skipped (#156). Not an error bucket -- it is a
+	 * saving -- but it does mean the run covered less than the given tree,
+	 * so it is recorded and reported rather than left silent.
+	 */
+	uint64_t	readonly_subvols;
 };
 int dbfile_record_run(struct dbhandle *db, const struct run_record *r);
 
@@ -209,6 +216,7 @@ struct run_summary {
 	uint64_t	last_skip_unsupported_fs;
 	/* Lifetime sum of all four, so a total stays honest. */
 	uint64_t	total_skip_errors;
+	uint64_t	last_readonly_subvols;
 };
 int dbfile_get_run_summary(struct dbhandle *db, struct run_summary *s);
 

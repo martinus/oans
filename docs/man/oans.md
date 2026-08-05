@@ -263,6 +263,26 @@ directory scans the regular files directly inside it; add **-r** to recurse.
 
 ## Output and information
 
+**\--skip-readonly-subvols**, **\--no-skip-readonly-subvols**
+
+  ~ Skip (or include) read-only btrfs subvolumes — snapshots taken with
+    `btrfs subvolume snapshot -r`, i.e. what snapper, Timeshift and Synology
+    create. **On by default when deduplicating** (**-d**), off otherwise.
+
+    A read-only subvolume can never be a dedupe *destination* — the kernel
+    refuses — so under **-d** every file read and hashed in one is provably
+    wasted work. The saving scales with snapshot count: 20 snapshots of a 1 TiB
+    tree means reading ~20 TiB to reclaim nothing from 19 of them. Without
+    **-d** they are scanned normally, since "what duplicates exist inside my
+    snapshots?" is a fair question to ask a reporting tool.
+
+    Detection is by property (the subvolume's read-only flag), not by directory
+    name, so it never fires on a writable directory that merely happens to be
+    called `.snapshots`. The number skipped is reported in the run summary and
+    in **\--json**; the choice is stored in the hashfile and replayed.
+
+<!-- -->
+
 **-q**, **\--quiet**
 
   ~ Quiet: print only errors and a one-line dedupe summary. Suppresses the live

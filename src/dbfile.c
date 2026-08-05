@@ -362,7 +362,8 @@ static int create_tables(sqlite3 *db)
 "skip_permission INTEGER NOT NULL DEFAULT 0, "				\
 "skip_unreadable INTEGER NOT NULL DEFAULT 0, "				\
 "skip_path_too_long INTEGER NOT NULL DEFAULT 0, "			\
-"skip_unsupported_fs INTEGER NOT NULL DEFAULT 0);"
+"skip_unsupported_fs INTEGER NOT NULL DEFAULT 0, "			\
+"readonly_subvols INTEGER NOT NULL DEFAULT 0);"
 	ret = sqlite3_exec(db, CREATE_TABLE_RUN_HISTORY, NULL, NULL, NULL);
 	if (ret)
 		goto out;
@@ -383,6 +384,7 @@ static int create_tables(sqlite3 *db)
 		"ALTER TABLE run_history ADD COLUMN skip_unreadable INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE run_history ADD COLUMN skip_path_too_long INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE run_history ADD COLUMN skip_unsupported_fs INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE run_history ADD COLUMN readonly_subvols INTEGER NOT NULL DEFAULT 0",
 	};
 	for (unsigned int i = 0; i < ARRAY_SIZE(run_history_adds); i++)
 		sqlite3_exec(db, run_history_adds[i], NULL, NULL, NULL);
@@ -1188,6 +1190,8 @@ int dbfile_store_scan_config(struct dbhandle *dbh, const struct scan_config *sc)
 	    (ret = sync_config_int(stmt, "opt_run_dedupe", sc->run_dedupe)) ||
 	    (ret = sync_config_int(stmt, "opt_recurse", sc->recurse)) ||
 	    (ret = sync_config_int(stmt, "opt_skip_zeroes", sc->skip_zeroes)) ||
+	    (ret = sync_config_int(stmt, "opt_skip_readonly_subvols",
+				   sc->skip_readonly_subvols)) ||
 	    (ret = sync_config_int(stmt, "opt_only_whole_files", sc->only_whole_files)) ||
 	    (ret = sync_config_int(stmt, "opt_do_block_hash", sc->do_block_hash)) ||
 	    (ret = sync_config_int(stmt, "opt_dedupe_same_file", sc->dedupe_same_file)) ||
@@ -1276,6 +1280,15 @@ int dbfile_load_scan_config(struct dbhandle *dbh, struct scan_config *sc)
 	get_config_int(stmt, "opt_run_dedupe", &sc->run_dedupe);
 	get_config_int(stmt, "opt_recurse", &sc->recurse);
 	get_config_int(stmt, "opt_skip_zeroes", &sc->skip_zeroes);
+	/*
+	 * Absent in a hashfile written before #156; get_config_int leaves the
+	 * caller's value alone, and scan_config is memset to 0 -- which would
+	 * read as an explicit "no". Pre-seed the auto sentinel so an old
+	 * hashfile replays with the current default rather than opting out.
+	 */
+	sc->skip_readonly_subvols = -1;
+	get_config_int(stmt, "opt_skip_readonly_subvols",
+		       &sc->skip_readonly_subvols);
 	get_config_int(stmt, "opt_only_whole_files", &sc->only_whole_files);
 	get_config_int(stmt, "opt_do_block_hash", &sc->do_block_hash);
 	get_config_int(stmt, "opt_dedupe_same_file", &sc->dedupe_same_file);
@@ -1322,8 +1335,9 @@ int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
 	ret = sqlite3_prepare_v2(dbh->db,
 		"insert into run_history(ts, duration_ms, files_scanned, "
 		"reclaimed, groups, kernel_bytes, deduped, skip_permission, "
-		"skip_unreadable, skip_path_too_long, skip_unsupported_fs) "
-		"values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+		"skip_unreadable, skip_path_too_long, skip_unsupported_fs, "
+		"readonly_subvols) "
+		"values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
 		-1, &stmt, NULL);
 	if (ret)
 		goto out;
@@ -1340,6 +1354,7 @@ int dbfile_record_run(struct dbhandle *dbh, const struct run_record *r)
 	sqlite3_bind_int64(stmt, 9, r->skip_unreadable);
 	sqlite3_bind_int64(stmt, 10, r->skip_path_too_long);
 	sqlite3_bind_int64(stmt, 11, r->skip_unsupported_fs);
+	sqlite3_bind_int64(stmt, 12, r->readonly_subvols);
 
 	if (sqlite3_step(stmt) != SQLITE_DONE)
 		ret = -1;
@@ -1383,7 +1398,8 @@ int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
 	stmt = NULL;
 	ret = sqlite3_prepare_v2(dbh->db,
 		"select skip_permission, skip_unreadable, skip_path_too_long, "
-		"skip_unsupported_fs from run_history order by ts desc limit 1",
+		"skip_unsupported_fs, readonly_subvols "
+		"from run_history order by ts desc limit 1",
 		-1, &stmt, NULL);
 	if (ret) {
 		perror_sqlite(ret, "reading last run skips");
@@ -1394,6 +1410,7 @@ int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
 		s->last_skip_unreadable = sqlite3_column_int64(stmt, 1);
 		s->last_skip_path_too_long = sqlite3_column_int64(stmt, 2);
 		s->last_skip_unsupported_fs = sqlite3_column_int64(stmt, 3);
+		s->last_readonly_subvols = sqlite3_column_int64(stmt, 4);
 	}
 	return 0;
 }

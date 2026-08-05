@@ -114,6 +114,10 @@ static char *scan_config_options_str(const struct scan_config *sc)
 		g_string_append(s, "-d ");
 	if (sc->skip_zeroes)
 		g_string_append(s, "--skip-zeroes ");
+	if (sc->skip_readonly_subvols == 0)
+		g_string_append(s, "--no-skip-readonly-subvols ");
+	else if (sc->skip_readonly_subvols == 1)
+		g_string_append(s, "--skip-readonly-subvols ");
 	if (sc->min_filesize > 1)
 		g_string_append_printf(s, "--min-filesize=%"PRIu64" ", sc->min_filesize);
 
@@ -496,6 +500,12 @@ static int print_metrics_json(char *filename)
 	printf("    \"unsupported_fs\": %"PRIu64"\n", sum.last_skip_unsupported_fs);
 	printf("  },\n");
 	printf("  \"scan_skipped_errors_total\": %"PRIu64",\n", sum.total_skip_errors);
+	/*
+	 * Deliberately outside the error object: a skipped snapshot is a saving,
+	 * not a fault, but it does mean the run covered less than the tree (#156).
+	 */
+	printf("  \"readonly_subvols_skipped_last_run\": %"PRIu64",\n",
+	       sum.last_readonly_subvols);
 	printf("  \"last_run_ts\": %"PRId64"\n", sum.last_ts);
 	printf("}\n");
 	return 0;
@@ -639,6 +649,8 @@ enum {
 	IO_THREADS_OPTION,
 	CPU_THREADS_OPTION,
 	SKIP_ZEROES_OPTION,
+	SKIP_RO_SUBVOLS_OPTION,
+	NO_SKIP_RO_SUBVOLS_OPTION,
 	DEDUPE_OPTS_OPTION,
 	QUIET_OPTION,
 	EXCLUDE_OPTION,
@@ -732,6 +744,9 @@ static void help(void)
 "  -q, --quiet                 print only errors and a one-line summary\n"
 "  -v                          verbose output\n"
 "      --progress=json         stream machine-readable progress (JSONL) to stderr\n"
+"      --[no-]skip-readonly-subvols\n"
+"                              skip read-only subvolumes (snapshots) when\n"
+"                              deduplicating; on by default with -d\n"
 "      --no-color              disable colored output\n"
 "      --debug                 print debug messages (implies -v)\n"
 "      --version               print version and exit\n"
@@ -756,6 +771,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "io-threads", 1, NULL, IO_THREADS_OPTION },
 		{ "cpu-threads", 1, NULL, CPU_THREADS_OPTION },
 		{ "skip-zeroes", 0, NULL, SKIP_ZEROES_OPTION },
+		{ "skip-readonly-subvols", 0, NULL, SKIP_RO_SUBVOLS_OPTION },
+		{ "no-skip-readonly-subvols", 0, NULL, NO_SKIP_RO_SUBVOLS_OPTION },
 		{ "dedupe-options", 1, NULL, DEDUPE_OPTS_OPTION },
 		{ "quiet", 0, NULL, QUIET_OPTION },
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
@@ -826,6 +843,12 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case SKIP_ZEROES_OPTION:
 			options.skip_zeroes = true;
+			break;
+		case SKIP_RO_SUBVOLS_OPTION:
+			options.skip_readonly_subvols = 1;
+			break;
+		case NO_SKIP_RO_SUBVOLS_OPTION:
+			options.skip_readonly_subvols = 0;
 			break;
 		case DEDUPE_OPTS_OPTION:
 			if (parse_dedupe_opts(optarg))
@@ -1336,12 +1359,26 @@ static void report_scan_skips(const uint64_t *skips)
 		printf(" %s(rerun with -v for detail)%s\n", col_dim, col_reset);
 	}
 
+	/*
+	 * Read-only subvolumes are reported by default, not just under -v: this
+	 * is the one config-ish bucket that *shrinks the scan the user asked
+	 * for*, and a default that quietly covers less is the same class of
+	 * surprise as the silent --exclude no-op #147 removed (#156).
+	 */
+	if (skips[SCAN_SKIP_READONLY_SUBVOL])
+		printf("  %sSnapshots%s      %"PRIu64" read-only subvolume%s skipped "
+		       "%s(--no-skip-readonly-subvols to include them)%s\n",
+		       col_dim, col_reset, skips[SCAN_SKIP_READONLY_SUBVOL],
+		       skips[SCAN_SKIP_READONLY_SUBVOL] == 1 ? "" : "s",
+		       col_dim, col_reset);
+
 	if (!verbose)
 		return;
 
 	sep = "";
 	for (i = 0; i < SCAN_SKIP__COUNT; i++) {
-		if (!skips[i] || scan_skip_is_error(i))
+		if (!skips[i] || scan_skip_is_error(i) ||
+		    i == SCAN_SKIP_READONLY_SUBVOL)
 			continue;
 		if (!*sep)
 			printf("  %sNot scanned%s    ", col_dim, col_reset);
@@ -1452,6 +1489,7 @@ static int apply_scan_config(const struct scan_config *sc)
 	options.run_dedupe = sc->run_dedupe;
 	options.recurse_dirs = sc->recurse;
 	options.skip_zeroes = sc->skip_zeroes;
+	options.skip_readonly_subvols = sc->skip_readonly_subvols;
 	options.only_whole_files = sc->only_whole_files;
 	options.do_block_hash = sc->do_block_hash;
 	options.dedupe_same_file = sc->dedupe_same_file;
@@ -1541,6 +1579,7 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	sc.run_dedupe = options.run_dedupe;
 	sc.recurse = options.recurse_dirs;
 	sc.skip_zeroes = options.skip_zeroes;
+	sc.skip_readonly_subvols = options.skip_readonly_subvols;
 	sc.only_whole_files = options.only_whole_files;
 	sc.do_block_hash = options.do_block_hash;
 	sc.dedupe_same_file = options.dedupe_same_file;
@@ -1759,6 +1798,7 @@ int main(int argc, char **argv)
 				.skip_unreadable = scan_skips[SCAN_SKIP_UNREADABLE],
 				.skip_path_too_long = scan_skips[SCAN_SKIP_PATH_TOO_LONG],
 				.skip_unsupported_fs = scan_skips[SCAN_SKIP_UNSUPPORTED_FS],
+				.readonly_subvols = scan_skips[SCAN_SKIP_READONLY_SUBVOL],
 			};
 			dbfile_record_run(db, &rec);
 		}
