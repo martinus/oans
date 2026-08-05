@@ -128,6 +128,9 @@ Because the hashfile also records the run\(cqs options, paths, and
 \f[B]\f[CB]oans \-\-hashfile=FILE\f[B]\f[R] with no \f[I]file\f[R]
 arguments \f[B]replays the last run\f[R] (any other options on that
 command line are ignored).
+That includes \f[B]\-d\f[R]: a hashfile seeded by a read\-only preview
+run replays as read\-only forever, so \f[CR]oans\f[R] warns on such a
+replay and prints the command to update it.
 If none of the stored paths still exist \f[CR]oans\f[R] refuses rather
 than prune every entry \(em guarding against, e.g., an unmounted drive
 \(em while individually missing paths are skipped with a warning.
@@ -292,6 +295,12 @@ a node_exporter textfile).
 freed is smaller on a compressed filesystem.
 Requires \f[B]\-\-hashfile\f[R].
 .RS
+.PP
+\f[CR]scan_configured_dedupe\f[R] is \f[CR]false\f[R] when the stored
+scan configuration has no \f[B]\-d\f[R] \(em a job in that state hashes
+but never deduplicates, and reports \f[CR]0 B\f[R] reclaimed forever,
+which is also what a healthy job on a clean tree reports.
+This is what tells them apart.
 .PP
 \f[CR]scan_skipped_last_run\f[R] reports what the most recent scan could
 \f[B]not\f[R] read, bucketed by cause (\f[CR]permission\f[R],

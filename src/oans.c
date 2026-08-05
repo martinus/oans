@@ -532,6 +532,19 @@ static int print_metrics_json(char *filename)
 	printf("  },\n");
 	printf("  \"scan_skipped_errors_total\": %"PRIu64",\n", sum.total_skip_errors);
 	/*
+	 * Whether the stored config deduplicates at all. A job seeded without -d
+	 * reports 0 reclaimed forever, which is also what a healthy job on a
+	 * clean tree reports - this is what tells them apart (#149).
+	 */
+	{
+		struct scan_config sc = {0};
+
+		if (dbfile_load_scan_config(db, &sc) > 0)
+			printf("  \"scan_configured_dedupe\": %s,\n",
+			       sc.run_dedupe ? "true" : "false");
+		scan_config_free(&sc);
+	}
+	/*
 	 * Deliberately outside the error object: a skipped snapshot is a saving,
 	 * not a fault, but it does mean the run covered less than the tree (#156).
 	 */
@@ -1628,6 +1641,36 @@ static int apply_scan_config(const struct scan_config *sc)
 			return 1;
 		}
 	}
+
+	/*
+	 * A replay inherits -d from the run that seeded the hashfile, and the
+	 * setup flow makes that easy to get wrong: the docs walk the user
+	 * through a first run to establish the hashfile, and the man page
+	 * actively suggests a preview run *without* -d. Seed it that way and the
+	 * timer inherits run_dedupe = 0 - after which it walks the tree, updates
+	 * hashes, records a run, exits 0 and reclaims nothing, every week,
+	 * indistinguishably from a healthy job. --history shows a growing list of
+	 * runs with 0 B reclaimed, which is also what a healthy job on an
+	 * already-deduped tree looks like.
+	 *
+	 * Not an error: a hash-only scheduled job is a legitimate setup (keeping
+	 * a hashfile warm so a later -d run is fast), so refusing would break
+	 * working configurations. Just say so, with the command that fixes it -
+	 * the whole point of a replay is that the user no longer remembers the
+	 * arguments. On stderr, so -q (what the shipped unit runs) still shows it.
+	 */
+	if (!sc->run_dedupe) {
+		eprintf("WARNING: the stored configuration for %s has no -d, so "
+			"this run will hash but not deduplicate.\n",
+			options.hashfile);
+		eprintf("         Re-run once with -d and the paths to update "
+			"it:\n           oans -%sd --hashfile=%s",
+			sc->recurse ? "r" : "", options.hashfile);
+		for (i = 0; i < sc->nroots; i++)
+			eprintf(" %s", sc->roots[i]);
+		eprintf("\n");
+	}
+
 	return 0;
 }
 

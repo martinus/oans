@@ -106,7 +106,9 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     Because the hashfile also records the run's options, paths, and **\--exclude**
     patterns, you need not repeat them: **`oans --hashfile=FILE`** with no *file*
     arguments **replays the last run** (any other options on that command line
-    are ignored). If none of the stored paths still exist `oans` refuses rather
+    are ignored). That includes **-d**: a hashfile seeded by a read-only preview
+    run replays as read-only forever, so `oans` warns on such a replay and
+    prints the command to update it. If none of the stored paths still exist `oans` refuses rather
     than prune every entry — guarding against, e.g., an unmounted drive — while
     individually missing paths are skipped with a warning.
 
@@ -244,6 +246,11 @@ directory scans the regular files directly inside it; add **-r** to recurse.
     to `jq`, Telegraf, a node_exporter textfile). `reclaimable_logical_bytes` is
     a logical upper bound; real disk freed is smaller on a compressed
     filesystem. Requires **\--hashfile**.
+
+    `scan_configured_dedupe` is `false` when the stored scan configuration has
+    no **-d** — a job in that state hashes but never deduplicates, and reports
+    `0 B` reclaimed forever, which is also what a healthy job on a clean tree
+    reports. This is what tells them apart.
 
     `scan_skipped_last_run` reports what the most recent scan could **not**
     read, bucketed by cause (`permission`, `unreadable`, `path_too_long`,
