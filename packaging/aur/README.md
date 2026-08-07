@@ -9,25 +9,46 @@ alongside the code:
 Both install a `duperemove` compatibility symlink, so they `provides`/`conflicts`
 with the `duperemove` package.
 
-## Publishing to the AUR
+`.SRCINFO` is committed next to each `PKGBUILD` so the two never drift, and so
+publishing is a copy rather than a regeneration on a machine that may not have
+`makepkg`.
 
-The AUR expects each package in its own git repo containing `PKGBUILD` and a
-generated `.SRCINFO`. To publish or update `oans`:
+## First-time publishing
+
+One-off, and it needs a human: an AUR account with an SSH key uploaded at
+<https://aur.archlinux.org/account>.
 
 ```sh
-cd packaging/aur/oans
-makepkg --printsrcinfo > .SRCINFO   # regenerate whenever PKGBUILD changes
-# then push PKGBUILD + .SRCINFO to ssh://aur@aur.archlinux.org/oans.git
+git clone ssh://aur@aur.archlinux.org/oans.git aur-oans   # empty on first use
+cp packaging/aur/oans/{PKGBUILD,.SRCINFO} aur-oans/
+cd aur-oans && git add PKGBUILD .SRCINFO
+git commit -m "Initial import: oans 1.7.1" && git push origin master
 ```
+
+Repeat with `oans-git`. The push is what creates the package; there is no
+separate "submit" step.
 
 ## On a new release
 
-Bump `pkgver`, reset `pkgrel=1`, and refresh the checksum in
-[`oans/PKGBUILD`](oans/PKGBUILD):
+1. Bump `pkgver` and reset `pkgrel=1` in [`oans/PKGBUILD`](oans/PKGBUILD).
+2. Refresh the checksum. On Arch that is `updpkgsums`; anywhere else:
 
-```sh
-updpkgsums          # rewrites sha256sums from the release tarball
-```
+   ```sh
+   curl -sL https://github.com/martinus/oans/archive/refs/tags/vX.Y.Z.tar.gz | sha256sum
+   ```
 
-`oans-git` needs no checksum or manual `pkgver` bump — its `pkgver()` derives the
-version from `git describe`.
+3. Mirror both into [`oans/.SRCINFO`](oans/.SRCINFO) (`pkgver`, `source`,
+   `sha256sums`), or regenerate it with `makepkg --printsrcinfo > .SRCINFO`.
+4. Copy both files into the AUR clone, commit, push.
+
+`oans-git` needs none of this: no checksum, and its `pkgver()` derives the
+version from `git describe` at build time.
+
+## Why the PKGBUILD passes VERSION
+
+The Makefile takes its version from `git describe`, which a release tarball has
+no metadata for, so an unpatched build reports `oans unknown`. The `_make`
+wrapper passes `VERSION="v$pkgver"` to **every** make invocation — not just
+`build()`. The Makefile rebuilds when `VERSTRING` changes, so a `package()` that
+omitted it would quietly rebuild the binary back to `unknown` after `build()` got
+it right.
