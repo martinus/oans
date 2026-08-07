@@ -155,10 +155,13 @@ integration: oans
 # `integration` - opt-in, not part of `check`. Needs valgrind installed.
 VGLOGDIR = $(CURDIR)/.vglogs
 .PHONY: integration-valgrind
+# TEST_SHARD=I/N runs only that slice, so CI can spread this leg (~90% of the
+# job's wall time) over parallel runners. Unset runs everything.
 integration-valgrind: oans
 	@command -v valgrind >/dev/null 2>&1 || { echo "valgrind not installed"; exit 1; }
 	rm -rf $(VGLOGDIR) && mkdir -p $(VGLOGDIR)
-	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py -j $(TEST_JOBS)
+	OANS_VG_LOGDIR=$(VGLOGDIR) DUPEREMOVE=tests/valgrind-wrap.sh python3 tests/run.py \
+		-j $(TEST_JOBS) $(if $(TEST_SHARD),--shard $(TEST_SHARD))
 	@if find $(VGLOGDIR) -type f -size +0c | grep -q .; then \
 		echo "=== valgrind reported errors/leaks ==="; \
 		find $(VGLOGDIR) -type f -size +0c -exec cat {} +; \

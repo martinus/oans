@@ -62,6 +62,27 @@ _REPLAY = {
 }
 
 
+def _shard(value):
+    """Parse an "I/N" shard spec into a 1-based (i, n) pair."""
+    try:
+        i, n = (int(x) for x in value.split("/", 1))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected I/N, got {value!r}")
+    if not 1 <= i <= n:
+        raise argparse.ArgumentTypeError(f"shard {i} out of range 1..{n}")
+    return i, n
+
+
+def _deal(ids, i, n):
+    """Every n-th id starting at i-1, over a stable ordering.
+
+    Sorted first so the split does not depend on discovery order: a given test
+    lands in the same shard on every machine and every run, which keeps a
+    failure reproducible from the shard number alone.
+    """
+    return sorted(ids)[i - 1::n]
+
+
 def _matches(test_id, patterns):
     return not patterns or any(p in test_id for p in patterns)
 
@@ -213,6 +234,9 @@ def main(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument("-j", "--jobs", type=_jobs, default="auto",
                         help="worker processes, or 'auto' (default: auto)")
+    parser.add_argument("--shard", type=_shard, default=None, metavar="I/N",
+                        help="run only shard I of N (1-based), for splitting a "
+                             "slow leg across CI jobs")
     parser.add_argument("patterns", nargs="*",
                         help="only run tests whose id contains one of these")
     args = parser.parse_args(argv[1:])
@@ -234,6 +258,17 @@ def main(argv):
     tests = [t for t in _iter_tests(discovered) if _matches(t.id(), args.patterns)]
     serial = [t.id() for t in tests if getattr(t, "serial", False)]
     parallel = [t.id() for t in tests if not getattr(t, "serial", False)]
+    if args.shard:
+        i, n = args.shard
+        # Deal round-robin over each group separately rather than cutting the
+        # list in two. Contiguous slices would put whole classes in one shard,
+        # and neighbouring tests in a class cost about the same, so the halves
+        # come out lopsided. Sharding the serial group too matters most: it runs
+        # one-at-a-time, so a shard that got all of it would still pay the full
+        # sequential floor and cap the whole split.
+        serial = _deal(serial, i, n)
+        parallel = _deal(parallel, i, n)
+        print(f"  shard  : {i} of {n}\n", file=sys.stderr)
     if serial:
         print(f"  serial : {len(serial)} extent-layout tests held to the end\n",
               flush=True)
