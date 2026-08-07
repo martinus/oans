@@ -385,6 +385,20 @@ directory name, so it never fires on a writable directory that merely
 happens to be called \f[CR].snapshots\f[R].
 The number skipped is reported in the run summary and in
 \f[B]\-\-json\f[R]; the choice is stored in the hashfile and replayed.
+.PP
+With \f[B]\-\-no\-skip\-readonly\-subvols\f[R], a file in a read\-only
+subvolume is only ever used as a dedupe \f[B]source\f[R], never as a
+destination: \f[CR]FIDEDUPERANGE\f[R] rewrites the destination and
+nothing else, so writing to one would modify a snapshot that is meant to
+be immutable.
+.PP
+Where a whole\-file group has such a member it is preferred as the
+target, so the writable copies are pointed at it and the space is
+reclaimed.
+Everywhere else \(em extent\-level groups, and groups already anchored
+to a target by an earlier pass \(em a read\-only member is simply
+skipped rather than written, and counted on the \f[I]Read\-only\f[R]
+summary line.
 .RE
 .TP
 \f[B]\-q\f[R], \f[B]\-\-quiet\f[R]

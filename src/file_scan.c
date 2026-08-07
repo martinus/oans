@@ -712,71 +712,102 @@ static void verified_dev_free(void)
  * .snapshots, and -- being an implicit default -- would never reach
  * scan_excludes, so a replay's scope would depend on the binary version.
  */
-struct ro_subvol_ent {
-	bool known;
-	bool rdonly;
-};
-static GHashTable *ro_subvols;		/* dev_t -> struct ro_subvol_ent * */
+static bool skipping_readonly_subvols(void);
+
+static GHashTable *ro_subvols;		/* dev_t -> (gpointer)(bool) read-only */
 static GMutex ro_subvol_lock;
 
-static void ro_subvol_free(void)
+/*
+ * Deliberately NOT called from filescan_free(): the dedupe phase queries this
+ * cache long after the walk is over (see filescan_fd_is_readonly_subvol), so
+ * freeing it there would empty it exactly when the second consumer starts and
+ * silently re-probe every device.
+ */
+void filescan_free_late(void)
 {
 	g_clear_pointer(&ro_subvols, g_hash_table_destroy);
 }
 
 /*
- * True when `path` (on device `dev`) lives in a read-only btrfs subvolume.
- * One ioctl per device; the answer is cached for every later path on it.
+ * Core lookup: is `fd`'s subvolume read-only? `fd` must be open on a file or
+ * directory inside it, and `dev` is its device, used as the cache key.
+ *
+ * count_skip belongs to the walk: it reports "N read-only subvolumes skipped",
+ * which must be counted once per subvolume rather than once per query, so only
+ * the call that actually resolves the device counts. The dedupe phase asks the
+ * same question about the same devices and must not inflate that number.
  */
-static bool dev_is_readonly_subvol(dev_t dev, const char *path)
+static bool ro_subvol_lookup(int fd, dev_t dev, bool count_skip)
 {
-	struct ro_subvol_ent *ent;
+	gpointer key = GSIZE_TO_POINTER((gsize)dev), val;
 	bool rdonly = false;
-	int fd;
 
 	g_mutex_lock(&ro_subvol_lock);
-	if (!ro_subvols)
-		ro_subvols = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-						   NULL, g_free);
-	ent = g_hash_table_lookup(ro_subvols, GSIZE_TO_POINTER((gsize)dev));
-	if (ent && ent->known) {
-		rdonly = ent->rdonly;
+	if (ro_subvols &&
+	    g_hash_table_lookup_extended(ro_subvols, key, NULL, &val)) {
 		g_mutex_unlock(&ro_subvol_lock);
-		return rdonly;
+		return GPOINTER_TO_INT(val);
 	}
 	g_mutex_unlock(&ro_subvol_lock);
 
 	/*
 	 * Probe outside the lock: the ioctl is the slow part, and a duplicate
-	 * probe from a second walker is harmless (same answer, idempotent
+	 * probe from a second thread is harmless (same answer, idempotent
 	 * insert) where holding the lock across it would serialise the walk.
 	 */
+	if (btrfs_subvol_is_readonly(fd, &rdonly))
+		rdonly = false;	/* not a subvolume, or an old kernel */
+
+	g_mutex_lock(&ro_subvol_lock);
+	if (!ro_subvols)
+		ro_subvols = g_hash_table_new(g_direct_hash, g_direct_equal);
+	if (g_hash_table_lookup_extended(ro_subvols, key, NULL, &val)) {
+		rdonly = GPOINTER_TO_INT(val);	/* lost the race; agree */
+	} else {
+		g_hash_table_insert(ro_subvols, key,
+				    GINT_TO_POINTER((int)rdonly));
+		if (rdonly && count_skip)
+			filescan_count_skip(SCAN_SKIP_READONLY_SUBVOL);
+	}
+	g_mutex_unlock(&ro_subvol_lock);
+
+	return rdonly;
+}
+
+bool filescan_fd_is_readonly_subvol(int fd)
+{
+	struct stat st;
+
+	/*
+	 * On the default path the walk keeps read-only subvolumes out of the
+	 * hashfile entirely, so no group can contain one and the answer is
+	 * false by construction. Bail before the fstat so the common case pays
+	 * nothing for a feature only --no-skip-readonly-subvols can reach.
+	 */
+	if (!locked_fs.is_btrfs || skipping_readonly_subvols())
+		return false;
+
+	if (fstat(fd, &st))
+		return false;
+
+	return ro_subvol_lookup(fd, st.st_dev, false);
+}
+
+/*
+ * True when `path` (on device `dev`) lives in a read-only btrfs subvolume.
+ * One ioctl per device; the answer is cached for every later path on it, and
+ * for the dedupe phase (see filescan_fd_is_readonly_subvol).
+ */
+static bool dev_is_readonly_subvol(dev_t dev, const char *path)
+{
+	bool rdonly;
+	int fd;
+
 	fd = longpath_open(path, O_RDONLY);
 	if (fd == -1)
 		return false;	/* unreadable is someone else's error to report */
-	if (btrfs_subvol_is_readonly(fd, &rdonly))
-		rdonly = false;	/* not a subvolume, or an old kernel: scan it */
+	rdonly = ro_subvol_lookup(fd, dev, true);
 	close(fd);
-
-	g_mutex_lock(&ro_subvol_lock);
-	ent = g_hash_table_lookup(ro_subvols, GSIZE_TO_POINTER((gsize)dev));
-	if (!ent) {
-		ent = g_malloc0(sizeof(*ent));
-		g_hash_table_insert(ro_subvols, GSIZE_TO_POINTER((gsize)dev), ent);
-	}
-	if (!ent->known) {
-		ent->known = true;
-		ent->rdonly = rdonly;
-		/*
-		 * Count subvolumes, not files: the skip happens at the
-		 * subvolume's root directory and never descends, so this fires
-		 * once per snapshot -- the number the summary should report.
-		 */
-		if (rdonly)
-			filescan_count_skip(SCAN_SKIP_READONLY_SUBVOL);
-	}
-	rdonly = ent->rdonly;
-	g_mutex_unlock(&ro_subvol_lock);
 
 	return rdonly;
 }
@@ -2873,7 +2904,6 @@ void filescan_free(void)
 	scan_writer_close();
 	subvol_cache_free();
 	verified_dev_free();
-	ro_subvol_free();
 	seen_inodes_free();
 
 	g_clear_pointer(&excludes, glob_set_free);

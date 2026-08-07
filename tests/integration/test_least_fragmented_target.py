@@ -16,27 +16,10 @@ class LeastFragmentedTargetTest(DuperemoveTest):
     # Extent-layout sensitive: see DuperemoveTest.serial.
     serial = True
 
-    def _fragment(self, rel, content):
-        """Write content, then rewrite alternate 4K blocks in place (COW) so the
-        file ends up split across many physical extents."""
-        p = self.path(rel)
-        with open(p, "wb") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        fd = os.open(p, os.O_WRONLY)
-        try:
-            for off in range(0, len(content), 8192):
-                os.pwrite(fd, content[off:off + 4096], off)
-                os.fsync(fd)
-        finally:
-            os.close(fd)
-        return p
-
     def test_dedupe_prefers_contiguous_target(self):
         content = os.urandom(8 * MiB)
         # Several fragmented copies plus one clean, contiguous copy.
-        frags = [self._fragment(f"tree/frag{i}", content) for i in range(3)]
+        frags = [self.fragment(f"tree/frag{i}", content) for i in range(3)]
         contig = self.write("tree/contig", content)
         self.sync()
 
