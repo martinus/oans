@@ -1,17 +1,21 @@
-"""A read-only subvolume can only ever be a dedupe *source* (#171).
+"""A read-only subvolume is *preferred* as the dedupe source, never refused (#171).
 
-FIDEDUPERANGE rewrites the destination and only the destination, so a member of
-a read-only subvolume can legally be the group's target (the source the kernel
-reads) and nothing else. Two things follow, and both are tested here:
+FIDEDUPERANGE rewrites the destination and only the destination, so which member
+of a group becomes the target decides which file gets rewritten. Where a group
+has a member in a read-only subvolume, electing it as the target leaves the
+snapshot alone and rewrites the writable copies instead.
 
-  * a read-only member must never be used as a destination, and
-  * when a group has one, it should be *preferred* as the target -- otherwise
-    the group either fails or, on kernels that do not enforce this, silently
-    rewrites the extent mapping of a snapshot that is supposed to be immutable.
+It is only a preference. The kernel deduplicates *into* a read-only subvolume
+quite happily: the content is byte-verified and never changes, only which
+extents back it, and people have relied on that since at least 2019 to shrink
+snapshot-based backups. Refusing it broke that workflow (see
+test_two_readonly_snapshots_still_dedupe, which is the regression guard).
 
-Whether the kernel refuses is version-dependent: a user on r/btrfs reports
-EROFS, while on 7.1.3 the ioctl accepts a read-only destination and rewrites it.
-oans therefore refuses on its own rather than relying on the kernel to refuse.
+The EROFS people do sometimes hit comes from a read-only *mount*, not from the
+subvolume flag: vfs_dedupe_file_range_one() calls mnt_want_write_file(), which
+tests the mount. A read-only subvolume under an ordinary read-write mount does
+not trip it, which is why the same operation works for most people and fails for
+someone whose snapshots are mounted -o ro.
 
 These only apply with --no-skip-readonly-subvols; the default (#156) keeps
 read-only subvolumes out of the scan entirely.
@@ -45,74 +49,52 @@ class ReadonlyTargetTest(DuperemoveTest):
         snap = self.snapshot(live, name)
         return os.path.join(snap, "f.bin")
 
-    def test_writable_copy_is_deduped_onto_the_snapshot(self):
-        """The whole point: the saving is taken, in the legal direction.
+    def test_two_readonly_snapshots_still_dedupe(self):
+        """Regression: refusing read-only destinations broke this outright.
+
+        Deduplicating snapshots against each other is the whole point of
+        running offline dedup on a backup target, and the kernel allows it.
+        oans must not second-guess that -- especially not when the user asked
+        for the snapshots to be included in the first place.
+        """
+        data = os.urandom(SIZE)
+        a_file = self._snapshot_of("snap_a", data)
+        b_file = self._snapshot_of("snap_b", data)
+        self.sync()
+
+        self.assertNotShared(a_file, b_file, "setup: must start unshared")
+
+        self.dm("-rd", NO_SKIP, os.path.dirname(a_file),
+                os.path.dirname(b_file))
+        self.assertDmOk()
+
+        self.assertShared(a_file, b_file,
+                          "two read-only snapshots were not deduplicated")
+
+    def test_a_readonly_member_is_preferred_as_the_target(self):
+        """The snapshot is left alone; the writable copy is the one rewritten.
 
         The snapshot's copy is deliberately the *more fragmented* one, so the
-        pre-#171 least-fragmented rule would have picked the writable file as
-        the target and rewritten the snapshot. Read-only-ness has to outrank
-        fragmentation for this to come out right.
+        least-fragmented rule alone would have elected the writable file and
+        rewritten the snapshot instead.
         """
         data = os.urandom(SIZE)
         snap_file = self._snapshot_of("snap", data, fragmented=True)
-        # Contiguous and independently stored (a plain write never reflinks),
-        # so fragmentation alone would elect it as target.
         rw = self.write("rw/f.bin", data)
         self.sync()
 
         snap_before = phys_extents(snap_file)
         self.assertGreater(len(snap_before), len(phys_extents(rw)),
                            "setup: the snapshot copy must be more fragmented")
-        self.assertNotShared(snap_file, rw,
-                             "setup: the copies must not already share")
+        self.assertNotShared(snap_file, rw, "setup: must start unshared")
 
         self.dm("-rd", NO_SKIP, os.path.dirname(snap_file), self.path("rw"))
         self.assertDmOk()
 
         self.assertEqual(snap_before, phys_extents(snap_file),
-                         "the read-only snapshot was rewritten")
+                         "the snapshot was rewritten instead of the copy")
         self.assertShared(rw, snap_file,
                           "the writable copy was not pointed at the snapshot")
-
-    def test_a_readonly_member_is_never_a_destination(self):
-        """With two read-only members, one cannot be the target -- skip it.
-
-        Before #171 the loser was handed to the kernel as a destination, which
-        on a permissive kernel rewrites a snapshot's extent mapping.
-        """
-        data = os.urandom(SIZE)
-        a_file = self._snapshot_of("snap_a", data)
-        b_file = self._snapshot_of("snap_b", data)
-        rw = self.write("rw/f.bin", data)
-        self.sync()
-
-        a_before, b_before = phys_extents(a_file), phys_extents(b_file)
-
-        self.dm("-rd", NO_SKIP, os.path.dirname(a_file),
-                os.path.dirname(b_file), self.path("rw"))
-        self.assertDmOk()
-
-        self.assertEqual(a_before, phys_extents(a_file),
-                         "snapshot A was rewritten")
-        self.assertEqual(b_before, phys_extents(b_file),
-                         "snapshot B was rewritten -- a read-only member was "
-                         "used as a dedupe destination")
-        # The writable copy still got deduped onto whichever snapshot won.
-        self.assertTrue(phys_extents(rw) & (a_before | b_before),
-                        "the writable copy was not deduped at all")
-
-    def test_the_skip_is_reported(self):
-        """Silently doing less is the failure mode #145/#147/#156 exist to stop."""
-        data = os.urandom(SIZE)
-        a_file = self._snapshot_of("snap_a", data)
-        b_file = self._snapshot_of("snap_b", data)
-        self.sync()
-
-        self.dm("-rd", NO_SKIP, os.path.dirname(a_file),
-                os.path.dirname(b_file), quiet=False)
-        self.assertDmOk()
-        self.assertIn("Read-only", self.out,
-                      "a skipped read-only destination was not reported")
 
     def test_default_still_keeps_snapshots_out_of_the_scan(self):
         """#156's behaviour is unchanged; this only affects the opt-in path."""

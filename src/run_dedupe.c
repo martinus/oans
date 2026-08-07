@@ -193,15 +193,6 @@ static _Atomic uint64_t dedupe_dest_errors;
 /* Destinations skipped because they already shared all storage with the
  * target (deduping them would have been a no-op). See fiemap_ranges_shared(). */
 static _Atomic uint64_t dedupe_dest_already_shared;
-/*
- * Destinations skipped because they live in a read-only subvolume (#171).
- * FIDEDUPERANGE only ever rewrites the *destination*, so such a file can
- * legally be the source and nothing else. Whether the kernel enforces that is
- * version-dependent - some return EROFS, others accept it and rewrite a
- * snapshot that is supposed to be immutable - so oans refuses on its own
- * rather than relying on the kernel to refuse for it.
- */
-static _Atomic uint64_t dedupe_dest_readonly;
 
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 				   uint64_t *kern_bytes)
@@ -418,12 +409,18 @@ static void pick_dedupe_target(struct dupe_extents *dext)
 		filerec_close(extent->e_file);
 
 		/*
-		 * Rank on (read-only, then fewest extents). A member in a
-		 * read-only subvolume is the only one that can legally be the
-		 * source, so electing it is what lets the group deduplicate at
-		 * all; every other member would be refused as a destination
-		 * below. Among equals the least-fragmented copy still wins, so
-		 * groups without one behave exactly as before.
+		 * Rank on (read-only, then fewest extents).
+		 *
+		 * The kernel is happy to dedupe *into* a read-only subvolume -
+		 * content is byte-verified and never changes, only which
+		 * extents back it - and people rely on that to shrink snapshot
+		 * backups, so this is a preference and never a refusal. What it
+		 * buys: where the destination is reached through a read-only
+		 * *mount* the ioctl does fail (mnt_want_write_file), and
+		 * electing the read-only member as the source is the direction
+		 * that still works. It also leaves snapshots alone in favour of
+		 * rewriting the writable copy, which is the less surprising
+		 * outcome. Among equals the least-fragmented copy still wins.
 		 */
 		if (best == NULL || rdonly > best_rdonly ||
 		    (rdonly == best_rdonly && n < best_extents)) {
@@ -651,23 +648,6 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			 */
 			if (tgt_extent == extent)
 				continue;
-		}
-
-		/*
-		 * A read-only member can only ever be the source; see
-		 * dedupe_dest_readonly. The target is exempt - being the source
-		 * is what pick_dedupe_target() elects it for.
-		 */
-		if (extent != tgt_extent &&
-		    filescan_fd_is_readonly_subvol(extent->e_file->fd)) {
-			atomic_fetch_add(&dedupe_dest_readonly, 1);
-			group_tick(gp, len);	/* skipped, but credit its work */
-			vprintf("[%p] %s is in a read-only subvolume; it can "
-				"only be a dedupe source, skipping.\n",
-				g_thread_self(), extent->e_file->filename);
-			if (ctxt && last)
-				goto run_dedupe;
-			continue;
 		}
 
 		/*
@@ -1312,11 +1292,6 @@ void dedupe_phase_end(void)
 			       "needed)\n", col_dim, col_reset,
 			       (uint64_t)dedupe_dest_already_shared,
 			       dedupe_dest_already_shared == 1 ? "" : "s");
-		if (dedupe_dest_readonly)
-			printf("  %sRead-only%s      %lu file%s skipped (can "
-			       "only be a dedupe source)\n", col_dim, col_reset,
-			       (uint64_t)dedupe_dest_readonly,
-			       dedupe_dest_readonly == 1 ? "" : "s");
 	}
 
 	/*
