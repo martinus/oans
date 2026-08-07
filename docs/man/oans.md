@@ -318,16 +318,20 @@ file is recorded once.
     called `.snapshots`. The number skipped is reported in the run summary and
     in **\--json**; the choice is stored in the hashfile and replayed.
 
-    With **\--no-skip-readonly-subvols**, a file in a read-only subvolume is
-    only ever used as a dedupe **source**, never as a destination:
-    `FIDEDUPERANGE` rewrites the destination and nothing else, so writing to one
-    would modify a snapshot that is meant to be immutable.
+    With **\--no-skip-readonly-subvols**, a whole-file group that has a member
+    in a read-only subvolume prefers it as the dedupe **target**, so the writable
+    copies are rewritten to point at it rather than the other way round.
 
-    Where a whole-file group has such a member it is preferred as the target, so
-    the writable copies are pointed at it and the space is reclaimed. Everywhere
-    else — extent-level groups, and groups already anchored to a target by an
-    earlier pass — a read-only member is simply skipped rather than written, and
-    counted on the *Read-only* summary line.
+    This is a preference, not a restriction. The kernel deduplicates *into* a
+    read-only subvolume quite happily — the content is byte-verified and never
+    changes, only which extents back it — and deduplicating snapshots against
+    each other is a normal way to shrink a backup target.
+
+    If you do see `EROFS` (error 30) from the dedupe ioctl, the cause is a
+    read-only **mount**, not the subvolume flag: the kernel's
+    `vfs_dedupe_file_range_one()` tests the mount. `findmnt -T` *path* will show
+    it. A read-only subvolume reached through an ordinary read-write mount is
+    unaffected.
 
 <!-- -->
 
