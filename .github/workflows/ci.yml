@@ -93,18 +93,20 @@ jobs:
   # memory behaviour is fs-independent - so it runs on btrfs only.
   # Split across runners: the integration step is ~90% of this job's wall time
   # (268s of 295s measured), and the setup it duplicates per shard is ~27s, so
-  # sharding trades a little runner time for a much shorter critical path. Three
-  # was the knee locally: 104s whole-suite becomes 35/34/41s per shard, and a
-  # fourth shard mostly buys duplicated setup. tests/run.py deals tests
-  # round-robin over a sorted id list, and shards the serial group separately -
-  # it runs one-at-a-time, so a shard holding all of it would cap the split.
+  # sharding trades a little runner time for a much shorter critical path.
+  # Measured on 4 cores, whole suite 104s vs per shard 27.0/28.1/24.4/28.7s.
+  # Returns are flattening here - the fixed setup is a growing share of each
+  # shard - so going beyond four mostly buys duplicated work. tests/run.py deals
+  # tests round-robin over a sorted id list, and shards the serial group
+  # separately: it runs one-at-a-time, so a shard holding all of it would still
+  # pay the full sequential floor and cap the split.
   valgrind:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: ["1/3", "2/3", "3/3"]
+        shard: ["1/4", "2/4", "3/4", "4/4"]
     steps:
       - uses: actions/checkout@v4
 
