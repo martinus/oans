@@ -302,25 +302,35 @@ file is recorded once.
 
 **\--skip-readonly-subvols**, **\--no-skip-readonly-subvols**
 
-  ~ Skip (or include) read-only btrfs subvolumes — snapshots taken with
-    `btrfs subvolume snapshot -r`, i.e. what snapper, Timeshift and Synology
-    create. **On by default when deduplicating** (**-d**), off otherwise.
+  ~ Keep read-only btrfs subvolumes — snapshots taken with `btrfs subvolume
+    snapshot -r`, i.e. what snapper, Timeshift and Synology create — out of the
+    scan. **Off by default**: snapshots are scanned and deduplicated like any
+    other directory.
 
-    A read-only subvolume can never be a dedupe *destination* — the kernel
-    refuses — so under **-d** every file read and hashed in one is provably
-    wasted work. The saving scales with snapshot count: 20 snapshots of a 1 TiB
-    tree means reading ~20 TiB to reclaim nothing from 19 of them. Without
-    **-d** they are scanned normally, since "what duplicates exist inside my
-    snapshots?" is a fair question to ask a reporting tool.
+    Turn it on where your snapshots are near-copies of the live subvolume, which
+    is the shape a snapper/Timeshift desktop has. A fresh snapshot already shares
+    every extent with the subvolume it came from, so reading and hashing it
+    reclaims nothing, and the waste scales with snapshot count: 20 snapshots of a
+    1 TiB tree means reading ~20 TiB to reclaim nothing from 19 of them.
+
+    Leave it off for a backup target — an rsync-into-a-subvolume-then-snapshot
+    setup, say — where each snapshot holds independently written copies of
+    unchanged files. Deduplicating those against each other is the whole reason
+    to run an offline deduplicator over such a tree, and it is what the option
+    would prevent.
+
+    Note the trade the default makes: a writable file deduplicated against a
+    snapshot is rewritten to point at the snapshot's extents, so deleting that
+    snapshot afterwards frees less than its size suggests.
 
     Detection is by property (the subvolume's read-only flag), not by directory
     name, so it never fires on a writable directory that merely happens to be
     called `.snapshots`. The number skipped is reported in the run summary and
     in **\--json**; the choice is stored in the hashfile and replayed.
 
-    With **\--no-skip-readonly-subvols**, a whole-file group that has a member
-    in a read-only subvolume prefers it as the dedupe **target**, so the writable
-    copies are rewritten to point at it rather than the other way round.
+    A whole-file group with a member in a read-only subvolume prefers it as the
+    dedupe **target**, so the writable copies are rewritten to point at it rather
+    than the other way round.
 
     This is a preference, not a restriction. The kernel deduplicates *into* a
     read-only subvolume quite happily — the content is byte-verified and never

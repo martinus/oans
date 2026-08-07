@@ -1,11 +1,16 @@
-"""Read-only btrfs subvolumes are dead weight under -d (#156).
+"""--skip-readonly-subvols keeps snapshots out of the scan; off by default (#182).
 
-Pointed at the normal shape of a NAS or a snapper/Timeshift desktop, oans used
-to walk into every read-only snapshot and read and hash every file in it. The
-behaviour was *safe* -- the already-shared check catches them before any ioctl
--- but by then all the read and hash I/O had been spent, and the waste scales
-with snapshot count: 20 snapshots of a 1 TiB tree means reading ~20 TiB to
-reclaim nothing from 19 of them.
+#156 made the skip the default under -d, on the premise that a read-only
+subvolume can never be a dedupe *destination* because the kernel refuses it.
+That premise is wrong (#171): the kernel deduplicates into a read-only
+subvolume quite happily -- only a read-only *mount* is refused -- so snapshots
+are ordinary dedupe material, and deduplicating them against each other is how
+a snapshot-based backup target is shrunk. The default now includes them.
+
+The option keeps its point for the other shape: where snapshots are near-copies
+of the live subvolume they already share its extents, so hashing them reclaims
+nothing and the waste scales with snapshot count (20 snapshots of a 1 TiB tree
+means reading ~20 TiB). A snapper/Timeshift desktop wants it on.
 
 Detected by property (BTRFS_IOC_GET_SUBVOL_INFO -> BTRFS_ROOT_SUBVOL_RDONLY),
 not by directory name, so it catches snapper, Timeshift and Synology alike and
@@ -18,6 +23,8 @@ import os
 import unittest
 
 from harness import DuperemoveTest, requires_btrfs
+
+SKIP = "--skip-readonly-subvols"
 
 
 @requires_btrfs
@@ -41,18 +48,18 @@ class ReadonlySubvolTest(DuperemoveTest):
         return {os.path.basename(os.path.dirname(row[0]))
                 for row in self.hf_query("select filename from files")}
 
-    def test_dedupe_does_not_hash_a_readonly_snapshot(self):
-        """The whole point: no read, no hash, no hashfile rows."""
+    def test_dedupe_covers_a_readonly_snapshot_by_default(self):
+        """The point of the flip: a backup target made of snapshots is served."""
         self._live_dups()
         self._snapshot("snap1")
         self.dedupe(self.work)
         self.assertDmOk()
-        self.assertNotIn("snap1", self._scanned(),
-                         "the read-only snapshot was hashed anyway")
+        self.assertIn("snap1", self._scanned(),
+                      "the read-only snapshot was skipped by default")
         self.assertIn("live", self._scanned())
 
-    def test_report_mode_still_covers_snapshots(self):
-        """Without -d, "what duplicates exist in my snapshots?" is fair to ask."""
+    def test_report_mode_covers_snapshots(self):
+        """"What duplicates exist in my snapshots?" is fair to ask."""
         self._live_dups()
         self._snapshot("snap1")
         self.scan(self.work)
@@ -60,30 +67,39 @@ class ReadonlySubvolTest(DuperemoveTest):
         self.assertIn("snap1", self._scanned(),
                       "report mode should not skip snapshots")
 
-    def test_skip_is_reported_not_silent(self):
-        """A default that quietly shrinks the scan is the #147 failure mode."""
+    def test_opt_in_keeps_them_out(self):
+        """No read, no hash, no hashfile rows -- what the option is for."""
         self._live_dups()
         self._snapshot("snap1")
-        self.dedupe(self.work)
-        self.assertIn("read-only subvolume", self.out,
-                      "the skip was silent")
+        self.dm("-rd", SKIP, self.work)
+        self.assertDmOk()
+        self.assertNotIn("snap1", self._scanned(),
+                         "the read-only snapshot was hashed anyway")
+        self.assertIn("live", self._scanned())
+
+    def test_skip_is_reported_not_silent(self):
+        """A scan that quietly shrinks is the #147 failure mode."""
+        self._live_dups()
+        self._snapshot("snap1")
+        self.dm("-rd", SKIP, self.work, quiet=False)
+        self.assertIn("read-only subvolume", self.out, "the skip was silent")
 
     def test_skip_is_counted_per_subvolume_not_per_file(self):
         self._live_dups()
         self._snapshot("snap1")
         self._snapshot("snap2")
-        self.dedupe(self.work)
+        self.dm("-rd", SKIP, self.work, quiet=False)
         self.assertIn("2 read-only subvolumes skipped", self.out)
 
-    def test_opt_out_scans_them_again(self):
+    def test_default_says_nothing_about_snapshots(self):
+        """Nothing is skipped, so there is no shrunk-scan line to report."""
         self._live_dups()
         self._snapshot("snap1")
-        self.dm("-rd", "--no-skip-readonly-subvols", self.work)
+        self.dedupe(self.work, "--no-skip-readonly-subvols")
         self.assertDmOk()
-        self.assertIn("snap1", self._scanned(),
-                      "--no-skip-readonly-subvols was ignored")
+        self.assertNotIn("read-only subvolume", self.out)
 
-    def test_opt_out_survives_a_replay(self):
+    def test_skip_survives_a_replay(self):
         """The choice is scan-shaping, so the hashfile must remember it.
 
         Otherwise a scheduled job's scope would silently change the first time
@@ -91,7 +107,7 @@ class ReadonlySubvolTest(DuperemoveTest):
         """
         self._live_dups()
         self._snapshot("snap1")
-        self.dm("-rd", "--no-skip-readonly-subvols", self.work)
+        self.dm("-rd", SKIP, self.work)
         rows_before = len(self.hf_query("select filename from files"))
 
         # Bare replay: no paths, no options.
@@ -99,13 +115,13 @@ class ReadonlySubvolTest(DuperemoveTest):
         self.assertDmOk()
         self.assertEqual(rows_before,
                          len(self.hf_query("select filename from files")),
-                         "the replay dropped the snapshot the opt-out included")
+                         "the replay scanned the snapshot the skip excluded")
 
-    def test_writable_snapshot_is_still_scanned(self):
+    def test_writable_snapshot_is_scanned_even_when_skipping(self):
         """Read-only-ness is the criterion, not "is a snapshot"."""
         self._live_dups()
         self._snapshot("snap1", readonly=False)
-        self.dedupe(self.work)
+        self.dm("-rd", SKIP, self.work)
         self.assertDmOk()
         self.assertIn("snap1", self._scanned(),
                       "a writable snapshot must still be deduplicated")
@@ -113,7 +129,7 @@ class ReadonlySubvolTest(DuperemoveTest):
     def test_skip_reaches_json(self):
         self._live_dups()
         self._snapshot("snap1")
-        self.dedupe(self.work)
+        self.dm("-rd", SKIP, self.work)
         metrics = json.loads(self.dm("--json"))
         self.assertEqual(1, metrics["readonly_subvols_skipped_last_run"])
         # A saving, not a fault: it must not raise the error total.

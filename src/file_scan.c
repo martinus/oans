@@ -712,8 +712,6 @@ static void verified_dev_free(void)
  * .snapshots, and -- being an implicit default -- would never reach
  * scan_excludes, so a replay's scope would depend on the binary version.
  */
-static bool skipping_readonly_subvols(void);
-
 static GHashTable *ro_subvols;		/* dev_t -> (gpointer)(bool) read-only */
 static GMutex ro_subvol_lock;
 
@@ -784,7 +782,7 @@ bool filescan_fd_is_readonly_subvol(int fd)
 	 * false by construction. Bail before the fstat so the common case pays
 	 * nothing for a feature only --no-skip-readonly-subvols can reach.
 	 */
-	if (!locked_fs.is_btrfs || skipping_readonly_subvols())
+	if (!locked_fs.is_btrfs || options.skip_readonly_subvols)
 		return false;
 
 	if (fstat(fd, &st))
@@ -810,14 +808,6 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 	close(fd);
 
 	return rdonly;
-}
-
-/* Whether this run should skip read-only subvolumes (-1 = auto: iff -d). */
-static bool skipping_readonly_subvols(void)
-{
-	if (options.skip_readonly_subvols < 0)
-		return options.run_dedupe;
-	return options.skip_readonly_subvols != 0;
 }
 
 static char *extract_first_device(const char *fs_source)
@@ -1007,25 +997,28 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	}
 
 	/*
-	 * Read-only subvolumes (snapshots) are dead weight under -d (#156).
+	 * --skip-readonly-subvols keeps snapshots out of the scan (#156, #182).
 	 *
-	 * Pointed at the normal shape of a NAS or a snapper/Timeshift desktop,
-	 * the walk descends into every read-only snapshot and reads and hashes
-	 * every file in it. The result is *safe* - the already-shared check
-	 * catches them before any ioctl - but by then all the read and hash I/O
-	 * has been spent, and it scales with snapshot count: 20 snapshots of a
-	 * 1 TiB tree means reading ~20 TiB to reclaim nothing from 19 of them.
+	 * Off by default. #156 made it the default under -d on the premise that
+	 * the kernel refuses a read-only *destination*, which would make the
+	 * read and hash of every file in a snapshot provably wasted. That premise
+	 * is wrong (#171): the kernel deduplicates into a read-only subvolume
+	 * quite happily - only a read-only *mount* is refused - and snapshots
+	 * deduplicated against each other are how a backup target is shrunk.
+	 * Skipping them by default silently defeated the workload oans is for.
 	 *
-	 * The kernel refuses a read-only destination, so under -d this work is
-	 * provably wasted, not merely usually wasted. In report mode it is not:
-	 * asking "what duplicates exist inside my snapshots?" is a reasonable
-	 * thing to ask a reporting tool, so the default keys off -d.
+	 * The cost the option still buys back is real, just not universal: where
+	 * snapshots are near-copies of the live subvolume they already share its
+	 * extents, so hashing them reclaims nothing, and the waste scales with
+	 * snapshot count - 20 snapshots of a 1 TiB tree means reading ~20 TiB. A
+	 * snapper/Timeshift desktop wants this on; an rsync-into-a-subvolume
+	 * backup target, where every snapshot holds independent copies, does not.
 	 *
 	 * Checked after the config skips so an explicit --exclude still wins,
 	 * and before the locked-fs probe so a snapshot costs one ioctl rather
 	 * than a full probe. Non-btrfs filesystems have no subvolumes at all.
 	 */
-	if (locked_fs.is_btrfs && skipping_readonly_subvols() &&
+	if (locked_fs.is_btrfs && options.skip_readonly_subvols &&
 	    dev_is_readonly_subvol(stx_to_dev(st), path)) {
 		vprintf("Skipping read-only subvolume: %s\n", path);
 		return false;
