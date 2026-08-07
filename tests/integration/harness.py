@@ -179,6 +179,12 @@ requires_btrfs = unittest.skipUnless(
     BTRFS, "test needs btrfs (copy-on-write fragmentation)")
 
 
+def btrfs_ok(*args):
+    """Run `btrfs <args>` quietly; True on success."""
+    return subprocess.run(["btrfs", *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
 # --------------------------------------------------------------------------
 # Base test case
 # --------------------------------------------------------------------------
@@ -229,8 +235,12 @@ class DuperemoveTest(unittest.TestCase):
         self.hf = os.path.join(self.work, "hashfile.db")
         self.out = ""       # combined output of the last dm() call
         self.rc = 0         # its exit code
+        self._subvols = []  # created via subvol()/snapshot(), see tearDown
 
     def tearDown(self):
+        # Innermost first: a snapshot must go before the subvolume it lives in.
+        for path in reversed(self._subvols):
+            btrfs_ok("subvolume", "delete", path)
         shutil.rmtree(self.work, ignore_errors=True)
 
     # -- running oans ------------------------------------------------
@@ -432,3 +442,51 @@ class DuperemoveTest(unittest.TestCase):
         dst = self.path(rel_dst)
         os.link(self.path(rel_src), dst)
         return dst
+
+    # -- btrfs subvolumes --------------------------------------------------
+    #
+    # Subvolumes cannot be removed with rmtree (a read-only one refuses even
+    # to have its files unlinked), so anything created here is tracked and
+    # deleted with the ioctl in tearDown, innermost first.
+
+    def subvol(self, name):
+        """Create a btrfs subvolume under the scratch dir; skips if it can't."""
+        p = os.path.join(self.work, name)
+        if not btrfs_ok("subvolume", "create", p):
+            self.skipTest("cannot create a btrfs subvolume here")
+        self._subvols.append(p)
+        return p
+
+    def snapshot(self, src, name, readonly=True):
+        """Snapshot `src` to `name`; read-only by default."""
+        args = ["subvolume", "snapshot"] + (["-r"] if readonly else [])
+        dst = os.path.join(self.work, name)
+        self.assertTrue(btrfs_ok(*args, src, dst),
+                        f"could not snapshot {src} into {name}")
+        self._subvols.append(dst)
+        return dst
+
+    def fragment(self, relpath, content):
+        """Write content, then rewrite alternate 4K blocks in place.
+
+        btrfs is copy-on-write, so the rewrites land elsewhere and the file
+        ends up split across many physical extents. Needs btrfs; on xfs the
+        overwrite happens in place and the file stays contiguous.
+        """
+        p = relpath if os.path.isabs(relpath) else self.path(relpath)
+        with open(p, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        fd = os.open(p, os.O_WRONLY)
+        try:
+            for off in range(0, len(content), 8192):
+                os.pwrite(fd, content[off:off + 4096], off)
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        return p
+
+    def scanned_files(self):
+        """Set of every path recorded in the hashfile."""
+        return {r[0] for r in self.hf_query("select filename from files")}

@@ -401,34 +401,31 @@ static void pick_dedupe_target(struct dupe_extents *dext)
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		unsigned int n;
-		bool rdonly = false;
-		struct stat st;
+		bool rdonly;
 
 		if (filerec_open(extent->e_file, true))
 			continue;
 		/* Count-only fiemap: we need the extent count, not the map. */
 		n = fiemap_count_extents(extent->e_file->fd, extent->e_loff,
 					 extent_len(extent));
-		if (fstat(extent->e_file->fd, &st) == 0)
-			rdonly = filescan_fd_is_readonly_subvol(
-					extent->e_file->fd, st.st_dev);
+		/* n == 0 means the fiemap failed; ignore that candidate before
+		 * paying for anything else. */
+		if (!n) {
+			filerec_close(extent->e_file);
+			continue;
+		}
+		rdonly = filescan_fd_is_readonly_subvol(extent->e_file->fd);
 		filerec_close(extent->e_file);
 
-		/* n == 0 means the fiemap failed; ignore that candidate. */
-		if (!n)
-			continue;
-
 		/*
-		 * Read-only-ness outranks fragmentation (#171). A member in a
+		 * Rank on (read-only, then fewest extents). A member in a
 		 * read-only subvolume is the only one that can legally be the
-		 * source, so making it the target is what lets the group
-		 * deduplicate at all; every other member would be refused as a
-		 * destination below. Among equals, keep preferring the
-		 * least-fragmented copy so the others do not inherit a bad
-		 * on-disk layout.
+		 * source, so electing it is what lets the group deduplicate at
+		 * all; every other member would be refused as a destination
+		 * below. Among equals the least-fragmented copy still wins, so
+		 * groups without one behave exactly as before.
 		 */
-		if (best == NULL ||
-		    (rdonly && !best_rdonly) ||
+		if (best == NULL || rdonly > best_rdonly ||
 		    (rdonly == best_rdonly && n < best_extents)) {
 			best = extent;
 			best_extents = n;
@@ -529,11 +526,10 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		add_shared_extents(dext, &shared_prev);
 
 	/*
-	 * Prefer the least-fragmented copy as the dedupe target so the others
-	 * don't inherit a bad on-disk layout. Only for whole files, and only
-	 * when the group has no anchor from an earlier pass - an anchored group
-	 * must keep its anchor (loaded first) as target so every pass converges
-	 * the copies onto the same physical extent.
+	 * Only for whole files, and only when the group has no anchor from an
+	 * earlier pass - an anchored group must keep its anchor (loaded first)
+	 * as target so every pass converges the copies onto the same physical
+	 * extent. See pick_dedupe_target() for how the target is chosen.
 	 */
 	if (whole_file_dedup && !dext->de_anchored)
 		pick_dedupe_target(dext);
@@ -543,8 +539,6 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	slot_show_group(slot, dext);
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
-		dev_t member_dev = 0;	/* 0 = fstat failed, see below */
-
 		if (list_is_last(&extent->e_list, &dext->de_extents))
 			last = 1;
 
@@ -598,10 +592,7 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		{
 			struct stat st;
 
-			if (fstat(extent->e_file->fd, &st) == 0)
-				member_dev = st.st_dev;
-
-			if (member_dev &&
+			if (fstat(extent->e_file->fd, &st) == 0 &&
 			    (whole_file_dedup ?
 			     (uint64_t)st.st_size != len :
 			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
@@ -663,23 +654,12 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		}
 
 		/*
-		 * Never rewrite a file in a read-only subvolume (#171).
-		 *
-		 * FIDEDUPERANGE only ever modifies the destination, so a member
-		 * of a read-only subvolume can legally be the source and
-		 * nothing else. Whether the kernel enforces that is
-		 * version-dependent: some return EROFS, others accept it and
-		 * rewrite the extent mapping of a snapshot that is supposed to
-		 * be immutable. Refuse here rather than rely on the kernel to
-		 * refuse for us.
-		 *
-		 * The target is exempt: being the source is exactly what a
-		 * read-only member is for, and pick_dedupe_target() prefers one
-		 * for that reason.
+		 * A read-only member can only ever be the source; see
+		 * dedupe_dest_readonly. The target is exempt - being the source
+		 * is what pick_dedupe_target() elects it for.
 		 */
-		if (extent != tgt_extent && member_dev &&
-		    filescan_fd_is_readonly_subvol(extent->e_file->fd,
-						   member_dev)) {
+		if (extent != tgt_extent &&
+		    filescan_fd_is_readonly_subvol(extent->e_file->fd)) {
 			atomic_fetch_add(&dedupe_dest_readonly, 1);
 			group_tick(gp, len);	/* skipped, but credit its work */
 			vprintf("[%p] %s is in a read-only subvolume; it can "

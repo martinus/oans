@@ -15,39 +15,19 @@ never fires on a writable directory that merely happens to be called
 
 import json
 import os
-import subprocess
 import unittest
 
 from harness import DuperemoveTest, requires_btrfs
-
-
-def _btrfs(*args):
-    return subprocess.run(["btrfs", *args], stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
 
 
 @requires_btrfs
 class ReadonlySubvolTest(DuperemoveTest):
     def setUp(self):
         super().setUp()
-        self.live = os.path.join(self.work, "live")
-        if not _btrfs("subvolume", "create", self.live):
-            self.skipTest("cannot create a btrfs subvolume here")
-
-    def tearDown(self):
-        # Subvolumes must be deleted with the ioctl, not rmtree.
-        for name in ("snap1", "snap2", "live"):
-            _btrfs("subvolume", "delete", os.path.join(self.work, name))
-        super().tearDown()
+        self.live = self.subvol("live")
 
     def _snapshot(self, name, readonly=True):
-        args = ["subvolume", "snapshot"]
-        if readonly:
-            args.append("-r")
-        dst = os.path.join(self.work, name)
-        self.assertTrue(_btrfs(*args, self.live, dst),
-                        f"could not snapshot into {name}")
-        return dst
+        return self.snapshot(self.live, name, readonly=readonly)
 
     def _live_dups(self):
         """Two duplicate files inside the live subvolume."""

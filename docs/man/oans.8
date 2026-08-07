@@ -391,10 +391,14 @@ subvolume is only ever used as a dedupe \f[B]source\f[R], never as a
 destination: \f[CR]FIDEDUPERANGE\f[R] rewrites the destination and
 nothing else, so writing to one would modify a snapshot that is meant to
 be immutable.
-A group containing such a file therefore takes it as the target and
-points the writable copies at it, which is the direction that reclaims
-space; any further read\-only members are skipped and counted on the
-\f[I]Read\-only\f[R] summary line.
+.PP
+Where a whole\-file group has such a member it is preferred as the
+target, so the writable copies are pointed at it and the space is
+reclaimed.
+Everywhere else \(em extent\-level groups, and groups already anchored
+to a target by an earlier pass \(em a read\-only member is simply
+skipped rather than written, and counted on the \f[I]Read\-only\f[R]
+summary line.
 .RE
 .TP
 \f[B]\-q\f[R], \f[B]\-\-quiet\f[R]

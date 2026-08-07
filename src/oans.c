@@ -1992,6 +1992,8 @@ int main(int argc, char **argv)
 out:
 	scan_config_free(&replay);
 	free_all_filerecs();
+	/* Outlives filescan_free(): the dedupe phase queries it. */
+	filescan_free_late();
 
 #ifdef DEBUG_BUILD
 	print_mem_stats();

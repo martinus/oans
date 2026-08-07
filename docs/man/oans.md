@@ -321,10 +321,13 @@ file is recorded once.
     With **\--no-skip-readonly-subvols**, a file in a read-only subvolume is
     only ever used as a dedupe **source**, never as a destination:
     `FIDEDUPERANGE` rewrites the destination and nothing else, so writing to one
-    would modify a snapshot that is meant to be immutable. A group containing
-    such a file therefore takes it as the target and points the writable copies
-    at it, which is the direction that reclaims space; any further read-only
-    members are skipped and counted on the *Read-only* summary line.
+    would modify a snapshot that is meant to be immutable.
+
+    Where a whole-file group has such a member it is preferred as the target, so
+    the writable copies are pointed at it and the space is reclaimed. Everywhere
+    else — extent-level groups, and groups already anchored to a target by an
+    earlier pass — a read-only member is simply skipped rather than written, and
+    counted on the *Read-only* summary line.
 
 <!-- -->
 
