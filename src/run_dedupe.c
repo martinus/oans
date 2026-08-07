@@ -43,6 +43,7 @@
 #include "dbfile.h"
 #include "fiemap.h"
 #include "find_dupes.h"
+#include "file_scan.h"
 #include "tsan.h"
 
 #include "run_dedupe.h"
@@ -192,6 +193,15 @@ static _Atomic uint64_t dedupe_dest_errors;
 /* Destinations skipped because they already shared all storage with the
  * target (deduping them would have been a no-op). See fiemap_ranges_shared(). */
 static _Atomic uint64_t dedupe_dest_already_shared;
+/*
+ * Destinations skipped because they live in a read-only subvolume (#171).
+ * FIDEDUPERANGE only ever rewrites the *destination*, so such a file can
+ * legally be the source and nothing else. Whether the kernel enforces that is
+ * version-dependent - some return EROFS, others accept it and rewrite a
+ * snapshot that is supposed to be immutable - so oans refuses on its own
+ * rather than relying on the kernel to refuse for it.
+ */
+static _Atomic uint64_t dedupe_dest_readonly;
 
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 				   uint64_t *kern_bytes)
@@ -372,6 +382,9 @@ static void clean_deduped(struct dupe_extents **ret_dext,
 }
 
 /*
+ * Choose which member of the group becomes the dedupe target, i.e. the source
+ * the kernel reads and every other member is pointed at.
+ *
  * Deduping every copy against a fragmented target makes each copy inherit that
  * fragmentation: one extent-tree op per target extent per copy, and all copies
  * left fragmented on disk (measured ~linear in target extents once past a fixed
@@ -380,25 +393,46 @@ static void clean_deduped(struct dupe_extents **ret_dext,
  * it to the front of the list; the loop below always dedupes against the first
  * entry. Extent-dedupe members are single extents, so this is skipped there.
  */
-static void pick_least_fragmented_target(struct dupe_extents *dext)
+static void pick_dedupe_target(struct dupe_extents *dext)
 {
 	struct extent *extent, *best = NULL;
 	unsigned int best_extents = 0;
+	bool best_rdonly = false;
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		unsigned int n;
+		bool rdonly = false;
+		struct stat st;
 
 		if (filerec_open(extent->e_file, true))
 			continue;
 		/* Count-only fiemap: we need the extent count, not the map. */
 		n = fiemap_count_extents(extent->e_file->fd, extent->e_loff,
 					 extent_len(extent));
+		if (fstat(extent->e_file->fd, &st) == 0)
+			rdonly = filescan_fd_is_readonly_subvol(
+					extent->e_file->fd, st.st_dev);
 		filerec_close(extent->e_file);
 
 		/* n == 0 means the fiemap failed; ignore that candidate. */
-		if (n && (best == NULL || n < best_extents)) {
+		if (!n)
+			continue;
+
+		/*
+		 * Read-only-ness outranks fragmentation (#171). A member in a
+		 * read-only subvolume is the only one that can legally be the
+		 * source, so making it the target is what lets the group
+		 * deduplicate at all; every other member would be refused as a
+		 * destination below. Among equals, keep preferring the
+		 * least-fragmented copy so the others do not inherit a bad
+		 * on-disk layout.
+		 */
+		if (best == NULL ||
+		    (rdonly && !best_rdonly) ||
+		    (rdonly == best_rdonly && n < best_extents)) {
 			best = extent;
 			best_extents = n;
+			best_rdonly = rdonly;
 		}
 	}
 
@@ -502,13 +536,15 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	 * the copies onto the same physical extent.
 	 */
 	if (whole_file_dedup && !dext->de_anchored)
-		pick_least_fragmented_target(dext);
+		pick_dedupe_target(dext);
 
 	/* clean_deduped/target selection may have changed the group; show the
 	 * real target and remaining work on this thread's status line. */
 	slot_show_group(slot, dext);
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
+		dev_t member_dev = 0;	/* 0 = fstat failed, see below */
+
 		if (list_is_last(&extent->e_list, &dext->de_extents))
 			last = 1;
 
@@ -562,7 +598,10 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		{
 			struct stat st;
 
-			if (fstat(extent->e_file->fd, &st) == 0 &&
+			if (fstat(extent->e_file->fd, &st) == 0)
+				member_dev = st.st_dev;
+
+			if (member_dev &&
 			    (whole_file_dedup ?
 			     (uint64_t)st.st_size != len :
 			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
@@ -621,6 +660,34 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			 */
 			if (tgt_extent == extent)
 				continue;
+		}
+
+		/*
+		 * Never rewrite a file in a read-only subvolume (#171).
+		 *
+		 * FIDEDUPERANGE only ever modifies the destination, so a member
+		 * of a read-only subvolume can legally be the source and
+		 * nothing else. Whether the kernel enforces that is
+		 * version-dependent: some return EROFS, others accept it and
+		 * rewrite the extent mapping of a snapshot that is supposed to
+		 * be immutable. Refuse here rather than rely on the kernel to
+		 * refuse for us.
+		 *
+		 * The target is exempt: being the source is exactly what a
+		 * read-only member is for, and pick_dedupe_target() prefers one
+		 * for that reason.
+		 */
+		if (extent != tgt_extent && member_dev &&
+		    filescan_fd_is_readonly_subvol(extent->e_file->fd,
+						   member_dev)) {
+			atomic_fetch_add(&dedupe_dest_readonly, 1);
+			group_tick(gp, len);	/* skipped, but credit its work */
+			vprintf("[%p] %s is in a read-only subvolume; it can "
+				"only be a dedupe source, skipping.\n",
+				g_thread_self(), extent->e_file->filename);
+			if (ctxt && last)
+				goto run_dedupe;
+			continue;
 		}
 
 		/*
@@ -1265,6 +1332,11 @@ void dedupe_phase_end(void)
 			       "needed)\n", col_dim, col_reset,
 			       (uint64_t)dedupe_dest_already_shared,
 			       dedupe_dest_already_shared == 1 ? "" : "s");
+		if (dedupe_dest_readonly)
+			printf("  %sRead-only%s      %lu file%s skipped (can "
+			       "only be a dedupe source)\n", col_dim, col_reset,
+			       (uint64_t)dedupe_dest_readonly,
+			       dedupe_dest_readonly == 1 ? "" : "s");
 	}
 
 	/*

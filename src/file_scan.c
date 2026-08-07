@@ -725,14 +725,16 @@ static void ro_subvol_free(void)
 }
 
 /*
- * True when `path` (on device `dev`) lives in a read-only btrfs subvolume.
- * One ioctl per device; the answer is cached for every later path on it.
+ * Core lookup: is `fd`'s subvolume read-only? `fd` must already be open on a
+ * file or directory inside it. Sets *first when this call is what resolved the
+ * device, so a caller that wants to count discoveries can do so exactly once.
  */
-static bool dev_is_readonly_subvol(dev_t dev, const char *path)
+static bool ro_subvol_lookup(int fd, dev_t dev, bool *first)
 {
 	struct ro_subvol_ent *ent;
 	bool rdonly = false;
-	int fd;
+
+	*first = false;
 
 	g_mutex_lock(&ro_subvol_lock);
 	if (!ro_subvols)
@@ -748,15 +750,11 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 
 	/*
 	 * Probe outside the lock: the ioctl is the slow part, and a duplicate
-	 * probe from a second walker is harmless (same answer, idempotent
+	 * probe from a second thread is harmless (same answer, idempotent
 	 * insert) where holding the lock across it would serialise the walk.
 	 */
-	fd = longpath_open(path, O_RDONLY);
-	if (fd == -1)
-		return false;	/* unreadable is someone else's error to report */
 	if (btrfs_subvol_is_readonly(fd, &rdonly))
-		rdonly = false;	/* not a subvolume, or an old kernel: scan it */
-	close(fd);
+		rdonly = false;	/* not a subvolume, or an old kernel */
 
 	g_mutex_lock(&ro_subvol_lock);
 	ent = g_hash_table_lookup(ro_subvols, GSIZE_TO_POINTER((gsize)dev));
@@ -767,16 +765,44 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 	if (!ent->known) {
 		ent->known = true;
 		ent->rdonly = rdonly;
-		/*
-		 * Count subvolumes, not files: the skip happens at the
-		 * subvolume's root directory and never descends, so this fires
-		 * once per snapshot -- the number the summary should report.
-		 */
-		if (rdonly)
-			filescan_count_skip(SCAN_SKIP_READONLY_SUBVOL);
+		*first = true;
 	}
 	rdonly = ent->rdonly;
 	g_mutex_unlock(&ro_subvol_lock);
+
+	return rdonly;
+}
+
+bool filescan_fd_is_readonly_subvol(int fd, dev_t dev)
+{
+	bool first;
+
+	return ro_subvol_lookup(fd, dev, &first);
+}
+
+/*
+ * True when `path` (on device `dev`) lives in a read-only btrfs subvolume.
+ * One ioctl per device; the answer is cached for every later path on it, and
+ * shared with the dedupe phase (see filescan_fd_is_readonly_subvol).
+ */
+static bool dev_is_readonly_subvol(dev_t dev, const char *path)
+{
+	bool rdonly, first;
+	int fd;
+
+	fd = longpath_open(path, O_RDONLY);
+	if (fd == -1)
+		return false;	/* unreadable is someone else's error to report */
+	rdonly = ro_subvol_lookup(fd, dev, &first);
+	close(fd);
+
+	/*
+	 * Count subvolumes, not files: the skip happens at the subvolume's root
+	 * directory and never descends, so this fires once per snapshot --
+	 * the number the summary should report.
+	 */
+	if (rdonly && first)
+		filescan_count_skip(SCAN_SKIP_READONLY_SUBVOL);
 
 	return rdonly;
 }

@@ -98,6 +98,17 @@ void filescan_count_errno_skip(int err);
  */
 void filescan_get_skips(uint64_t out[SCAN_SKIP__COUNT]);
 
+/*
+ * True when the already-open `fd` (on device `dev`) lives in a read-only btrfs
+ * subvolume. One ioctl per device, cached and shared with the walk's own
+ * lookups. False for anything that is not a btrfs subvolume.
+ *
+ * Used by the dedupe phase, which must never make such a file a dedupe
+ * *destination*: FIDEDUPERANGE only ever rewrites the destination, so a
+ * read-only member can legally be the source and nothing else (#171).
+ */
+bool filescan_fd_is_readonly_subvol(int fd, dev_t dev);
+
 /* For dbfile.c */
 struct block_csum {
 	uint64_t	loff;

@@ -318,6 +318,14 @@ file is recorded once.
     called `.snapshots`. The number skipped is reported in the run summary and
     in **\--json**; the choice is stored in the hashfile and replayed.
 
+    With **\--no-skip-readonly-subvols**, a file in a read-only subvolume is
+    only ever used as a dedupe **source**, never as a destination:
+    `FIDEDUPERANGE` rewrites the destination and nothing else, so writing to one
+    would modify a snapshot that is meant to be immutable. A group containing
+    such a file therefore takes it as the target and points the writable copies
+    at it, which is the direction that reclaims space; any further read-only
+    members are skipped and counted on the *Read-only* summary line.
+
 <!-- -->
 
 **-q**, **\--quiet**
