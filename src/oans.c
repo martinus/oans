@@ -127,9 +127,7 @@ static char *scan_config_options_str(const struct scan_config *sc)
 		g_string_append(s, "-d ");
 	if (sc->skip_zeroes)
 		g_string_append(s, "--skip-zeroes ");
-	if (sc->skip_readonly_subvols == 0)
-		g_string_append(s, "--no-skip-readonly-subvols ");
-	else if (sc->skip_readonly_subvols == 1)
+	if (sc->skip_readonly_subvols)
 		g_string_append(s, "--skip-readonly-subvols ");
 	if (sc->min_filesize > 1)
 		g_string_append_printf(s, "--min-filesize=%"PRIu64" ", sc->min_filesize);
@@ -868,9 +866,9 @@ static void help(void)
 "  -q, --quiet                 print only errors and a one-line summary\n"
 "  -v                          verbose output\n"
 "      --progress=json         stream machine-readable progress (JSONL) to stderr\n"
-"      --[no-]skip-readonly-subvols\n"
-"                              skip read-only subvolumes (snapshots) when\n"
-"                              deduplicating; on by default with -d\n"
+"      --skip-readonly-subvols\n"
+"                              keep read-only subvolumes (snapshots) out of\n"
+"                              the scan; off by default\n"
 "      --no-color              disable colored output\n"
 "      --debug                 print debug messages (implies -v)\n"
 "      --version               print version and exit\n"
@@ -970,10 +968,10 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			options.skip_zeroes = true;
 			break;
 		case SKIP_RO_SUBVOLS_OPTION:
-			options.skip_readonly_subvols = 1;
+			options.skip_readonly_subvols = true;
 			break;
 		case NO_SKIP_RO_SUBVOLS_OPTION:
-			options.skip_readonly_subvols = 0;
+			options.skip_readonly_subvols = false;
 			break;
 		case DEDUPE_OPTS_OPTION:
 			if (parse_dedupe_opts(optarg))
@@ -1494,15 +1492,17 @@ static void report_scan_skips(const uint64_t *skips)
 				       col_dim, col_reset);
 
 	/*
-	 * Read-only subvolumes are reported by default, not just under -v: this
-	 * is the one config-ish bucket that *shrinks the scan the user asked
-	 * for*, and a default that quietly covers less is the same class of
-	 * surprise as the silent --exclude no-op #147 removed (#156).
+	 * Read-only subvolumes are reported outside -v, unlike the other
+	 * config-driven buckets: this is the one that *shrinks the scan the user
+	 * asked for*, so it says plainly how much of the tree went unlooked-at.
+	 * Only reachable via --skip-readonly-subvols now that including them is
+	 * the default (#182), but a scan that quietly covers less is worth a
+	 * line either way.
 	 */
 	if (skips[SCAN_SKIP_READONLY_SUBVOL])
 		g_string_append_printf(out,
 			"  %sSnapshots%s      %"PRIu64" read-only subvolume%s skipped "
-			"%s(--no-skip-readonly-subvols to include them)%s\n",
+			"%s(--skip-readonly-subvols)%s\n",
 			col_dim, col_reset, skips[SCAN_SKIP_READONLY_SUBVOL],
 			skips[SCAN_SKIP_READONLY_SUBVOL] == 1 ? "" : "s",
 			col_dim, col_reset);

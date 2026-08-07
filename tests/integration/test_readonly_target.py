@@ -17,8 +17,9 @@ tests the mount. A read-only subvolume under an ordinary read-write mount does
 not trip it, which is why the same operation works for most people and fails for
 someone whose snapshots are mounted -o ro.
 
-These only apply with --no-skip-readonly-subvols; the default (#156) keeps
-read-only subvolumes out of the scan entirely.
+Snapshots are in the scan by default (#182); --skip-readonly-subvols is the
+opt-out. The tests below pass --no-skip-readonly-subvols explicitly anyway, so
+they keep testing target selection rather than whatever the default is.
 """
 
 import os
@@ -96,8 +97,13 @@ class ReadonlyTargetTest(DuperemoveTest):
         self.assertShared(rw, snap_file,
                           "the writable copy was not pointed at the snapshot")
 
-    def test_default_still_keeps_snapshots_out_of_the_scan(self):
-        """#156's behaviour is unchanged; this only affects the opt-in path."""
+    def test_the_default_reaches_into_a_readonly_subvolume(self):
+        """No flag needed: a snapshot-based backup target dedupes out of the box.
+
+        The counterpart to test_two_readonly_snapshots_still_dedupe -- that one
+        proves the dedupe is allowed, this one proves the scan gets there at all,
+        which is what #156's default used to prevent (#182).
+        """
         data = os.urandom(1 << 20)
         snap_file = self._snapshot_of("snap", data)
         self.write("rw/f.bin", data)
@@ -106,9 +112,11 @@ class ReadonlyTargetTest(DuperemoveTest):
         snap_dir = os.path.dirname(snap_file)
         self.dm("-rd", snap_dir, self.path("rw"))
         self.assertDmOk()
-        self.assertFalse(
+        self.assertTrue(
             any(p.startswith(snap_dir) for p in self.scanned_files()),
-            "the default scanned into a read-only subvolume")
+            "the default did not scan into a read-only subvolume")
+        self.assertShared(self.path("rw/f.bin"), snap_file,
+                          "the writable copy was not deduped against the snapshot")
 
 
 if __name__ == "__main__":

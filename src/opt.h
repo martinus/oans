@@ -30,13 +30,16 @@ struct options {
 	unsigned int cpu_threads;
 	bool skip_zeroes : 1;
 	/*
-	 * Skip read-only btrfs subvolumes (snapshots) when deduplicating. A
-	 * read-only subvolume can never be a dedupe *destination* -- the kernel
-	 * refuses -- so under -d the read and hash of every file in it is
-	 * provably wasted, not merely usually wasted. Tri-state so an explicit
-	 * --[no-]skip-readonly-subvols beats the -d-derived default (#156).
+	 * Keep read-only btrfs subvolumes (snapshots) out of the scan. Off by
+	 * default: the kernel deduplicates *into* a read-only subvolume quite
+	 * happily, so snapshots are ordinary dedupe material and a backup target
+	 * made of them is a workload oans exists to serve (#182). Worth turning
+	 * on where snapshots are near-copies of the live subvolume already
+	 * sharing its extents - a snapper/Timeshift desktop - since there the
+	 * read and hash of every file in every snapshot buys nothing and the
+	 * cost scales with snapshot count.
 	 */
-	int skip_readonly_subvols;	/* -1 = auto (on iff -d), 0 = no, 1 = yes */
+	bool skip_readonly_subvols : 1;
 	bool only_whole_files : 1;
 	bool do_block_hash : 1;
 	bool dedupe_same_file : 1;

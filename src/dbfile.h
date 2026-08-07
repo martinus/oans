@@ -149,7 +149,7 @@ struct scan_config {
 	int		run_dedupe;
 	int		recurse;
 	int		skip_zeroes;
-	int		skip_readonly_subvols;	/* -1 auto, 0 no, 1 yes (#156) */
+	int		skip_readonly_subvols;	/* off by default (#156, #182) */
 	int		only_whole_files;
 	int		do_block_hash;
 	int		dedupe_same_file;

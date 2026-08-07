@@ -1281,14 +1281,15 @@ int dbfile_load_scan_config(struct dbhandle *dbh, struct scan_config *sc)
 	get_config_int(stmt, "opt_recurse", &sc->recurse);
 	get_config_int(stmt, "opt_skip_zeroes", &sc->skip_zeroes);
 	/*
-	 * Absent in a hashfile written before #156; get_config_int leaves the
-	 * caller's value alone, and scan_config is memset to 0 -- which would
-	 * read as an explicit "no". Pre-seed the auto sentinel so an old
-	 * hashfile replays with the current default rather than opting out.
+	 * Absent in a hashfile written before #156, and written as -1 ("auto")
+	 * by 1.7.x, which resolved it to "skip" under -d. Both mean "the user
+	 * never asked for it", so both must land on the current default rather
+	 * than on 1.7.x's; only an explicit 1 survives a replay (#182).
 	 */
-	sc->skip_readonly_subvols = -1;
 	get_config_int(stmt, "opt_skip_readonly_subvols",
 		       &sc->skip_readonly_subvols);
+	if (sc->skip_readonly_subvols < 0)
+		sc->skip_readonly_subvols = 0;
 	get_config_int(stmt, "opt_only_whole_files", &sc->only_whole_files);
 	get_config_int(stmt, "opt_do_block_hash", &sc->do_block_hash);
 	get_config_int(stmt, "opt_dedupe_same_file", &sc->dedupe_same_file);

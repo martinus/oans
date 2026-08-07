@@ -89,7 +89,13 @@ static void printer_stop(void)
 }
 
 bool tty;
-unsigned int w_col;
+/*
+ * Terminal width, refreshed from TIOCGWINSZ by the printer thread outside
+ * pscan.mutex and read by whichever thread renders - the main thread whenever a
+ * message is routed around the block. Atomic for the same reason spin_frame is:
+ * cosmetic, not worth the critical section, but a plain int here is a race.
+ */
+_Atomic unsigned int w_col;
 
 /*
  * When set (--progress=json), the progress thread streams newline-delimited
@@ -375,7 +381,14 @@ static const char *stage_color(enum stage s)
 static const char *const spinner_frames[] = {
 	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 };
-static unsigned int spin_frame;
+/*
+ * Advanced by the printer thread outside pscan.mutex (it is only a cosmetic
+ * counter, not worth widening the critical section for), and read by whichever
+ * thread renders - which is the main thread whenever a message is routed around
+ * the block. Atomic so that is a defined race rather than one tsan is right to
+ * flag; a torn read would only pick the wrong spinner frame.
+ */
+static _Atomic unsigned int spin_frame;
 
 static const char *spinner_glyph(void)
 {
