@@ -13,6 +13,16 @@ from harness import DuperemoveTest, requires_reflink
 
 @requires_reflink
 class EinvalTest(DuperemoveTest):
+    # test_unaligned_shared_tail builds a *unique* head, a hole, then a *shared*
+    # tail, so the tail is the only shareable region and has to land as its own
+    # extent for the dedupe to have anything to do. That depends on btrfs
+    # writeback placing the hole boundary where the setup intends, which
+    # concurrent I/O from the rest of the suite perturbs -- the same reason
+    # test_extent_order_independent and test_streaming_dedupe are held back.
+    # Seen once on a CI runner (UBSAN leg, master @ e8e6a3d): assertShared
+    # failed while the other seven legs passed on the same commit.
+    serial = True
+
     def test_unaligned_shared_tail(self):
         # Unique aligned head, a hole, then an identical unaligned tail. The
         # tail is the shared extent whose block-rounded length overshoots EOF.
