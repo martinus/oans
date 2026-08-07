@@ -1,0 +1,22 @@
+pkgbase = oans-git
+	pkgdesc = Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork (VCS)
+	pkgver = 1.2.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/martinus/oans
+	arch = x86_64
+	license = GPL-2.0-only
+	makedepends = git
+	makedepends = pkgconf
+	depends = glib2
+	depends = sqlite
+	depends = xxhash
+	depends = util-linux-libs
+	depends = libbsd
+	provides = oans
+	provides = duperemove
+	conflicts = oans
+	conflicts = duperemove
+	source = git+https://github.com/martinus/oans.git
+	sha256sums = SKIP
+
+pkgname = oans-git

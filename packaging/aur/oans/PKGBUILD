@@ -1,6 +1,6 @@
 # Maintainer: martinus <martin.ankerl@gmail.com>
 pkgname=oans
-pkgver=1.2.0
+pkgver=1.7.1
 pkgrel=1
 pkgdesc="Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork"
 arch=('x86_64')
@@ -11,15 +11,32 @@ makedepends=('pkgconf')
 provides=('duperemove')
 conflicts=('duperemove')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('257580e6dd3c1099750e7780fbbcd7b9d59b99b6097cd3346c5862caa9483413')
+sha256sums=('9f7a402206e9017619a8df2d7dabdb64567073f7d16decb0d482b4ef6bff560b')
+
+# The Makefile derives VERSION from `git describe`, which a release tarball has
+# no metadata for - without this the binary reports "oans unknown". It must be
+# passed to *every* make invocation: the Makefile rebuilds when VERSTRING
+# changes, so an unset VERSION in package() would quietly rebuild it back to
+# "unknown".
+_make() {
+  make VERSION="v$pkgver" "$@"
+}
 
 build() {
   cd "$pkgname-$pkgver"
-  make
+  _make
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  # Unit tests only: the integration suite needs a reflink-capable scratch
+  # filesystem, which a build chroot does not have. `make test` builds and runs.
+  _make test
 }
 
 package() {
   cd "$pkgname-$pkgver"
-  make install DESTDIR="$pkgdir" PREFIX=/usr
-  make install-systemd DESTDIR="$pkgdir" PREFIX=/usr
+  _make install DESTDIR="$pkgdir" PREFIX=/usr
+  _make install-systemd DESTDIR="$pkgdir" PREFIX=/usr
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
