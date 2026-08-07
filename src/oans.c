@@ -1336,7 +1336,7 @@ static void process_duplicates(struct dbhandle *db)
 	 * Start the live dedupe block first, then do the deferred post-scan prep
 	 * under it so the seconds it can take on a big hashfile animate instead of
 	 * freezing the display. With the printer running, qprintf() routes these
-	 * status lines above the block (see progress_print). The prep:
+	 * status lines above the block (see progress_printf). The prep:
 	 *   - drop rows for files deleted from disk since they were scanned, so a
 	 *     stale hashfile does not grow and the dedupe phase does not load
 	 *     phantom groups (must precede the count and the per-pass loads);
@@ -1426,7 +1426,9 @@ static void report_scan_stats(void)
 	filescan_get_workq_stats(&pops, &empty_waits);
 	dbfile_get_lock_stats(&lock_total, &lock_contended, &lock_wait_ns);
 
-	fprintf(stderr,
+	/* eprintf, not fprintf: this lands while the scan block is still on
+	 * screen, and an unrouted line strands a row of it (#179). */
+	eprintf(
 		"scan-stats: csum-queue pops=%" PRIu64 " empty-waits=%" PRIu64
 		" (%.1f%% starved); write-lock acquisitions=%" PRIu64
 		" contended=%" PRIu64 " (%.1f%%); lock-wait total=%.2fs"
@@ -1449,7 +1451,7 @@ static void report_scan_stats(void)
 		double over_per_file = (double)over_ns / cal_files;
 		double hash_per_byte = (double)hash_ns / cal_bytes;
 
-		fprintf(stderr,
+		eprintf(
 			"eta-calibration: overhead=%.1fus/file hash=%.2fs/GiB"
 			" -> ideal weight %.0f KiB/file (using %" PRIu64 " KiB)\n",
 			over_per_file / 1e3,
@@ -1467,28 +1469,29 @@ static void report_scan_stats(void)
  * exactly the error a journal must carry. The config-driven buckets are
  * verbose-only - they are the user's own --exclude and --min-filesize doing
  * their job, and 812 of them read as alarming next to the one that matters.
+ *
+ * Assembled into one string and printed in one call: this lands while the live
+ * block is still on screen, and each print erases and redraws it (#179).
  */
 static void report_scan_skips(const uint64_t *skips)
 {
+	GString *out = g_string_new(NULL);
 	const char *sep = "";
-	uint64_t errors = 0;
 	unsigned int i;
 
-	for (i = 0; i < SCAN_SKIP__COUNT; i++)
-		if (scan_skip_is_error(i))
-			errors += skips[i];
-
-	if (errors) {
-		printf("  %sSkipped%s        ", col_dim, col_reset);
-		for (i = 0; i < SCAN_SKIP__COUNT; i++) {
-			if (!skips[i] || !scan_skip_is_error(i))
-				continue;
-			printf("%s%"PRIu64" %s", sep, skips[i],
-			       scan_skip_desc(i));
-			sep = ", ";
-		}
-		printf(" %s(rerun with -v for detail)%s\n", col_dim, col_reset);
+	for (i = 0; i < SCAN_SKIP__COUNT; i++) {
+		if (!skips[i] || !scan_skip_is_error(i))
+			continue;
+		if (!*sep)
+			g_string_append_printf(out, "  %sSkipped%s        ",
+					       col_dim, col_reset);
+		g_string_append_printf(out, "%s%"PRIu64" %s", sep, skips[i],
+				       scan_skip_desc(i));
+		sep = ", ";
 	}
+	if (*sep)
+		g_string_append_printf(out, " %s(rerun with -v for detail)%s\n",
+				       col_dim, col_reset);
 
 	/*
 	 * Read-only subvolumes are reported by default, not just under -v: this
@@ -1497,27 +1500,33 @@ static void report_scan_skips(const uint64_t *skips)
 	 * surprise as the silent --exclude no-op #147 removed (#156).
 	 */
 	if (skips[SCAN_SKIP_READONLY_SUBVOL])
-		printf("  %sSnapshots%s      %"PRIu64" read-only subvolume%s skipped "
-		       "%s(--no-skip-readonly-subvols to include them)%s\n",
-		       col_dim, col_reset, skips[SCAN_SKIP_READONLY_SUBVOL],
-		       skips[SCAN_SKIP_READONLY_SUBVOL] == 1 ? "" : "s",
-		       col_dim, col_reset);
+		g_string_append_printf(out,
+			"  %sSnapshots%s      %"PRIu64" read-only subvolume%s skipped "
+			"%s(--no-skip-readonly-subvols to include them)%s\n",
+			col_dim, col_reset, skips[SCAN_SKIP_READONLY_SUBVOL],
+			skips[SCAN_SKIP_READONLY_SUBVOL] == 1 ? "" : "s",
+			col_dim, col_reset);
 
-	if (!verbose)
-		return;
-
-	sep = "";
-	for (i = 0; i < SCAN_SKIP__COUNT; i++) {
-		if (!skips[i] || scan_skip_is_error(i) ||
-		    i == SCAN_SKIP_READONLY_SUBVOL)
-			continue;
-		if (!*sep)
-			printf("  %sNot scanned%s    ", col_dim, col_reset);
-		printf("%s%"PRIu64" %s", sep, skips[i], scan_skip_desc(i));
-		sep = ", ";
+	if (verbose) {
+		sep = "";
+		for (i = 0; i < SCAN_SKIP__COUNT; i++) {
+			if (!skips[i] || scan_skip_is_error(i) ||
+			    i == SCAN_SKIP_READONLY_SUBVOL)
+				continue;
+			if (!*sep)
+				g_string_append_printf(out, "  %sNot scanned%s    ",
+						       col_dim, col_reset);
+			g_string_append_printf(out, "%s%"PRIu64" %s", sep,
+					       skips[i], scan_skip_desc(i));
+			sep = ", ";
+		}
+		if (*sep)
+			g_string_append_c(out, '\n');
 	}
-	if (*sep)
-		printf("\n");
+
+	if (out->len)
+		progress_printf(stdout, "%s", out->str);
+	g_string_free(out, TRUE);
 }
 
 static int scan_files(char **roots, int nroots, struct dbhandle *db,

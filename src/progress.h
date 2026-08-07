@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <stdio.h>	/* FILE, for progress_printf() */
 
 #include "glib.h"
 
@@ -142,13 +143,14 @@ void pscan_slot_idle(struct pscan_thread *slot);
  */
 void pscan_slot_waiting(struct pscan_thread *slot, bool waiting);
 
-bool is_progress_printer_running(void);
-
 /*
- * The progress thread overwrites its area.
- * This function is used to write something before that area
+ * Print above the live progress block, which owns the bottom of the screen -
+ * the only sanctioned way to write anything while a run is in progress. Use the
+ * dprintf/vprintf/qprintf/eprintf macros in debug.h rather than calling this
+ * directly. One call per whole line; see progress.c for why.
  */
-void pscan_printf(char *fmt, ...);
+void progress_printf(FILE *stream, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
 
 /*
  * Dedupe-phase status. Reuses the same reserved screen area, per-thread lines

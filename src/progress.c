@@ -114,6 +114,18 @@ void progress_set_json(bool on)
 static unsigned int drawn_lines;
 
 /*
+ * Is a block on screen, with drawn_lines saying how far above the cursor it
+ * starts? Everything written while that holds has to go through
+ * progress_printf(), or the cursor drifts down without drawn_lines following,
+ * the next progress_home() lands *inside* the block, and its erase-below both
+ * strands the rows it skipped and wipes the message that caused it (#179).
+ */
+static bool block_live(void)
+{
+	return tty && drawn_lines != 0;
+}
+
+/*
  * The unified live display walks a run through four monotonic stages. The stage
  * line shows all four at once, each with a spinner (running), a tick (finished)
  * or a dim dot (pending); the progress bar and detail line below it describe
@@ -253,7 +265,7 @@ static uint64_t work_total_clamped(void)
 /* Move the cursor to the top-left of the block drawn in the previous render. */
 static void progress_home(void)
 {
-	if (tty && drawn_lines)
+	if (block_live())
 		printf("\33[%uA\r", drawn_lines);
 }
 
@@ -1167,37 +1179,55 @@ void pscan_slot_waiting(struct pscan_thread *slot, bool waiting)
 	slot->waiting_since = waiting ? g_get_monotonic_time() : 0;
 }
 
-bool is_progress_printer_running(void)
+/* Erase the live block, print where it sat (that row becomes scrollback), then
+ * redraw the block below the message. */
+static void print_above_block(const char *fmt, va_list args)
 {
-	return printer ? true : false;
-}
-
-void pscan_printf(char *fmt, ...)
-{
-	va_list args;
-	va_start(args, fmt);
-
 	/* JSON mode draws no block (and the progress stream is on stderr), so a
 	 * routed message is just a plain stdout print. */
 	if (progress_json) {
 		vfprintf(stdout, fmt, args);
-		va_end(args);
 		return;
 	}
 
 	g_mutex_lock(&pscan.mutex);
 
-	/* Erase the live block, print the message where it sat (it becomes
-	 * scrollback), then redraw the block below it. */
 	progress_home();
 	progress_wipe();
 	drawn_lines = 0;
 
 	vfprintf(stdout, fmt, args);
-	va_end(args);
 
 	print_progress();
 	g_mutex_unlock(&pscan.mutex);
+}
+
+/*
+ * Print a message without disturbing the live block (see block_live()). The
+ * message lands above the block and scrolls away as history; `stream` is used
+ * only when there is no block to work around.
+ *
+ * Two states count as "a block to work around", and missing either one is what
+ * #179 was: a printer thread is animating it, *or* one is simply sitting there
+ * with nobody drawing - the scan hands its block to the dedupe phase
+ * (pscan_join(continues=true) ... pdedupe_begin()) with no printer alive across
+ * the gap. Testing `printer` first also keeps drawn_lines from being read while
+ * a printer thread could be writing it.
+ *
+ * One call is one erase/print/redraw cycle, so callers pass whole lines: a
+ * message assembled from several calls would redraw the block between the
+ * pieces.
+ */
+void progress_printf(FILE *stream, const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	if (printer || block_live())
+		print_above_block(fmt, args);
+	else
+		vfprintf(stream, fmt, args);
+	va_end(args);
 }
 
 /*

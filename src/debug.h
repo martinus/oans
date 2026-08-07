@@ -30,17 +30,14 @@ extern int quiet;
 #define likely(x)	__builtin_expect(!!(x), 1)
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 
-#define progress_print(stream, format, ...) do {			\
-	if (is_progress_printer_running())						\
-		pscan_printf(format, ##__VA_ARGS__);			\
-	else								\
-		fprintf(stream, format, ##__VA_ARGS__);         	\
-} while (0)
-
-#define dprintf(format, ...) if (debug) progress_print(stdout, format, ##__VA_ARGS__)
-#define vprintf(format, ...) if (verbose) progress_print(stdout, format, ##__VA_ARGS__)
-#define qprintf(format, ...) if (!quiet) progress_print(stdout, format, ##__VA_ARGS__)
-#define eprintf(format, ...) progress_print(stderr, format, ##__VA_ARGS__)
+/*
+ * All four print around the live progress block; see progress_printf() in
+ * progress.c for what that costs and why every message must go through it.
+ */
+#define dprintf(format, ...) if (debug) progress_printf(stdout, format, ##__VA_ARGS__)
+#define vprintf(format, ...) if (verbose) progress_printf(stdout, format, ##__VA_ARGS__)
+#define qprintf(format, ...) if (!quiet) progress_printf(stdout, format, ##__VA_ARGS__)
+#define eprintf(format, ...) progress_printf(stderr, format, ##__VA_ARGS__)
 
 void print_stack_trace(void);/* defined in util.c */
 #define	abort_lineno()	do {						\

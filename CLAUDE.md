@@ -468,6 +468,33 @@ count, so it moves smoothly 0→100% (like hashing) even through one giant group
   monotone clamp — machine consumers want truth); `pdedupe_end()` emits one
   final dedupe record so the last line shows the settled `done == total`.
 
+## Nothing prints past the live block (#179)
+
+The block is redrawn by moving the cursor up `drawn_lines`, so **every byte
+written while one is on screen must go through `progress_printf()`** — i.e. the
+`dprintf`/`vprintf`/`qprintf`/`eprintf` macros, never a bare `printf`. The
+mechanism and the failure mode are documented at the definition in `progress.c`;
+what belongs here is when it bites:
+
+- **"A block is on screen" ≠ "a printer thread is running."** The scan hands its
+  block straight to the dedupe phase (`pscan_join(continues=true)` …
+  `pdedupe_begin()`) with no printer alive across the gap, so `progress_printf()`
+  routes on `printer || block_live()`. Keying it on the printer alone was #179:
+  one stranded worker row per unrouted line, *and* the scan-skip report silently
+  erased on every run that had one.
+- **Route whole lines.** One call is one erase/print/redraw cycle, so a message
+  assembled from several calls redraws the block between the pieces —
+  `report_scan_skips()` builds its whole report in a `GString` first.
+- Non-tty output is untouched (`block_live()` is gated on `tty`), which is also
+  why the plain integration suite can't see any of this. The regression test
+  drives a real pty and replays the stream through a small ANSI emulator:
+  `tests/integration/test_progress_tty.py`. Its invariant — *no worker-slot row
+  may survive the end of a run* — catches the whole class, not just this site.
+- **Known gap, not yet fixed:** a routed `eprintf` lands on **stdout**, because
+  `print_above_block()` only knows the stream the block lives on. So an error's
+  destination depends on whether a block happened to be up. Pre-existing; fixing
+  it means flushing across the two streams mid-redraw.
+
 ## Valgrind
 
 `verify.sh` runs the smoke. Manual, with the suppressions file (filters the one
