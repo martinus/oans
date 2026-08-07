@@ -92,6 +92,18 @@ The non\-option arguments are the \f[I]files\f[R] and
 the list from standard input, one path per line.
 Naming a directory scans the regular files directly inside it; add
 \f[B]\-r\f[R] to recurse.
+.PP
+\f[B]Symlinks.\f[R] A path given as an argument is resolved, so naming a
+symlink to a directory scans what it points at, and the files are
+recorded under their canonical paths.
+Symlinks \f[I]encountered during\f[R] the walk are not followed: only
+regular files and directories are descended into.
+This keeps a run\(cqs scope equal to what was named on the command line
+\(em one symlink pointing outside the tree would otherwise silently
+enlarge a job that deduplicates data.
+To include such a target, name it as an additional argument; scanning a
+directory and a symlink to it in the same run is safe, as both resolve
+to the same canonical path and the file is recorded once.
 .SS Operation
 .TP
 \f[B]\-d\f[R]
