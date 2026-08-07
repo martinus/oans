@@ -31,24 +31,13 @@ extern int quiet;
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 
 /*
- * Route a message around the live progress block when there is one - including
- * the window between the scan and the dedupe phase, where the block is on
- * screen with no printer thread animating it (progress_block_live()). Each
- * invocation is one home/wipe/print/redraw cycle, so pass whole lines: a
- * message assembled from several calls would redraw the block between the
- * pieces.
+ * All four print around the live progress block; see progress_printf() in
+ * progress.c for what that costs and why every message must go through it.
  */
-#define progress_print(stream, format, ...) do {			\
-	if (is_progress_printer_running() || progress_block_live())	\
-		pscan_printf(format, ##__VA_ARGS__);			\
-	else								\
-		fprintf(stream, format, ##__VA_ARGS__);         	\
-} while (0)
-
-#define dprintf(format, ...) if (debug) progress_print(stdout, format, ##__VA_ARGS__)
-#define vprintf(format, ...) if (verbose) progress_print(stdout, format, ##__VA_ARGS__)
-#define qprintf(format, ...) if (!quiet) progress_print(stdout, format, ##__VA_ARGS__)
-#define eprintf(format, ...) progress_print(stderr, format, ##__VA_ARGS__)
+#define dprintf(format, ...) if (debug) progress_printf(stdout, format, ##__VA_ARGS__)
+#define vprintf(format, ...) if (verbose) progress_printf(stdout, format, ##__VA_ARGS__)
+#define qprintf(format, ...) if (!quiet) progress_printf(stdout, format, ##__VA_ARGS__)
+#define eprintf(format, ...) progress_printf(stderr, format, ##__VA_ARGS__)
 
 void print_stack_trace(void);/* defined in util.c */
 #define	abort_lineno()	do {						\

@@ -470,27 +470,30 @@ count, so it moves smoothly 0→100% (like hashing) even through one giant group
 
 ## Nothing prints past the live block (#179)
 
-The block is redrawn by moving the cursor up `drawn_lines`. **Every byte written
-while a block is on screen must go through `pscan_printf()`** (i.e. the
-`dprintf`/`vprintf`/`qprintf`/`eprintf` macros), or the cursor drifts down
-without `drawn_lines` following, the next `progress_home()` lands *inside* the
-block, and its erase-below both strands the rows above the landing point and
-wipes the message that caused it.
+The block is redrawn by moving the cursor up `drawn_lines`, so **every byte
+written while one is on screen must go through `progress_printf()`** — i.e. the
+`dprintf`/`vprintf`/`qprintf`/`eprintf` macros, never a bare `printf`. The
+mechanism and the failure mode are documented at the definition in `progress.c`;
+what belongs here is when it bites:
 
 - **"A block is on screen" ≠ "a printer thread is running."** The scan hands its
   block straight to the dedupe phase (`pscan_join(continues=true)` …
-  `pdedupe_begin()`) with no printer alive across the gap. `progress_print()`
-  therefore routes on `is_progress_printer_running() || progress_block_live()`
-  (`tty && drawn_lines`); keying it on the printer alone is what #179 was, and
-  it silently ate the scan-skip report on every run that had one.
-- **Route whole lines.** Each routed call is a home/wipe/print/redraw cycle, so a
-  message assembled from several `printf`s would redraw the block between the
-  pieces — `report_scan_skips()` builds its report in a `GString` first.
-- Non-tty output is untouched (`progress_block_live()` is gated on `tty`), which
-  is also why the plain integration suite can't see any of this. The regression
-  test drives a real pty and replays the stream through a small ANSI emulator:
+  `pdedupe_begin()`) with no printer alive across the gap, so `progress_printf()`
+  routes on `printer || block_live()`. Keying it on the printer alone was #179:
+  one stranded worker row per unrouted line, *and* the scan-skip report silently
+  erased on every run that had one.
+- **Route whole lines.** One call is one erase/print/redraw cycle, so a message
+  assembled from several calls redraws the block between the pieces —
+  `report_scan_skips()` builds its whole report in a `GString` first.
+- Non-tty output is untouched (`block_live()` is gated on `tty`), which is also
+  why the plain integration suite can't see any of this. The regression test
+  drives a real pty and replays the stream through a small ANSI emulator:
   `tests/integration/test_progress_tty.py`. Its invariant — *no worker-slot row
   may survive the end of a run* — catches the whole class, not just this site.
+- **Known gap, not yet fixed:** a routed `eprintf` lands on **stdout**, because
+  `print_above_block()` only knows the stream the block lives on. So an error's
+  destination depends on whether a block happened to be up. Pre-existing; fixing
+  it means flushing across the two streams mid-redraw.
 
 ## Valgrind
 
