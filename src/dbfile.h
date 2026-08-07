@@ -334,7 +334,8 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db);
  * progress total/ETA. Counts identical-file groups plus, unless whole_file_only,
  * duplicate-extent groups across the whole hashfile.
  */
-uint64_t dbfile_count_dupe_groups(struct dbhandle *db, bool whole_file_only);
+uint64_t dbfile_count_dupe_groups(struct dbhandle *db, unsigned int seq_lo,
+				  bool whole_file_only);
 
 /*
  * Exact pending dedupe work in bytes for generations > seq_lo, matching what the

@@ -520,6 +520,34 @@ what belongs here is when it bites:
   destination depends on whether a block happened to be up. Pre-existing; fixing
   it means flushing across the two streams mid-redraw.
 
+## Dedupe pre-analysis must scale with the new work, not the hashfile
+
+"analyzing duplicates" is two SQL aggregates that scale the progress bar:
+`dbfile_count_dupe_groups` (the fuzzy group estimate) and
+`dbfile_count_dupe_bytes` (the exact byte total). Both are **pure display**, and
+both used to be whole-hashfile `group by`s run on every single run — ~7 s of SQL
+on a 595 MiB hashfile (2M files / 2M extents), the extent byte count alone 4 s
+because of its per-row `FILEDUP_MEMBER` probe. A user with a 1 GiB hashfile hit
+this on every scheduled run (#184).
+
+- **Guard first:** `process_duplicates()` skips both entirely unless
+  `max > first_seq`. With no newer generation `stream_duplicates()` does nothing,
+  and the byte totals are 0 *by construction* (both require a member with
+  `dedupe_seq > ?1`). Don't move the counts back out of that `if`.
+- **`FILES_GROUP_IS_NEW` / `EXTENTS_GROUP_IS_NEW`** move the "has a new member"
+  test from `HAVING` to a `WHERE` on the **group key**, so it is an index seek
+  (`idx_files_dedupeseq` → `idx_files_digest_size` / `idx_extents_digest_len`)
+  instead of a verdict reachable only after grouping everything. Same answers —
+  a group they drop would have failed `having new_cnt > 0` anyway, and they never
+  filter individual rows, so `count(*)`/`new_cnt`/`old_cnt` are untouched.
+  Measured with 500 new files among 2M: 1.52 s → 0.002 s and 4.05 s → 0.0002 s.
+- The group estimate is now **per-run** rather than lifetime, which it should
+  always have been: `pdd.done` counts groups deduped *this run*, so the old
+  denominator advertised groups the run could not touch ("1 / ~5 groups" for one
+  new pair among four deduped ones). Pinned by `test_progress_bytes.py`.
+- Same trap as `FILEDUP_MEMBER`'s (see `dbfile.c`): the fix is always to make the
+  predicate index-seekable, never to materialize a membership CTE.
+
 ## Valgrind
 
 `verify.sh` runs the smoke. Manual, with the suppressions file (filters the one

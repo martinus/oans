@@ -1366,11 +1366,20 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
-	if (options.run_dedupe) {
+	/*
+	 * Scale the bar - but only if there is anything to scale it for. Both
+	 * counts are pure display, and with no generation newer than first_seq
+	 * the loop below does nothing at all, so on a rerun that found no
+	 * changes this is two group-by scans of the whole hashfile to describe
+	 * zero work (~7 s on a 595 MiB one; the byte totals are 0 by
+	 * construction, since both require a member with dedupe_seq > ?1).
+	 */
+	if (options.run_dedupe && max > first_seq) {
 		unsigned long long total;
 
 		pdedupe_set_activity("analyzing duplicates");
-		total = dbfile_count_dupe_groups(db, options.only_whole_files);
+		total = dbfile_count_dupe_groups(db, first_seq,
+						 options.only_whole_files);
 		pdedupe_set_estimate(total);
 		/*
 		 * Exact byte total for the smooth progress bar. Uses first_seq

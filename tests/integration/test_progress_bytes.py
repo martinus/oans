@@ -116,6 +116,35 @@ class ProgressBytesTest(DuperemoveTest):
         done = [e for e in events if e.get("event") == "done"]
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["groups_deduped"], 0)
+        # The phase does nothing, so there is nothing to scale a bar against.
+        # Also what keeps oans from running two whole-hashfile group-by scans
+        # to describe zero work: it used to report the hashfile's *lifetime*
+        # dup-group count here (4), at ~7s of SQL on a 595 MiB hashfile.
+        self.assertTrue(all(e["groups_total"] == 0 for e in dedupe),
+                        "a no-op rerun must not analyse the whole hashfile")
+
+    @requires_reflink
+    def test_group_total_counts_only_this_run_s_work(self):
+        """The denominator is the work in scope, not the hashfile's history.
+
+        Adding one pair to four already-deduped ones used to read "1 / ~5
+        groups" -- four of which this run cannot touch, since the loop only
+        walks generations newer than the phase-start watermark.
+        """
+        for i in range(4):
+            self.mkdup(f"tree/a{i}", f"tree/b{i}", 256 * 1024)
+        self.sync()
+        self._run("-rd", self.path("tree"))
+
+        self.mkdup("tree/new_a", "tree/new_b", 256 * 1024)
+        self.sync()
+        _p, events = self._run("-rd", self.path("tree"))
+
+        dedupe = self._dedupe_evs(events)
+        self.assertTrue(dedupe)
+        self.assertEqual(dedupe[-1]["groups_total"], 1)
+        done = [e for e in events if e.get("event") == "done"]
+        self.assertEqual(done[0]["groups_deduped"], 1)
 
     @requires_reflink
     def test_skip_work_is_fully_credited(self):
