@@ -145,6 +145,13 @@ void pscan_slot_waiting(struct pscan_thread *slot, bool waiting);
 bool is_progress_printer_running(void);
 
 /*
+ * True while a drawn block sits at the bottom of the screen, whether or not a
+ * printer thread is currently animating it. Anything printed in that state has
+ * to go through pscan_printf() - see progress.c.
+ */
+bool progress_block_live(void);
+
+/*
  * The progress thread overwrites its area.
  * This function is used to write something before that area
  */

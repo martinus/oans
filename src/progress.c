@@ -1172,6 +1172,28 @@ bool is_progress_printer_running(void)
 	return printer ? true : false;
 }
 
+/*
+ * A block is on screen and drawn_lines says how far above the cursor it starts.
+ * Every byte written while that holds must go through pscan_printf(), or the
+ * cursor drifts down without drawn_lines following and the next
+ * progress_home() lands *inside* the block, stranding the rows it skipped
+ * (#179).
+ *
+ * Deliberately not the same question as is_progress_printer_running(): the scan
+ * hands its block straight to the dedupe phase (pscan_join(continues=true) ...
+ * pdedupe_begin()) and no printer thread is alive across that gap, yet the
+ * block is very much on screen. One unrouted line printed there - the scan-skip
+ * report, say - stranded one worker row per line.
+ *
+ * Racy in principle (drawn_lines is written by the printer thread under
+ * pscan.mutex) but not in practice: callers test is_progress_printer_running()
+ * first, so this is only reached when no printer thread exists to write it.
+ */
+bool progress_block_live(void)
+{
+	return tty && drawn_lines != 0;
+}
+
 void pscan_printf(char *fmt, ...)
 {
 	va_list args;

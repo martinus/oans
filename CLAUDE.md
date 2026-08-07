@@ -468,6 +468,30 @@ count, so it moves smoothly 0→100% (like hashing) even through one giant group
   monotone clamp — machine consumers want truth); `pdedupe_end()` emits one
   final dedupe record so the last line shows the settled `done == total`.
 
+## Nothing prints past the live block (#179)
+
+The block is redrawn by moving the cursor up `drawn_lines`. **Every byte written
+while a block is on screen must go through `pscan_printf()`** (i.e. the
+`dprintf`/`vprintf`/`qprintf`/`eprintf` macros), or the cursor drifts down
+without `drawn_lines` following, the next `progress_home()` lands *inside* the
+block, and its erase-below both strands the rows above the landing point and
+wipes the message that caused it.
+
+- **"A block is on screen" ≠ "a printer thread is running."** The scan hands its
+  block straight to the dedupe phase (`pscan_join(continues=true)` …
+  `pdedupe_begin()`) with no printer alive across the gap. `progress_print()`
+  therefore routes on `is_progress_printer_running() || progress_block_live()`
+  (`tty && drawn_lines`); keying it on the printer alone is what #179 was, and
+  it silently ate the scan-skip report on every run that had one.
+- **Route whole lines.** Each routed call is a home/wipe/print/redraw cycle, so a
+  message assembled from several `printf`s would redraw the block between the
+  pieces — `report_scan_skips()` builds its report in a `GString` first.
+- Non-tty output is untouched (`progress_block_live()` is gated on `tty`), which
+  is also why the plain integration suite can't see any of this. The regression
+  test drives a real pty and replays the stream through a small ANSI emulator:
+  `tests/integration/test_progress_tty.py`. Its invariant — *no worker-slot row
+  may survive the end of a run* — catches the whole class, not just this site.
+
 ## Valgrind
 
 `verify.sh` runs the smoke. Manual, with the suppressions file (filters the one

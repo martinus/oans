@@ -30,8 +30,16 @@ extern int quiet;
 #define likely(x)	__builtin_expect(!!(x), 1)
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 
+/*
+ * Route a message around the live progress block when there is one - including
+ * the window between the scan and the dedupe phase, where the block is on
+ * screen with no printer thread animating it (progress_block_live()). Each
+ * invocation is one home/wipe/print/redraw cycle, so pass whole lines: a
+ * message assembled from several calls would redraw the block between the
+ * pieces.
+ */
 #define progress_print(stream, format, ...) do {			\
-	if (is_progress_printer_running())						\
+	if (is_progress_printer_running() || progress_block_live())	\
 		pscan_printf(format, ##__VA_ARGS__);			\
 	else								\
 		fprintf(stream, format, ##__VA_ARGS__);         	\
