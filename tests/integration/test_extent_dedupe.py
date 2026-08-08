@@ -110,6 +110,4 @@ class ExtentDedupeTest(DuperemoveTest):
         self.dm("-rd", self.path("tree"), hashfile=False)
         self.assertDmOk()
         self.assertNoNewSharing()
-        summary = self.reclaimed_summary()
-        self.assertTrue(summary is None or summary[0] == "0 B",
-                        f"second run should reclaim nothing, got {summary}")
+        self.assertReclaimedNothing("second run should find the group settled")

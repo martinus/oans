@@ -14,36 +14,28 @@ and every second run would pass for the wrong reason.
 """
 
 import os
-import re
 from harness import DuperemoveTest, requires_reflink
 
 KiB = 1 << 10
 
-_ALREADY_SHARED_RE = re.compile(r"Already shared (\d+) file")
-
 
 @requires_reflink
 class DedupeIdempotentTest(DuperemoveTest):
-    def already_shared(self):
-        """Destinations the last run skipped as already sharing the target."""
-        m = _ALREADY_SHARED_RE.search(self.out)
-        return int(m.group(1)) if m else 0
+    def assertRunFindsNothingToDo(self, tree, why):
+        """One dedupe over `tree` that must free nothing and say why."""
+        self.dm("-rd", tree, hashfile=False, quiet=False)
+        self.assertDmOk()
+        self.assertReclaimedNothing(why)
+        # Distinguishes "recognised as shared" from "no group at all".
+        self.assertGreater(self.already_shared(), 0,
+                           "expected the already-shared skip to fire")
 
-    def assertSecondRunIsNoop(self, tree, expect_skips=True):
+    def assertSecondRunIsNoop(self, tree):
         """Dedupe twice; the second run must reclaim nothing."""
         self.dm("-rd", tree, hashfile=False)
         self.assertDmOk("first dedupe")
         self.sync()
-
-        self.dm("-rd", tree, hashfile=False, quiet=False)
-        self.assertDmOk("second dedupe")
-        summary = self.reclaimed_summary()
-        self.assertTrue(summary is None or summary[0] == "0 B",
-                        f"second run reclaimed {summary}, expected nothing")
-        if expect_skips:
-            # Distinguishes "recognised as shared" from "no group at all".
-            self.assertGreater(self.already_shared(), 0,
-                               "expected the already-shared skip to fire")
+        self.assertRunFindsNothingToDo(tree, "the tree is already deduped")
 
     def test_block_aligned_files(self):
         self.mkdup("tree/a", "tree/b", 64 * KiB)
@@ -99,13 +91,8 @@ class DedupeIdempotentTest(DuperemoveTest):
             f.write(data[aligned:])
         self.sync()
 
-        self.dm("-rd", self.path("tree"), hashfile=False, quiet=False)
-        self.assertDmOk()
-        summary = self.reclaimed_summary()
-        self.assertTrue(summary is None or summary[0] == "0 B",
-                        f"nothing here is shareable, but it reclaimed {summary}")
-        self.assertGreater(self.already_shared(), 0,
-                           "expected the already-shared skip to fire")
+        self.assertRunFindsNothingToDo(self.path("tree"),
+                                       "nothing here is left to share")
 
     def test_sparse_twins(self):
         """fiemap omits holes, so the map stops short of the range end. Two

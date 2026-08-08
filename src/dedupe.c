@@ -161,21 +161,29 @@ static unsigned int get_fs_blocksize(int fd)
 }
 
 /*
- * Block size the kernel will align a dedupe request to, cached after the first
- * query. Unlike fs_blocksize above - which stays 0 until a request actually
- * comes back EINVAL - this is always a real value, because callers need it
- * before they submit anything.
+ * The filesystem's block size, queried once. Unlike fs_blocksize above - which
+ * stays 0 until a request actually comes back EINVAL, and so doubles as "this
+ * kernel will not shorten for us" - this is always a real value.
  *
  * Racy by design: concurrent dedupe workers may all query it, but they compute
  * the same value from the same filesystem, so the store is idempotent.
  */
-unsigned int dedupe_blocksize(int fd)
+static unsigned int cached_blocksize(int fd)
 {
 	static unsigned int cached;
 
 	if (!cached)
 		cached = get_fs_blocksize(fd);
 	return cached;
+}
+
+uint64_t dedupe_shareable_len(int fd, uint64_t len)
+{
+	unsigned int bs = cached_blocksize(fd);
+
+	/* Under a block there is nothing to round down to - the kernel takes
+	 * such a range whole or not at all. */
+	return len < bs ? len : len & ~((uint64_t)bs - 1);
 }
 
 struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
@@ -269,8 +277,11 @@ static void set_aligned_same_length(struct dedupe_ctxt *ctxt,
 	same->src_length = ctxt->len;
 	if (same->src_length > DEDUPE_ROUND_LEN)
 		same->src_length = DEDUPE_ROUND_LEN;
-	if (fs_blocksize != 0 && same->src_length > fs_blocksize)
-		same->src_length &= ~((uint64_t)fs_blocksize - 1);
+	/* Only once we know this kernel returns EINVAL rather than shortening
+	 * for us; the rounding rule itself is dedupe_shareable_len's. */
+	if (fs_blocksize != 0)
+		same->src_length = dedupe_shareable_len(ctxt->ioctl_file->fd,
+							same->src_length);
 }
 
 static void populate_dedupe_request(struct dedupe_ctxt *ctxt,
@@ -459,7 +470,7 @@ retry:
 			print_btrfs_same_info(ctxt);
 
 		if (ctxt->same->info[0].status == -EINVAL && !fs_blocksize) {
-			fs_blocksize = get_fs_blocksize(ctxt->ioctl_file->fd);
+			fs_blocksize = cached_blocksize(ctxt->ioctl_file->fd);
 			set_aligned_same_length(ctxt, ctxt->same);
 			goto retry;
 		}

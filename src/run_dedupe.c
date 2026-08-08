@@ -293,38 +293,26 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
 }
 
 /*
- * Drop the members that already share the target's storage: deduping them
- * would be a no-op. We err on the side of more deduping here.
+ * Drop the members that already share `target`'s storage: deduping them would
+ * be a no-op. Cheap pre-filter over the poffs the scan already stored, so it
+ * saves the exact fiemap_range_shared_with() call the loop would otherwise make
+ * per destination.
  *
- * The comparison is against *the target*, deliberately - not pairwise between
- * members. Collapsing the group to one survivor per distinct physical offset
- * looks equivalent, since same-poff members really are already shared with
- * each other, but it is not: only the survivor is repointed by the ioctl, so
- * every other member of its class stays on the old extent and that extent is
- * never freed. A group with N copies sitting on the wrong extent then needs N
- * runs to converge, moving one copy per run and freeing nothing until the last
- * one lands - which on a large tree it never does (#186).
+ * The two tiers only coexist safely under one rule: **this must never cull
+ * anything fiemap_range_shared_with() would not also skip.** Both are therefore
+ * relative to the target. Culling pairwise instead - one survivor per distinct
+ * poff - is what broke that and made dedupe non-convergent; see CLAUDE.md for
+ * why (#186).
  *
- * Only the extent pass gets past the target check below. Whole-file groups are
- * loaded with poff 0 (GET_DUPLICATE_FILES has no fiemap to draw on), so they
- * keep every member and rely on the per-destination
- * fiemap_range_shared_with() skip in dedupe_extent_list() - which compares
- * against the target too, and is why whole-file dedupe never had this bug.
+ * Whole-file groups load with poff 0 (GET_DUPLICATE_FILES has no fiemap to draw
+ * on), so they bail below and lean entirely on the exact check.
  */
 static void clean_deduped(struct dupe_extents **ret_dext,
-			  struct results_tree *res)
+			  struct results_tree *res, struct extent *target)
 {
 	struct dupe_extents *dext = *ret_dext;
-	struct extent *target, *extent;
-	struct rb_node *node, *next;
-	uint64_t tgt_poff;
-
-	if (!dext || dext->de_num_dupes == 0)
-		return;
-
-	/* dedupe_extent_list() dedupes against the first list entry. */
-	target = list_first_entry(&dext->de_extents, struct extent, e_list);
-	tgt_poff = extent_poff(target);
+	struct extent *extent, *tmp;
+	uint64_t tgt_poff = extent_poff(target);
 
 	/*
 	 * A poff of 0 means fiemap failed or was never run, so we cannot tell
@@ -334,9 +322,8 @@ static void clean_deduped(struct dupe_extents **ret_dext,
 	if (tgt_poff == 0 || disk_extent_grew(dext, target))
 		return;
 
-	for (node = rb_first(&dext->de_extents_root); node; node = next) {
-		extent = rb_entry(node, struct extent, e_node);
-		next = rb_next(node);
+	list_for_each_entry_safe(extent, tmp, &dext->de_extents, e_list) {
+		unsigned int left;
 
 		if (extent == target || extent_poff(extent) != tgt_poff ||
 		    disk_extent_grew(dext, extent))
@@ -348,12 +335,13 @@ static void clean_deduped(struct dupe_extents **ret_dext,
 
 		g_mutex_lock(&mutex);
 		/* Cascades to a full free once fewer than two members remain. */
-		if (remove_extent(res, extent) == 0) {
-			g_mutex_unlock(&mutex);
+		left = remove_extent(res, extent);
+		g_mutex_unlock(&mutex);
+
+		if (left == 0) {
 			*ret_dext = NULL;
 			return;
 		}
-		g_mutex_unlock(&mutex);
 	}
 }
 
@@ -466,11 +454,13 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	struct dedupe_ctxt *ctxt = NULL;
 	struct pscan_thread *slot = gp->slot;
 	uint64_t len = dext->de_len;
-	/* Target's extent map, fetched once and reused to skip already-shared
-	 * destinations (see the shared-check below), plus the length that check
-	 * runs over: `len` trimmed to whole filesystem blocks, since that is all
-	 * the kernel would dedupe. Zero until the target is known. */
+	/* Target's extent map, used to skip already-shared destinations (see the
+	 * shared-check below). Fetched on the first destination, once the target
+	 * is open; tgt_mapped says the attempt was made, so a target we cannot
+	 * fiemap is not retried for every remaining member. */
 	_cleanup_(freep) struct fiemap *tgt_map = NULL;
+	bool tgt_mapped = false;
+	/* What that check compares: all of `len` the kernel would dedupe. */
 	uint64_t cmp_len = 0;
 	OPEN_ONCE(open_files);
 	struct extent *tgt_extent = NULL;
@@ -490,13 +480,29 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	}
 
 	shared_prev = shared_post = 0ULL;
+
+	/*
+	 * Settle the target first: it is the head of the list, and everything
+	 * below is relative to it. Ordering matters - clean_deduped() culls
+	 * against the target, so a later reorder would leave it having culled
+	 * against the wrong one.
+	 *
+	 * Only for whole files, and only when the group has no anchor from an
+	 * earlier pass - an anchored group must keep its anchor (loaded first)
+	 * as target so every pass converges the copies onto the same physical
+	 * extent. See pick_dedupe_target() for how the target is chosen.
+	 */
+	if (whole_file_dedup && !dext->de_anchored)
+		pick_dedupe_target(dext);
+
 	/*
 	 * Remove any extents which have already been deduped. This
 	 * will free dext for us if the number of available extents
 	 * goes below 2. If that happens, we return a special value so
 	 * the caller knows not to reference dext any more.
 	 */
-	clean_deduped(&dext, res);
+	clean_deduped(&dext, res,
+		      list_first_entry(&dext->de_extents, struct extent, e_list));
 	if (!dext) {
 		vprintf("[%p] Skipping - extents are already deduped.\n",
 		       g_thread_self());
@@ -509,15 +515,6 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	 */
 	if (report_net_shared)
 		add_shared_extents(dext, &shared_prev);
-
-	/*
-	 * Only for whole files, and only when the group has no anchor from an
-	 * earlier pass - an anchored group must keep its anchor (loaded first)
-	 * as target so every pass converges the copies onto the same physical
-	 * extent. See pick_dedupe_target() for how the target is chosen.
-	 */
-	if (whole_file_dedup && !dext->de_anchored)
-		pick_dedupe_target(dext);
 
 	/* clean_deduped/target selection may have changed the group; show the
 	 * real target and remaining work on this thread's status line. */
@@ -648,19 +645,13 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		 * for every destination; it never skips a real dedupe (see
 		 * fiemap_range_shared_with()).
 		 */
-		if (!tgt_map) {
-			unsigned int bs = dedupe_blocksize(tgt_extent->e_file->fd);
-
-			/*
-			 * Trim to whole blocks, since the kernel will not share
-			 * a trailing partial one. A range shorter than a block
-			 * is all tail: trimming would leave nothing to compare
-			 * and disable the skip entirely, so compare it whole -
-			 * it is a single record on each side either way.
-			 */
-			cmp_len = len & ~(uint64_t)(bs - 1);
-			if (!cmp_len)
-				cmp_len = len;
+		if (!tgt_mapped) {
+			tgt_mapped = true;
+			/* Compare only what a dedupe would actually share, or
+			 * the trailing partial block of an unaligned file - which
+			 * the kernel never shares - makes the check unsatisfiable
+			 * and every such file is resubmitted on every run. */
+			cmp_len = dedupe_shareable_len(tgt_extent->e_file->fd, len);
 			tgt_map = do_fiemap_range(tgt_extent->e_file->fd,
 						  tgt_extent->e_loff, cmp_len);
 		}

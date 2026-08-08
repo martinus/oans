@@ -51,6 +51,7 @@ _NET_CHANGE_RE = re.compile(r"net change in shared extents of:\s*(\d+)")
 # The size is human_size()-rendered ("1.0 MiB", "512 B"), so assert on the
 # rendered string; for exact bytes use --json's reclaimed_total_bytes instead.
 _RECLAIMED_RE = re.compile(r"Reclaimed\s+([\d.]+ [A-Za-z]+)\s+across\s+(\d+)\s+group")
+_ALREADY_SHARED_RE = re.compile(r"Already shared (\d+) file")
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +324,22 @@ class DuperemoveTest(unittest.TestCase):
     def assertReclaimed(self, size_str, groups, msg=None):
         """Assert the summary reported `size_str` reclaimed across `groups`."""
         self.assertEqual((size_str, groups), self.reclaimed_summary(), msg)
+
+    def assertReclaimedNothing(self, msg=None):
+        """The last run freed nothing: '0 B', or no Reclaimed line at all."""
+        summary = self.reclaimed_summary()
+        self.assertTrue(summary is None or summary[0] == "0 B",
+                        (msg or "expected nothing to be reclaimed") +
+                        f", got {summary}")
+
+    def already_shared(self):
+        """Count from the 'Already shared N files skipped' summary line.
+
+        Zero when the line is absent, which is also what oans prints when no
+        destination was skipped.
+        """
+        m = _ALREADY_SHARED_RE.search(self.out)
+        return int(m.group(1)) if m else 0
 
     # -- hashfile (SQLite) inspection --------------------------------------
 

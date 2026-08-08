@@ -218,32 +218,40 @@ int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shar
 			FIEMAP_EXTENT_DATA_INLINE)
 
 /*
+ * Unallocated bytes at `off`: fiemap omits holes, so a gap before the record -
+ * or having run out of records - is one. `rest` is what remains of the range.
+ */
+static uint64_t gap_at(const struct fiemap_extent *e, uint64_t off, uint64_t rest)
+{
+	if (!e)
+		return rest;
+	return e->fe_logical > off ? e->fe_logical - off : 0;
+}
+
+/*
  * Do the two ranges already resolve to the same stored extents, so that
  * deduping the destination against the target would change nothing?
  *
- * `len` must already be trimmed to what the kernel would actually dedupe (see
- * dedupe_blocksize()); a range's trailing partial block can never be shared,
- * so comparing it would make this permanently unsatisfiable.
+ * `len` must already be what the kernel would actually dedupe (see
+ * dedupe_shareable_len()); see fiemap.h.
  *
- * The walk covers the range rather than comparing extent records one for one.
- * The same shared storage can be described with different record boundaries in
- * each file - a dedupe that stopped on a block boundary leaves the destination
- * with a split tail where the target has one record - and record-for-record
- * equality reads that as "not shared", so the whole file gets resubmitted to
- * the kernel on every run (#186).
+ * This walks the range instead of comparing extent records one for one,
+ * because the same storage gets described with different record boundaries in
+ * each file - the split tail a dedupe leaves behind is enough - and treating
+ * that as "not shared" resubmits the whole file to the kernel on every run
+ * (#186). Holes count as shared when both sides have one.
  *
  * fe_physical is only ever compared for equality, never with an offset added:
  * on a compressed extent it addresses the compressed extent as a whole, so
- * physical + logical_delta is meaningless. Records that begin before the range
- * are handled by requiring both sides to start the same distance into the same
- * stored extent. Extents with no real physical location (delalloc, unknown,
- * inline) all report fe_physical 0 and must never count as shared.
+ * physical + logical_delta is meaningless. Extents with no real physical
+ * location (delalloc, unknown, inline) all report fe_physical 0 and must never
+ * count as shared.
  */
 static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 			      const struct fiemap *dm, uint64_t dest_off,
 			      uint64_t len)
 {
-	unsigned int ia = 0, ib = 0;
+	unsigned int i = 0;	/* both maps advance together, or we bail */
 	uint64_t pos = 0;	/* bytes of the range proven shared so far */
 
 	if (len == 0 || !tgt || !dm || tgt->fm_mapped_extents == 0)
@@ -253,29 +261,18 @@ static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 		const struct fiemap_extent *ea, *eb;
 		uint64_t pa, pb;	/* range position, relative to the record */
 		uint64_t ha, hb;	/* unallocated bytes at this position */
-		uint64_t ra, rb, step;
+		uint64_t ra, rb;
 
-		ea = ia < tgt->fm_mapped_extents ? &tgt->fm_extents[ia] : NULL;
-		eb = ib < dm->fm_mapped_extents ? &dm->fm_extents[ib] : NULL;
+		ea = i < tgt->fm_mapped_extents ? &tgt->fm_extents[i] : NULL;
+		eb = i < dm->fm_mapped_extents ? &dm->fm_extents[i] : NULL;
 
-		/*
-		 * fiemap omits holes, so a gap before the next record - or
-		 * running out of records - means unallocated space. Sparse
-		 * files are common (a browser cache is mostly hole), and two
-		 * files with the same hole layout share it just fine; only a
-		 * hole facing data on the other side is a real difference.
-		 */
-		ha = !ea ? len - pos :
-			(ea->fe_logical > tgt_off + pos ?
-			 ea->fe_logical - (tgt_off + pos) : 0);
-		hb = !eb ? len - pos :
-			(eb->fe_logical > dest_off + pos ?
-			 eb->fe_logical - (dest_off + pos) : 0);
+		ha = gap_at(ea, tgt_off + pos, len - pos);
+		hb = gap_at(eb, dest_off + pos, len - pos);
 		if (ha || hb) {
-			if (!ha || !hb)
+			/* A hole facing data is a real difference. */
+			if (ha != hb)
 				return false;
-			step = ha < hb ? ha : hb;
-			pos += step > len - pos ? len - pos : step;
+			pos += ha;
 			continue;
 		}
 
@@ -294,10 +291,8 @@ static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 
 		ra = ea->fe_length - pa;
 		rb = eb->fe_length - pb;
-		step = ra < rb ? ra : rb;
-		pos += step > len - pos ? len - pos : step;
-		ia++;
-		ib++;
+		pos += ra < rb ? ra : rb;
+		i++;
 
 		/*
 		 * Same storage, different record boundaries. The shorter side
@@ -312,12 +307,13 @@ static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 	return true;
 }
 
-/* Map the destination range and compare it with the target's map. */
 bool fiemap_range_shared_with(const struct fiemap *tgt, uint64_t tgt_off,
 			      int dest_fd, uint64_t dest_off, uint64_t len)
 {
 	_cleanup_(freep) struct fiemap *dm = NULL;
 
+	/* Cheap reject before paying for the destination's map: a target we
+	 * could not map is nothing to compare against. */
 	if (len == 0 || !tgt || tgt->fm_mapped_extents == 0)
 		return false;
 
