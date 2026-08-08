@@ -1503,28 +1503,13 @@ static inline bool is_file_renamed(char *path_in_db, char *path)
 	return longpath_lstat(path_in_db, &st);
 }
 
-/*
- * Take up hashing a file where an interrupted run left off (#159).
- *
- * True only if there is a checkpoint, it describes the file as it is now, and
- * this binary can read the checksum state in it - so the caller gets either a
- * usable resume point or the ordinary "hash it from the start" path, never a
- * half-adopted one. Anything unusable is deleted on the way out: it describes a
- * file that has since changed, or a running checksum from an xxhash this binary
- * is not linked against, and either way it will never become valid again.
- *
- * Hashes at or past the resume point go too. There should be none - extent rows
- * are only written by a checkpoint - but block rows flush on their own batch
- * cadence (#161), so a run killed between the last checkpoint and the next can
- * leave blocks beyond it, and those are about to be hashed again.
- */
-static void drop_resume_csums(struct file_to_scan *resume)
+void scan_resume_drop(struct scan_resume *resume)
 {
-	if (resume->resume_csum)
-		finish_running_checksum(resume->resume_csum, NULL);
-	if (resume->resume_ext_csum)
-		finish_running_checksum(resume->resume_ext_csum, NULL);
-	resume->resume_csum = resume->resume_ext_csum = NULL;
+	if (resume->csum)
+		finish_running_checksum(resume->csum, NULL);
+	if (resume->ext_csum)
+		finish_running_checksum(resume->ext_csum, NULL);
+	resume->csum = resume->ext_csum = NULL;
 }
 
 /*
@@ -1568,57 +1553,74 @@ static int64_t store_file_row(struct file *dbfile, char *path, bool file_renamed
 	return fileid;
 }
 
+/*
+ * Take up hashing a file where an interrupted run left off (#159).
+ *
+ * True only if there is a checkpoint, it describes the file as it is now, and
+ * this binary can read both checksum states in it - so the caller gets either a
+ * usable resume point or the ordinary "hash it from the start" path, never a
+ * half-adopted one.
+ *
+ * A checkpoint that fails any of that is deleted rather than left to be
+ * re-examined: it describes a file that has since changed, or a running
+ * checksum from an xxhash this binary is not linked against, and neither will
+ * become valid again. A usable one instead drops the hashes at or past its
+ * offset, which are about to be recomputed. There should be none - extent rows
+ * are only ever written by a checkpoint - but block rows flush on their own
+ * batch cadence (#161), so a run killed between two checkpoints can leave
+ * blocks beyond the last one.
+ */
 static bool resume_scan(struct dbhandle *db, struct file *dbfile,
-			struct file_to_scan *resume)
+			struct scan_resume *resume)
 {
 	size_t cap = running_checksum_state_size();
 	_cleanup_(freep) void *file_state = malloc(cap);
 	_cleanup_(freep) void *ext_state = malloc(cap);
 	struct scan_checkpoint cp = { .file_state = file_state,
 				      .ext_state = ext_state };
+	bool usable = false;
 
 	if (!file_state || !ext_state)
 		return false;
 
-	if (!dbfile_load_checkpoint(db, dbfile->id, &cp, cap))
+	if (!dbfile_load_checkpoint(db, dbfile->id, &cp))
 		return false;
 
 	if (cp.size == dbfile->size && cp.mtime == dbfile->mtime &&
 	    cp.loff > 0 && cp.loff < dbfile->size) {
-		resume->resume_csum = running_checksum_restore(cp.file_state,
-							       cp.file_state_len);
-		if (cp.ext_state_len)
-			resume->resume_ext_csum =
-				running_checksum_restore(cp.ext_state,
-							 cp.ext_state_len);
+		resume->csum = running_checksum_restore(cp.file_state, cap);
+		if (cp.has_ext_state)
+			resume->ext_csum = running_checksum_restore(cp.ext_state,
+								    cap);
 		/* Both or neither: half a checkpoint is no checkpoint. */
-		if (!resume->resume_csum ||
-		    (cp.ext_state_len && !resume->resume_ext_csum))
-			drop_resume_csums(resume);
+		usable = resume->csum &&
+			 (!cp.has_ext_state || resume->ext_csum);
+		if (!usable)
+			scan_resume_drop(resume);
 	}
 
 	dbfile_lock();
 	if (scan_write_begin() != 0) {
 		dbfile_unlock();
-		drop_resume_csums(resume);
+		scan_resume_drop(resume);
 		return false;
 	}
-	if (resume->resume_csum)
+	if (usable)
 		dbfile_remove_hashes_from(scan_writer, dbfile->id, cp.loff);
 	else
 		dbfile_remove_checkpoint(scan_writer, dbfile->id);
 	scan_write_end();
 	dbfile_unlock();
 
-	if (!resume->resume_csum) {
+	if (!usable) {
 		vprintf("Discarding an unusable checkpoint for %s; hashing it "
 			"from the start\n", dbfile->filename);
 		return false;
 	}
 
-	resume->resume_off = cp.loff;
-	resume->resume_ext_loff = cp.ext_loff;
-	resume->resume_ext_len = cp.ext_len;
+	resume->off = cp.loff;
+	resume->ext_loff = cp.ext_loff;
+	resume->ext_len = cp.ext_len;
 	vprintf("Resuming %s at %"PRIu64" of %"PRIu64" bytes\n",
 		dbfile->filename, cp.loff, (uint64_t)dbfile->size);
 	return true;
@@ -1638,7 +1640,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	struct file_to_scan *file;
 	int64_t fileid = 0;
 	bool file_renamed, unchanged, resumed = false;
-	struct file_to_scan resume = {0,};
+	struct scan_resume resume = {0,};
 	static uint64_t position = 0;
 
 	/*
@@ -1734,7 +1736,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	 * itself stays exactly as it was, since rewriting it would cascade the
 	 * checkpoint and the hashes already stored straight back out.
 	 */
-	if (unchanged && !dbfile.digest_valid && !file_renamed)
+	if (dbfile.id && unchanged && !dbfile.digest_valid && !file_renamed)
 		resumed = resume_scan(db, &dbfile, &resume);
 
 	/*
@@ -1755,8 +1757,10 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	} else {
 		fileid = store_file_row(&dbfile, path, file_renamed);
 	}
-	if (!fileid)
+	if (!fileid) {
+		scan_resume_drop(&resume);
 		return 0;
+	}
 	mark_file_seen(fileid);		/* on disk: the prune can skip it */
 
 	/* Remember this inode so later hardlinks to it are skipped. */
@@ -1765,14 +1769,14 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	/* Schedule the file for scan */
 	file = malloc(sizeof(struct file_to_scan)); /* Freed by csum_whole_file() */
 
-	*file = resume;			/* zeroed unless we are resuming */
 	file->path = strdup(path);
 	file->fileid = fileid;
 	file->filesize = st->stx_size;
 	file->mtime = dbfile.mtime;
+	file->resume = resume;		/* zeroed unless we are resuming */
 
 	/* Only the bytes still to be read are this run's work. */
-	pscan_set_progress(1, st->stx_size - file->resume_off);
+	pscan_set_progress(1, st->stx_size - resume.off);
 	position++;
 	file->file_position = position;
 
@@ -1903,6 +1907,40 @@ static int ensure_hash_capacity(void **arr, unsigned int *count,
  * bracket as everything else on the scan path, so the rows join the current
  * transaction rather than forcing a commit of their own.
  */
+static int store_block_batch(struct hashes *hashes)
+{
+	int ret;
+
+	if (!hashes->blocks_index)
+		return 0;
+
+	ret = dbfile_store_block_hashes(hashes->db, hashes->fileid,
+					hashes->blocks_index, hashes->blocks);
+	if (ret)
+		return ret;
+
+	hashes->blocks_flushed += hashes->blocks_index;
+	hashes->blocks_index = 0;
+	return 0;
+}
+
+/* The same, for the extent digests staged so far. */
+static int store_extent_batch(struct hashes *hashes)
+{
+	int ret;
+
+	if (!hashes->extents_index)
+		return 0;
+
+	ret = dbfile_store_extent_hashes(hashes->db, hashes->fileid,
+					 hashes->extents_index, hashes->extents);
+	if (ret)
+		return ret;
+
+	hashes->extents_index = 0;
+	return 0;
+}
+
 static int flush_block_hashes(struct hashes *hashes)
 {
 	int ret;
@@ -1917,41 +1955,14 @@ static int flush_block_hashes(struct hashes *hashes)
 		return ret;
 	}
 
-	ret = dbfile_store_block_hashes(hashes->db, hashes->fileid,
-					hashes->blocks_index, hashes->blocks);
+	ret = store_block_batch(hashes);
 	if (ret)
 		scan_write_abort();
 	else
 		ret = scan_write_end();
 	dbfile_unlock();
 
-	if (ret)
-		return ret;
-
-	hashes->blocks_flushed += hashes->blocks_index;
-	hashes->blocks_index = 0;
-	return 0;
-}
-
-/*
- * Write the extent digests gathered so far and reset the batch. The mirror of
- * flush_block_hashes(); only a checkpoint calls it mid-file, so unlike the
- * blocks there is never an extent row past the last checkpoint.
- */
-static int flush_extent_hashes(struct hashes *hashes)
-{
-	int ret;
-
-	if (!hashes->extents_index)
-		return 0;
-
-	ret = dbfile_store_extent_hashes(hashes->db, hashes->fileid,
-					 hashes->extents_index, hashes->extents);
-	if (ret)
-		return ret;
-
-	hashes->extents_index = 0;
-	return 0;
+	return ret;
 }
 
 /*
@@ -1979,7 +1990,6 @@ static int write_checkpoint(struct hashes *hashes, struct scan_ctxt *ctxt,
 		.size		= ctxt->filesize,
 		.mtime		= mtime,
 		.file_state	= file_state,
-		.file_state_len	= len,
 		.ext_state	= ext_state,
 	};
 
@@ -2008,7 +2018,7 @@ static int write_checkpoint(struct hashes *hashes, struct scan_ctxt *ctxt,
 			return ret;
 		cp.ext_loff = e->fe_logical;
 		cp.ext_len = e->fe_length;
-		cp.ext_state_len = len;
+		cp.has_ext_state = true;
 	}
 
 	dbfile_lock();
@@ -2018,16 +2028,9 @@ static int write_checkpoint(struct hashes *hashes, struct scan_ctxt *ctxt,
 		return ret;
 	}
 
-	ret = flush_extent_hashes(hashes);
-	if (!ret && hashes->blocks_index) {
-		ret = dbfile_store_block_hashes(hashes->db, hashes->fileid,
-						hashes->blocks_index,
-						hashes->blocks);
-		if (!ret) {
-			hashes->blocks_flushed += hashes->blocks_index;
-			hashes->blocks_index = 0;
-		}
-	}
+	ret = store_extent_batch(hashes);
+	if (!ret)
+		ret = store_block_batch(hashes);
 	if (!ret)
 		ret = dbfile_store_checkpoint(hashes->db, hashes->fileid, &cp);
 	if (ret)
@@ -2040,55 +2043,73 @@ static int write_checkpoint(struct hashes *hashes, struct scan_ctxt *ctxt,
 }
 
 /*
- * True if the extent a resumed checkpoint left half-hashed is not where it was.
- *
- * The digest carried over covers part of one specific extent, so it means
- * nothing if that extent has been rewritten. mtime and size - what normally
- * stands for "unchanged" - need not move when a file is defragmented or deduped
- * by something else, so the record the resume depends on is checked directly.
+ * Release a queued file. Its resume checksums are dropped too: they belong to
+ * the file_to_scan until adopt_resume() hands them to the scan context, and
+ * every early return before that point comes through here.
  */
-static bool checkpoint_extent_moved(struct scan_ctxt *ctxt,
-				    struct file_to_scan *file)
+static void free_file_to_scan(struct file_to_scan **filep)
 {
-	struct fiemap_extent *e = get_extent(ctxt->fiemap, ctxt->off,
-					     &ctxt->extent_cursor);
+	struct file_to_scan *file = *filep;
 
-	return !e || e->fe_logical != file->resume_ext_loff ||
-	       e->fe_length != file->resume_ext_len;
+	if (!file)
+		return;
+	scan_resume_drop(&file->resume);
+	free(file);
 }
 
 /*
- * Give up on a resume and hash the file from byte zero. Everything stored for
- * it describes a layout that is no longer there, so none of it may survive -
- * including the checkpoint itself, which is now describing nothing.
+ * Adopt what an interrupted run left behind, now that the fiemap is in hand.
  *
- * False only if a fresh checksum could not be allocated, i.e. the file cannot
- * be hashed at all.
+ * The carried extent digest covers part of one specific extent, so it means
+ * nothing if that extent has been rewritten - and mtime and size, what normally
+ * stands for "unchanged", need not move when a file is defragmented or deduped
+ * by something else. So the one record the resume depends on is checked
+ * directly, and if it moved the whole checkpoint is describing a layout that no
+ * longer exists (#159).
+ *
+ * Nothing is taken over until that check passes, so declining costs no unwind:
+ * the context is still the from-scratch one. Everything stored for the file
+ * goes, though, including the checkpoint itself.
  */
-static bool rewind_to_start(struct scan_ctxt *ctxt, struct file_to_scan *file,
-			    struct pscan_thread *tprogress, struct dbhandle *db)
+static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
+			 struct pscan_thread *tprogress, struct dbhandle *db)
 {
-	finish_running_checksum(ctxt->extent_csum, NULL);
-	ctxt->extent_csum = NULL;
-	finish_running_checksum(ctxt->file_csum, NULL);
-	ctxt->file_csum = start_running_checksum();
-	if (!ctxt->file_csum)
-		return false;
-	ctxt->off = 0;
-	ctxt->extent_cursor = 0;
+	struct scan_resume *r = &file->resume;
+	struct fiemap_extent *e;
 
-	/* The skipped bytes are back on the bill, here and in the run-wide
-	 * total __scan_file() sized without them. */
-	pscan_set_file(tprogress, file->path, ctxt->filesize);
-	pscan_set_progress(0, file->resume_off);
+	if (r->ext_csum) {
+		e = get_extent(ctxt->fiemap, r->off, &ctxt->extent_cursor);
+		if (!e || e->fe_logical != r->ext_loff ||
+		    e->fe_length != r->ext_len) {
+			vprintf("%s: extent layout changed since the checkpoint "
+				"at %"PRIu64" bytes; hashing from the start\n",
+				file->path, r->off);
+			scan_resume_drop(r);
+			ctxt->extent_cursor = 0;
 
-	dbfile_lock();
-	if (scan_write_begin() == 0) {
-		dbfile_remove_hashes(db, file->fileid);
-		dbfile_remove_checkpoint(db, file->fileid);
-		scan_write_end();
+			/* The skipped bytes are back on the bill, here and in
+			 * the run-wide total __scan_file() sized without them. */
+			pscan_set_file(tprogress, file->path, ctxt->filesize);
+			pscan_set_progress(0, r->off);
+			r->off = 0;
+
+			dbfile_lock();
+			if (scan_write_begin() == 0) {
+				dbfile_remove_hashes(db, file->fileid);
+				dbfile_remove_checkpoint(db, file->fileid);
+				scan_write_end();
+			}
+			dbfile_unlock();
+			return false;
+		}
 	}
-	dbfile_unlock();
+
+	/* free_scan_ctxt() owns the checksums from here on. */
+	finish_running_checksum(ctxt->file_csum, NULL);
+	ctxt->file_csum = r->csum;
+	ctxt->extent_csum = r->ext_csum;
+	ctxt->off = r->off;
+	r->csum = r->ext_csum = NULL;
 	return true;
 }
 
@@ -2631,27 +2652,21 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * out here too or the file would reconcile against a total it was never
 	 * going to reach.
 	 */
-	pscan_set_file(tprogress, file->path, file->filesize - file->resume_off);
+	pscan_set_file(tprogress, file->path,
+		       file->filesize - file->resume.off);
 	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
 
 	/* Dummy variables used to trigger the cleanup code */
 	_cleanup_(freep) char *path = file->path;
-	_cleanup_(freep) struct file_to_scan *clean_file = file;
+	_cleanup_(free_file_to_scan) struct file_to_scan *clean_file = file;
 
 	/*
-	 * Adopt the running checksum an interrupted run left behind, before any
-	 * early return can leak it. ctxt.off starts where that run stopped, so
-	 * the loop below reads the rest of the file and nothing else; free_scan_
-	 * ctxt() disposes of the checksum on every path out of here.
-	 */
-	ctxt.file_csum = file->resume_csum;
-	ctxt.extent_csum = file->resume_ext_csum;
-	ctxt.off = file->resume_off;
-	/*
 	 * Non-zero exactly while a checkpoint row exists for this file, so it
-	 * also says whether one has to be retired when the digest lands.
+	 * also says whether one has to be retired when the digest lands. The
+	 * resume itself is only taken over once the fiemap can vouch for it,
+	 * below; until then this is a from-scratch scan.
 	 */
-	uint64_t last_checkpoint = ctxt.off;
+	uint64_t last_checkpoint = file->resume.off;
 	unsigned int checkpoints = 0;
 	/*
 	 * Nothing to resume from without a hashfile - the database dies with
@@ -2691,8 +2706,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	}
 
 	ctxt.filesize = file->filesize;
-	if (!ctxt.file_csum)
-		ctxt.file_csum = start_running_checksum();
+	ctxt.file_csum = start_running_checksum();
 	if (!ctxt.file_csum)
 		return;
 
@@ -2711,23 +2725,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (!ctxt.fiemap)
 		return;
 
-	/*
-	 * The extent digest carried over from the interrupted run only means
-	 * anything if it is still the same extent. mtime and size are what
-	 * normally stand for "unchanged", and neither has to move when a file is
-	 * defragmented or deduped by something else, so check the one record the
-	 * resume actually depends on. If it moved, the run this checkpoint came
-	 * from was describing a layout that no longer exists: give up on it and
-	 * hash the file from the start (#159).
-	 */
-	if (ctxt.extent_csum && checkpoint_extent_moved(&ctxt, file)) {
-		vprintf("%s: extent layout changed since the checkpoint at "
-			"%"PRIu64" bytes; hashing from the start\n",
-			file->path, (uint64_t)ctxt.off);
-		if (!rewind_to_start(&ctxt, file, tprogress, db))
-			return;
-		last_checkpoint = 0;
-	}
+	/* Take over the interrupted run's state, if the layout still backs it. */
+	if (file->resume.csum &&
+	    !adopt_resume(&ctxt, file, tprogress, db))
+		last_checkpoint = 0;	/* declined, and the row is already gone */
 
 	if (!allocate_hashes(&hashes, &ctxt)) {
 		eprintf("allocate_hashes failed\n");
@@ -2912,24 +2913,13 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 */
 	abort_on(inlined && hashes.blocks_flushed != 0);
 
-	if (hashes.blocks_index != 0 && !inlined) {
-		ret = dbfile_store_block_hashes(db, file->fileid,
-						hashes.blocks_index, hashes.blocks);
-		if (ret) {
-			scan_write_abort();
-			dbfile_unlock();
-			return;
-		}
-	}
-
-
-	if (hashes.extents_index != 0) {
-		ret = dbfile_store_extent_hashes(db, file->fileid, hashes.extents_index, hashes.extents);
-		if (ret) {
-			scan_write_abort();
-			dbfile_unlock();
-			return;
-		}
+	ret = inlined ? 0 : store_block_batch(&hashes);
+	if (!ret)
+		ret = store_extent_batch(&hashes);
+	if (ret) {
+		scan_write_abort();
+		dbfile_unlock();
+		return;
 	}
 
 	/* Flag the file if its last extent is INLINED.
@@ -3269,8 +3259,12 @@ void filescan_init(void)
 			checkpoint_interval = v;
 	}
 
-	if (stop_env)
-		checkpoint_stop_after = strtoul(stop_env, NULL, 10);
+	if (stop_env) {
+		unsigned long v = strtoul(stop_env, NULL, 10);
+
+		if (v > 0 && v <= UINT_MAX)
+			checkpoint_stop_after = (unsigned int)v;
+	}
 
 	abort_on(scan_workq.workers);
 	abort_on(scan_writer_open());

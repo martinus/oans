@@ -131,29 +131,37 @@ struct extent_csum {
 	unsigned char	digest[DIGEST_LEN];
 };
 
+/*
+ * Where an earlier, interrupted run got to, and the running checksums as they
+ * stood there (#159). All zero for the normal case of hashing a file from the
+ * beginning: `csum` NULL means "there is nothing to resume".
+ *
+ * The checksums are restored on the listing thread, so a state this binary
+ * cannot read is spotted while the decision to rescan from scratch is still
+ * cheap to make. `ext_csum` is the digest of the extent that was mid-flight,
+ * with ext_loff/ext_len naming it so the worker can confirm the layout has not
+ * been rewritten since; NULL when the offset fell on an extent boundary.
+ */
+struct scan_resume {
+	uint64_t off;
+	struct running_checksum *csum;
+	struct running_checksum *ext_csum;
+	uint64_t ext_loff;
+	uint64_t ext_len;
+};
+
+/* Release checksums nothing has taken ownership of yet. */
+void scan_resume_drop(struct scan_resume *resume);
+
 struct file_to_scan {
 	char *path;
 	int64_t fileid;
 	size_t filesize;
 	uint64_t mtime;		/* stamped into any checkpoint this file writes */
 
-	/*
-	 * Where an earlier, interrupted run got to, and the running checksums as
-	 * they stood there (#159). Zero and NULL for the normal case of hashing
-	 * a file from the beginning. They are restored on the listing thread, so
-	 * a state this binary cannot read is spotted while the decision to
-	 * rescan from scratch is still cheap to make; the worker that picks the
-	 * file up takes ownership of them.
-	 *
-	 * resume_ext_csum is the digest of the extent that was mid-flight, with
-	 * resume_ext_loff/len naming it so the worker can confirm the layout has
-	 * not been rewritten since. NULL when the offset fell on a boundary.
-	 */
-	uint64_t resume_off;
-	struct running_checksum *resume_csum;
-	struct running_checksum *resume_ext_csum;
-	uint64_t resume_ext_loff;
-	uint64_t resume_ext_len;
+	/* Owned by whoever holds this file_to_scan, until the worker adopts
+	 * the checksums into its scan context. */
+	struct scan_resume resume;
 
 	/*
 	 * Used to record the current file position in the scan queue,

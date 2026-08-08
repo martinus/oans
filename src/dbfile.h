@@ -60,8 +60,6 @@ struct stmts {
 	sqlite3_stmt *select_checkpoint;
 	sqlite3_stmt *delete_checkpoint;
 	sqlite3_stmt *update_dedupe_seq;
-	sqlite3_stmt *delete_blocks_from;
-	sqlite3_stmt *delete_extents_from;
 };
 
 struct dbhandle {
@@ -347,9 +345,10 @@ int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff
  * (#159). At most one checkpoint per file, alive only while that file is
  * partially hashed.
  *
- * The two states are opaque here - see running_checksum_save(). The extent one
- * is absent (ext_state_len 0) when loff fell on an extent boundary and no
- * extent digest was in progress.
+ * The two states are opaque here - see running_checksum_save(). Both buffers
+ * are owned by the caller and are always running_checksum_state_size() bytes;
+ * has_ext_state is false when loff fell on an extent boundary and no extent
+ * digest was in progress.
  */
 struct scan_checkpoint {
 	uint64_t	loff;		/* bytes of the file hashed so far */
@@ -358,15 +357,14 @@ struct scan_checkpoint {
 	uint64_t	ext_loff;	/* the extent being hashed at loff, */
 	uint64_t	ext_len;	/* checked to still be there on resume */
 	void		*file_state;
-	size_t		file_state_len;
 	void		*ext_state;
-	size_t		ext_state_len;
+	bool		has_ext_state;
 };
 
 int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
 			    const struct scan_checkpoint *cp);
 bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
-			    struct scan_checkpoint *cp, size_t state_cap);
+			    struct scan_checkpoint *cp);
 int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid);
 /* Put a resumed file in this run's dedupe generation, leaving its row (and so
  * its checkpoint and stored hashes) otherwise intact. */

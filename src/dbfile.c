@@ -771,12 +771,19 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "mtime, dedupe_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);"
 	dbfile_prepare_stmt(write_file, WRITE_FILE);
 
+	/*
+	 * Drop a file's hashes from `?2` onwards. Removing all of them is the
+	 * same statement with ?2 = 0, so there is one pair rather than two:
+	 * UNIQUE(fileid, loff...) makes both forms the same index range scan,
+	 * and struct stmts is per-connection - the listing handle, the batched
+	 * writer and every walker each prepare the whole set.
+	 */
 #define REMOVE_BLOCK_HASHES						\
-"delete from blocks where fileid = ?1;"
+"delete from blocks where fileid = ?1 and loff >= ?2;"
 	dbfile_prepare_stmt(remove_block_hashes, REMOVE_BLOCK_HASHES);
 
 #define REMOVE_EXTENT_HASHES						\
-"delete from extents where fileid = ?1;"
+"delete from extents where fileid = ?1 and loff >= ?2;"
 	dbfile_prepare_stmt(remove_extent_hashes, REMOVE_EXTENT_HASHES);
 
 #define LOAD_FILEREC							\
@@ -962,19 +969,6 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	 */
 #define UPDATE_DEDUPE_SEQ "update files set dedupe_seq = ?2 where id = ?1;"
 	dbfile_prepare_stmt(update_dedupe_seq, UPDATE_DEDUPE_SEQ);
-
-	/*
-	 * Drop the hashes a resumed scan is about to recompute. Extent rows only
-	 * ever land at a checkpoint, so there are none past it; block rows flush
-	 * on their own batch cadence (#161) and can sit anywhere.
-	 */
-#define DELETE_BLOCKS_FROM						\
-"delete from blocks where fileid = ?1 and loff >= ?2;"
-	dbfile_prepare_stmt(delete_blocks_from, DELETE_BLOCKS_FROM);
-
-#define DELETE_EXTENTS_FROM						\
-"delete from extents where fileid = ?1 and loff >= ?2;"
-	dbfile_prepare_stmt(delete_extents_from, DELETE_EXTENTS_FROM);
 
 #define RENAME_FILE							\
 "update or replace files set filename = ?1, path_hash = ?2 where id = ?3;"
@@ -1781,43 +1775,56 @@ out_error:
 	return 0;
 }
 
-static int __dbfile_remove_file_hashes(sqlite3_stmt *stmt, int64_t fileid)
+/* Step a statement that returns no rows, reporting anything but a clean end. */
+static int step_done(sqlite3_stmt *stmt)
+{
+	int ret = sqlite3_step(stmt);
+
+	if (ret == SQLITE_DONE)
+		return 0;
+
+	perror_sqlite(ret, "executing statement");
+	return ret;
+}
+
+/* Run a statement taking a fileid, and optionally a logical offset. */
+static int run_by_fileid(sqlite3_stmt *stmt, int64_t fileid, const uint64_t *loff)
 {
 	int ret;
 
 	ret = sqlite3_bind_int64(stmt, 1, fileid);
+	if (!ret && loff)
+		ret = sqlite3_bind_int64(stmt, 2, *loff);
 	if (ret) {
-		perror_sqlite(ret, "binding fileid");
-		goto out;
+		perror_sqlite(ret, "binding values");
+		return ret;
 	}
 
-	ret = sqlite3_step(stmt);
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "removing hashes statement");
-		goto out;
-	}
-
-	ret = 0;
-out:
-	return ret;
+	return step_done(stmt);
 }
 
 int dbfile_remove_extent_hashes(struct dbhandle *db, int64_t fileid)
 {
+	uint64_t all = 0;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.remove_extent_hashes;
-	return __dbfile_remove_file_hashes(stmt, fileid);
+	return run_by_fileid(stmt, fileid, &all);
+}
+
+int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff)
+{
+	int ret;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *b = db->stmts.remove_block_hashes;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *e = db->stmts.remove_extent_hashes;
+
+	ret = run_by_fileid(b, fileid, &loff);
+	if (ret)
+		return ret;
+	return run_by_fileid(e, fileid, &loff);
 }
 
 int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid)
 {
-	int ret = 0;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *b_stmt = db->stmts.remove_block_hashes;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *e_stmt = db->stmts.remove_extent_hashes;
-
-	ret += __dbfile_remove_file_hashes(b_stmt, fileid);
-	ret += __dbfile_remove_file_hashes(e_stmt, fileid);
-
-	return ret;
+	return dbfile_remove_hashes_from(db, fileid, 0);
 }
 
 int dbfile_store_block_hashes(struct dbhandle *db, int64_t fileid,
@@ -1892,80 +1899,62 @@ out_error:
 	return ret;
 }
 
-/* Run a statement that takes just a fileid, or a fileid and an offset. */
-static int run_by_fileid(sqlite3_stmt *stmt, int64_t fileid, const uint64_t *loff)
-{
-	int ret;
-
-	ret = sqlite3_bind_int64(stmt, 1, fileid);
-	if (!ret && loff)
-		ret = sqlite3_bind_int64(stmt, 2, *loff);
-	if (ret) {
-		perror_sqlite(ret, "binding values");
-		return ret;
-	}
-
-	ret = sqlite3_step(stmt);
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "executing statement");
-		return ret;
-	}
-
-	return 0;
-}
-
 int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
 			    const struct scan_checkpoint *cp)
 {
 	int ret;
+	size_t len = running_checksum_state_size();
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.write_checkpoint;
 
 	ret = sqlite3_bind_int64(stmt, 1, fileid);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 2, cp->loff);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 3, cp->size);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 4, cp->mtime);
-	if (!ret)
-		ret = sqlite3_bind_blob(stmt, 5, cp->file_state,
-					cp->file_state_len, SQLITE_STATIC);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 6, cp->ext_loff);
-	if (!ret)
-		ret = sqlite3_bind_int64(stmt, 7, cp->ext_len);
-	if (!ret)
-		ret = cp->ext_state_len ?
-			sqlite3_bind_blob(stmt, 8, cp->ext_state,
-					  cp->ext_state_len, SQLITE_STATIC) :
-			sqlite3_bind_null(stmt, 8);
-	if (ret) {
-		perror_sqlite(ret, "binding values");
-		return ret;
-	}
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_int64(stmt, 2, cp->loff);
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_int64(stmt, 3, cp->size);
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_int64(stmt, 4, cp->mtime);
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_blob(stmt, 5, cp->file_state, len, SQLITE_STATIC);
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_int64(stmt, 6, cp->ext_loff);
+	if (ret)
+		goto bind_error;
+	ret = sqlite3_bind_int64(stmt, 7, cp->ext_len);
+	if (ret)
+		goto bind_error;
+	ret = cp->has_ext_state ?
+		sqlite3_bind_blob(stmt, 8, cp->ext_state, len, SQLITE_STATIC) :
+		sqlite3_bind_null(stmt, 8);
+	if (ret)
+		goto bind_error;
 
-	ret = sqlite3_step(stmt);
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "executing statement");
-		return ret;
-	}
+	return step_done(stmt);
 
-	return 0;
+bind_error:
+	perror_sqlite(ret, "binding values");
+	return ret;
 }
 
 /*
- * Read one file's checkpoint. `file_state` and `ext_state` must point at
- * buffers of `state_cap` bytes, which the *_len fields are set to describe.
+ * Read one file's checkpoint into the caller's buffers, which must each hold
+ * running_checksum_state_size() bytes.
  *
- * False when there is no checkpoint, or when a state does not fit - a blob
- * written by a build whose snapshot was a different size, which is unreadable
- * here for the same reason a foreign one is.
+ * False when there is no checkpoint, or when a stored state is not exactly that
+ * size - a blob written by a build whose snapshot differed, which is unreadable
+ * here for the same reason a foreign one is (running_checksum_restore() would
+ * refuse it a moment later anyway).
  */
 bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
-			    struct scan_checkpoint *cp, size_t state_cap)
+			    struct scan_checkpoint *cp)
 {
 	int ret;
-	int len, ext_len;
+	size_t len = running_checksum_state_size();
+	int ext_len;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.select_checkpoint;
 
 	ret = sqlite3_bind_int64(stmt, 1, fileid);
@@ -1982,22 +1971,20 @@ bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
 		return false;
 	}
 
-	len = sqlite3_column_bytes(stmt, 3);
 	ext_len = sqlite3_column_bytes(stmt, 6);
-	if (len <= 0 || (size_t)len > state_cap ||
-	    ext_len < 0 || (size_t)ext_len > state_cap)
+	if ((size_t)sqlite3_column_bytes(stmt, 3) != len ||
+	    (ext_len != 0 && (size_t)ext_len != len))
 		return false;
 
 	cp->loff = sqlite3_column_int64(stmt, 0);
 	cp->size = sqlite3_column_int64(stmt, 1);
 	cp->mtime = sqlite3_column_int64(stmt, 2);
 	memcpy(cp->file_state, sqlite3_column_blob(stmt, 3), len);
-	cp->file_state_len = len;
 	cp->ext_loff = sqlite3_column_int64(stmt, 4);
 	cp->ext_len = sqlite3_column_int64(stmt, 5);
-	if (ext_len)
-		memcpy(cp->ext_state, sqlite3_column_blob(stmt, 6), ext_len);
-	cp->ext_state_len = ext_len;
+	cp->has_ext_state = ext_len != 0;
+	if (cp->has_ext_state)
+		memcpy(cp->ext_state, sqlite3_column_blob(stmt, 6), len);
 
 	return true;
 }
@@ -2012,18 +1999,6 @@ int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
 {
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
 	return run_by_fileid(stmt, fileid, &seq);
-}
-
-int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff)
-{
-	int ret;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *b = db->stmts.delete_blocks_from;
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *e = db->stmts.delete_extents_from;
-
-	ret = run_by_fileid(b, fileid, &loff);
-	if (ret)
-		return ret;
-	return run_by_fileid(e, fileid, &loff);
 }
 
 int dbfile_store_extent_hashes(struct dbhandle *db, int64_t fileid,
