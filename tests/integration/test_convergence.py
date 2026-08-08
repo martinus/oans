@@ -124,9 +124,11 @@ class ConvergenceTest(DuperemoveTest):
     ALL = ("independent", "three_way", "unaligned", "sub_block", "sparse",
            "trailing_hole", "split_tail", "half_shared",
            "two_physical_classes", "two_extent_classes")
-    # Layouts where the reported figure is exactly the storage freed.
+    # Layouts where the reported figure is exactly the storage freed. The two
+    # two-class ones are here because of #191: their members already share
+    # storage with each other, which used to be credited once per member.
     EXACT = ("independent", "three_way", "sparse", "trailing_hole",
-             "half_shared")
+             "half_shared", "two_physical_classes", "two_extent_classes")
     # Already as shared as the kernel can make them, so a run must free nothing
     # and say so - the case an over-reporting figure used to hide.
     NOTHING_TO_FREE = ("split_tail",)
@@ -176,11 +178,9 @@ class ConvergenceTest(DuperemoveTest):
         of what oans computed - the check neither #186 nor #187 had, which is
         why both could ship. Per layout, so a failure names the shape.
 
-        The two-class layouts are left out: two members of one group sitting
-        on a single extent are each credited in full, while releasing that
-        extent frees its length once (2.0 MiB reported against 1 MiB freed). A
-        real over-count (#191); convergence is unaffected and the test above
-        covers both layouts.
+        The two-class layouts matter most here: their members already share
+        storage with each other, so crediting each in full claimed twice what
+        releasing that one extent frees (#191).
         """
         seen = 0
         for name in self.EXACT + self.BLOCK_ROUNDED + self.NOTHING_TO_FREE:

@@ -460,10 +460,11 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	 * is open; tgt_mapped says the attempt was made, so a target we cannot
 	 * fiemap is not retried for every remaining member. */
 	_cleanup_(freep) struct fiemap *tgt_map = NULL;
-	/* The target's physical addresses, for measuring how much of a
-	 * destination is genuinely duplicated rather than already shared. */
-	_cleanup_(freep) uint64_t *tgt_phys = NULL;
-	unsigned int tgt_phys_n = 0;
+	/* Storage this group has already accounted for: the target's, plus each
+	 * destination's as it is measured, so two destinations that already
+	 * share an extent are not both credited for it. */
+	_cleanup_(fiemap_phys_set_free) struct fiemap_phys_set seen = {0};
+	bool seen_built = false;
 	bool tgt_mapped = false;
 	/* What that check compares: all of `len` the kernel would dedupe. */
 	uint64_t cmp_len = 0;
@@ -675,13 +676,13 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 							extent->e_loff, cmp_len);
 
 			if (!shared) {
-				/* Built on first real use: a run over an
+				/* Seeded on first real use: a run over an
 				 * already-shared tree never needs it. */
-				if (!tgt_phys)
-					tgt_phys = fiemap_phys_sorted(tgt_map,
-								      &tgt_phys_n);
-				unshared = fiemap_unshared_bytes(tgt_phys,
-								 tgt_phys_n,
+				if (!seen_built) {
+					seen_built = true;
+					fiemap_phys_set_init(&seen, tgt_map);
+				}
+				unshared = fiemap_unshared_bytes(&seen,
 								 dest_map,
 								 extent->e_loff,
 								 cmp_len);
