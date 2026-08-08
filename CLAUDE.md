@@ -492,6 +492,25 @@ count, so it moves smoothly 0→100% (like hashing) even through one giant group
 - `--progress=json` emits `work_done_bytes`/`work_total_bytes` **raw** (no
   monotone clamp — machine consumers want truth); `pdedupe_end()` emits one
   final dedupe record so the last line shows the settled `done == total`.
+- **The pre-analysis scales with the new work, not the hashfile (#184).** Both
+  figures come from one `dbfile_count_dupe_work()` call — one query per pass
+  yielding count *and* sum, since they group over the identical row set — and
+  `FILES_GROUP_IS_NEW`/`EXTENTS_GROUP_IS_NEW` restrict each to groups with a
+  member newer than `first_seq`, as a `WHERE` on the **group key** (index seek)
+  rather than a `having` verdict reachable only after grouping everything. On
+  2M files/2M extents: 1% new 8.95 s → 0.10 s. **The trade:** the scoped form
+  loses the index-ordered group-by, so at ~100% new (a first scan, or any run
+  without `--hashfile`) it is *slower* — 8.98 s → 12.5 s, crossing over near
+  50% new. Right side of the trade: a first scan spends far longer hashing,
+  while the incremental case is every scheduled run.
+- The group estimate is therefore **per-run**, not lifetime, which it always
+  should have been — `pdd.done` counts groups deduped *this* run, so
+  `max(estimate, queued)` was comparing a lifetime figure to a per-run one and
+  the bar sat low (one new pair among four deduped read "1 / ~5 groups").
+- `process_duplicates()` also skips the call entirely when `passes == 0`. That
+  is **insurance, not the fix** — with the macros the no-op case already costs
+  ~0.5 ms. It matters only if the search indexes are missing, since
+  `dbfile_create_search_indexes()` is best-effort.
 
 ## Nothing prints past the live block (#179)
 

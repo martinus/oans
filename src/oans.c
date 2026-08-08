@@ -1366,20 +1366,21 @@ static void process_duplicates(struct dbhandle *db)
 	if (options.do_block_hash)
 		extents_search_init();
 
-	if (options.run_dedupe) {
-		unsigned long long total;
+	/*
+	 * Scale the bar. first_seq (the phase-start dedupe_seq) is the "old"
+	 * watermark, so both figures match exactly what the per-pass loaders
+	 * hand the workers however the generations split across passes. Skipped
+	 * when there are no passes: it is pure display, and there would be
+	 * nothing to describe.
+	 */
+	if (options.run_dedupe && passes) {
+		uint64_t groups, bytes;
 
 		pdedupe_set_activity("analyzing duplicates");
-		total = dbfile_count_dupe_groups(db, options.only_whole_files);
-		pdedupe_set_estimate(total);
-		/*
-		 * Exact byte total for the smooth progress bar. Uses first_seq
-		 * (the phase-start dedupe_seq) as the "old" watermark so it
-		 * matches exactly what the per-pass loaders hand the workers,
-		 * regardless of how the generations get split across passes.
-		 */
-		pdedupe_set_work_total(dbfile_count_dupe_bytes(db, first_seq,
-						options.only_whole_files));
+		dbfile_count_dupe_work(db, first_seq, options.only_whole_files,
+				       &groups, &bytes);
+		pdedupe_set_estimate(groups);
+		pdedupe_set_work_total(bytes);
 	}
 
 	if (options.run_dedupe) {
