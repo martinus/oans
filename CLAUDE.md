@@ -466,6 +466,63 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
   makes a fast worker win too rarely); producer-vs-worker lifetime rules need
   review, not just the suite.
 
+## Dedupe must converge — the already-shared skip (#186)
+
+**A second `-d` run over an unchanged tree must reclaim 0.** Nothing in the
+output tells you when it doesn't: `FIDEDUPERANGE` returns `bytes_deduped` for a
+range that already shares storage, so a run that frees nothing still reports
+gigabytes. On a 415 GiB home, `oans -dr ~/` claimed **6.6 GiB every single run**
+with a measured free-space change of **0**. Check convergence by *repeating the
+command*, not by reading the summary.
+
+Three separate causes, each worth a fix; the numbers are successive stages on
+that same tree (6.6 GiB → 1.4 GiB → 131 MiB → 21.3 MiB → **0 B**):
+
+- **`clean_deduped()` culls against the target, not pairwise.** It used to
+  collapse a group to one survivor per distinct physical offset. Only that
+  survivor is repointed by the ioctl, so the rest of its class stayed on the old
+  extent and that extent was never freed — one copy moved per run, nothing
+  reclaimed until the last one landed. **Whole-file groups load with `poff = 0`**
+  (`GET_DUPLICATE_FILES` has no fiemap to draw on) so they never hit this, which
+  is why `--dedupe-options=only_whole_files` converged where the default did not.
+  That asymmetry is the diagnostic — if only_whole_files converges, suspect the
+  extent path.
+- **`fiemap_range_shared_with()` compares coverage, not extent records.** The
+  same shared storage is described with different record boundaries in each
+  file: a dedupe stops on a block boundary and splits the destination's tail
+  where the target has one record. Record-for-record equality reads that as "not
+  shared" and resubmits the whole file forever. **Never do `fe_physical + delta`
+  arithmetic** — on a compressed extent `fe_physical` addresses the compressed
+  extent as a whole, so an offset into it is meaningless; compare `fe_physical`
+  for equality only, at points where both sides sit the same distance into their
+  record. Holes count too: fiemap omits them, matching holes on both sides *are*
+  shared (a browser cache is mostly hole), and a hole facing data is not.
+- **Compare whole blocks only.** The kernel rounds a dedupe length down to a
+  filesystem block, so a trailing partial block can never be shared and
+  comparing it makes the check permanently unsatisfiable. Trim with
+  `dedupe_blocksize()` — but **fall back to the untrimmed length below one
+  block**, or the skip is silently disabled for every sub-block file (that alone
+  was the last 21.3 MiB).
+
+Diagnosing this class: **bisect by scope.** Every subdirectory and every *pair*
+of subdirectories converged while their union did not — that pattern means the
+group got bigger, not that some directory is cursed.
+
+Pinned by `tests/integration/test_dedupe_idempotent.py`,
+`test_extent_dedupe.py::test_group_on_two_physical_extents_converges_in_one_run`
+and the `test_fiemap_maps_share` unit test (the map walk is pure and worth
+testing directly — synthetic fiemap records beat coaxing btrfs into a layout).
+
+Two traps when writing tests here, both of which make a test pass while testing
+nothing:
+
+- **coreutils `cp` and `cat` reflink.** They go through `copy_file_range()`,
+  which btrfs implements as a clone — `cp --reflink=never` does *not* give you
+  an independent copy. Use `dd`, or write the bytes from python.
+- **A file below btrfs `max_inline` (2048 by default) is stored inline**, has no
+  physical location, and the kernel declines to dedupe it. Any "reclaimed 0"
+  assertion on such a file holds no matter what the code does.
+
 ## Dedupe progress is byte-weighted (not group-counted)
 
 The dedupe bar tracks the kernel **byte-verify volume**, not a fuzzy group

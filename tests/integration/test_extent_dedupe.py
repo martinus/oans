@@ -36,6 +36,24 @@ class ExtentDedupeTest(DuperemoveTest):
             f.write(tail)
         return p
 
+    def _reflink_new_head(self, src_rel, dst_rel, head_len):
+        """Reflink src, then rewrite its head in place.
+
+        Copy-on-write replaces only the head blocks, so the copy keeps the
+        seed's tail extents byte for byte - a physical class of two that does
+        not depend on how writeback laid anything out.
+        """
+        p = self.reflink(src_rel, dst_rel)
+        with open(p, "r+b") as f:
+            f.write(os.urandom(head_len))
+        return p
+
+    def _layout(self, **files):
+        """Physical extents per file, for a failure message worth reading."""
+        from harness import phys_extents
+        return "\n  " + "\n  ".join(
+            f"{name}: {sorted(phys_extents(p))}" for name, p in files.items())
+
     def test_shared_tail_is_deduped(self):
         # Distinct heads, identical tail -> not whole-file dupes, so only the
         # extent pass can share the tail.
@@ -59,3 +77,61 @@ class ExtentDedupeTest(DuperemoveTest):
         self.dedupe(self.path("tree"))
         self.assertDmOk()
         self.assertNoNewSharing()
+
+    def test_group_on_two_physical_extents_converges_in_one_run(self):
+        """Every member lands on the target, not just one per physical extent.
+
+        clean_deduped() used to cull pairwise, keeping one survivor per distinct
+        physical offset. Only that survivor is repointed by the ioctl, so the
+        rest of its class stayed on the old extent, which was therefore never
+        freed - one copy moved per run, nothing reclaimed until the last one
+        landed, which on a large tree never happened (#186).
+
+        Runs without a hashfile so each invocation reconsiders the whole tree:
+        with one, the incremental dedupe_seq watermark would skip the unchanged
+        groups and the second run would be a no-op for the wrong reason.
+
+        The two classes are built with reflinks rather than by deduping the
+        subtrees first. A reflink copies the extent map exactly, so each pair
+        provably lands in one group; writing four files independently and
+        hoping writeback splits all four tails the same way does not survive a
+        different allocator (it failed on CI's fresh 2 GiB image while passing
+        on a large aged filesystem). Only a1-vs-b1 still relies on two
+        head+fsync+tail writes matching, which test_shared_tail_is_deduped
+        above already depends on.
+        """
+        head = 64 * 1024        # block-aligned, so rewriting it spares the tail
+        tail = os.urandom(4 * MiB)
+        a1 = self._mkfile("tree/a/1", os.urandom(head), tail)
+        b1 = self._mkfile("tree/b/1", os.urandom(head), tail)
+        self.sync()
+        # Same tail extents as the seed, different head - so same size but a
+        # different file, which keeps all four out of the whole-file pass.
+        a2 = self._reflink_new_head("tree/a/1", "tree/a/2", head)
+        b2 = self._reflink_new_head("tree/b/1", "tree/b/2", head)
+        self.sync()
+
+        self.assertShared(a1, a2, "a/* share one physical copy of the tail")
+        self.assertShared(b1, b2, "b/* share the other")
+        self.assertNotShared(a1, b1, "the two copies are still independent")
+
+        before = self.tree_digest(self.path("tree"))
+        self.dm("-rd", self.path("tree"), hashfile=False)
+        self.assertDmOk()
+        self.sync()
+
+        # One run has to collapse all four onto one extent. Whichever class the
+        # target comes from, the old cull left the other class's non-survivor
+        # behind, so check every member against the same reference.
+        for other, name in ((a2, "a/2"), (b1, "b/1"), (b2, "b/2")):
+            self.assertShared(a1, other,
+                              f"{name} still on its old extent after one run"
+                              + self._layout(a1=a1, a2=a2, b1=b1, b2=b2))
+        self.assertEqual(before, self.tree_digest(self.path("tree")),
+                         "dedupe preserved file contents")
+
+        # ... so there is nothing left for a second run to do.
+        self.dm("-rd", self.path("tree"), hashfile=False)
+        self.assertDmOk()
+        self.assertNoNewSharing()
+        self.assertReclaimedNothing("second run should find the group settled")

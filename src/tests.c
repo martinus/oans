@@ -132,17 +132,31 @@ MU_TEST(test_seen_inode) {
 	seen_inodes_free();
 }
 
-MU_TEST(test_get_extent) {
-	/* Three data extents with holes between them:
-	 * [0, 4k)   hole   [8k, 12k)   hole   [16k, 20k) */
-	unsigned int n = 3;
+/* One fiemap record: {logical, physical, length, flags}. */
+struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
+
+static struct fiemap *mkmap(const struct fm_rec *recs, unsigned int n)
+{
 	struct fiemap *fm = calloc(1, sizeof(*fm) +
 				   n * sizeof(struct fiemap_extent));
 
 	fm->fm_mapped_extents = n;
-	fm->fm_extents[0].fe_logical = 0;     fm->fm_extents[0].fe_length = 4096;
-	fm->fm_extents[1].fe_logical = 8192;  fm->fm_extents[1].fe_length = 4096;
-	fm->fm_extents[2].fe_logical = 16384; fm->fm_extents[2].fe_length = 4096;
+	for (unsigned int i = 0; i < n; i++) {
+		fm->fm_extents[i].fe_logical = recs[i].log;
+		fm->fm_extents[i].fe_physical = recs[i].phys;
+		fm->fm_extents[i].fe_length = recs[i].len;
+		fm->fm_extents[i].fe_flags = recs[i].flags;
+	}
+	return fm;
+}
+
+MU_TEST(test_get_extent) {
+	/* Three data extents with holes between them:
+	 * [0, 4k)   hole   [8k, 12k)   hole   [16k, 20k) */
+	struct fm_rec recs[] = {
+		{0, 0, 4096, 0}, {8192, 0, 4096, 0}, {16384, 0, 4096, 0}
+	};
+	struct fiemap *fm = mkmap(recs, ARRAY_SIZE(recs));
 
 	/* Plain lookups (no cursor). */
 	mu_check(get_extent(fm, 0, NULL) == &fm->fm_extents[0]);
@@ -175,6 +189,100 @@ MU_TEST(test_get_extent) {
 	mu_check(cur == 1);
 
 	free(fm);
+}
+
+/*
+ * fiemap_maps_share() decides whether deduping one range against another would
+ * be a no-op. It has to answer "yes" for storage that is genuinely shared but
+ * described with different record boundaries, or the same file is resubmitted
+ * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
+ */
+/* Build both maps, compare, free. Keeps each case below to its records. */
+static bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
+		  const struct fm_rec *rb, unsigned int nb, uint64_t off_b,
+		  uint64_t len)
+{
+	struct fiemap *a = mkmap(ra, na), *b = mkmap(rb, nb);
+	bool shared = fiemap_maps_share(a, off_a, b, off_b, len);
+
+	free(a);
+	free(b);
+	return shared;
+}
+
+/*
+ * fiemap_maps_share() decides whether deduping one range against another would
+ * be a no-op. It has to answer "yes" for storage that is genuinely shared but
+ * described with different record boundaries, or the same file is resubmitted
+ * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
+ */
+MU_TEST(test_fiemap_maps_share) {
+	const uint32_t SH = FIEMAP_EXTENT_SHARED;
+	const uint32_t ENC = FIEMAP_EXTENT_ENCODED;
+
+	/* Identical single records over the whole range. */
+	struct fm_rec one[] = {{0, 4096, 8192, SH}};
+
+	mu_check(share(one, 1, 0, one, 1, 0, 8192));
+
+	/* Different stored extent: not shared. */
+	struct fm_rec elsewhere[] = {{0, 8192, 8192, SH}};
+
+	mu_check(!share(one, 1, 0, elsewhere, 1, 0, 8192));
+
+	/*
+	 * The regression: same storage, but the destination's tail is split at
+	 * the block boundary a previous dedupe stopped on.
+	 */
+	struct fm_rec whole[] = {{0, 4096, 12288, SH | ENC}};
+	struct fm_rec split[] = {{0, 4096, 8192, SH | ENC},
+				 {8192, 99999, 4096, ENC}};
+
+	mu_check(share(whole, 1, 0, split, 2, 0, 8192));
+	/* ... but not once the range reaches into the split-off part. */
+	mu_check(!share(whole, 1, 0, split, 2, 0, 12288));
+
+	/*
+	 * Matching holes are shared: a sparse cache file is mostly hole, so the
+	 * map simply stops before the end of the range.
+	 */
+	mu_check(share(one, 1, 0, one, 1, 0, 262144));
+
+	/* A hole facing data is a real difference. */
+	struct fm_rec then_data[] = {{0, 4096, 8192, SH}, {8192, 8192, 4096, 0}};
+
+	mu_check(!share(one, 1, 0, then_data, 2, 0, 12288));
+
+	/* Interior holes must line up on both sides. */
+	struct fm_rec gapped[] = {{0, 4096, 4096, SH}, {8192, 8192, 4096, SH}};
+	struct fm_rec packed[] = {{0, 4096, 4096, SH}, {4096, 8192, 4096, SH}};
+
+	mu_check(share(gapped, 2, 0, gapped, 2, 0, 12288));
+	mu_check(!share(gapped, 2, 0, packed, 2, 0, 12288));
+
+	/* No stable physical location: never shared, whatever the offsets say. */
+	struct fm_rec delalloc[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
+
+	mu_check(!share(delalloc, 1, 0, delalloc, 1, 0, 8192));
+
+	/*
+	 * Ranges at different logical offsets, on the same stored extent at the
+	 * same offset into it (the extent pass compares mid-file ranges).
+	 */
+	struct fm_rec at64k[] = {{65536, 4096, 8192, SH}};
+	struct fm_rec at128k[] = {{131072, 4096, 8192, SH}};
+
+	mu_check(share(at64k, 1, 65536, at128k, 1, 131072, 8192));
+
+	/*
+	 * A record that begins before the range: shared only when both sides
+	 * start the same distance into the same stored extent.
+	 */
+	struct fm_rec big[] = {{0, 4096, 16384, SH}};
+	struct fm_rec offset[] = {{4096, 4096, 12288, SH}};
+
+	mu_check(share(big, 1, 8192, big, 1, 8192, 8192));
+	mu_check(!share(big, 1, 8192, offset, 1, 8192, 4096));
 }
 
 MU_TEST(test_sanitize_ctrl) {
@@ -814,6 +922,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_file_renamed);
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
+	MU_RUN_TEST(test_fiemap_maps_share);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_progress_copy_path);
 	MU_RUN_TEST(test_progress_path_two_stage_render);

@@ -70,6 +70,18 @@ struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
 void free_dedupe_ctxt(struct dedupe_ctxt *ctxt);
 
 /*
+ * How much of a `len`-byte dedupe request the kernel would actually share:
+ * it rounds the length down to a whole filesystem block
+ * (generic_remap_check_len()), so a trailing partial block never gets shared.
+ * A range under one block is returned unchanged - there is nothing to round
+ * down to, and the kernel takes it whole or not at all.
+ *
+ * The one rule, for both the code that submits requests and the code that
+ * reasons about what a request would achieve.
+ */
+uint64_t dedupe_shareable_len(int fd, uint64_t len);
+
+/*
  * add_extent_to_dedupe returns:
  *  < 0: error
  * == 0: no more extents after this one

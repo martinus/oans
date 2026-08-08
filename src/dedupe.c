@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <sys/vfs.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -160,6 +161,38 @@ static unsigned int get_fs_blocksize(int fd)
 	return fs.f_bsize;
 }
 
+/*
+ * The filesystem's block size, queried once. Unlike fs_blocksize above - which
+ * stays 0 until a request actually comes back EINVAL, and so doubles as "this
+ * kernel will not shorten for us" - this is always a real value.
+ *
+ * Every dedupe worker reaches this, so the cache is atomic. Relaxed is enough:
+ * racing threads all store the same value (one filesystem, one fstatfs answer),
+ * and the only ordering that matters is that a reader sees either 0 or that
+ * value. A plain int here is a genuine data race, not a benign one - TSan flags
+ * it, and the compiler is entitled to reload it.
+ */
+static unsigned int cached_blocksize(int fd)
+{
+	static _Atomic unsigned int cached;
+	unsigned int bs = atomic_load_explicit(&cached, memory_order_relaxed);
+
+	if (!bs) {
+		bs = get_fs_blocksize(fd);
+		atomic_store_explicit(&cached, bs, memory_order_relaxed);
+	}
+	return bs;
+}
+
+uint64_t dedupe_shareable_len(int fd, uint64_t len)
+{
+	unsigned int bs = cached_blocksize(fd);
+
+	/* Under a block there is nothing to round down to - the kernel takes
+	 * such a range whole or not at all. */
+	return len < bs ? len : len & ~((uint64_t)bs - 1);
+}
+
 struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
 				    uint64_t elen, struct filerec *ioctl_file)
 {
@@ -251,8 +284,11 @@ static void set_aligned_same_length(struct dedupe_ctxt *ctxt,
 	same->src_length = ctxt->len;
 	if (same->src_length > DEDUPE_ROUND_LEN)
 		same->src_length = DEDUPE_ROUND_LEN;
-	if (fs_blocksize != 0 && same->src_length > fs_blocksize)
-		same->src_length &= ~((uint64_t)fs_blocksize - 1);
+	/* Only once we know this kernel returns EINVAL rather than shortening
+	 * for us; the rounding rule itself is dedupe_shareable_len's. */
+	if (fs_blocksize != 0)
+		same->src_length = dedupe_shareable_len(ctxt->ioctl_file->fd,
+							same->src_length);
 }
 
 static void populate_dedupe_request(struct dedupe_ctxt *ctxt,
@@ -441,7 +477,7 @@ retry:
 			print_btrfs_same_info(ctxt);
 
 		if (ctxt->same->info[0].status == -EINVAL && !fs_blocksize) {
-			fs_blocksize = get_fs_blocksize(ctxt->ioctl_file->fd);
+			fs_blocksize = cached_blocksize(ctxt->ioctl_file->fd);
 			set_aligned_same_length(ctxt, ctxt->same);
 			goto retry;
 		}
