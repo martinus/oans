@@ -160,6 +160,24 @@ static unsigned int get_fs_blocksize(int fd)
 	return fs.f_bsize;
 }
 
+/*
+ * Block size the kernel will align a dedupe request to, cached after the first
+ * query. Unlike fs_blocksize above - which stays 0 until a request actually
+ * comes back EINVAL - this is always a real value, because callers need it
+ * before they submit anything.
+ *
+ * Racy by design: concurrent dedupe workers may all query it, but they compute
+ * the same value from the same filesystem, so the store is idempotent.
+ */
+unsigned int dedupe_blocksize(int fd)
+{
+	static unsigned int cached;
+
+	if (!cached)
+		cached = get_fs_blocksize(fd);
+	return cached;
+}
+
 struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
 				    uint64_t elen, struct filerec *ioctl_file)
 {

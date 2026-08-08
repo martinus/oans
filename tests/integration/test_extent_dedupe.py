@@ -59,3 +59,57 @@ class ExtentDedupeTest(DuperemoveTest):
         self.dedupe(self.path("tree"))
         self.assertDmOk()
         self.assertNoNewSharing()
+
+    def test_group_on_two_physical_extents_converges_in_one_run(self):
+        """Every member lands on the target, not just one per physical extent.
+
+        clean_deduped() used to cull pairwise, keeping one survivor per distinct
+        physical offset. Only that survivor is repointed by the ioctl, so the
+        rest of its class stayed on the old extent, which was therefore never
+        freed - one copy moved per run, nothing reclaimed until the last one
+        landed, which on a large tree never happened (#186).
+
+        Runs without a hashfile so each invocation reconsiders the whole tree:
+        with one, the incremental dedupe_seq watermark would skip the unchanged
+        groups and the second run would be a no-op for the wrong reason.
+        """
+        tail = os.urandom(4 * MiB)
+        # Distinct head sizes keep these four out of the whole-file pass.
+        a1 = self._mkfile("tree/a/1", os.urandom(64 * 1024), tail)
+        a2 = self._mkfile("tree/a/2", os.urandom(96 * 1024), tail)
+        b1 = self._mkfile("tree/b/1", os.urandom(128 * 1024), tail)
+        b2 = self._mkfile("tree/b/2", os.urandom(160 * 1024), tail)
+        self.sync()
+
+        # Two independent physical copies of `tail`, two members each: dedupe
+        # the subtrees separately so a/* land on one extent and b/* the other.
+        self.dm("-rd", self.path("tree/a"), hashfile=False)
+        self.assertDmOk()
+        self.dm("-rd", self.path("tree/b"), hashfile=False)
+        self.assertDmOk()
+        self.sync()
+        self.assertShared(a1, a2, "a/* share one physical copy of the tail")
+        self.assertShared(b1, b2, "b/* share the other")
+        self.assertNotShared(a1, b1, "the two copies are still independent")
+
+        before = self.tree_digest(self.path("tree"))
+        self.dm("-rd", self.path("tree"), hashfile=False)
+        self.assertDmOk()
+        self.sync()
+
+        # One run has to collapse all four onto one extent. Whichever class the
+        # target comes from, the old cull left the other class's non-survivor
+        # behind, so check every member against the same reference.
+        for other, name in ((a2, "a/2"), (b1, "b/1"), (b2, "b/2")):
+            self.assertShared(a1, other,
+                              f"{name} still on its old extent after one run")
+        self.assertEqual(before, self.tree_digest(self.path("tree")),
+                         "dedupe preserved file contents")
+
+        # ... so there is nothing left for a second run to do.
+        self.dm("-rd", self.path("tree"), hashfile=False)
+        self.assertDmOk()
+        self.assertNoNewSharing()
+        summary = self.reclaimed_summary()
+        self.assertTrue(summary is None or summary[0] == "0 B",
+                        f"second run should reclaim nothing, got {summary}")

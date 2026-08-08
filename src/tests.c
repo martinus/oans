@@ -177,6 +177,136 @@ MU_TEST(test_get_extent) {
 	free(fm);
 }
 
+/* One fiemap record: {logical, physical, length, flags}. */
+struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
+
+static struct fiemap *mkmap(const struct fm_rec *recs, unsigned int n)
+{
+	struct fiemap *fm = calloc(1, sizeof(*fm) +
+				   n * sizeof(struct fiemap_extent));
+
+	fm->fm_mapped_extents = n;
+	for (unsigned int i = 0; i < n; i++) {
+		fm->fm_extents[i].fe_logical = recs[i].log;
+		fm->fm_extents[i].fe_physical = recs[i].phys;
+		fm->fm_extents[i].fe_length = recs[i].len;
+		fm->fm_extents[i].fe_flags = recs[i].flags;
+	}
+	return fm;
+}
+
+/*
+ * fiemap_maps_share() decides whether deduping one range against another would
+ * be a no-op. It has to answer "yes" for storage that is genuinely shared but
+ * described with different record boundaries, or the same file is resubmitted
+ * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
+ */
+MU_TEST(test_fiemap_maps_share) {
+	const uint32_t SH = FIEMAP_EXTENT_SHARED;
+	const uint32_t ENC = FIEMAP_EXTENT_ENCODED;
+	struct fiemap *a, *b;
+
+	/* Identical single records over the whole range. */
+	{
+		struct fm_rec r[] = {{0, 4096, 8192, SH}};
+
+		a = mkmap(r, 1); b = mkmap(r, 1);
+		mu_check(fiemap_maps_share(a, 0, b, 0, 8192));
+		free(a); free(b);
+	}
+
+	/* Different stored extent: not shared. */
+	{
+		struct fm_rec ra[] = {{0, 4096, 8192, SH}};
+		struct fm_rec rb[] = {{0, 8192, 8192, SH}};
+
+		a = mkmap(ra, 1); b = mkmap(rb, 1);
+		mu_check(!fiemap_maps_share(a, 0, b, 0, 8192));
+		free(a); free(b);
+	}
+
+	/* The regression: same storage, but the destination's tail is split at
+	 * the block boundary a previous dedupe stopped on. Shared over the
+	 * range the caller asked about. */
+	{
+		struct fm_rec ra[] = {{0, 4096, 12288, SH | ENC}};
+		struct fm_rec rb[] = {{0, 4096, 8192, SH | ENC},
+				      {8192, 99999, 4096, ENC}};
+
+		a = mkmap(ra, 1); b = mkmap(rb, 2);
+		mu_check(fiemap_maps_share(a, 0, b, 0, 8192));
+		/* ... but not once the range reaches into the split-off part. */
+		mu_check(!fiemap_maps_share(a, 0, b, 0, 12288));
+		free(a); free(b);
+	}
+
+	/* Matching holes are shared: a sparse cache file is mostly hole, and
+	 * the map simply stops before the end of the range. */
+	{
+		struct fm_rec r[] = {{0, 4096, 8192, SH}};
+
+		a = mkmap(r, 1); b = mkmap(r, 1);
+		mu_check(fiemap_maps_share(a, 0, b, 0, 262144));
+		free(a); free(b);
+	}
+
+	/* A hole facing data is a real difference. */
+	{
+		struct fm_rec ra[] = {{0, 4096, 8192, SH}};
+		struct fm_rec rb[] = {{0, 4096, 8192, SH}, {8192, 8192, 4096, 0}};
+
+		a = mkmap(ra, 1); b = mkmap(rb, 2);
+		mu_check(!fiemap_maps_share(a, 0, b, 0, 12288));
+		free(a); free(b);
+	}
+
+	/* Interior holes must line up on both sides. */
+	{
+		struct fm_rec ra[] = {{0, 4096, 4096, SH}, {8192, 8192, 4096, SH}};
+		struct fm_rec rb[] = {{0, 4096, 4096, SH}, {4096, 8192, 4096, SH}};
+
+		a = mkmap(ra, 2); b = mkmap(rb, 2);
+		mu_check(fiemap_maps_share(a, 0, a, 0, 12288));
+		mu_check(!fiemap_maps_share(a, 0, b, 0, 12288));
+		free(a); free(b);
+	}
+
+	/* No stable physical location: never "shared", whatever the offsets say. */
+	{
+		struct fm_rec r[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
+
+		a = mkmap(r, 1); b = mkmap(r, 1);
+		mu_check(!fiemap_maps_share(a, 0, b, 0, 8192));
+		free(a); free(b);
+	}
+
+	/* Ranges at different logical offsets, on the same stored extent at the
+	 * same offset into it (the extent pass compares mid-file ranges). */
+	{
+		struct fm_rec ra[] = {{65536, 4096, 8192, SH}};
+		struct fm_rec rb[] = {{131072, 4096, 8192, SH}};
+
+		a = mkmap(ra, 1); b = mkmap(rb, 1);
+		mu_check(fiemap_maps_share(a, 65536, b, 131072, 8192));
+		free(a); free(b);
+	}
+
+	/* A record that begins before the range: shared only when both sides
+	 * start the same distance into the same stored extent. */
+	{
+		struct fm_rec ra[] = {{0, 4096, 16384, SH}};
+		struct fm_rec rb[] = {{0, 4096, 16384, SH}};
+		struct fm_rec rc[] = {{4096, 4096, 12288, SH}};
+
+		a = mkmap(ra, 1); b = mkmap(rb, 1);
+		mu_check(fiemap_maps_share(a, 8192, b, 8192, 8192));
+		free(b);
+		b = mkmap(rc, 1);
+		mu_check(!fiemap_maps_share(a, 8192, b, 8192, 4096));
+		free(a); free(b);
+	}
+}
+
 MU_TEST(test_sanitize_ctrl) {
 	char out[64];
 
@@ -814,6 +944,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_file_renamed);
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
+	MU_RUN_TEST(test_fiemap_maps_share);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_progress_copy_path);
 	MU_RUN_TEST(test_progress_path_two_stage_render);

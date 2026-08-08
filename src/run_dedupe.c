@@ -293,82 +293,67 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
 }
 
 /*
- * Removes extents which it believes have already been deduped. We err
- * on the side of more deduping here.
+ * Drop the members that already share the target's storage: deduping them
+ * would be a no-op. We err on the side of more deduping here.
+ *
+ * The comparison is against *the target*, deliberately - not pairwise between
+ * members. Collapsing the group to one survivor per distinct physical offset
+ * looks equivalent, since same-poff members really are already shared with
+ * each other, but it is not: only the survivor is repointed by the ioctl, so
+ * every other member of its class stays on the old extent and that extent is
+ * never freed. A group with N copies sitting on the wrong extent then needs N
+ * runs to converge, moving one copy per run and freeing nothing until the last
+ * one lands - which on a large tree it never does (#186).
+ *
+ * Only the extent pass gets past the target check below. Whole-file groups are
+ * loaded with poff 0 (GET_DUPLICATE_FILES has no fiemap to draw on), so they
+ * keep every member and rely on the per-destination
+ * fiemap_range_shared_with() skip in dedupe_extent_list() - which compares
+ * against the target too, and is why whole-file dedupe never had this bug.
  */
 static void clean_deduped(struct dupe_extents **ret_dext,
 			  struct results_tree *res)
 {
-	int left;
-	int extents_kept = 0;
-	int first = 1;
 	struct dupe_extents *dext = *ret_dext;
-	struct rb_node *inner, *outer;
-	struct extent *inner_extent, *outer_extent;
+	struct extent *target, *extent;
+	struct rb_node *node, *next;
+	uint64_t tgt_poff;
 
 	if (!dext || dext->de_num_dupes == 0)
 		return;
 
-	outer = rb_first(&dext->de_extents_root);
-	while (outer) {
-		outer_extent = rb_entry(outer, struct extent, e_node);
+	/* dedupe_extent_list() dedupes against the first list entry. */
+	target = list_first_entry(&dext->de_extents, struct extent, e_list);
+	tgt_poff = extent_poff(target);
 
-		/*
-		 * First extent will not be considered for removal
-		 * below, which is fine as remove_extent() handles the
-		 * case of only 1 extent left on the dext for us.
-		 *
-		 * Replicate the checks though and count it as kept if
-		 * we don't want it deleted. That will trigger the
-		 * logic below to save the dext if we should wind up
-		 * throwing everything else out.
-		 */
-		if (first &&
-		    (extent_poff(outer_extent) == 0 ||
-		     disk_extent_grew(dext, outer_extent)))
-			extents_kept++;
-		first = 0;
+	/*
+	 * A poff of 0 means fiemap failed or was never run, so we cannot tell
+	 * what is shared; disk_extent_grew() means the target's physical extent
+	 * is shorter than the duplicate range. Either way, keep everything.
+	 */
+	if (tgt_poff == 0 || disk_extent_grew(dext, target))
+		return;
 
-		inner = rb_next(outer);
-		while (inner) {
-			inner_extent = rb_entry(inner, struct extent, e_node);
-			inner = rb_next(inner);
+	for (node = rb_first(&dext->de_extents_root); node; node = next) {
+		extent = rb_entry(node, struct extent, e_node);
+		next = rb_next(node);
 
-			/*
-			 * Track if any extents have survived the
-			 * culling. If we're down to the last two and
-			 * at least one of them was deemed worthy,
-			 * exit here so that he may be deduped.
-			 */
-			if (dext->de_num_dupes == 2 && extents_kept)
-				return;
+		if (extent == target || extent_poff(extent) != tgt_poff ||
+		    disk_extent_grew(dext, extent))
+			continue;
 
-			/*
-			 * e_poff could be zero if fiemap from
-			 * add_shared_extents fails. In that case,
-			 * skip the extent (it might want to be
-			 * deduped).
-			 */
-			if (extent_poff(inner_extent)
-			    && extent_poff(outer_extent) == extent_poff(inner_extent)
-			    && !disk_extent_grew(dext, inner_extent)) {
-				dprintf("Remove extent "
-					"(\"%s\", %"PRIu64", %"PRIu64")\n",
-					inner_extent->e_file->filename,
-					extent_poff(inner_extent),
-					extent_plen(inner_extent));
+		dprintf("Remove extent (\"%s\", %"PRIu64", %"PRIu64")\n",
+			extent->e_file->filename, extent_poff(extent),
+			extent_plen(extent));
 
-				g_mutex_lock(&mutex);
-				left = remove_extent(res, inner_extent);
-				g_mutex_unlock(&mutex);
-				if (left == 0) {
-					*ret_dext = dext = NULL;
-					return;
-				}
-			} else
-				extents_kept++;
+		g_mutex_lock(&mutex);
+		/* Cascades to a full free once fewer than two members remain. */
+		if (remove_extent(res, extent) == 0) {
+			g_mutex_unlock(&mutex);
+			*ret_dext = NULL;
+			return;
 		}
-		outer = rb_next(outer);
+		g_mutex_unlock(&mutex);
 	}
 }
 
@@ -482,8 +467,11 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	struct pscan_thread *slot = gp->slot;
 	uint64_t len = dext->de_len;
 	/* Target's extent map, fetched once and reused to skip already-shared
-	 * destinations (see the shared-check below). */
+	 * destinations (see the shared-check below), plus the length that check
+	 * runs over: `len` trimmed to whole filesystem blocks, since that is all
+	 * the kernel would dedupe. Zero until the target is known. */
 	_cleanup_(freep) struct fiemap *tgt_map = NULL;
+	uint64_t cmp_len = 0;
 	OPEN_ONCE(open_files);
 	struct extent *tgt_extent = NULL;
 
@@ -660,12 +648,25 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		 * for every destination; it never skips a real dedupe (see
 		 * fiemap_range_shared_with()).
 		 */
-		if (!tgt_map)
+		if (!tgt_map) {
+			unsigned int bs = dedupe_blocksize(tgt_extent->e_file->fd);
+
+			/*
+			 * Trim to whole blocks, since the kernel will not share
+			 * a trailing partial one. A range shorter than a block
+			 * is all tail: trimming would leave nothing to compare
+			 * and disable the skip entirely, so compare it whole -
+			 * it is a single record on each side either way.
+			 */
+			cmp_len = len & ~(uint64_t)(bs - 1);
+			if (!cmp_len)
+				cmp_len = len;
 			tgt_map = do_fiemap_range(tgt_extent->e_file->fd,
-						  tgt_extent->e_loff, len);
+						  tgt_extent->e_loff, cmp_len);
+		}
 		if (fiemap_range_shared_with(tgt_map, tgt_extent->e_loff,
 					     extent->e_file->fd, extent->e_loff,
-					     len)) {
+					     cmp_len)) {
 			atomic_fetch_add(&dedupe_dest_already_shared, 1);
 			group_tick(gp, len);	/* skipped, but credit its work */
 			vprintf("[%p] %s already shares the target's extents; "

@@ -70,6 +70,14 @@ struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
 void free_dedupe_ctxt(struct dedupe_ctxt *ctxt);
 
 /*
+ * Block size a dedupe request gets aligned to. The kernel rounds the length
+ * down to a multiple of it (generic_remap_check_len()), so the trailing
+ * partial block of a file whose size is not a multiple can never be shared.
+ * Callers that reason about what the kernel *would* share need this.
+ */
+unsigned int dedupe_blocksize(int fd);
+
+/*
  * add_extent_to_dedupe returns:
  *  < 0: error
  * == 0: no more extents after this one
