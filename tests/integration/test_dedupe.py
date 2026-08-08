@@ -1,7 +1,6 @@
 """Dedupe phase: identical files share storage, data is preserved, second run
 is a no-op. Requires a reflink-capable filesystem."""
 
-import json
 import os
 from harness import DuperemoveTest, phys_extents, requires_reflink
 
@@ -75,8 +74,7 @@ class DedupeTest(DuperemoveTest):
         # target and b the destination whose unshared half gets counted.
         self.dedupe(self.path("tree"))
         self.assertDmOk()
-        self.assertEqual(MiB,
-                         json.loads(self.dm("--json"))["reclaimed_total_bytes"],
+        self.assertEqual(MiB, self.reclaimed_bytes(),
                          "only the half that was still duplicated was freed")
 
     def test_is_idempotent(self):

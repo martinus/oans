@@ -84,9 +84,11 @@ uint64_t dedupe_shareable_len(int fd, uint64_t len);
 /*
  * Queue one destination. `unshared` is how many of its bytes are not already
  * on the target's storage - what this dedupe would actually stop duplicating,
- * handed back by pop_one_dedupe_result() so the caller can report space freed
- * rather than bytes the kernel compared (#187). Callers that cannot tell pass
- * the full length.
+ * handed back by pop_one_dedupe_result() so the caller reports space freed
+ * rather than bytes the kernel compared (#187). It must be measured against
+ * the target (fiemap_unshared_bytes()); passing the full length credits the
+ * whole range, which is that over-count, and is only right when the target
+ * could not be mapped at all.
  *
  * Returns:
  *  < 0: error
@@ -97,11 +99,11 @@ int add_extent_to_dedupe(struct dedupe_ctxt *ctxt, uint64_t loff,
 			 struct filerec *file, uint64_t unshared);
 int dedupe_extents(struct dedupe_ctxt *ctxt);
 /*
- * `bytes_deduped` is what the kernel reported comparing and sharing;
- * `bytes_freed` is the part of that which was not already shared.
+ * `bytes_freed` is the destination's `unshared` bytes, capped at what the
+ * kernel actually processed and zero unless it accepted the request - i.e.
+ * space this dedupe stopped duplicating, not length it compared.
  */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
-			  uint64_t *off, uint64_t *bytes_deduped,
 			  uint64_t *bytes_freed, struct filerec **file);
 
 #endif	/* __DEDUPE_H__ */

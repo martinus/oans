@@ -487,7 +487,7 @@ that same tree (6.6 GiB → 1.4 GiB → 131 MiB → 21.3 MiB → **0 B**):
   is why `--dedupe-options=only_whole_files` converged where the default did not.
   That asymmetry is the diagnostic — if only_whole_files converges, suspect the
   extent path.
-- **`fiemap_range_shared_with()` compares coverage, not extent records.** The
+- **`fiemap_maps_share()` compares coverage, not extent records.** The
   same shared storage is described with different record boundaries in each
   file: a dedupe stops on a block boundary and splits the destination's tail
   where the target has one record. Record-for-record equality reads that as "not

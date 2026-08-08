@@ -191,7 +191,7 @@ static _Atomic uint64_t dedupe_dest_changed;
 static _Atomic uint64_t dedupe_dest_differs;
 static _Atomic uint64_t dedupe_dest_errors;
 /* Destinations skipped because they already shared all storage with the
- * target (deduping them would have been a no-op). See fiemap_ranges_shared(). */
+ * target (deduping them would have been a no-op). See fiemap_maps_share(). */
 static _Atomic uint64_t dedupe_dest_already_shared;
 
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
@@ -199,20 +199,15 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 {
 	int done = 0;
 	int target_status;
-	uint64_t target_loff, target_bytes, target_freed;
+	uint64_t target_freed;
 	struct filerec *f;
 	const char *status_str = "[unknown status]";
 
 	while (!done) {
-		done = pop_one_dedupe_result(ctxt, &target_status, &target_loff,
-					     &target_bytes, &target_freed, &f);
-		/*
-		 * Credit what stopped being duplicated, not what the kernel
-		 * compared: FIDEDUPERANGE reports the full length even when the
-		 * range already shared the target's storage, so counting that
-		 * let a run which freed nothing claim gigabytes (#187).
-		 */
-		if (freed_bytes && target_status == 0)
+		done = pop_one_dedupe_result(ctxt, &target_status,
+					     &target_freed, &f);
+		/* Space freed, not length compared (#187). */
+		if (freed_bytes)
 			*freed_bytes += target_freed;
 
 		/*
@@ -301,11 +296,11 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
 /*
  * Drop the members that already share `target`'s storage: deduping them would
  * be a no-op. Cheap pre-filter over the poffs the scan already stored, so it
- * saves the exact fiemap_range_shared_with() call the loop would otherwise make
+ * saves the exact fiemap_maps_share() call the loop would otherwise make
  * per destination.
  *
  * The two tiers only coexist safely under one rule: **this must never cull
- * anything fiemap_range_shared_with() would not also skip.** Both are therefore
+ * anything fiemap_maps_share() would not also skip.** Both are therefore
  * relative to the target. Culling pairwise instead - one survivor per distinct
  * poff - is what broke that and made dedupe non-convergent; see CLAUDE.md for
  * why (#186).
@@ -472,9 +467,6 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	bool tgt_mapped = false;
 	/* What that check compares: all of `len` the kernel would dedupe. */
 	uint64_t cmp_len = 0;
-	/* Per-destination scratch, freed as soon as it has been read. */
-	struct fiemap *dest_map = NULL;
-	uint64_t unshared;
 	OPEN_ONCE(open_files);
 	struct extent *tgt_extent = NULL;
 
@@ -534,6 +526,9 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	slot_show_group(slot, dext);
 
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
+		/* Declared before the gotos below jump forward past it. */
+		uint64_t unshared;
+
 		if (list_is_last(&extent->e_list, &dext->de_extents))
 			last = 1;
 
@@ -649,17 +644,11 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		}
 
 		/*
-		 * Map this destination once and get two things from it: whether
-		 * it already maps to the same physical extents as the target -
-		 * deduping it would be a byte-for-byte no-op, but the kernel
-		 * still reads and compares the whole range, the dominant cost on
-		 * already-shared trees like repeated snapshots (upstream #331) -
-		 * and, if not, how much of it is genuinely duplicated, which is
-		 * what the run gets to claim it freed (#187).
-		 *
-		 * The target's map and its sorted addresses are built once (a
-		 * couple of cheap metadata ioctls) and reused for every
-		 * destination.
+		 * One map of this destination answers both questions: is it
+		 * already on the target's extents, so deduping it would be a
+		 * byte-for-byte no-op the kernel would still read and compare in
+		 * full (upstream #331), and if not, how much of it is genuinely
+		 * duplicated - which is all the run may claim it freed (#187).
 		 */
 		if (!tgt_mapped) {
 			tgt_mapped = true;
@@ -670,27 +659,45 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			cmp_len = dedupe_shareable_len(tgt_extent->e_file->fd, len);
 			tgt_map = do_fiemap_range(tgt_extent->e_file->fd,
 						  tgt_extent->e_loff, cmp_len);
-			tgt_phys = fiemap_phys_sorted(tgt_map, &tgt_phys_n);
 		}
-		dest_map = do_fiemap_range(extent->e_file->fd, extent->e_loff,
-					   cmp_len);
-		if (fiemap_maps_share(tgt_map, tgt_extent->e_loff, dest_map,
-				      extent->e_loff, cmp_len)) {
+		/* Nothing to measure against: credit the whole range, as the
+		 * figure did before it could measure at all. */
+		unshared = cmp_len;
+		if (tgt_map) {
+			/* Measure while the map is in hand, free it once, then
+			 * act on the verdict. */
+			struct fiemap *dest_map =
+				do_fiemap_range(extent->e_file->fd,
+						extent->e_loff, cmp_len);
+			bool shared = fiemap_maps_share(tgt_map,
+							tgt_extent->e_loff,
+							dest_map,
+							extent->e_loff, cmp_len);
+
+			if (!shared) {
+				/* Built on first real use: a run over an
+				 * already-shared tree never needs it. */
+				if (!tgt_phys)
+					tgt_phys = fiemap_phys_sorted(tgt_map,
+								      &tgt_phys_n);
+				unshared = fiemap_unshared_bytes(tgt_phys,
+								 tgt_phys_n,
+								 dest_map,
+								 extent->e_loff,
+								 cmp_len);
+			}
 			free(dest_map);
-			dest_map = NULL;
-			atomic_fetch_add(&dedupe_dest_already_shared, 1);
-			group_tick(gp, len);	/* skipped, but credit its work */
-			vprintf("[%p] %s already shares the target's extents; "
-				"skipping.\n", g_thread_self(),
-				extent->e_file->filename);
-			if (ctxt && last)
-				goto run_dedupe;
-			continue;
+			if (shared) {
+				atomic_fetch_add(&dedupe_dest_already_shared, 1);
+				group_tick(gp, len); /* skipped, but credit its work */
+				vprintf("[%p] %s already shares the target's "
+					"extents; skipping.\n", g_thread_self(),
+					extent->e_file->filename);
+				if (ctxt && last)
+					goto run_dedupe;
+				continue;
+			}
 		}
-		unshared = fiemap_unshared_bytes(tgt_phys, tgt_phys_n, dest_map,
-						 extent->e_loff, cmp_len);
-		free(dest_map);
-		dest_map = NULL;
 
 		rc = add_extent_to_dedupe(ctxt, extent->e_loff, extent->e_file,
 					  unshared);

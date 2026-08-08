@@ -517,7 +517,6 @@ retry:
  * Returns 1 when we have no more items.
  */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
-			  uint64_t *off, uint64_t *bytes_deduped,
 			  uint64_t *bytes_freed, struct filerec **file)
 {
 	struct dedupe_req *req;
@@ -532,13 +531,10 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 	list_del_init(&req->req_list);
 
 	*status = req->req_status;
-	*off = req->req_loff - req->req_total;
-	*bytes_deduped = req->req_total;
-	/* Capped: the kernel may have got through less than the whole range
-	 * (a short round, a clamped length), and it cannot free more of the
-	 * duplication than it actually processed. */
-	*bytes_freed = req->req_unshared < req->req_total ?
-		req->req_unshared : req->req_total;
+	/* Zero unless the kernel took it, and never more than it processed. */
+	*bytes_freed = req->req_status ? 0 :
+		(req->req_unshared < req->req_total ?
+		 req->req_unshared : req->req_total);
 	*file = req->req_file;
 
 	free_dedupe_req(req);

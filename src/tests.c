@@ -347,6 +347,24 @@ MU_TEST(test_fiemap_unshared_bytes) {
 
 	/* No destination map at all (fiemap failed): same fallback. */
 	mu_check(unshared(tgt, 1, NULL, 0, 0, 8192) == 8192);
+
+	/*
+	 * The two measures gate different things - one a skip, one a number -
+	 * but they must agree at the boundary: anything fiemap_maps_share()
+	 * calls fully shared has nothing left to free. Shared fixtures, so a
+	 * future relaxation of one cannot silently drift from the other.
+	 */
+	struct fm_rec tail[] = {{0, 4096, 8192, SH}, {8192, 99999, 4096, 0}};
+
+	/* Identical maps. */
+	mu_check(share(tgt, 1, 0, tgt, 1, 0, 8192));
+	mu_check(unshared(tgt, 1, tgt, 1, 0, 8192) == 0);
+	/* A tail split off past the compared range. */
+	mu_check(share(tgt, 1, 0, tail, 2, 0, 8192));
+	mu_check(unshared(tgt, 1, tail, 2, 0, 8192) == 0);
+	/* Matching holes to the end of the range. */
+	mu_check(share(tgt, 1, 0, tgt, 1, 0, 262144));
+	mu_check(unshared(tgt, 1, tgt, 1, 0, 262144) == 0);
 }
 
 MU_TEST(test_sanitize_ctrl) {

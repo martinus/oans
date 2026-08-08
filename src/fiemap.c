@@ -307,13 +307,6 @@ bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 	return true;
 }
 
-static int cmp_u64(const void *a, const void *b)
-{
-	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-
-	return (x > y) - (x < y);
-}
-
 uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count)
 {
 	uint64_t *v;
@@ -333,6 +326,19 @@ uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count)
 		v[n++] = fm->fm_extents[i].fe_physical;
 	}
 	qsort(v, n, sizeof(*v), cmp_u64);
+
+	/* Collapse duplicates: a compressed extent reports one address for every
+	 * record referencing it, and a fragmented file can repeat one many times.
+	 * Shrinking the array shortens every later search. */
+	if (n > 1) {
+		unsigned int uniq = 1;
+
+		for (unsigned int i = 1; i < n; i++)
+			if (v[i] != v[uniq - 1])
+				v[uniq++] = v[i];
+		n = uniq;
+	}
+
 	*count = n;
 	return v;
 }
@@ -356,6 +362,7 @@ uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
 			       const struct fiemap *dm, uint64_t dest_off,
 			       uint64_t len)
 {
+	const uint64_t dest_end = dest_off + len;
 	uint64_t unshared = 0;
 
 	/* No destination map means we could not tell: assume nothing is shared,
@@ -368,12 +375,12 @@ uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
 		uint64_t start = e->fe_logical > dest_off ? e->fe_logical : dest_off;
 		uint64_t end = e->fe_logical + e->fe_length;
 
-		if (end > dest_off + len)
-			end = dest_off + len;
+		if (end > dest_end)
+			end = dest_end;
 		if (end <= start)
 			continue;
 
-		if (!(e->fe_flags & FIEMAP_NO_PHYS) && tgt_phys &&
+		if (!(e->fe_flags & FIEMAP_NO_PHYS) && tgt_n &&
 		    bsearch(&e->fe_physical, tgt_phys, tgt_n, sizeof(*tgt_phys),
 			    cmp_u64))
 			continue;	/* already on the target's storage */
