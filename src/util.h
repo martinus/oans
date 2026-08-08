@@ -93,6 +93,14 @@ unsigned int get_num_cpus(void);
 /* Bump up maximum open file limit. */
 int increase_limits(void);
 
+/* qsort/bsearch over a plain uint64_t array. */
+static inline int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x > y) - (x < y);
+}
+
 #define _cleanup_(x) __attribute__((cleanup(x)))
 static inline void freep(void *p)
 {

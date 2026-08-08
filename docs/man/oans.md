@@ -421,10 +421,14 @@ Summary
 
 **Reclaimed** is the disk space actually freed: for a group of *N* identical
 copies, `oans` keeps one physical copy and frees the other *N*−1, so this is the
-honest bytes-freed figure, not an inflated count. **Already shared** counts
-files skipped because their storage was already shared. If some destinations
-could not be deduped (their data changed since the scan, or the kernel refused),
-a **Not deduped** line reports the counts; re-run with **-v** for detail.
+honest bytes-freed figure, not an inflated count. Only data that was still
+duplicated counts towards it — a copy already sharing part of the target's
+storage contributes just the remainder, so a run over an already-deduplicated
+tree reports `0 B` rather than the volume it re-examined. **Already shared**
+counts files skipped entirely because their storage was already shared. If some
+destinations could not be deduped (their data changed since the scan, or the
+kernel refused), a **Not deduped** line reports the counts; re-run with **-v**
+for detail.
 
 When standard output is not a terminal, or under **-q**, `oans` also prints a
 stable machine-readable line:

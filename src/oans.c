@@ -87,13 +87,6 @@ static void print_file(char *filename, char *ino, char *subvol)
 		printf("%s\n", filename);
 }
 
-static int cmp_u64(const void *a, const void *b)
-{
-	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-
-	return x < y ? -1 : x > y ? 1 : 0;
-}
-
 /* Human duration for the timing lines: ms under a second, else seconds. */
 static const char *fmt_dur(char *buf, size_t n, double s)
 {

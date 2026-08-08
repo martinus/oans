@@ -487,7 +487,7 @@ that same tree (6.6 GiB → 1.4 GiB → 131 MiB → 21.3 MiB → **0 B**):
   is why `--dedupe-options=only_whole_files` converged where the default did not.
   That asymmetry is the diagnostic — if only_whole_files converges, suspect the
   extent path.
-- **`fiemap_range_shared_with()` compares coverage, not extent records.** The
+- **`fiemap_maps_share()` compares coverage, not extent records.** The
   same shared storage is described with different record boundaries in each
   file: a dedupe stops on a block boundary and splits the destination's tail
   where the target has one record. Record-for-record equality reads that as "not
@@ -658,3 +658,16 @@ check unlinks and recreates (it's only a cache).
   `-q` "net change in shared extents" line is a separate fiemap diagnostic
   (counts the surviving copy too, ~2× for pairs); `--json`
   `reclaimable_logical_bytes` is a logical upper bound.
+- **Never credit the kernel's `bytes_deduped` as space freed (#187).**
+  `FIDEDUPERANGE` reports the whole compared length whether or not the range
+  already shared the target's storage, so summing it counted work as savings: a
+  destination half of which was already shared credited twice what it freed, and
+  before #186 a run that freed *nothing* claimed 6.6 GiB. Each destination is
+  measured before submission — `fiemap_unshared_bytes()` over the target's
+  sorted physical addresses — and only that part is credited, capped by what the
+  kernel got through and only for destinations it accepted. Approximate by at
+  most one extent either way (a partial reference at a different offset into an
+  uncompressed extent reads as unshared; any part of a compressed extent reads
+  as shared), which is why it must never gate a *decision*, only the figure.
+  Pinned by `test_reclaimed_excludes_what_was_already_shared` and the
+  `test_fiemap_unshared_bytes` unit test.

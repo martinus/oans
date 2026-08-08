@@ -45,11 +45,13 @@ struct dedupe_req {
 
 	uint64_t		req_loff;
 	uint64_t		req_total; /* total bytes processed by kernel */
+	uint64_t		req_unshared; /* of which was not already shared */
 	int			req_status;
 	int			req_idx; /* index into same->info */
 };
 
-static struct dedupe_req *new_dedupe_req(struct filerec *file, uint64_t loff)
+static struct dedupe_req *new_dedupe_req(struct filerec *file, uint64_t loff,
+					 uint64_t unshared)
 {
 	struct dedupe_req *req = calloc(1, sizeof(*req));
 
@@ -57,6 +59,7 @@ static struct dedupe_req *new_dedupe_req(struct filerec *file, uint64_t loff)
 		INIT_LIST_HEAD(&req->req_list);
 		req->req_file = file;
 		req->req_loff = loff;
+		req->req_unshared = unshared;
 	}
 	return req;
 }
@@ -233,9 +236,9 @@ struct dedupe_ctxt *new_dedupe_ctxt(unsigned int max_extents, uint64_t loff,
 }
 
 int add_extent_to_dedupe(struct dedupe_ctxt *ctxt, uint64_t loff,
-			 struct filerec *file)
+			 struct filerec *file, uint64_t unshared)
 {
-	struct dedupe_req *req = new_dedupe_req(file, loff);
+	struct dedupe_req *req = new_dedupe_req(file, loff, unshared);
 
 	abort_on(ctxt->num_queued >= ctxt->max_queable);
 
@@ -514,8 +517,7 @@ retry:
  * Returns 1 when we have no more items.
  */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
-			  uint64_t *off, uint64_t *bytes_deduped,
-			  struct filerec **file)
+			  uint64_t *bytes_freed, struct filerec **file)
 {
 	struct dedupe_req *req;
 
@@ -529,8 +531,10 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 	list_del_init(&req->req_list);
 
 	*status = req->req_status;
-	*off = req->req_loff - req->req_total;
-	*bytes_deduped = req->req_total;
+	/* Zero unless the kernel took it, and never more than it processed. */
+	*bytes_freed = req->req_status ? 0 :
+		(req->req_unshared < req->req_total ?
+		 req->req_unshared : req->req_total);
 	*file = req->req_file;
 
 	free_dedupe_req(req);

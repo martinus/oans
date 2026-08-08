@@ -18,6 +18,7 @@ Configuration via environment:
 import ctypes
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -49,7 +50,7 @@ _ERROR_RE = re.compile(
 _NET_CHANGE_RE = re.compile(r"net change in shared extents of:\s*(\d+)")
 # The human summary line, e.g. "  Reclaimed      1.0 MiB across 1 group".
 # The size is human_size()-rendered ("1.0 MiB", "512 B"), so assert on the
-# rendered string; for exact bytes use --json's reclaimed_total_bytes instead.
+# rendered string; for exact bytes use reclaimed_bytes() below.
 _RECLAIMED_RE = re.compile(r"Reclaimed\s+([\d.]+ [A-Za-z]+)\s+across\s+(\d+)\s+group")
 _ALREADY_SHARED_RE = re.compile(r"Already shared (\d+) file")
 
@@ -315,11 +316,18 @@ class DuperemoveTest(unittest.TestCase):
         size_str is the rendered human figure (e.g. '1.0 MiB') — the honest
         disk-freed amount, one physical copy kept per group. Matches both the
         full Summary block and the -q one-liner (#148); returns None when there
-        was nothing to dedupe. For exact byte assertions use the --json
-        `reclaimed_total_bytes` field.
+        was nothing to dedupe. For exact byte assertions use reclaimed_bytes().
         """
         m = _RECLAIMED_RE.search(self.out)
         return (m.group(1), int(m.group(2))) if m else None
+
+    def reclaimed_bytes(self):
+        """Exact bytes freed, from the hashfile's --json metrics.
+
+        The human summary rounds ('1.0 MiB'); this is the figure to assert on.
+        Runs oans again, so it needs a hashfile the previous run wrote to.
+        """
+        return json.loads(self.dm("--json"))["reclaimed_total_bytes"]
 
     def assertReclaimed(self, size_str, groups, msg=None):
         """Assert the summary reported `size_str` reclaimed across `groups`."""

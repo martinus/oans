@@ -247,9 +247,9 @@ static uint64_t gap_at(const struct fiemap_extent *e, uint64_t off, uint64_t res
  * location (delalloc, unknown, inline) all report fe_physical 0 and must never
  * count as shared.
  */
-static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
-			      const struct fiemap *dm, uint64_t dest_off,
-			      uint64_t len)
+bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
+		       const struct fiemap *dm, uint64_t dest_off,
+		       uint64_t len)
 {
 	unsigned int i = 0;	/* both maps advance together, or we bail */
 	uint64_t pos = 0;	/* bytes of the range proven shared so far */
@@ -307,18 +307,85 @@ static bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 	return true;
 }
 
-bool fiemap_range_shared_with(const struct fiemap *tgt, uint64_t tgt_off,
-			      int dest_fd, uint64_t dest_off, uint64_t len)
+uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count)
 {
-	_cleanup_(freep) struct fiemap *dm = NULL;
+	uint64_t *v;
+	unsigned int n = 0;
 
-	/* Cheap reject before paying for the destination's map: a target we
-	 * could not map is nothing to compare against. */
-	if (len == 0 || !tgt || tgt->fm_mapped_extents == 0)
-		return false;
+	*count = 0;
+	if (!fm || fm->fm_mapped_extents == 0)
+		return NULL;
 
-	/* NULL means an error or a hole-only range: not known shared. */
-	dm = do_fiemap_range(dest_fd, dest_off, len);
+	v = malloc(fm->fm_mapped_extents * sizeof(*v));
+	if (!v)
+		return NULL;
 
-	return fiemap_maps_share(tgt, tgt_off, dm, dest_off, len);
+	for (unsigned int i = 0; i < fm->fm_mapped_extents; i++) {
+		if (fm->fm_extents[i].fe_flags & FIEMAP_NO_PHYS)
+			continue;	/* no stable address to match against */
+		v[n++] = fm->fm_extents[i].fe_physical;
+	}
+	qsort(v, n, sizeof(*v), cmp_u64);
+
+	/* Collapse duplicates: a compressed extent reports one address for every
+	 * record referencing it, and a fragmented file can repeat one many times.
+	 * Shrinking the array shortens every later search. */
+	if (n > 1) {
+		unsigned int uniq = 1;
+
+		for (unsigned int i = 1; i < n; i++)
+			if (v[i] != v[uniq - 1])
+				v[uniq++] = v[i];
+		n = uniq;
+	}
+
+	*count = n;
+	return v;
+}
+
+/*
+ * How many bytes of [dest_off, dest_off+len) are NOT already on storage the
+ * target references - i.e. how much a dedupe would actually stop duplicating.
+ *
+ * Membership is by physical address: two records with the same fe_physical are
+ * the same stored bytes, so a destination record already sitting on one of the
+ * target's extents frees nothing, and where in the range it sits is irrelevant
+ * to that. Holes contribute nothing, having nothing to free.
+ *
+ * Approximate at the edges, by at most one extent either way: a partial
+ * reference at a different offset into the same uncompressed extent reports a
+ * different fe_physical and is counted as unshared, while a compressed extent
+ * reports one address for the whole extent so any part of it counts as shared.
+ * This only feeds the reported figure, never a decision to skip work.
+ */
+uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
+			       const struct fiemap *dm, uint64_t dest_off,
+			       uint64_t len)
+{
+	const uint64_t dest_end = dest_off + len;
+	uint64_t unshared = 0;
+
+	/* No destination map means we could not tell: assume nothing is shared,
+	 * which is what the figure said before it could tell at all. */
+	if (!dm)
+		return len;
+
+	for (unsigned int i = 0; i < dm->fm_mapped_extents; i++) {
+		const struct fiemap_extent *e = &dm->fm_extents[i];
+		uint64_t start = e->fe_logical > dest_off ? e->fe_logical : dest_off;
+		uint64_t end = e->fe_logical + e->fe_length;
+
+		if (end > dest_end)
+			end = dest_end;
+		if (end <= start)
+			continue;
+
+		if (!(e->fe_flags & FIEMAP_NO_PHYS) && tgt_n &&
+		    bsearch(&e->fe_physical, tgt_phys, tgt_n, sizeof(*tgt_phys),
+			    cmp_u64))
+			continue;	/* already on the target's storage */
+
+		unshared += end - start;
+	}
+	return unshared;
 }

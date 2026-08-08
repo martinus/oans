@@ -46,17 +46,15 @@ int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
 int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shared);
 
 /*
- * True if [dest_off, dest_off+len) on dest_fd already resolves to the same
- * stored extents as the precomputed target map `tgt` (which describes
- * [tgt_off, tgt_off+len)) - i.e. the two ranges share all their storage, so
- * deduping them would be a byte-for-byte no-op. The target is passed as an
- * already-fetched map so a caller comparing one target against many
- * destinations fiemaps the target only once; get it from
- * do_fiemap_range(tgt_fd, tgt_off, len).
+ * True if [dest_off, dest_off+len) described by `dm` already resolves to the
+ * same stored extents as [tgt_off, tgt_off+len) described by `tgt` - i.e. the
+ * two ranges share all their storage, so deduping them would be a byte-for-byte
+ * no-op. Both maps come from do_fiemap_range(); a caller comparing one target
+ * against many destinations fetches the target's once.
  *
  * Compares coverage, not extent records: the same storage may be described
  * with different record boundaries in each file. Matching holes count as
- * shared. Conservative otherwise - returns false on any fiemap failure, any
+ * shared. Conservative otherwise - returns false on any missing map, any
  * difference it cannot prove away, or any extent without a real physical
  * location - so a caller only ever skips a genuine no-op, never a real dedupe.
  *
@@ -64,8 +62,26 @@ int fiemap_count_shared(int fd, size_t start_off, size_t end_off, uint64_t *shar
  * dedupe_shareable_len() first. A trailing partial block is never shared, so
  * including one makes this permanently false for every unaligned file.
  */
-bool fiemap_range_shared_with(const struct fiemap *tgt, uint64_t tgt_off,
-			      int dest_fd, uint64_t dest_off, uint64_t len);
+bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
+		       const struct fiemap *dm, uint64_t dest_off, uint64_t len);
+
+/*
+ * The physical addresses `fm` references, sorted, for fiemap_unshared_bytes()
+ * to look up. Built once per target and reused across its destinations.
+ * Returns NULL (count 0) for an empty map or on allocation failure; the caller
+ * frees it.
+ */
+uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count);
+
+/*
+ * Bytes of [dest_off, dest_off+len) that are not already on storage `tgt_phys`
+ * references - what deduping the destination would actually stop duplicating,
+ * as opposed to what the kernel reports having compared. See the definition for
+ * where it approximates.
+ */
+uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
+			       const struct fiemap *dm, uint64_t dest_off,
+			       uint64_t len);
 
 /*
  * Number of physical extents overlapping [start, start+length), via a single
