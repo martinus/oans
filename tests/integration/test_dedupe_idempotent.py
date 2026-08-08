@@ -21,14 +21,24 @@ KiB = 1 << 10
 
 @requires_reflink
 class DedupeIdempotentTest(DuperemoveTest):
+    # Every case here turns on the physical layout dedupe leaves behind - a
+    # split tail, a hole map, a sub-block extent - so it belongs in the
+    # one-at-a-time pass. See DuperemoveTest.serial: concurrent I/O perturbs
+    # btrfs writeback, and CI caught exactly that (a valgrind shard failed
+    # test_tail_block_split_off while the plain btrfs legs passed).
+    serial = True
+
     def assertRunFindsNothingToDo(self, tree, why):
         """One dedupe over `tree` that must free nothing and say why."""
         self.dm("-rd", tree, hashfile=False, quiet=False)
         self.assertDmOk()
         self.assertReclaimedNothing(why)
-        # Distinguishes "recognised as shared" from "no group at all".
+        # Distinguishes "recognised as shared" from "no group at all" - the
+        # latter would make every assertion above pass without testing
+        # anything. On failure the run's own summary says which it was.
         self.assertGreater(self.already_shared(), 0,
-                           "expected the already-shared skip to fire")
+                           "expected the already-shared skip to fire; oans said:"
+                           f"\n{self.out.strip()}")
 
     def assertSecondRunIsNoop(self, tree):
         """Dedupe twice; the second run must reclaim nothing."""
