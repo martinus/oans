@@ -36,6 +36,24 @@ class ExtentDedupeTest(DuperemoveTest):
             f.write(tail)
         return p
 
+    def _reflink_new_head(self, src_rel, dst_rel, head_len):
+        """Reflink src, then rewrite its head in place.
+
+        Copy-on-write replaces only the head blocks, so the copy keeps the
+        seed's tail extents byte for byte - a physical class of two that does
+        not depend on how writeback laid anything out.
+        """
+        p = self.reflink(src_rel, dst_rel)
+        with open(p, "r+b") as f:
+            f.write(os.urandom(head_len))
+        return p
+
+    def _layout(self, **files):
+        """Physical extents per file, for a failure message worth reading."""
+        from harness import phys_extents
+        return "\n  " + "\n  ".join(
+            f"{name}: {sorted(phys_extents(p))}" for name, p in files.items())
+
     def test_shared_tail_is_deduped(self):
         # Distinct heads, identical tail -> not whole-file dupes, so only the
         # extent pass can share the tail.
@@ -72,22 +90,27 @@ class ExtentDedupeTest(DuperemoveTest):
         Runs without a hashfile so each invocation reconsiders the whole tree:
         with one, the incremental dedupe_seq watermark would skip the unchanged
         groups and the second run would be a no-op for the wrong reason.
+
+        The two classes are built with reflinks rather than by deduping the
+        subtrees first. A reflink copies the extent map exactly, so each pair
+        provably lands in one group; writing four files independently and
+        hoping writeback splits all four tails the same way does not survive a
+        different allocator (it failed on CI's fresh 2 GiB image while passing
+        on a large aged filesystem). Only a1-vs-b1 still relies on two
+        head+fsync+tail writes matching, which test_shared_tail_is_deduped
+        above already depends on.
         """
+        head = 64 * 1024        # block-aligned, so rewriting it spares the tail
         tail = os.urandom(4 * MiB)
-        # Distinct head sizes keep these four out of the whole-file pass.
-        a1 = self._mkfile("tree/a/1", os.urandom(64 * 1024), tail)
-        a2 = self._mkfile("tree/a/2", os.urandom(96 * 1024), tail)
-        b1 = self._mkfile("tree/b/1", os.urandom(128 * 1024), tail)
-        b2 = self._mkfile("tree/b/2", os.urandom(160 * 1024), tail)
+        a1 = self._mkfile("tree/a/1", os.urandom(head), tail)
+        b1 = self._mkfile("tree/b/1", os.urandom(head), tail)
+        self.sync()
+        # Same tail extents as the seed, different head - so same size but a
+        # different file, which keeps all four out of the whole-file pass.
+        a2 = self._reflink_new_head("tree/a/1", "tree/a/2", head)
+        b2 = self._reflink_new_head("tree/b/1", "tree/b/2", head)
         self.sync()
 
-        # Two independent physical copies of `tail`, two members each: dedupe
-        # the subtrees separately so a/* land on one extent and b/* the other.
-        self.dm("-rd", self.path("tree/a"), hashfile=False)
-        self.assertDmOk()
-        self.dm("-rd", self.path("tree/b"), hashfile=False)
-        self.assertDmOk()
-        self.sync()
         self.assertShared(a1, a2, "a/* share one physical copy of the tail")
         self.assertShared(b1, b2, "b/* share the other")
         self.assertNotShared(a1, b1, "the two copies are still independent")
@@ -102,7 +125,8 @@ class ExtentDedupeTest(DuperemoveTest):
         # behind, so check every member against the same reference.
         for other, name in ((a2, "a/2"), (b1, "b/1"), (b2, "b/2")):
             self.assertShared(a1, other,
-                              f"{name} still on its old extent after one run")
+                              f"{name} still on its old extent after one run"
+                              + self._layout(a1=a1, a2=a2, b1=b1, b2=b2))
         self.assertEqual(before, self.tree_digest(self.path("tree")),
                          "dedupe preserved file contents")
 
