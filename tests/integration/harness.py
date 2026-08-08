@@ -133,6 +133,42 @@ def files_share(a, b, dir_fd=None):
     return bool(phys_extents(a, dir_fd) & phys_extents(b, dir_fd))
 
 
+def physical_footprint(directory):
+    """Bytes of distinct physical storage the files under `directory` reference.
+
+    The union of [physical, physical+length) over every regular file's real
+    extents, so storage that several files share is counted once. Reducing this
+    number is dedupe's entire job, which makes the drop across a run the ground
+    truth to check a reported "Reclaimed" against - arrived at from the kernel's
+    extent maps, independently of anything oans computes.
+
+    Only meaningful for incompressible data: on a compressed filesystem
+    fe_length is the *logical* length while fe_physical is a disk address, so
+    the ranges are not real disk ranges. Callers write os.urandom(), which btrfs
+    detects as incompressible and stores raw even under compress=zstd.
+    """
+    ranges = []
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            p = os.path.join(root, name)
+            if os.path.islink(p) or not os.path.isfile(p):
+                continue
+            ranges.extend((phys, phys + length)
+                          for _log, phys, length, flags in fiemap_extents(p)
+                          if not (flags & _NO_PHYS))
+
+    total = 0
+    start = end = None
+    for lo, hi in sorted(ranges):
+        if end is not None and lo <= end:
+            end = max(end, hi)
+            continue
+        if end is not None:
+            total += end - start
+        start, end = lo, hi
+    return total + (end - start if end is not None else 0)
+
+
 # --------------------------------------------------------------------------
 # Reflink support probe
 # --------------------------------------------------------------------------
