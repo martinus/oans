@@ -195,19 +195,25 @@ static _Atomic uint64_t dedupe_dest_errors;
 static _Atomic uint64_t dedupe_dest_already_shared;
 
 static void process_dedupe_results(struct dedupe_ctxt *ctxt,
-				   uint64_t *kern_bytes)
+				   uint64_t *freed_bytes)
 {
 	int done = 0;
 	int target_status;
-	uint64_t target_loff, target_bytes;
+	uint64_t target_loff, target_bytes, target_freed;
 	struct filerec *f;
 	const char *status_str = "[unknown status]";
 
 	while (!done) {
 		done = pop_one_dedupe_result(ctxt, &target_status, &target_loff,
-					     &target_bytes, &f);
-		if (kern_bytes)
-			*kern_bytes += target_bytes;
+					     &target_bytes, &target_freed, &f);
+		/*
+		 * Credit what stopped being duplicated, not what the kernel
+		 * compared: FIDEDUPERANGE reports the full length even when the
+		 * range already shared the target's storage, so counting that
+		 * let a run which freed nothing claim gigabytes (#187).
+		 */
+		if (freed_bytes && target_status == 0)
+			*freed_bytes += target_freed;
 
 		/*
 		 * Only report errors.
@@ -443,7 +449,7 @@ static void group_tick(void *arg, uint64_t bytes)
 static int dedupe_extent_list(struct dupe_extents *dext,
 			      struct group_progress *gp, bool whole_file_dedup,
 			      struct results_tree *res,
-			      uint64_t *fiemap_bytes, uint64_t *kern_bytes,
+			      uint64_t *fiemap_bytes, uint64_t *freed_bytes,
 			      unsigned long long passno)
 {
 	int ret = 0;
@@ -459,9 +465,16 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	 * is open; tgt_mapped says the attempt was made, so a target we cannot
 	 * fiemap is not retried for every remaining member. */
 	_cleanup_(freep) struct fiemap *tgt_map = NULL;
+	/* The target's physical addresses, for measuring how much of a
+	 * destination is genuinely duplicated rather than already shared. */
+	_cleanup_(freep) uint64_t *tgt_phys = NULL;
+	unsigned int tgt_phys_n = 0;
 	bool tgt_mapped = false;
 	/* What that check compares: all of `len` the kernel would dedupe. */
 	uint64_t cmp_len = 0;
+	/* Per-destination scratch, freed as soon as it has been read. */
+	struct fiemap *dest_map = NULL;
+	uint64_t unshared;
 	OPEN_ONCE(open_files);
 	struct extent *tgt_extent = NULL;
 
@@ -636,14 +649,17 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		}
 
 		/*
-		 * Skip a destination that already maps to the exact same
-		 * physical extents as the target: deduping it would be a
-		 * byte-for-byte no-op, but the kernel still reads and compares
-		 * the whole range, which is the dominant cost on already-shared
-		 * trees like repeated snapshots (upstream #331). The target map
-		 * is fetched once (a couple of cheap metadata ioctls) and reused
-		 * for every destination; it never skips a real dedupe (see
-		 * fiemap_range_shared_with()).
+		 * Map this destination once and get two things from it: whether
+		 * it already maps to the same physical extents as the target -
+		 * deduping it would be a byte-for-byte no-op, but the kernel
+		 * still reads and compares the whole range, the dominant cost on
+		 * already-shared trees like repeated snapshots (upstream #331) -
+		 * and, if not, how much of it is genuinely duplicated, which is
+		 * what the run gets to claim it freed (#187).
+		 *
+		 * The target's map and its sorted addresses are built once (a
+		 * couple of cheap metadata ioctls) and reused for every
+		 * destination.
 		 */
 		if (!tgt_mapped) {
 			tgt_mapped = true;
@@ -654,10 +670,14 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			cmp_len = dedupe_shareable_len(tgt_extent->e_file->fd, len);
 			tgt_map = do_fiemap_range(tgt_extent->e_file->fd,
 						  tgt_extent->e_loff, cmp_len);
+			tgt_phys = fiemap_phys_sorted(tgt_map, &tgt_phys_n);
 		}
-		if (fiemap_range_shared_with(tgt_map, tgt_extent->e_loff,
-					     extent->e_file->fd, extent->e_loff,
-					     cmp_len)) {
+		dest_map = do_fiemap_range(extent->e_file->fd, extent->e_loff,
+					   cmp_len);
+		if (fiemap_maps_share(tgt_map, tgt_extent->e_loff, dest_map,
+				      extent->e_loff, cmp_len)) {
+			free(dest_map);
+			dest_map = NULL;
 			atomic_fetch_add(&dedupe_dest_already_shared, 1);
 			group_tick(gp, len);	/* skipped, but credit its work */
 			vprintf("[%p] %s already shares the target's extents; "
@@ -667,8 +687,13 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 				goto run_dedupe;
 			continue;
 		}
+		unshared = fiemap_unshared_bytes(tgt_phys, tgt_phys_n, dest_map,
+						 extent->e_loff, cmp_len);
+		free(dest_map);
+		dest_map = NULL;
 
-		rc = add_extent_to_dedupe(ctxt, extent->e_loff, extent->e_file);
+		rc = add_extent_to_dedupe(ctxt, extent->e_loff, extent->e_file,
+					  unshared);
 		if (rc) {
 			if (rc < 0) {
 				/* This can only be ENOMEM. */
@@ -704,7 +729,7 @@ run_dedupe:
 
 			ret = dedupe_extents(ctxt);
 			if (ret == 0) {
-				process_dedupe_results(ctxt, kern_bytes);
+				process_dedupe_results(ctxt, freed_bytes);
 			} else {
 				ret = errno;
 				eprintf("FAILURE: Dedupe ioctl returns %d: %s\n",
@@ -765,7 +790,7 @@ out:
 static int extent_dedupe_worker(struct dupe_extents *dext,
 				struct group_progress *gp, bool whole_file_dedup,
 				struct results_tree *res,
-				uint64_t *fiemap_bytes, uint64_t *kern_bytes)
+				uint64_t *fiemap_bytes, uint64_t *freed_bytes)
 {
 	int ret;
 	unsigned long long passno = __atomic_add_fetch(&curr_dedupe_pass, 1, __ATOMIC_SEQ_CST);
@@ -775,7 +800,7 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	struct dbhandle *db = dbfile_get_handle();
 
 	ret = dedupe_extent_list(dext, gp, whole_file_dedup, res, fiemap_bytes,
-				 kern_bytes, passno);
+				 freed_bytes, passno);
 	if (ret) {
 		if (ret == DEDUPE_EXTENTS_CLEANED)
 			return 0;
@@ -834,7 +859,7 @@ static void batch_maybe_complete_locked(struct dedupe_batch *batch)
 static void dedupe_worker_body(void *priv)
 {
 	uint64_t fiemap_bytes = 0ULL;
-	uint64_t kern_bytes = 0ULL;
+	uint64_t freed_bytes = 0ULL;
 	struct dedupe_work_item *item = priv;
 	struct dupe_extents *dext = item->dext;
 	struct dedupe_batch *batch = item->batch;
@@ -862,7 +887,7 @@ static void dedupe_worker_body(void *priv)
 	slot_show_group(slot, dext);
 
 	extent_dedupe_worker(dext, &gp, whole_file, res, &fiemap_bytes,
-			     &kern_bytes);
+			     &freed_bytes);
 
 	/*
 	 * Settle up the byte bar: credit whatever work never reached the kernel
@@ -881,7 +906,7 @@ static void dedupe_worker_body(void *priv)
 	 * too (~2x for pairs), so it is reported only as the "net change in
 	 * shared extents" diagnostic, not as space reclaimed.
 	 */
-	pdedupe_group_done(kern_bytes, fiemap_bytes);
+	pdedupe_group_done(freed_bytes, fiemap_bytes);
 
 	/* Last one out of this batch wakes the producer to reap it. */
 	g_mutex_lock(&producer_mutex);

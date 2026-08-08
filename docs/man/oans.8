@@ -503,8 +503,12 @@ Summary
 \f[I]N\f[R] identical copies, \f[CR]oans\f[R] keeps one physical copy
 and frees the other \f[I]N\f[R]−1, so this is the honest bytes\-freed
 figure, not an inflated count.
-\f[B]Already shared\f[R] counts files skipped because their storage was
-already shared.
+Only data that was still duplicated counts towards it \(em a copy
+already sharing part of the target\(cqs storage contributes just the
+remainder, so a run over an already\-deduplicated tree reports
+\f[CR]0 B\f[R] rather than the volume it re\-examined.
+\f[B]Already shared\f[R] counts files skipped entirely because their
+storage was already shared.
 If some destinations could not be deduped (their data changed since the
 scan, or the kernel refused), a \f[B]Not deduped\f[R] line reports the
 counts; re\-run with \f[B]\-v\f[R] for detail.

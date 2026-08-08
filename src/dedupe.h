@@ -82,16 +82,26 @@ void free_dedupe_ctxt(struct dedupe_ctxt *ctxt);
 uint64_t dedupe_shareable_len(int fd, uint64_t len);
 
 /*
- * add_extent_to_dedupe returns:
+ * Queue one destination. `unshared` is how many of its bytes are not already
+ * on the target's storage - what this dedupe would actually stop duplicating,
+ * handed back by pop_one_dedupe_result() so the caller can report space freed
+ * rather than bytes the kernel compared (#187). Callers that cannot tell pass
+ * the full length.
+ *
+ * Returns:
  *  < 0: error
  * == 0: no more extents after this one
  *  > 0: ok, can accept more extents
  */
 int add_extent_to_dedupe(struct dedupe_ctxt *ctxt, uint64_t loff,
-			 struct filerec *file);
+			 struct filerec *file, uint64_t unshared);
 int dedupe_extents(struct dedupe_ctxt *ctxt);
+/*
+ * `bytes_deduped` is what the kernel reported comparing and sharing;
+ * `bytes_freed` is the part of that which was not already shared.
+ */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 			  uint64_t *off, uint64_t *bytes_deduped,
-			  struct filerec **file);
+			  uint64_t *bytes_freed, struct filerec **file);
 
 #endif	/* __DEDUPE_H__ */

@@ -191,12 +191,6 @@ MU_TEST(test_get_extent) {
 	free(fm);
 }
 
-/*
- * fiemap_maps_share() decides whether deduping one range against another would
- * be a no-op. It has to answer "yes" for storage that is genuinely shared but
- * described with different record boundaries, or the same file is resubmitted
- * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
- */
 /* Build both maps, compare, free. Keeps each case below to its records. */
 static bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
 		  const struct fm_rec *rb, unsigned int nb, uint64_t off_b,
@@ -283,6 +277,76 @@ MU_TEST(test_fiemap_maps_share) {
 
 	mu_check(share(big, 1, 8192, big, 1, 8192, 8192));
 	mu_check(!share(big, 1, 8192, offset, 1, 8192, 4096));
+}
+
+/* Sort the target's addresses, measure the destination against them, free. */
+static uint64_t unshared(const struct fm_rec *rt, unsigned int nt,
+			 const struct fm_rec *rd, unsigned int nd,
+			 uint64_t dest_off, uint64_t len)
+{
+	struct fiemap *t = mkmap(rt, nt), *d = nd ? mkmap(rd, nd) : NULL;
+	unsigned int n = 0;
+	uint64_t *phys = fiemap_phys_sorted(t, &n);
+	uint64_t bytes = fiemap_unshared_bytes(phys, n, d, dest_off, len);
+
+	free(phys);
+	free(t);
+	free(d);
+	return bytes;
+}
+
+/*
+ * fiemap_unshared_bytes() answers "how much would deduping this destination
+ * actually stop duplicating" - the figure a run reports as reclaimed. The
+ * kernel's own byte count cannot answer it: FIDEDUPERANGE reports the whole
+ * compared length even for a range that already shared the target's storage
+ * (#187).
+ */
+MU_TEST(test_fiemap_unshared_bytes) {
+	const uint32_t SH = FIEMAP_EXTENT_SHARED;
+	struct fm_rec tgt[] = {{0, 4096, 8192, SH}};
+
+	/* Already on the target's extent: nothing would be freed. */
+	mu_check(unshared(tgt, 1, tgt, 1, 0, 8192) == 0);
+
+	/* A copy of its own: all of it. */
+	struct fm_rec other[] = {{0, 99999, 8192, 0}};
+
+	mu_check(unshared(tgt, 1, other, 1, 0, 8192) == 8192);
+
+	/*
+	 * The case the reported figure got wrong: half the destination already
+	 * sits on the target's extent, so only the other half is duplicated.
+	 */
+	struct fm_rec half[] = {{0, 4096, 4096, SH}, {4096, 99999, 4096, 0}};
+
+	mu_check(unshared(tgt, 1, half, 2, 0, 4096 * 2) == 4096);
+
+	/* Position is irrelevant: the same stored extent frees nothing wherever
+	 * the destination references it. */
+	struct fm_rec elsewhere[] = {{0, 4096, 4096, SH}};
+
+	mu_check(unshared(tgt, 1, elsewhere, 1, 0, 4096) == 0);
+
+	/* Records are clipped to the range, not counted whole. */
+	struct fm_rec wide[] = {{0, 99999, 1 << 20, 0}};
+
+	mu_check(unshared(tgt, 1, wide, 1, 0, 8192) == 8192);
+
+	/* A hole frees nothing - there is nothing there to stop duplicating. */
+	struct fm_rec late[] = {{65536, 99999, 4096, 0}};
+
+	mu_check(unshared(tgt, 1, late, 1, 0, 8192) == 0);
+
+	/* No usable address on either side: cannot prove anything is shared, so
+	 * report it all as duplicated rather than over-claiming a saving. */
+	struct fm_rec delalloc[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
+
+	mu_check(unshared(tgt, 1, delalloc, 1, 0, 8192) == 8192);
+	mu_check(unshared(delalloc, 1, tgt, 1, 0, 8192) == 8192);
+
+	/* No destination map at all (fiemap failed): same fallback. */
+	mu_check(unshared(tgt, 1, NULL, 0, 0, 8192) == 8192);
 }
 
 MU_TEST(test_sanitize_ctrl) {
@@ -923,6 +987,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
 	MU_RUN_TEST(test_fiemap_maps_share);
+	MU_RUN_TEST(test_fiemap_unshared_bytes);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_progress_copy_path);
 	MU_RUN_TEST(test_progress_path_two_stage_render);

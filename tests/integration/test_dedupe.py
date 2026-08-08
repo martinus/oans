@@ -1,14 +1,19 @@
 """Dedupe phase: identical files share storage, data is preserved, second run
 is a no-op. Requires a reflink-capable filesystem."""
 
+import json
 import os
-from harness import DuperemoveTest, requires_reflink
+from harness import DuperemoveTest, phys_extents, requires_reflink
 
 MiB = 1 << 20
 
 
 @requires_reflink
 class DedupeTest(DuperemoveTest):
+    # test_reclaimed_excludes_what_was_already_shared turns on the physical
+    # layout a reflink-plus-rewrite leaves behind; see DuperemoveTest.serial.
+    serial = True
+
     def test_shares_identical_files(self):
         a, b = self.mkdup("tree/a", "tree/b", MiB)
         self.sync()
@@ -39,6 +44,40 @@ class DedupeTest(DuperemoveTest):
         self.dm("-rd", self.path("tree"), quiet=False)  # full Summary block
         self.assertDmOk()
         self.assertReclaimed("1.0 MiB", 1)
+
+    def test_reclaimed_excludes_what_was_already_shared(self):
+        """Half the copy already sits on the target's extents: half is freed.
+
+        FIDEDUPERANGE reports the whole compared length as deduped whether or
+        not the range already shared that storage, so crediting the kernel's
+        figure counted the shared half as freed too - and a run that freed
+        nothing could still claim gigabytes (#187).
+
+        Built by reflinking and then rewriting the second half, so exactly
+        1 MiB of the 2 MiB copy is duplicated. Layout-sensitive, hence serial;
+        the precondition is checked rather than assumed.
+        """
+        data = os.urandom(2 * MiB)
+        a = self.write("tree/a", data)
+        self.sync()
+        b = self.reflink("tree/a", "tree/b")
+        with open(b, "r+b") as f:
+            f.seek(MiB)
+            f.write(data[MiB:])
+        self.sync()
+
+        pa, pb = phys_extents(a), phys_extents(b)
+        if not (pa & pb) or not (pb - pa):
+            self.skipTest(f"no half-shared layout here: a={sorted(pa)} "
+                          f"b={sorted(pb)}")
+
+        # a is the least fragmented, so pick_dedupe_target() makes it the
+        # target and b the destination whose unshared half gets counted.
+        self.dedupe(self.path("tree"))
+        self.assertDmOk()
+        self.assertEqual(MiB,
+                         json.loads(self.dm("--json"))["reclaimed_total_bytes"],
+                         "only the half that was still duplicated was freed")
 
     def test_is_idempotent(self):
         a, b = self.mkdup("tree/a", "tree/b", MiB)
