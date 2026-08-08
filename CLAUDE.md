@@ -268,6 +268,25 @@ run picks the file up there.
   left discards the checkpoint and starts over — which doubles as the one cheap
   check that the layout was not rewritten underneath (mtime and size need not
   move on a defrag).
+- **A checkpoint is trusted on mtime + size, and that is not certain.** Measured:
+  a `chattr +C` (nodatacow) file modified in place with the timestamp restored
+  afterwards resumes across the change and yields a digest of a byte string that
+  never existed. The point is that **the ordinary incremental path has the same
+  blind spot** — measured on the same file, a full scan then the same
+  modification leaves a stored digest that no longer describes it — so resume
+  inherits oans's guarantee rather than weakening it, and the real safety net is
+  that `FIDEDUPERANGE` byte-verifies (two files oans believed identical deduped
+  to `0 B` with both intact). Don't "fix" this in the resume path alone; a
+  stronger identity (statx `STATX_CHANGE_COOKIE`/`i_version`) would be a
+  repo-wide change to change detection or nothing.
+  - On CoW btrfs the extent check above usually catches that case anyway, since
+    an in-place write splits the extent. Incidental, not a guarantee: it is gone
+    on nodatacow and whenever a checkpoint lands on an extent boundary (no
+    extent state, so nothing to check).
+  - **The checkpoint stamps the mtime read when the file was *listed*, not the
+    one current at checkpoint time.** Stamping the current one would make a file
+    modified *during* run 1's hashing look consistent to run 2, which would then
+    resume across the modification. Listing-time makes it fail closed.
 - **Change detection had a matching hole.** A file's row is written with its
   mtime and size *before* hashing starts; only the digest says it was ever
   hashed. `SELECT_FILE_CHANGES` therefore also selects `digest is not null`, and

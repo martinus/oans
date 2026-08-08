@@ -686,9 +686,20 @@ Files it finished hashing keep their hashes, and a very large file it
 was in the middle of \(em a disk image, a backup archive \(em is
 checkpointed as it goes, so the next run picks it up where the last one
 stopped rather than reading it again from the start.
-Checkpoints need a \f[B]\-\-hashfile\f[R] to live in; they are dropped
-automatically once the file is fully hashed, and ignored if the file
-changed in the meantime.
+Checkpoints need a \f[B]\-\-hashfile\f[R] to live in, and are dropped
+automatically once the file is fully hashed.
+.PP
+A checkpoint is only used if the file\(cqs size and modification time
+are still what they were, which is the same test \f[CR]oans\f[R] applies
+to every file in a hashfile to decide it need not be read again.
+A file whose contents change while size and mtime are both held fixed
+\(em restoring the timestamp after an in\-place write, say \(em is
+therefore not noticed, exactly as it would not be for a fully scanned
+file.
+The consequence is a stale or mismatched digest, so a duplicate may be
+missed or a group needlessly compared; it is never a risk to data,
+because the kernel byte\-verifies every deduplication and refuses any
+pair that does not match.
 .PP
 Two logically identical files are not always deduped: \f[CR]oans\f[R]
 works on extent boundaries, so files with the same content but a

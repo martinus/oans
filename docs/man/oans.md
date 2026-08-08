@@ -584,9 +584,18 @@ An interrupted run also does not lose the work it had done. Files it finished
 hashing keep their hashes, and a very large file it was in the middle of —
 a disk image, a backup archive — is checkpointed as it goes, so the next run
 picks it up where the last one stopped rather than reading it again from the
-start. Checkpoints need a **\--hashfile** to live in; they are dropped
-automatically once the file is fully hashed, and ignored if the file changed in
-the meantime.
+start. Checkpoints need a **\--hashfile** to live in, and are dropped
+automatically once the file is fully hashed.
+
+A checkpoint is only used if the file's size and modification time are still
+what they were, which is the same test `oans` applies to every file in a
+hashfile to decide it need not be read again. A file whose contents change
+while size and mtime are both held fixed — restoring the timestamp after an
+in-place write, say — is therefore not noticed, exactly as it would not be for
+a fully scanned file. The consequence is a stale or mismatched digest, so a
+duplicate may be missed or a group needlessly compared; it is never a risk to
+data, because the kernel byte-verifies every deduplication and refuses any pair
+that does not match.
 
 Two logically identical files are not always deduped: `oans` works on extent
 boundaries, so files with the same content but a different on-disk extent layout
