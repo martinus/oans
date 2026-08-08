@@ -307,62 +307,130 @@ bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 	return true;
 }
 
-uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count)
+/* Sorted-unique in place; returns the surviving count. */
+static unsigned int sort_uniq(uint64_t *v, unsigned int n)
 {
-	uint64_t *v;
+	unsigned int w = 1;
+
+	if (n < 2)
+		return n;
+	qsort(v, n, sizeof(*v), cmp_u64);
+	for (unsigned int i = 1; i < n; i++)
+		if (v[i] != v[w - 1])
+			v[w++] = v[i];
+	return w;
+}
+
+void fiemap_phys_set_init(struct fiemap_phys_set *set, const struct fiemap *fm)
+{
 	unsigned int n = 0;
 
-	*count = 0;
+	set->v = NULL;
+	set->n = set->cap = 0;
 	if (!fm || fm->fm_mapped_extents == 0)
-		return NULL;
+		return;
 
-	v = malloc(fm->fm_mapped_extents * sizeof(*v));
-	if (!v)
-		return NULL;
+	set->v = malloc(fm->fm_mapped_extents * sizeof(*set->v));
+	if (!set->v)
+		return;
+	set->cap = fm->fm_mapped_extents;
 
 	for (unsigned int i = 0; i < fm->fm_mapped_extents; i++) {
 		if (fm->fm_extents[i].fe_flags & FIEMAP_NO_PHYS)
 			continue;	/* no stable address to match against */
-		v[n++] = fm->fm_extents[i].fe_physical;
+		set->v[n++] = fm->fm_extents[i].fe_physical;
 	}
-	qsort(v, n, sizeof(*v), cmp_u64);
+	/* Duplicates are common - a compressed extent reports one address for
+	 * every record referencing it - and collapsing them shortens every
+	 * later search. */
+	set->n = sort_uniq(set->v, n);
+}
 
-	/* Collapse duplicates: a compressed extent reports one address for every
-	 * record referencing it, and a fragmented file can repeat one many times.
-	 * Shrinking the array shortens every later search. */
-	if (n > 1) {
-		unsigned int uniq = 1;
-
-		for (unsigned int i = 1; i < n; i++)
-			if (v[i] != v[uniq - 1])
-				v[uniq++] = v[i];
-		n = uniq;
-	}
-
-	*count = n;
-	return v;
+void fiemap_phys_set_free(struct fiemap_phys_set *set)
+{
+	free(set->v);
+	set->v = NULL;
+	set->n = set->cap = 0;
 }
 
 /*
- * How many bytes of [dest_off, dest_off+len) are NOT already on storage the
- * target references - i.e. how much a dedupe would actually stop duplicating.
+ * Merge `add` (sorted, unique) into the set. Merging per destination rather
+ * than inserting per address keeps this O(n) per destination instead of O(n)
+ * per element - the difference between usable and hopeless on the fragmented
+ * whole-file groups the sorted array exists for.
+ *
+ * On allocation failure the set is left as it was: the reported figure loses
+ * accuracy for the rest of the group, which is all this feeds.
+ */
+static void phys_set_merge(struct fiemap_phys_set *set, const uint64_t *add,
+			   unsigned int n_add)
+{
+	unsigned int i, j, k, w;
+
+	if (!n_add)
+		return;
+
+	if (set->n + n_add > set->cap) {
+		unsigned int cap = set->cap ? set->cap : 16;
+		uint64_t *grown;
+
+		while (cap < set->n + n_add)
+			cap *= 2;
+		grown = realloc(set->v, cap * sizeof(*grown));
+		if (!grown)
+			return;
+		set->v = grown;
+		set->cap = cap;
+	}
+
+	/* Backwards, so the merge can run in place. */
+	i = set->n;
+	j = n_add;
+	k = set->n + n_add;
+	while (j > 0) {
+		if (i > 0 && set->v[i - 1] > add[j - 1])
+			set->v[--k] = set->v[--i];
+		else
+			set->v[--k] = add[--j];
+	}
+	set->n += n_add;
+
+	w = 1;
+	for (i = 1; i < set->n; i++)
+		if (set->v[i] != set->v[w - 1])
+			set->v[w++] = set->v[i];
+	set->n = w;
+}
+
+/*
+ * How many bytes of [dest_off, dest_off+len) are NOT already on storage that
+ * `seen` accounts for - i.e. how much deduplicating this destination would
+ * actually stop duplicating - after which its addresses join the set.
+ *
+ * The set accumulating is the point. It starts as the target's addresses, but
+ * two destinations of one group can already share an extent with *each other*;
+ * crediting both in full claimed twice what releasing that one extent frees
+ * (#191). Whoever is measured first pays for it, and the rest are free.
  *
  * Membership is by physical address: two records with the same fe_physical are
- * the same stored bytes, so a destination record already sitting on one of the
- * target's extents frees nothing, and where in the range it sits is irrelevant
- * to that. Holes contribute nothing, having nothing to free.
+ * the same stored bytes, so a destination already sitting on accounted-for
+ * storage frees nothing, and where in the range it sits is irrelevant to that.
+ * Holes contribute nothing, having nothing to free.
  *
  * Approximate at the edges, by at most one extent either way: a partial
  * reference at a different offset into the same uncompressed extent reports a
  * different fe_physical and is counted as unshared, while a compressed extent
  * reports one address for the whole extent so any part of it counts as shared.
- * This only feeds the reported figure, never a decision to skip work.
+ * One address repeated *within* a single destination is also still counted
+ * twice. This only feeds the reported figure, never a decision to skip work.
  */
-uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
+uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
 			       const struct fiemap *dm, uint64_t dest_off,
 			       uint64_t len)
 {
 	const uint64_t dest_end = dest_off + len;
+	_cleanup_(freep) uint64_t *fresh = NULL;
+	unsigned int n_fresh = 0;
 	uint64_t unshared = 0;
 
 	/* No destination map means we could not tell: assume nothing is shared,
@@ -370,22 +438,30 @@ uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
 	if (!dm)
 		return len;
 
+	fresh = malloc(dm->fm_mapped_extents * sizeof(*fresh));
+
 	for (unsigned int i = 0; i < dm->fm_mapped_extents; i++) {
 		const struct fiemap_extent *e = &dm->fm_extents[i];
 		uint64_t start = e->fe_logical > dest_off ? e->fe_logical : dest_off;
 		uint64_t end = e->fe_logical + e->fe_length;
+		bool addressable = !(e->fe_flags & FIEMAP_NO_PHYS);
 
 		if (end > dest_end)
 			end = dest_end;
 		if (end <= start)
 			continue;
 
-		if (!(e->fe_flags & FIEMAP_NO_PHYS) && tgt_n &&
-		    bsearch(&e->fe_physical, tgt_phys, tgt_n, sizeof(*tgt_phys),
+		if (addressable && seen->n &&
+		    bsearch(&e->fe_physical, seen->v, seen->n, sizeof(*seen->v),
 			    cmp_u64))
-			continue;	/* already on the target's storage */
+			continue;	/* already accounted for */
 
 		unshared += end - start;
+		if (addressable && fresh)
+			fresh[n_fresh++] = e->fe_physical;
 	}
+
+	if (fresh)
+		phys_set_merge(seen, fresh, sort_uniq(fresh, n_fresh));
 	return unshared;
 }

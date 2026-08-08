@@ -683,8 +683,11 @@ check unlinks and recreates (it's only a cache).
     groups load with `poff = 0` and skip `clean_deduped()` entirely, so only an
     extent-pass layout (same tail, different heads) reproduces #186 — a
     four-identical-file version of the same physical shape does not.
-  - **Known over-count (#191), deliberately excluded from that test:** two members of
-    one group sitting on a *single* extent are each credited in full, while
-    releasing that extent frees its length once — 2.0 MiB reported against
-    1 MiB freed. The per-destination measure has no notion of destinations
-    sharing storage with *each other*. Convergence is unaffected.
+  - **The accounted-for set accumulates across a group's destinations (#191).**
+    Seeded from the target, then grown by `fiemap_unshared_bytes()` as each
+    destination is measured — because two destinations can already share an
+    extent with *each other*, and crediting both in full claimed twice what
+    releasing that one extent frees. Merged per destination, never inserted per
+    address: the fragmented whole-file groups the sorted array exists for make
+    the latter hopeless. Still counts one address repeated *within* a single
+    destination twice; bounded, and noted at the definition.

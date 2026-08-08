@@ -66,20 +66,29 @@ bool fiemap_maps_share(const struct fiemap *tgt, uint64_t tgt_off,
 		       const struct fiemap *dm, uint64_t dest_off, uint64_t len);
 
 /*
- * The physical addresses `fm` references, sorted, for fiemap_unshared_bytes()
- * to look up. Built once per target and reused across its destinations.
- * Returns NULL (count 0) for an empty map or on allocation failure; the caller
- * frees it.
+ * The physical addresses a group has already accounted for, sorted and unique.
+ * Seeded from the dedupe target's map, then grown by fiemap_unshared_bytes()
+ * as each destination is measured, so storage two destinations already share
+ * with each other is only ever credited once (#191).
  */
-uint64_t *fiemap_phys_sorted(const struct fiemap *fm, unsigned int *count);
+struct fiemap_phys_set {
+	uint64_t	*v;
+	unsigned int	n;
+	unsigned int	cap;
+};
+
+void fiemap_phys_set_init(struct fiemap_phys_set *set, const struct fiemap *fm);
+void fiemap_phys_set_free(struct fiemap_phys_set *set);
 
 /*
- * Bytes of [dest_off, dest_off+len) that are not already on storage `tgt_phys`
- * references - what deduping the destination would actually stop duplicating,
- * as opposed to what the kernel reports having compared. See the definition for
- * where it approximates.
+ * Bytes of [dest_off, dest_off+len) not already on storage `seen` accounts
+ * for - what deduplicating this destination would actually stop duplicating,
+ * as opposed to what the kernel reports having compared. Adds the
+ * destination's own addresses to `seen`. See the definition for where it
+ * approximates; it must only ever feed a reported figure, never a decision to
+ * skip work.
  */
-uint64_t fiemap_unshared_bytes(const uint64_t *tgt_phys, unsigned int tgt_n,
+uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
 			       const struct fiemap *dm, uint64_t dest_off,
 			       uint64_t len);
 

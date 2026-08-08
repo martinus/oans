@@ -285,11 +285,12 @@ static uint64_t unshared(const struct fm_rec *rt, unsigned int nt,
 			 uint64_t dest_off, uint64_t len)
 {
 	struct fiemap *t = mkmap(rt, nt), *d = nd ? mkmap(rd, nd) : NULL;
-	unsigned int n = 0;
-	uint64_t *phys = fiemap_phys_sorted(t, &n);
-	uint64_t bytes = fiemap_unshared_bytes(phys, n, d, dest_off, len);
+	struct fiemap_phys_set seen;
+	uint64_t bytes;
 
-	free(phys);
+	fiemap_phys_set_init(&seen, t);
+	bytes = fiemap_unshared_bytes(&seen, d, dest_off, len);
+	fiemap_phys_set_free(&seen);
 	free(t);
 	free(d);
 	return bytes;
@@ -365,6 +366,65 @@ MU_TEST(test_fiemap_unshared_bytes) {
 	/* Matching holes to the end of the range. */
 	mu_check(share(tgt, 1, 0, tgt, 1, 0, 262144));
 	mu_check(unshared(tgt, 1, tgt, 1, 0, 262144) == 0);
+}
+
+/*
+ * Storage two destinations of one group already share with *each other* must
+ * be credited once, not once each: releasing that one extent frees its length
+ * once (#191). The set the measure carries is what makes that work, so drive
+ * it across several destinations the way a group does.
+ */
+MU_TEST(test_fiemap_unshared_bytes_accumulates) {
+	const uint32_t SH = FIEMAP_EXTENT_SHARED;
+	struct fm_rec tgt[] = {{0, 4096, 8192, SH}};
+	struct fm_rec on_b[] = {{0, 50000, 8192, SH}};
+	struct fm_rec on_c[] = {{0, 90000, 8192, 0}};
+	struct fiemap *t = mkmap(tgt, 1), *b = mkmap(on_b, 1), *c = mkmap(on_c, 1);
+	struct fiemap_phys_set seen;
+
+	fiemap_phys_set_init(&seen, t);
+
+	/* First destination on extent B: its length is genuinely duplicated. */
+	mu_check(fiemap_unshared_bytes(&seen, b, 0, 8192) == 8192);
+	/* A second destination on the same extent frees nothing further. */
+	mu_check(fiemap_unshared_bytes(&seen, b, 0, 8192) == 0);
+	/* A third, on storage of its own, is credited again. */
+	mu_check(fiemap_unshared_bytes(&seen, c, 0, 8192) == 8192);
+	mu_check(fiemap_unshared_bytes(&seen, c, 0, 8192) == 0);
+	/* The target's own storage was never creditable. */
+	mu_check(fiemap_unshared_bytes(&seen, t, 0, 8192) == 0);
+
+	fiemap_phys_set_free(&seen);
+	free(t);
+	free(b);
+	free(c);
+}
+
+/* The set has to stay sorted and unique across many merges, or bsearch starts
+ * missing addresses and the over-count creeps back in one destination at a
+ * time. Drive enough destinations to force it through several growths. */
+MU_TEST(test_fiemap_phys_set_grows) {
+	struct fiemap *t = mkmap((struct fm_rec[]){{0, 4096, 4096, 0}}, 1);
+	struct fiemap_phys_set seen;
+
+	fiemap_phys_set_init(&seen, t);
+	free(t);
+
+	for (unsigned int i = 0; i < 200; i++) {
+		/* Descending addresses, so every merge prepends. */
+		struct fm_rec r[] = {{0, 1000000 - i * 4096, 4096, 0}};
+		struct fiemap *d = mkmap(r, 1);
+
+		mu_check(fiemap_unshared_bytes(&seen, d, 0, 4096) == 4096);
+		mu_check(fiemap_unshared_bytes(&seen, d, 0, 4096) == 0);
+		free(d);
+	}
+
+	mu_check(seen.n == 201);		/* target + 200 distinct */
+	for (unsigned int i = 1; i < seen.n; i++)
+		mu_check(seen.v[i - 1] < seen.v[i]);	/* sorted, unique */
+
+	fiemap_phys_set_free(&seen);
 }
 
 MU_TEST(test_sanitize_ctrl) {
@@ -1006,6 +1066,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_get_extent);
 	MU_RUN_TEST(test_fiemap_maps_share);
 	MU_RUN_TEST(test_fiemap_unshared_bytes);
+	MU_RUN_TEST(test_fiemap_unshared_bytes_accumulates);
+	MU_RUN_TEST(test_fiemap_phys_set_grows);
 	MU_RUN_TEST(test_sanitize_ctrl);
 	MU_RUN_TEST(test_progress_copy_path);
 	MU_RUN_TEST(test_progress_path_two_stage_render);
