@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <sys/vfs.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -165,16 +166,22 @@ static unsigned int get_fs_blocksize(int fd)
  * stays 0 until a request actually comes back EINVAL, and so doubles as "this
  * kernel will not shorten for us" - this is always a real value.
  *
- * Racy by design: concurrent dedupe workers may all query it, but they compute
- * the same value from the same filesystem, so the store is idempotent.
+ * Every dedupe worker reaches this, so the cache is atomic. Relaxed is enough:
+ * racing threads all store the same value (one filesystem, one fstatfs answer),
+ * and the only ordering that matters is that a reader sees either 0 or that
+ * value. A plain int here is a genuine data race, not a benign one - TSan flags
+ * it, and the compiler is entitled to reload it.
  */
 static unsigned int cached_blocksize(int fd)
 {
-	static unsigned int cached;
+	static _Atomic unsigned int cached;
+	unsigned int bs = atomic_load_explicit(&cached, memory_order_relaxed);
 
-	if (!cached)
-		cached = get_fs_blocksize(fd);
-	return cached;
+	if (!bs) {
+		bs = get_fs_blocksize(fd);
+		atomic_store_explicit(&cached, bs, memory_order_relaxed);
+	}
+	return bs;
 }
 
 uint64_t dedupe_shareable_len(int fd, uint64_t len)
