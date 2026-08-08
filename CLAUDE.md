@@ -671,3 +671,20 @@ check unlinks and recreates (it's only a cache).
   as shared), which is why it must never gate a *decision*, only the figure.
   Pinned by `test_reclaimed_excludes_what_was_already_shared` and the
   `test_fiemap_unshared_bytes` unit test.
+- **Check a reported figure against `physical_footprint()`, not against
+  sharing.** `tests/integration/test_convergence.py` asserts the two properties
+  a summary cannot show — a second run frees nothing, and the reported figure
+  equals the drop in distinct physical storage the tree references (summed from
+  fiemap in the harness, independently of anything oans computes). #186 and
+  #187 both shipped because the suite checked what oans *said* and which
+  extents it *shared*, and never either of these. Its layout zoo lives in one
+  tree on purpose: #186 only reproduced at that scale.
+  - **A whole-file group is not a substitute for an extent group.** Whole-file
+    groups load with `poff = 0` and skip `clean_deduped()` entirely, so only an
+    extent-pass layout (same tail, different heads) reproduces #186 — a
+    four-identical-file version of the same physical shape does not.
+  - **Known over-count (#191), deliberately excluded from that test:** two members of
+    one group sitting on a *single* extent are each credited in full, while
+    releasing that extent frees its length once — 2.0 MiB reported against
+    1 MiB freed. The per-destination measure has no notion of destinations
+    sharing storage with *each other*. Convergence is unaffected.
