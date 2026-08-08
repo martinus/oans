@@ -1058,7 +1058,70 @@ MU_TEST(test_glob_empty_set_matches_nothing) {
 	glob_set_free(gs);
 }
 
+/*
+ * The property the whole of #159 rests on: hashing a byte stream in one go and
+ * hashing it across a save/restore must give the same digest. If it ever did
+ * not, a resumed scan would store a digest matching nothing - silently, since
+ * nothing downstream can tell a wrong digest from a file that simply has no
+ * duplicate.
+ */
+MU_TEST(test_running_checksum_survives_save_restore) {
+	unsigned char data[8192];
+	unsigned char whole[DIGEST_LEN], resumed[DIGEST_LEN];
+	_cleanup_(freep) void *blob = malloc(running_checksum_state_size());
+	struct running_checksum *c;
+
+	for (unsigned int i = 0; i < sizeof(data); i++)
+		data[i] = (unsigned char)(i * 31 + (i >> 3));
+
+	c = start_running_checksum();
+	add_to_running_checksum(c, data, sizeof(data));
+	finish_running_checksum(c, whole);
+
+	/*
+	 * Split at 1000 bytes: not a multiple of XXH3's 256-byte internal
+	 * buffer, so the state carries buffered bytes across the break - the
+	 * case a naive "just keep the accumulators" save would get wrong.
+	 */
+	c = start_running_checksum();
+	add_to_running_checksum(c, data, 1000);
+	mu_check(running_checksum_save(c, blob, running_checksum_state_size()) == 0);
+	finish_running_checksum(c, NULL);
+
+	c = running_checksum_restore(blob, running_checksum_state_size());
+	mu_check(c != NULL);
+	add_to_running_checksum(c, data + 1000, sizeof(data) - 1000);
+	finish_running_checksum(c, resumed);
+
+	mu_check(memcmp(whole, resumed, DIGEST_LEN) == 0);
+}
+
+/* A blob this binary cannot vouch for must be refused, not reinterpreted. */
+MU_TEST(test_running_checksum_rejects_foreign_state) {
+	size_t len = running_checksum_state_size();
+	_cleanup_(freep) unsigned char *blob = malloc(len);
+	struct running_checksum *c = start_running_checksum();
+
+	mu_check(running_checksum_save(c, blob, len) == 0);
+	finish_running_checksum(c, NULL);
+	mu_check(running_checksum_restore(blob, len) != NULL);
+
+	/* A different xxhash - what a distro upgrade leaves behind. */
+	blob[8] ^= 0xff;
+	mu_check(running_checksum_restore(blob, len) == NULL);
+	blob[8] ^= 0xff;
+
+	/* Truncated, or from a build whose state struct was a different size. */
+	mu_check(running_checksum_restore(blob, len - 1) == NULL);
+
+	/* Not one of ours at all. */
+	blob[0] ^= 0xff;
+	mu_check(running_checksum_restore(blob, len) == NULL);
+}
+
 MU_TEST_SUITE(test_suite) {
+	MU_RUN_TEST(test_running_checksum_survives_save_restore);
+	MU_RUN_TEST(test_running_checksum_rejects_foreign_state);
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
 	MU_RUN_TEST(test_is_file_renamed);

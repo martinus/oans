@@ -350,6 +350,37 @@ static int create_tables(sqlite3 *db)
 		goto out;
 
 	/*
+	 * Where hashing of one very large file got to, so an interrupted run can
+	 * pick it up instead of starting the file over (#159). At most one row
+	 * per file, and only while that file is partially hashed: the row is
+	 * dropped the moment the digest lands.
+	 *
+	 * size and mtime are the file's as of the checkpoint, re-checked before
+	 * the state is used - the same staleness test the scan applies to
+	 * everything else. The two states are opaque running-checksum snapshots;
+	 * only csum.c interprets them, and it refuses any it cannot vouch for.
+	 *
+	 * ext_state is the digest of the extent being hashed when the checkpoint
+	 * was taken, NULL if the offset happened to fall on an extent boundary.
+	 * Carrying it is what lets a checkpoint land anywhere: btrfs reports a
+	 * contiguously allocated file as a single fiemap extent however large it
+	 * is, so waiting for a boundary would mean never checkpointing exactly
+	 * the files this is for. ext_loff/ext_len identify that extent, and a
+	 * resume that does not find it where it was left treats the whole
+	 * checkpoint as stale - which is also the one cheap check on the layout
+	 * having been rewritten underneath.
+	 */
+#define CREATE_TABLE_SCAN_CHECKPOINTS					\
+"CREATE TABLE IF NOT EXISTS scan_checkpoints("				\
+"fileid INTEGER PRIMARY KEY NOT NULL, loff INTEGER NOT NULL, "		\
+"size INTEGER NOT NULL, mtime INTEGER NOT NULL, state BLOB NOT NULL, "	\
+"ext_loff INTEGER NOT NULL, ext_len INTEGER NOT NULL, ext_state BLOB, "	\
+"FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
+	ret = sqlite3_exec(db, CREATE_TABLE_SCAN_CHECKPOINTS, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	/*
 	 * One row per oans run (see dbfile_record_run): a timeline of what each
 	 * run reclaimed, for `--history` and the `--json` metrics export.
 	 */
@@ -876,8 +907,15 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "delete from files where id = ?1;"
 	dbfile_prepare_stmt(delete_file_by_id, DELETE_FILE_BY_ID);
 
+	/*
+	 * `digest is not null` distinguishes a fully hashed file from one left
+	 * partway through by an interrupted run (#159). Without it, matching
+	 * mtime and size would read as "up to date" for a file that has no
+	 * digest at all - the row is written before hashing starts, not after.
+	 */
 #define SELECT_FILE_CHANGES						\
-"select mtime, size, filename, id from files where ino = ?1 and subvol = ?2;"
+"select mtime, size, filename, id, digest is not null from files "	\
+"where ino = ?1 and subvol = ?2;"
 	dbfile_prepare_stmt(select_file_changes, SELECT_FILE_CHANGES);
 
 #define COUNT_B_HASHES "select COUNT(*) from blocks;"
@@ -892,8 +930,51 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 #define GET_MAX_DEDUPE_SEQ "select max(dedupe_seq) from files;"
 	dbfile_prepare_stmt(get_max_dedupe_seq, GET_MAX_DEDUPE_SEQ);
 
-#define DELETE_UNSCANNED_FILES "delete from files where digest is NULL;"
+	/*
+	 * A row with no digest is the wreckage of an interrupted run - except
+	 * where that run left a checkpoint to resume from, which is the whole
+	 * point of keeping it (#159). Those rows are dropped by the scan itself
+	 * once it decides the checkpoint is unusable.
+	 */
+#define DELETE_UNSCANNED_FILES						\
+"delete from files where digest is NULL and "				\
+"id not in (select fileid from scan_checkpoints);"
 	dbfile_prepare_stmt(delete_unscanned_files, DELETE_UNSCANNED_FILES);
+
+#define WRITE_CHECKPOINT						\
+"INSERT OR REPLACE INTO scan_checkpoints "				\
+"(fileid, loff, size, mtime, state, ext_loff, ext_len, ext_state) "	\
+"VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);"
+	dbfile_prepare_stmt(write_checkpoint, WRITE_CHECKPOINT);
+
+#define SELECT_CHECKPOINT						\
+"select loff, size, mtime, state, ext_loff, ext_len, ext_state "	\
+"from scan_checkpoints where fileid = ?1;"
+	dbfile_prepare_stmt(select_checkpoint, SELECT_CHECKPOINT);
+
+#define DELETE_CHECKPOINT "delete from scan_checkpoints where fileid = ?1;"
+	dbfile_prepare_stmt(delete_checkpoint, DELETE_CHECKPOINT);
+
+	/*
+	 * Move a resumed file into this run's generation (#159). An update, not
+	 * the usual upsert: replacing the row would cascade away the very
+	 * checkpoint and hashes the resume is built on.
+	 */
+#define UPDATE_DEDUPE_SEQ "update files set dedupe_seq = ?2 where id = ?1;"
+	dbfile_prepare_stmt(update_dedupe_seq, UPDATE_DEDUPE_SEQ);
+
+	/*
+	 * Drop the hashes a resumed scan is about to recompute. Extent rows only
+	 * ever land at a checkpoint, so there are none past it; block rows flush
+	 * on their own batch cadence (#161) and can sit anywhere.
+	 */
+#define DELETE_BLOCKS_FROM						\
+"delete from blocks where fileid = ?1 and loff >= ?2;"
+	dbfile_prepare_stmt(delete_blocks_from, DELETE_BLOCKS_FROM);
+
+#define DELETE_EXTENTS_FROM						\
+"delete from extents where fileid = ?1 and loff >= ?2;"
+	dbfile_prepare_stmt(delete_extents_from, DELETE_EXTENTS_FROM);
 
 #define RENAME_FILE							\
 "update or replace files set filename = ?1, path_hash = ?2 where id = ?3;"
@@ -1811,6 +1892,140 @@ out_error:
 	return ret;
 }
 
+/* Run a statement that takes just a fileid, or a fileid and an offset. */
+static int run_by_fileid(sqlite3_stmt *stmt, int64_t fileid, const uint64_t *loff)
+{
+	int ret;
+
+	ret = sqlite3_bind_int64(stmt, 1, fileid);
+	if (!ret && loff)
+		ret = sqlite3_bind_int64(stmt, 2, *loff);
+	if (ret) {
+		perror_sqlite(ret, "binding values");
+		return ret;
+	}
+
+	ret = sqlite3_step(stmt);
+	if (ret != SQLITE_DONE) {
+		perror_sqlite(ret, "executing statement");
+		return ret;
+	}
+
+	return 0;
+}
+
+int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
+			    const struct scan_checkpoint *cp)
+{
+	int ret;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.write_checkpoint;
+
+	ret = sqlite3_bind_int64(stmt, 1, fileid);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 2, cp->loff);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 3, cp->size);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 4, cp->mtime);
+	if (!ret)
+		ret = sqlite3_bind_blob(stmt, 5, cp->file_state,
+					cp->file_state_len, SQLITE_STATIC);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 6, cp->ext_loff);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 7, cp->ext_len);
+	if (!ret)
+		ret = cp->ext_state_len ?
+			sqlite3_bind_blob(stmt, 8, cp->ext_state,
+					  cp->ext_state_len, SQLITE_STATIC) :
+			sqlite3_bind_null(stmt, 8);
+	if (ret) {
+		perror_sqlite(ret, "binding values");
+		return ret;
+	}
+
+	ret = sqlite3_step(stmt);
+	if (ret != SQLITE_DONE) {
+		perror_sqlite(ret, "executing statement");
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Read one file's checkpoint. `file_state` and `ext_state` must point at
+ * buffers of `state_cap` bytes, which the *_len fields are set to describe.
+ *
+ * False when there is no checkpoint, or when a state does not fit - a blob
+ * written by a build whose snapshot was a different size, which is unreadable
+ * here for the same reason a foreign one is.
+ */
+bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
+			    struct scan_checkpoint *cp, size_t state_cap)
+{
+	int ret;
+	int len, ext_len;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.select_checkpoint;
+
+	ret = sqlite3_bind_int64(stmt, 1, fileid);
+	if (ret) {
+		perror_sqlite(ret, "binding fileid");
+		return false;
+	}
+
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_DONE)
+		return false;
+	if (ret != SQLITE_ROW) {
+		perror_sqlite(ret, "fetching a checkpoint");
+		return false;
+	}
+
+	len = sqlite3_column_bytes(stmt, 3);
+	ext_len = sqlite3_column_bytes(stmt, 6);
+	if (len <= 0 || (size_t)len > state_cap ||
+	    ext_len < 0 || (size_t)ext_len > state_cap)
+		return false;
+
+	cp->loff = sqlite3_column_int64(stmt, 0);
+	cp->size = sqlite3_column_int64(stmt, 1);
+	cp->mtime = sqlite3_column_int64(stmt, 2);
+	memcpy(cp->file_state, sqlite3_column_blob(stmt, 3), len);
+	cp->file_state_len = len;
+	cp->ext_loff = sqlite3_column_int64(stmt, 4);
+	cp->ext_len = sqlite3_column_int64(stmt, 5);
+	if (ext_len)
+		memcpy(cp->ext_state, sqlite3_column_blob(stmt, 6), ext_len);
+	cp->ext_state_len = ext_len;
+
+	return true;
+}
+
+int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.delete_checkpoint;
+	return run_by_fileid(stmt, fileid, NULL);
+}
+
+int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
+	return run_by_fileid(stmt, fileid, &seq);
+}
+
+int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff)
+{
+	int ret;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *b = db->stmts.delete_blocks_from;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *e = db->stmts.delete_extents_from;
+
+	ret = run_by_fileid(b, fileid, &loff);
+	if (ret)
+		return ret;
+	return run_by_fileid(e, fileid, &loff);
+}
+
 int dbfile_store_extent_hashes(struct dbhandle *db, int64_t fileid,
 				uint64_t nb_hash, struct extent_csum *hashes)
 {
@@ -2152,6 +2367,7 @@ int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 	}
 
 	dbfile->id = sqlite3_column_int64(stmt, 3);
+	dbfile->digest_valid = sqlite3_column_int(stmt, 4) != 0;
 
 	ret = 0;
 
