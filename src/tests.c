@@ -1104,7 +1104,11 @@ MU_TEST(test_running_checksum_rejects_foreign_state) {
 
 	mu_check(running_checksum_save(c, blob, len) == 0);
 	finish_running_checksum(c, NULL);
-	mu_check(running_checksum_restore(blob, len) != NULL);
+
+	/* The control: unmodified, this one has to be accepted. */
+	c = running_checksum_restore(blob, len);
+	mu_check(c != NULL);
+	finish_running_checksum(c, NULL);
 
 	/* A different xxhash - what a distro upgrade leaves behind. */
 	blob[8] ^= 0xff;
