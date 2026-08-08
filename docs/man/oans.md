@@ -2,7 +2,7 @@
 title: oans
 section: 8
 header: System Manager’s Manual
-footer: oans 1.8.0
+footer: oans 1.8.1
 date: July 2026
 ---
 
