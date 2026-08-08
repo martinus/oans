@@ -116,15 +116,13 @@ class ProgressBytesTest(DuperemoveTest):
         done = [e for e in events if e.get("event") == "done"]
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["groups_deduped"], 0)
-        # The phase does nothing, so there is nothing to scale a bar against.
-        # Also what keeps oans from running two whole-hashfile group-by scans
-        # to describe zero work: it used to report the hashfile's *lifetime*
-        # dup-group count here (4), at ~7s of SQL on a 595 MiB hashfile.
+        # Nothing to dedupe, so nothing to scale a bar against -- it used to
+        # report the hashfile's lifetime dup-group count (4) here.
         self.assertTrue(all(e["groups_total"] == 0 for e in dedupe),
                         "a no-op rerun must not analyse the whole hashfile")
 
     @requires_reflink
-    def test_group_total_counts_only_this_run_s_work(self):
+    def test_group_total_is_per_run(self):
         """The denominator is the work in scope, not the hashfile's history.
 
         Adding one pair to four already-deduped ones used to read "1 / ~5
@@ -143,7 +141,10 @@ class ProgressBytesTest(DuperemoveTest):
         dedupe = self._dedupe_evs(events)
         self.assertTrue(dedupe)
         self.assertEqual(dedupe[-1]["groups_total"], 1)
+        # Anchors the total: without it a denominator of 1 would pass even if
+        # the run deduped nothing.
         done = [e for e in events if e.get("event") == "done"]
+        self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["groups_deduped"], 1)
 
     @requires_reflink

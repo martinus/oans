@@ -330,23 +330,20 @@ int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid);
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
 
 /*
- * Approximate number of duplicate groups the dedupe phase will process, for a
- * progress total/ETA. Counts identical-file groups plus, unless whole_file_only,
- * duplicate-extent groups across the whole hashfile.
+ * What the dedupe phase is about to do, for the progress bar and ETA, counting
+ * only generations > seq_lo - the ones this run can touch. Both figures come
+ * from one query per pass, so they cannot drift.
+ *
+ * *groups is approximate (identical-file groups, and unless whole_file_only the
+ * larger of that and the duplicate-extent group count, since the two overlap).
+ * *bytes is exact and matches what the loaders (GET_DUPLICATE_FILES /
+ * GET_DUPLICATE_EXTENTS) will hand the workers: de_len * (de_num_dupes - 1)
+ * summed over every group, with the extent part excluding extents owned by
+ * whole-file dup-group members (the whole-file pass deletes those rows first).
  */
-uint64_t dbfile_count_dupe_groups(struct dbhandle *db, unsigned int seq_lo,
-				  bool whole_file_only);
-
-/*
- * Exact pending dedupe work in bytes for generations > seq_lo, matching what the
- * loaders (GET_DUPLICATE_FILES / GET_DUPLICATE_EXTENTS) will hand to the workers:
- * de_len * (de_num_dupes - 1) summed over every group. The extent part excludes
- * extents owned by whole-file dup-group members, since the whole-file pass
- * deletes those rows before the extent loader runs. Unless whole_file_only, the
- * result is the sum of both parts. Used for the byte-weighted dedupe progress bar.
- */
-uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
-				 bool whole_file_only);
+void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
+			    bool whole_file_only, uint64_t *groups,
+			    uint64_t *bytes);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
 int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t));
 

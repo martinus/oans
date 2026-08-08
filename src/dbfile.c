@@ -691,7 +691,7 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
  * digest+size, >1 member) - the same membership GET_DUPLICATE_FILES tests.
  * Whole-file dedupe remaps/removes their extents, so both the extent loader
  * (GET_DUPLICATE_EXTENTS) and the pending-work byte count
- * (dbfile_count_dupe_bytes) must exclude them. Defined once so the loader and
+ * (dbfile_count_dupe_work) must exclude them. Defined once so the loader and
  * the progress total can't silently drift.
  *
  * Deliberately a correlated exists probe (via idx_files_digest_size), NOT a
@@ -2263,88 +2263,92 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 	return sqlite3_column_int64(stmt, 0);
 }
 
-/* Like dbfile_query_u64 but binds a single uint64 into ?1 first. */
-static uint64_t dbfile_query_u64_arg(sqlite3 *db, const char *sql, uint64_t arg)
-{
-	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
-	uint64_t v = 0;
-
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-	    sqlite3_bind_int64(stmt, 1, arg) == SQLITE_OK &&
-	    sqlite3_step(stmt) == SQLITE_ROW)
-		v = sqlite3_column_int64(stmt, 0);
-	return v;
-}
-
 /*
  * Restrict a dup-group aggregate to the groups this run can actually touch:
  * those with at least one member newer than the phase-start watermark ?1.
  *
- * Both users below already drop everything else with `having ... new_cnt > 0`,
- * so this changes no answer - but as a HAVING clause that verdict costs a
- * group-by over the *entire* hashfile before it can be reached, every run,
- * however little changed. As a WHERE predicate on the group key it is an index
- * seek instead (idx_files_dedupeseq to find the new rows, then
+ * Written as a WHERE on the *group key* rather than the `having ... new_cnt > 0`
+ * it replaces, because a HAVING verdict is only reachable after grouping the
+ * entire hashfile - every run, however little changed. As a WHERE it drives an
+ * index loop instead (idx_files_dedupeseq for the new rows, then
  * idx_files_digest_size / idx_extents_digest_len to pull their groups), so the
- * cost tracks the new work rather than the accumulated hashfile.
+ * cost tracks the new work. Neither macro ever filters individual rows, only the
+ * group key, so count(*)/new_cnt/old_cnt within a surviving group are unchanged.
  *
- * It filters on the *group key*, never on individual rows, so every member of a
- * surviving group is still counted and count(*)/new_cnt/old_cnt are unchanged.
- * On a 2M-file, 2M-extent hashfile with 500 new files: 1.52 s -> 0.002 s
- * (whole-file) and 4.05 s -> 0.0002 s (extent), same answers.
+ * The two are not equally strong, and the difference is load-bearing:
+ *
+ *   FILES_GROUP_IS_NEW repeats the outer query's own filters, so its witness row
+ *   is necessarily inside the group -> new_cnt >= 1. `having new_cnt > 0` is
+ *   implied and kept only for symmetry.
+ *
+ *   EXTENTS_GROUP_IS_NEW deliberately does NOT repeat FILEDUP_MEMBER: pushing
+ *   that correlated probe into the subquery costs more than the outer seeks it
+ *   saves (7.99 s vs 7.41 s at 100% new). So a group can be admitted by a new
+ *   extent whose file *is* a whole-file dup member and then have every outer row
+ *   filtered away - `having new_cnt > 0` is what drops it. Do not "simplify" it
+ *   away.
+ *
+ * The trade, measured on a 2M-file / 2M-extent hashfile: the scoped form loses
+ * the index-ordered group-by and needs a temp b-tree, so it wins hugely when
+ * little is new (1% new: 8.95 s -> 0.10 s) and loses when nearly everything is
+ * (100% new: 8.98 s -> 12.5 s), crossing over around 50%. That is the right side
+ * of the trade to be on: 100%-new is a first scan, which spends far longer
+ * hashing than analysing, while the incremental case is every scheduled run.
  */
 #define FILES_GROUP_IS_NEW						\
-"(digest, size) in (select digest, size from files "			\
-"	where dedupe_seq > ?1 "						\
-"	and digest is not null and not (flags & 1)) "
+"(digest, size) in (select fnew.digest, fnew.size from files fnew "	\
+"	where fnew.dedupe_seq > ?1 "					\
+"	and fnew.digest is not null and not (fnew.flags & 1)) "
 
 #define EXTENTS_GROUP_IS_NEW						\
 "(e.digest, e.len) in (select e2.digest, e2.len from extents e2 "	\
 "	join files f2 on e2.fileid = f2.id "				\
 "	where f2.dedupe_seq > ?1) "
 
-uint64_t dbfile_count_dupe_groups(struct dbhandle *db, unsigned int seq_lo,
-				  bool whole_file_only)
+/* Run `sql` with seq_lo bound to ?1 and read the first two columns. */
+static void dbfile_query_2u64_arg(sqlite3 *db, const char *sql, uint64_t arg,
+				  uint64_t *a, uint64_t *b)
 {
-	uint64_t files, extents;
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
 
-	files = dbfile_query_u64_arg(db->db,
-		"select count(*) from (select 1 from files "
-		"where digest is not null and not (flags & 1) "
-		"and " FILES_GROUP_IS_NEW
-		"group by digest, size having count(*) > 1)", seq_lo);
-	if (whole_file_only)
-		return files;
-
-	extents = dbfile_query_u64_arg(db->db,
-		"select count(*) from (select 1 from extents e "
-		"where " EXTENTS_GROUP_IS_NEW
-		"group by e.digest, e.len having count(*) > 1)", seq_lo);
-	/*
-	 * The whole-file and extent groups overlap heavily (a duplicate file is
-	 * also a set of duplicate extents), so summing overshoots. The larger of
-	 * the two is a closer, under-biased estimate for the bar; the caller
-	 * clamps the total up if the running count exceeds it.
-	 */
-	return files > extents ? files : extents;
+	*a = *b = 0;
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+	    sqlite3_bind_int64(stmt, 1, arg) == SQLITE_OK &&
+	    sqlite3_step(stmt) == SQLITE_ROW) {
+		*a = sqlite3_column_int64(stmt, 0);
+		*b = sqlite3_column_int64(stmt, 1);
+	}
 }
 
-uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
-				 bool whole_file_only)
+/*
+ * How much the dedupe phase is about to do, for the progress bar: the number of
+ * duplicate groups and the exact kernel byte-verify volume, both counting only
+ * generations newer than seq_lo. Pure display - nothing here decides what gets
+ * deduplicated.
+ *
+ * One query per pass yields both figures, rather than one per figure: they group
+ * over the identical row set, so counting and summing separately scanned it
+ * twice (measured 5.10 s vs 10.00 s at 100% new) and left two copies of a
+ * predicate that must not drift.
+ */
+void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
+			    bool whole_file_only, uint64_t *groups,
+			    uint64_t *bytes)
 {
-	uint64_t files, extents;
+	uint64_t fgroups, fbytes, egroups = 0, ebytes = 0;
 
 	/*
 	 * Whole-file work. Mirrors GET_DUPLICATE_FILES: a group with an
 	 * already-deduped member (old_cnt > 0) dedupes all its new members
 	 * against that anchor (new_cnt copies); a group with only new members
 	 * promotes one to target and dedupes the rest (new_cnt - 1). Summing
-	 * per-group over the whole hashfile is exact regardless of how the
-	 * generations get split into passes: across passes the first new member
-	 * becomes the anchor and every later one dedupes against it.
+	 * per-group is exact regardless of how the generations get split into
+	 * passes: across passes the first new member becomes the anchor and
+	 * every later one dedupes against it.
 	 */
-	files = dbfile_query_u64_arg(db->db,
-		"select coalesce(sum(size * (case when old_cnt > 0 then new_cnt "
+	dbfile_query_2u64_arg(db->db,
+		"select count(*), "
+		"       coalesce(sum(size * (case when old_cnt > 0 then new_cnt "
 		"                                 else new_cnt - 1 end)), 0) "
 		"from ( "
 		"  select size, "
@@ -2354,31 +2358,43 @@ uint64_t dbfile_count_dupe_bytes(struct dbhandle *db, unsigned int seq_lo,
 		"  where digest is not null and not (flags & 1) "
 		"  and " FILES_GROUP_IS_NEW
 		"  group by digest, size "
-		"  having count(*) > 1 and new_cnt > 0)", seq_lo);
-	if (whole_file_only)
-		return files;
+		"  having count(*) > 1 and new_cnt > 0)", seq_lo,
+		&fgroups, &fbytes);
 
 	/*
 	 * Extent work, excluding extents whose file is a whole-file dup-group
 	 * member: the whole-file pass deletes those extent rows
 	 * (dbfile_remove_extent_hashes) before the extent loader runs in the
-	 * same pass, so counting them would double-count. This exclusion is
-	 * what makes the total exact where the group-count estimate could only
-	 * be max()-fudged.
+	 * same pass, so counting them would double-count. GET_DUPLICATE_EXTENTS
+	 * excludes them statically too, so the group count gets the exclusion
+	 * for free by sharing this query - it used to over-count them (400k vs
+	 * 200k groups on a 2M-extent hashfile).
 	 */
-	extents = dbfile_query_u64_arg(db->db,
-		"select coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
-		"                                else new_cnt - 1 end)), 0) "
-		"from ( "
-		"  select e.len as len, "
-		"         sum(f.dedupe_seq >  ?1) as new_cnt, "
-		"         sum(f.dedupe_seq <= ?1) as old_cnt "
-		"  from extents e join files f on e.fileid = f.id "
-		"  where not " FILEDUP_MEMBER("f")
-		"  and " EXTENTS_GROUP_IS_NEW
-		"  group by e.digest, e.len "
-		"  having count(*) > 1 and new_cnt > 0)", seq_lo);
-	return files + extents;
+	if (!whole_file_only)
+		dbfile_query_2u64_arg(db->db,
+			"select count(*), "
+			"       coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
+			"                                else new_cnt - 1 end)), 0) "
+			"from ( "
+			"  select e.len as len, "
+			"         sum(f.dedupe_seq >  ?1) as new_cnt, "
+			"         sum(f.dedupe_seq <= ?1) as old_cnt "
+			"  from extents e join files f on e.fileid = f.id "
+			"  where not " FILEDUP_MEMBER("f")
+			"  and " EXTENTS_GROUP_IS_NEW
+			"  group by e.digest, e.len "
+			"  having count(*) > 1 and new_cnt > 0)", seq_lo,
+			&egroups, &ebytes);
+
+	/*
+	 * The whole-file and extent groups overlap heavily (a duplicate file is
+	 * also a set of duplicate extents), so summing the counts overshoots.
+	 * The larger of the two is a closer, under-biased estimate for the bar;
+	 * the caller clamps it up if the running count exceeds it. The *bytes*
+	 * do sum: the exclusion above makes the two disjoint.
+	 */
+	*groups = fgroups > egroups ? fgroups : egroups;
+	*bytes = fbytes + ebytes;
 }
 
 /*
