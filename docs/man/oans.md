@@ -580,6 +580,14 @@ hashfile is a transactional database, so you can stop and re-run without
 corrupting either. Only a power loss can, in principle, damage a hashfile — and
 never your data.
 
+An interrupted run also does not lose the work it had done. Files it finished
+hashing keep their hashes, and a very large file it was in the middle of —
+a disk image, a backup archive — is checkpointed as it goes, so the next run
+picks it up where the last one stopped rather than reading it again from the
+start. Checkpoints need a **\--hashfile** to live in; they are dropped
+automatically once the file is fully hashed, and ignored if the file changed in
+the meantime.
+
 Two logically identical files are not always deduped: `oans` works on extent
 boundaries, so files with the same content but a different on-disk extent layout
 may not match unless block-level matching is enabled with

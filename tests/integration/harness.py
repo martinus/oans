@@ -397,6 +397,17 @@ class DuperemoveTest(unittest.TestCase):
         finally:
             con.close()
 
+    def hf_exec(self, sql, params=()):
+        """Modify the hashfile behind oans's back, to set up a state that only
+        arises from an event a test cannot stage (a hash-library upgrade, a
+        defragmentation between runs)."""
+        con = sqlite3.connect(self.hf)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
     def hf_count(self, table):
         return self.hf_query(f"select count(*) from {table}")[0][0]
 

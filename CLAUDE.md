@@ -232,6 +232,69 @@ walkers.**
 - Cold-walk cost is fundamental btrfs metadata I/O (`statx→btrfs_iget→btree`);
   SQLite is <2%, so parallelizing the consumer wouldn't help.
 
+## Hash resume for very large files (#159)
+
+A 1 TiB file interrupted six hours into hashing used to restart at byte zero, so
+on a big enough file a scheduled scan could never finish. Now `csum_whole_file()`
+writes a **checkpoint** every `CHECKPOINT_INTERVAL_BYTES` (1 GiB) and the next
+run picks the file up there.
+
+- **The digest is unchanged — that was the whole design constraint.** The
+  original plan (#158) was to redefine the file digest as a hash of extent
+  digests, which is additive and so trivially resumable; it was rejected because
+  it makes fragmentation part of file identity, so byte-identical files with
+  different extent layouts stop matching. Instead the *running xxhash state* is
+  snapshotted (`running_checksum_save/restore` in `csum.c`, the only file that
+  knows xxhash). Nothing about what a digest means changed, and no existing
+  hashfile is invalidated.
+  - xxhash publishes no serialization, so this copies `XXH3_state_t` verbatim.
+    Legitimate within one build (`XXH3_copyState` is the same copy) but not
+    across, so the blob carries magic + `XXH_versionNumber()` + `sizeof(state)`
+    and **restore refuses anything it cannot vouch for** — a distro xxhash
+    upgrade just means a rehash, never a wrong digest. On restore, `extSecret`
+    must be re-pointed at this process's static secret; everything else is data.
+  - **`start_running_checksum()` memsets the state before resetting it.** A
+    reset only initialises the fields it uses, leaving alignment padding and the
+    unused tail of the internal buffer undefined — harmless until the struct is
+    copied out, at which point those bytes get written to the hashfile. Valgrind
+    caught exactly this. Don't drop the memset; it costs nothing measurable
+    (`fragmented`, 262k extents: 2.53 → 2.54 s median).
+- **The in-flight extent digest rides along in the checkpoint.** The first cut
+  only checkpointed at extent boundaries, so no extent state was needed — and it
+  never fired, because **btrfs reports a contiguously allocated file as a single
+  fiemap extent however large it is**. That is precisely the shape this feature
+  exists for. So a checkpoint carries the partial extent digest plus
+  `ext_loff`/`ext_len`, and a resume that does not find that extent where it was
+  left discards the checkpoint and starts over — which doubles as the one cheap
+  check that the layout was not rewritten underneath (mtime and size need not
+  move on a defrag).
+- **Change detection had a matching hole.** A file's row is written with its
+  mtime and size *before* hashing starts; only the digest says it was ever
+  hashed. `SELECT_FILE_CHANGES` therefore also selects `digest is not null`, and
+  the up-to-date shortcut requires it. Until now nothing noticed, because
+  `dbfile_prune_unscanned_files()` deleted every digest-less row at startup —
+  that prune now spares rows with a checkpoint, which is what keeps them alive.
+- **A resumed file keeps its row but gets this run's `dedupe_seq`**
+  (`dbfile_update_dedupe_seq`, a targeted UPDATE). Re-running the usual upsert
+  would `INSERT OR REPLACE` the row and cascade away the checkpoint and stored
+  hashes; leaving the generation alone lets a dedupe phase in between draw level
+  with it, and a file at or below the watermark is one dedupe never looks at.
+  Pinned by `test_a_resumed_file_is_deduped_by_the_run_that_finishes_it`.
+- Hashes for the region just covered and the checkpoint claiming it land in **one
+  transaction, force-committed** (`scan_write_flush`, not the batched writer's
+  10 s cadence — a checkpoint still inside an open transaction protects nothing).
+  Extent rows are only ever written by a checkpoint, so none exist past one;
+  block rows flush on their own batch cadence (#161) and can, hence
+  `dbfile_remove_hashes_from()` on resume.
+- Test hooks: `DUPEREMOVE_CHECKPOINT_BYTES` lowers the interval,
+  `DUPEREMOVE_CHECKPOINT_STOP=N` abandons a file after N checkpoints — an
+  interrupted run, deterministically, rather than racing a signal against a read.
+  `tests/integration/test_hash_resume.py` drives a tree through dozens of
+  interruptions and asserts the digests, extent hashes and block hashes are
+  **identical to one straight-through scan**; that is the property that matters,
+  since nothing downstream could tell a wrong digest from a file with no
+  duplicate.
+
 ## io-threads default (storage heuristic)
 
 `--io-threads` sizes three pools (walkers, csum/read, dedupe). One mechanism

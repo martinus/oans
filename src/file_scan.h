@@ -135,6 +135,25 @@ struct file_to_scan {
 	char *path;
 	int64_t fileid;
 	size_t filesize;
+	uint64_t mtime;		/* stamped into any checkpoint this file writes */
+
+	/*
+	 * Where an earlier, interrupted run got to, and the running checksums as
+	 * they stood there (#159). Zero and NULL for the normal case of hashing
+	 * a file from the beginning. They are restored on the listing thread, so
+	 * a state this binary cannot read is spotted while the decision to
+	 * rescan from scratch is still cheap to make; the worker that picks the
+	 * file up takes ownership of them.
+	 *
+	 * resume_ext_csum is the digest of the extent that was mid-flight, with
+	 * resume_ext_loff/len naming it so the worker can confirm the layout has
+	 * not been rewritten since. NULL when the offset fell on a boundary.
+	 */
+	uint64_t resume_off;
+	struct running_checksum *resume_csum;
+	struct running_checksum *resume_ext_csum;
+	uint64_t resume_ext_loff;
+	uint64_t resume_ext_len;
 
 	/*
 	 * Used to record the current file position in the scan queue,

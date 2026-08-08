@@ -50,6 +50,26 @@ void add_to_running_checksum(struct running_checksum *c,
 			     unsigned char *buf, unsigned int len);
 void finish_running_checksum(struct running_checksum *c, unsigned char *digest);
 
+/*
+ * Freeze a running checksum so hashing can be picked up later, in another
+ * process (#159). Together these let a multi-hour hash of one huge file survive
+ * an interruption without changing what the digest *is* - the alternative,
+ * redefining the file digest as a hash of chunk digests, would have invalidated
+ * every existing hashfile.
+ *
+ * The blob is an opaque snapshot of the hash library's internal streaming
+ * state, self-describing enough to be recognised as unreadable rather than
+ * misread: restore returns NULL for a blob written by a different xxhash than
+ * this binary links against, which a distro upgrade can and will produce. That
+ * is not an error - the caller simply rehashes from the beginning, which is
+ * what it would have done anyway.
+ *
+ * Saving does not consume the checksum: it stays usable afterwards.
+ */
+size_t running_checksum_state_size(void);
+int running_checksum_save(struct running_checksum *c, void *buf, size_t len);
+struct running_checksum *running_checksum_restore(const void *buf, size_t len);
+
 #define	DECLARE_RUNNING_CSUM_CAST_FUNCS(_type)				\
 static inline struct _type *						\
 rc_to_priv(struct running_checksum *rc)					\

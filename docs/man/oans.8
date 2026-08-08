@@ -681,6 +681,15 @@ without corrupting either.
 Only a power loss can, in principle, damage a hashfile \(em and never
 your data.
 .PP
+An interrupted run also does not lose the work it had done.
+Files it finished hashing keep their hashes, and a very large file it
+was in the middle of \(em a disk image, a backup archive \(em is
+checkpointed as it goes, so the next run picks it up where the last one
+stopped rather than reading it again from the start.
+Checkpoints need a \f[B]\-\-hashfile\f[R] to live in; they are dropped
+automatically once the file is fully hashed, and ignored if the file
+changed in the meantime.
+.PP
 Two logically identical files are not always deduped: \f[CR]oans\f[R]
 works on extent boundaries, so files with the same content but a
 different on\-disk extent layout may not match unless block\-level
