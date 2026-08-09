@@ -296,7 +296,8 @@ int dbfile_store_block_hashes(struct dbhandle *db, int64_t fileid,
 int dbfile_store_extent_hashes(struct dbhandle *db, int64_t fileid,
 				uint64_t nb_hash, struct extent_csum *hashes);
 int dbfile_update_scanned_file(struct dbhandle *db, int64_t fileid,
-				unsigned char *digest, unsigned int flags);
+				unsigned char *digest, unsigned int flags,
+				unsigned int nr_extents);
 int dbfile_begin_trans(sqlite3 *db);
 int dbfile_commit_trans(sqlite3 *db);
 int dbfile_abort_trans(sqlite3 *db);
