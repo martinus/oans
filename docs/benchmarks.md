@@ -103,6 +103,14 @@ them**. That comparison reads the data the scanner just finished hashing.
   in-kernel dedupe read path does *not* issue readahead, so cold it crawls
   (~50 MiB/s in our measurements, vs GiB/s for a normal sequential read).
 
+Why the kernel path is that slow is now confirmed: before v5.0 btrfs had its own
+dedupe ioctl that fetched pages **16 MiB at a time** and compared them once they
+were resident. The generic VFS implementation that replaced it in v5.0 lost that
+batching — it now fetches and compares one page at a time, so the compare loop
+demand-faults its way through both files in lockstep. ([Zygo Blaxell on
+linux-btrfs](https://lore.kernel.org/linux-btrfs/), 2026-08-09; `bees` does a
+userspace read before the ioctl for exactly this reason.)
+
 Whether the hashed data survives to the dedupe phase depends entirely on whether
 the working set **fits in RAM**:
 
@@ -143,6 +151,13 @@ the cold re-read:
    instead of the cold path. This covers the larger-than-RAM case, where #1 can't
    keep everything warm. It is chunked to the dedupe round, so a file far larger
    than RAM is warmed a piece at a time.
+
+It has to be a real `pread()`. `posix_fadvise(WILLNEED)`, `readahead()` and
+`madvise()` all queue the I/O at *idle* priority, so the ioctl — running at
+normal priority — preempts the prefetch and demand-reads the pages itself; we
+measured no improvement over not prefetching at all. Nor does the prefetch cost
+extra page-cache pressure: the ioctl reads the same pages into the cache and
+leaves them there, so prefetching changes *when* they arrive, not whether.
 
 Upstream duperemove has neither, so under memory pressure its dedupe phase takes
 the cold in-kernel read path for the evicted data. The dedupe phase also now runs

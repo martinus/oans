@@ -425,13 +425,26 @@ static void clamp_len_to_ioctl_file(struct dedupe_ctxt *ctxt)
  * crawls (~10x). A plain sequential read primes those pages fast, so the ioctl
  * compares from RAM.
  *
+ * The reason the kernel path is slow is that it stopped batching. Before v5.0
+ * btrfs had its own dedupe ioctl which fetched pages 16 MiB at a time and only
+ * then compared them; the generic VFS implementation that replaced it compares
+ * page by page, faulting each one in on demand. (Confirmed by Zygo Blaxell on
+ * linux-btrfs, 2026-08-09; bees prefetches for the same reason.)
+ *
  * It must be a real read: posix_fadvise(WILLNEED) is asynchronous and the ioctl
- * outruns it (measured ~10x slower, i.e. no better than not prefetching). We
- * prefetch only the current round (src_length <= DEDUPE_ROUND_LEN per range), so
- * a duplicated file far larger than RAM is warmed a chunk at a time - the working
- * set is (1 + dest_count) * <=32 MiB, independent of file size. When the data is
- * already resident (the common case, since the scan just hashed it) these reads
- * are cheap page-cache hits.
+ * outruns it (measured ~10x slower, i.e. no better than not prefetching).
+ * readahead()/madvise() are no better and for the same reason - they queue the
+ * I/O at *idle* priority, so the ioctl, running at normal priority, preempts the
+ * prefetch and demand-reads the pages itself. Only a pread() actually gets the
+ * data there first.
+ *
+ * We prefetch only the current round (src_length <= DEDUPE_ROUND_LEN per range),
+ * so a duplicated file far larger than RAM is warmed a chunk at a time - the
+ * working set is (1 + dest_count) * <=32 MiB, independent of file size. When the
+ * data is already resident (the common case, since the scan just hashed it) these
+ * reads are cheap page-cache hits. It costs no extra page-cache pressure either:
+ * the ioctl reads those same pages into the cache and leaves them there, so the
+ * pages we pull in are exactly the ones it would have pulled in anyway.
  */
 static void prefetch_range(int fd, uint64_t off, uint64_t len)
 {
