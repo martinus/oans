@@ -397,6 +397,17 @@ class DuperemoveTest(unittest.TestCase):
         finally:
             con.close()
 
+    def hf_exec(self, sql, params=()):
+        """Modify the hashfile behind oans's back, to set up a state that only
+        arises from an event a test cannot stage (a hash-library upgrade, a
+        defragmentation between runs)."""
+        con = sqlite3.connect(self.hf)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
     def hf_count(self, table):
         return self.hf_query(f"select count(*) from {table}")[0][0]
 
@@ -410,6 +421,21 @@ class DuperemoveTest(unittest.TestCase):
             "select filename, ino, subvol, size, quote(digest), flags "
             "from files order by filename")
         return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+    def blocks_fingerprint(self):
+        rows = self.hf_query(
+            "select f.filename, b.loff, quote(b.digest) from blocks b "
+            "join files f on f.id = b.fileid order by f.filename, b.loff")
+        return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+    def drop_hashfile(self):
+        """Delete the hashfile and its WAL sidecars, so the next run starts
+        from nothing. Removing only the .db leaves a -wal SQLite will replay."""
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(self.hf + suffix)
+            except FileNotFoundError:
+                pass
 
     def extents_fingerprint(self):
         rows = self.hf_query(

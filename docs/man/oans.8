@@ -681,6 +681,47 @@ without corrupting either.
 Only a power loss can, in principle, damage a hashfile \(em and never
 your data.
 .PP
+Re\-running after an interruption resumes rather than starting over, so
+a scan too long to finish in one sitting still converges if you keep
+running it.
+Two things carry over: files that were fully hashed keep their hashes
+and are skipped next time, and a very large file that was in the middle
+of being hashed \(em a disk image, a backup archive \(em is checkpointed
+as it goes, so the next run picks it up where the last one stopped
+instead of reading it again from the start.
+Checkpoints need a \f[B]\-\-hashfile\f[R] to live in, and are dropped
+automatically once the file is fully hashed.
+.PP
+A file left partly hashed is picked up at the very start of the next
+run, before the directory walk begins, rather than when the walk happens
+to reach it \(em on a large tree that can be minutes later, and a
+nearly\-finished large file is the one most worth completing.
+Only files under the roots named on that command line are resumed this
+way, so a hashfile shared between several trees never causes one run to
+hash another tree\(cqs files.
+.PP
+What does not carry over is anything not yet written to the hashfile.
+To keep a scan of millions of files from committing once per file,
+results are batched and written every ten seconds, and additionally at
+each checkpoint; a run killed before its first commit contributes
+nothing.
+Ctrl\-C is no gentler than a crash here \(em it is not trapped, so it
+discards the batch in progress too.
+In practice this only matters if runs are being cut short after a few
+seconds, which makes no progress however often it is repeated.
+.PP
+A checkpoint is only used if the file\(cqs size and modification time
+are still what they were, which is the same test \f[CR]oans\f[R] applies
+to every file in a hashfile to decide it need not be read again.
+A file whose contents change while size and mtime are both held fixed
+\(em restoring the timestamp after an in\-place write, say \(em is
+therefore not noticed, exactly as it would not be for a fully scanned
+file.
+The consequence is a stale or mismatched digest, so a duplicate may be
+missed or a group needlessly compared; it is never a risk to data,
+because the kernel byte\-verifies every deduplication and refuses any
+pair that does not match.
+.PP
 Two logically identical files are not always deduped: \f[CR]oans\f[R]
 works on extent boundaries, so files with the same content but a
 different on\-disk extent layout may not match unless block\-level

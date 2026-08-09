@@ -29,14 +29,15 @@ COLS, ROWS = 100, 30
 WORKER_ROW = re.compile(r"^ {2}\d+ {2}(idle|hashing|mapping|commit|wait lock|deduping)\b")
 
 _CSI = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
+_ANSI_TEXT = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def _run_in_pty(argv):
+def _run_in_pty(argv, env=None):
     """Run argv on a COLS x ROWS pty; return its raw output bytes."""
     pid, fd = pty.fork()
     if pid == 0:                                  # child
         try:
-            os.execvp(argv[0], argv)
+            os.execvpe(argv[0], argv, os.environ if env is None else env)
         finally:                                  # execvp raises, never returns
             os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -54,6 +55,25 @@ def _run_in_pty(argv):
     os.close(fd)
     os.waitpid(pid, 0)
     return b"".join(chunks)
+
+
+def _worker_rows(data, name, status="hashing"):
+    """Every worker row naming `name` drawn in `status`, in order.
+
+    _render() rebuilds the *final* screen, and the block is wiped before exit -
+    so a row that only existed mid-run has to be read out of the raw stream.
+
+    Filtering on the status matters: the same slot also renders the file while
+    mapping and committing, and those rows carry "(size: N)" instead of the
+    done/total the callers here are asking about.
+    """
+    text = _ANSI_TEXT.sub("", data.decode("utf-8", "replace"))
+    rows = []
+    for ln in re.split(r"[\r\n]", text):
+        m = WORKER_ROW.match(ln)
+        if m and m.group(1) == status and name in ln:
+            rows.append(ln.strip())
+    return rows
 
 
 def _render(data):
@@ -160,6 +180,57 @@ class ProgressTtyTest(DuperemoveTest):
         self.assertTrue(
             any("2 permission denied" in ln for ln in screen),
             f"the scan-skip report was erased by the block:\n  {shown}")
+
+    # Depends on hashing outlasting one REDRAW_MS (100 ms) tick, so the row
+    # exists at a redraw. Kept CPU-bound (4K blocks, partial mode) rather than
+    # sized in bytes: a faster disk shrinks an I/O-bound run but not this one.
+    # If it ever goes quiet, raise SIZE rather than deleting the assertion.
+    RESUME_SIZE = 256 * 1024 * 1024
+    RESUME_CKPT = 64 * 1024 * 1024
+
+    def test_resumed_file_shows_its_real_size_and_progress(self):
+        """A resumed file must look resumed, not restarted (#159).
+
+        Its row reports the whole file, with the bytes an earlier run already
+        hashed credited up front. Reporting only the remainder is what this
+        pins: the row then restarts near 0% *and* understates the file - an
+        18.4 GiB movie resumed at 3 GiB drew as "0.2 GiB/15.4 GiB (1%)", which
+        is indistinguishable from the resume having silently failed, and was
+        reported as exactly that.
+
+        The run-wide totals are a separate matter and deliberately do count
+        only this run's work, so this asserts on the per-file row alone.
+        """
+        opts = ["-b", "4096", "--dedupe-options=partial", "--io-threads=1"]
+        env = {"DUPEREMOVE_CHECKPOINT_BYTES": str(self.RESUME_CKPT)}
+        self.mkrand("tree/movie.bin", self.RESUME_SIZE)
+        self.sync()
+        tree = os.path.join(self.work, "tree")
+
+        # Stop after one checkpoint, as an interrupted run would.
+        self.dm("-r", tree, *opts, env=dict(env, DUPEREMOVE_CHECKPOINT_STOP="1"))
+        self.assertDmOk("interrupted scan")
+        stopped_at = self.hf_scalar("select loff from scan_checkpoints")
+        self.assertEqual(self.RESUME_CKPT, stopped_at, "unexpected resume point")
+
+        rows = _worker_rows(_run_in_pty(
+            [DUPEREMOVE, "-r", "--hashfile", self.hf, tree] + opts,
+            env=dict(os.environ, **env)), "movie.bin")
+        self.assertTrue(rows, "the resumed file never appeared in the block; "
+                              "see RESUME_SIZE above")
+
+        # 256.0 MiB is the file. 192.0 MiB - what is left after the
+        # checkpoint - is the bug: the remainder drawn as if it were the whole.
+        bad = [r for r in rows if "/256.0 MiB" not in r]
+        self.assertEqual([], bad, "a resumed row reported something other than "
+                                  "the file's real size:\n  " + "\n  ".join(bad))
+
+        # ... and it picks up from the checkpoint rather than starting over.
+        pct = re.search(r"\((\d+\.\d+)%\)", rows[0])
+        self.assertTrue(pct, f"no percentage in {rows[0]!r}")
+        self.assertGreaterEqual(
+            float(pct.group(1)), 100.0 * stopped_at / self.RESUME_SIZE,
+            f"the resumed row restarted below its checkpoint:\n  {rows[0]}")
 
 
 if __name__ == "__main__":

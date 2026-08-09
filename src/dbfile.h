@@ -56,6 +56,10 @@ struct stmts {
 	sqlite3_stmt *get_max_dedupe_seq;
 	sqlite3_stmt *delete_unscanned_files;
 	sqlite3_stmt *rename_file;
+	sqlite3_stmt *write_checkpoint;
+	sqlite3_stmt *select_checkpoint;
+	sqlite3_stmt *delete_checkpoint;
+	sqlite3_stmt *update_dedupe_seq;
 };
 
 struct dbhandle {
@@ -78,6 +82,13 @@ struct file {
 	uint64_t	mtime;
 	unsigned int	dedupe_seq;
 	char		digest[DIGEST_LEN];
+	/*
+	 * Whether the stored row actually has a digest. It gets one only once
+	 * the file has been hashed all the way through, so this is what tells a
+	 * scanned file from one an interrupted run left partway (#159) - mtime
+	 * and size are written up front and say nothing about it.
+	 */
+	bool		digest_valid;
 	unsigned int	flags;
 };
 
@@ -326,6 +337,46 @@ static inline void sqlite3_reset_stmt(sqlite3_stmt **stmt)
 
 void dbfile_set_gdb(struct dbhandle *db);
 int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid);
+/* Drop a file's block and extent hashes at or past `loff` (resume, #159). */
+int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff);
+
+/*
+ * How far hashing of one file got, and enough state to carry on from there
+ * (#159). At most one checkpoint per file, alive only while that file is
+ * partially hashed.
+ *
+ * The two states are opaque here - see running_checksum_save(). Both buffers
+ * are owned by the caller and are always running_checksum_state_size() bytes;
+ * has_ext_state is false when loff fell on an extent boundary and no extent
+ * digest was in progress.
+ */
+struct scan_checkpoint {
+	uint64_t	loff;		/* bytes of the file hashed so far */
+	uint64_t	size;		/* the file as of the checkpoint, so a */
+	uint64_t	mtime;		/* resume can tell it has since changed */
+	uint64_t	ext_loff;	/* the extent being hashed at loff, */
+	uint64_t	ext_len;	/* checked to still be there on resume */
+	void		*file_state;
+	void		*ext_state;
+	bool		has_ext_state;
+};
+
+int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
+			    const struct scan_checkpoint *cp);
+bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
+			    struct scan_checkpoint *cp);
+int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid);
+
+/*
+ * Paths of every file a checkpoint is waiting on. A scan hands these to the
+ * consumer up front rather than waiting for the walk to rediscover them, which
+ * on a large tree takes minutes (#159). Free with scan_config_free()'s idiom:
+ * each string, then the array.
+ */
+int dbfile_load_checkpointed_paths(struct dbhandle *db, char ***out, int *nout);
+/* Put a resumed file in this run's dedupe generation, leaving its row (and so
+ * its checkpoint and stored hashes) otherwise intact. */
+int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq);
 
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
 

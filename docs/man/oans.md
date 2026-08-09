@@ -580,6 +580,40 @@ hashfile is a transactional database, so you can stop and re-run without
 corrupting either. Only a power loss can, in principle, damage a hashfile — and
 never your data.
 
+Re-running after an interruption resumes rather than starting over, so a scan
+too long to finish in one sitting still converges if you keep running it. Two
+things carry over: files that were fully hashed keep their hashes and are
+skipped next time, and a very large file that was in the middle of being
+hashed — a disk image, a backup archive — is checkpointed as it goes, so the
+next run picks it up where the last one stopped instead of reading it again
+from the start. Checkpoints need a **\--hashfile** to live in, and are dropped
+automatically once the file is fully hashed.
+
+A file left partly hashed is picked up at the very start of the next run,
+before the directory walk begins, rather than when the walk happens to reach
+it — on a large tree that can be minutes later, and a nearly-finished large
+file is the one most worth completing. Only files under the roots named on that
+command line are resumed this way, so a hashfile shared between several trees
+never causes one run to hash another tree's files.
+
+What does not carry over is anything not yet written to the hashfile. To keep a
+scan of millions of files from committing once per file, results are batched and
+written every ten seconds, and additionally at each checkpoint; a run killed
+before its first commit contributes nothing. Ctrl-C is no gentler than a crash
+here — it is not trapped, so it discards the batch in progress too. In practice
+this only matters if runs are being cut short after a few seconds, which makes
+no progress however often it is repeated.
+
+A checkpoint is only used if the file's size and modification time are still
+what they were, which is the same test `oans` applies to every file in a
+hashfile to decide it need not be read again. A file whose contents change
+while size and mtime are both held fixed — restoring the timestamp after an
+in-place write, say — is therefore not noticed, exactly as it would not be for
+a fully scanned file. The consequence is a stale or mismatched digest, so a
+duplicate may be missed or a group needlessly compared; it is never a risk to
+data, because the kernel byte-verifies every deduplication and refuses any pair
+that does not match.
+
 Two logically identical files are not always deduped: `oans` works on extent
 boundaries, so files with the same content but a different on-disk extent layout
 may not match unless block-level matching is enabled with
