@@ -28,11 +28,23 @@ class CrossPassTest(DuperemoveTest):
 
         # Every copy must end on the SAME single physical extent - a per-pass
         # target would leave one cluster per pass.
-        allphys = set()
+        #
+        # On failure, say how the copies are grouped rather than just how many
+        # groups there are: the shape is the diagnosis (#197). A few singletons
+        # means individual copies were left behind - a skip or a declined
+        # ioctl. Several clusters of roughly a pass's worth means the passes
+        # each chose their own target, which is the bug this test exists for.
+        clusters = {}
         for p in paths:
-            allphys |= phys_extents(p)
-        self.assertEqual(len(allphys), 1,
-                         f"all 120 copies converge to one extent, got {len(allphys)}")
+            for ph in phys_extents(p):
+                clusters.setdefault(ph, []).append(os.path.basename(p))
+        if len(clusters) != 1:
+            sizes = sorted(clusters.values(), key=len, reverse=True)
+            shape = ", ".join(f"{len(c)}x({c[0]}..{c[-1]})" for c in sizes[:8])
+            self.fail(
+                f"all 120 copies converge to one extent, got {len(clusters)}"
+                f"\n  clusters: {shape}"
+                f"\n  oans said:\n{self.out.strip()}")
 
         # Data intact.
         for p in (paths[0], paths[60], paths[-1]):
