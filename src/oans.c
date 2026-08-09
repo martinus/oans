@@ -81,10 +81,13 @@ struct dbfile_config dbfile_cfg;
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
+	_cleanup_(freep) char *disp = path_for_display(filename);
+	const char *name = disp ? disp : filename;
+
 	if (verbose)
-		printf("%s\t%s\t%s\n", filename, ino, subvol);
+		printf("%s\t%s\t%s\n", name, ino, subvol);
 	else
-		printf("%s\n", filename);
+		printf("%s\n", name);
 }
 
 /* Human duration for the timing lines: ms under a second, else seconds. */
@@ -268,14 +271,22 @@ static int print_hashfile_stats(char *filename)
 			       col_bold, col_blue, col_reset, col_dim, filename, col_reset);
 			printf("  %soptions%s         %s\n", col_dim, col_reset, opts);
 			free(opts);
-			for (i = 0; i < sc.nroots; i++)
+			for (i = 0; i < sc.nroots; i++) {
+				_cleanup_(freep) char *disp =
+					path_for_display(sc.roots[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "paths      " : "           ",
-				       col_reset, sc.roots[i]);
-			for (i = 0; i < sc.nexcludes; i++)
+				       col_reset, disp ? disp : sc.roots[i]);
+			}
+			for (i = 0; i < sc.nexcludes; i++) {
+				_cleanup_(freep) char *disp =
+					path_for_display(sc.excludes[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "excludes   " : "           ",
-				       col_reset, sc.excludes[i]);
+				       col_reset, disp ? disp : sc.excludes[i]);
+			}
 			fflush(stdout);
 			scan_config_free(&sc);
 		}
@@ -378,8 +389,11 @@ static int print_hashfile_stats(char *filename)
 		snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(top[i].size),
 			 top[i].count);
 		snprintf(wb, sizeof(wb), "%s", human_size(top[i].waste));
+		_cleanup_(freep) char *disp = top[i].path ?
+			path_for_display(top[i].path) : NULL;
+
 		printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb, col_reset,
-		       top[i].path ? top[i].path : "");
+		       disp ? disp : (top[i].path ? top[i].path : ""));
 		free(top[i].path);
 	}
 	fflush(stdout);
@@ -402,8 +416,11 @@ static void print_json_str(const char *s)
 
 		if (c == '"' || c == '\\')
 			printf("\\%c", c);
-		else if (c < 0x20)
+		else if (c < 0x20 || c == 0x7f)
 			printf("\\u%04x", c);
+		else if (c == 0xc2 && (unsigned char)s[1] >= 0x80 &&
+			 (unsigned char)s[1] <= 0x9f)
+			printf("\\u%04x", (unsigned char)*++s);	/* a C1 control */
 		else
 			putchar(c);
 	}
@@ -686,10 +703,14 @@ static int rm_db_files(int numfiles, char **files)
 			continue;
 		}
 
-		if (dbfile_remove_file(db, name))
+		if (dbfile_remove_file(db, name)) {
 			ret = -1;
-		else
-			vprintf("Removed \"%s\" from hashfile.\n", name);
+		} else if (verbose) {
+			_cleanup_(freep) char *disp = path_for_display(name);
+
+			vprintf("Removed \"%s\" from hashfile.\n",
+				disp ? disp : name);
+		}
 	}
 	return ret;
 }
@@ -779,7 +800,10 @@ enum {
 static int add_one_stdin_file(char *path, void *db)
 {
 	if (scan_file(path, db)) {
-		eprintf("Error: cannot add %s into the lookup list\n", path);
+		_cleanup_(freep) char *disp = path_for_display(path);
+
+		eprintf("Error: cannot add %s into the lookup list\n",
+			disp ? disp : path);
 		return 1;
 	}
 	return 0;
@@ -1697,8 +1721,11 @@ static int drop_missing_roots(struct scan_config *sc, int *dropped)
 		if (stat(sc->roots[i], &st) == 0) {
 			sc->roots[live++] = sc->roots[i];
 		} else {
+			_cleanup_(freep) char *disp =
+				path_for_display(sc->roots[i]);
+
 			eprintf("Warning: stored path \"%s\" no longer exists, "
-				"skipping.\n", sc->roots[i]);
+				"skipping.\n", disp ? disp : sc->roots[i]);
 			free(sc->roots[i]);
 			(*dropped)++;
 		}

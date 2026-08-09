@@ -255,6 +255,35 @@ void debug_print_uuid(uuid_t uuid)
 	eprintf("%s", buf);
 }
 
+/*
+ * Render one control byte into `buf` (at least SANITIZE_CTRL_MAX bytes) and
+ * return how many characters it took. Not NUL-terminated.
+ */
+static size_t escape_ctrl_byte(unsigned char c, char *buf)
+{
+	static const char hex[] = "0123456789abcdef";
+	char shorthand;
+
+	switch (c) {
+	case '\t': shorthand = 't'; break;
+	case '\n': shorthand = 'n'; break;
+	case '\r': shorthand = 'r'; break;
+	default:   shorthand = 0;   break;
+	}
+
+	if (shorthand) {
+		buf[0] = '\\';
+		buf[1] = shorthand;
+		return 2;
+	}
+
+	buf[0] = '\\';
+	buf[1] = 'x';
+	buf[2] = hex[c >> 4];
+	buf[3] = hex[c & 0xf];
+	return 4;
+}
+
 void sanitize_ctrl(const char *in, char *out, size_t out_sz)
 {
 	const unsigned char *p = (const unsigned char *)in;
@@ -263,16 +292,38 @@ void sanitize_ctrl(const char *in, char *out, size_t out_sz)
 	if (out_sz == 0)
 		return;
 
-	while (*p && o + 1 < out_sz) {
+	while (*p) {
+		char esc[SANITIZE_CTRL_MAX];
+		size_t n;
+
 		if (*p < 0x20 || *p == 0x7f) {
-			out[o++] = '?';
+			n = escape_ctrl_byte(*p, esc);
 			p++;
 		} else if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
-			out[o++] = '?';
+			/* A C1 control, which UTF-8 spells in two bytes; name
+			 * it by its code point, not by either byte. */
+			n = escape_ctrl_byte(p[1], esc);
 			p += 2;
 		} else {
-			out[o++] = *p++;
+			esc[0] = (char)*p++;
+			n = 1;
 		}
+
+		/* Stop before splitting an escape rather than emitting half. */
+		if (o + n + 1 > out_sz)
+			break;
+		memcpy(out + o, esc, n);
+		o += n;
 	}
 	out[o] = '\0';
+}
+
+char *path_for_display(const char *path)
+{
+	size_t sz = SANITIZE_CTRL_MAX * strlen(path) + 1;
+	char *out = malloc(sz);
+
+	if (out)
+		sanitize_ctrl(path, out, sz);
+	return out;
 }

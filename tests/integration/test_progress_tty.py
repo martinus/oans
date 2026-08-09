@@ -181,6 +181,24 @@ class ProgressTtyTest(DuperemoveTest):
             any("2 permission denied" in ln for ln in screen),
             f"the scan-skip report was erased by the block:\n  {shown}")
 
+    def test_a_crafted_name_cannot_inject_ansi_into_the_block(self):
+        """The worker rows are drawn straight to the tty (#202).
+
+        The block's own ANSI is expected; what must never appear is a sequence
+        that came out of a file name. ESC[2J would clear the user's screen.
+        """
+        d = os.path.join(self.work, "tree")
+        os.makedirs(d, exist_ok=True)
+        for side in (b"a-", b"b-"):
+            with open(os.path.join(d.encode(),
+                                   side + b"esc\x1b[2J\x1b[31mred.bin"),
+                      "wb") as f:
+                f.write(b"z" * (4 * 1024 * 1024))
+
+        raw = _run_in_pty([DUPEREMOVE, "-dvr", "--hashfile", self.hf, d])
+        self.assertNotIn(b"\x1b[2J", raw, "a file name's ESC[2J reached the tty")
+        self.assertIn(b"esc\\x1b[2J", raw, "the name was not printed at all")
+
     # Depends on hashing outlasting one REDRAW_MS (100 ms) tick, so the row
     # exists at a redraw. Kept CPU-bound (4K blocks, partial mode) rather than
     # sized in bytes: a faster disk shrinks an I/O-bound run but not this one.

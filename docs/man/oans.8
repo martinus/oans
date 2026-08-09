@@ -524,6 +524,22 @@ This \f[I]N\f[R] is a lower\-level fiemap diagnostic \(em the change in
 bytes the filesystem reports as shared \(em and counts the surviving
 copy as shared too, so for pairs it is about twice \f[B]Reclaimed\f[R].
 Scripts that parsed this line from upstream duperemove continue to work.
+.SS File names in output
+A file name is untrusted input: anyone who can create a file inside a
+scanned tree chooses bytes that \f[CR]oans\f[R] then writes to your
+terminal.
+So wherever a path is printed \(em reports, the \f[B]\-L\f[R] listing,
+\f[B]\-\-stats\f[R], error messages and the live progress display \(em
+control characters in it are escaped: tab, newline and carriage return
+as \f[CR]\(rst\f[R], \f[CR]\(rsn\f[R], \f[CR]\(rsr\f[R], every other C0
+control, DEL and the C1 controls as \f[CR]\(rsxNN\f[R].
+Valid UTF\-8 is untouched, so ordinary names print exactly as they are.
+Escaping is unconditional, whether or not output is a terminal.
+.PP
+The escape is meant to be read, not parsed back into a path: a name
+containing a literal backslash is passed through unchanged.
+\f[B]\-\-json\f[R] escapes the same characters as \f[CR]\(rsu00NN\f[R],
+per JSON.
 .PP
 On a \f[B]compressed\f[R] btrfs, \f[B]Reclaimed\f[R] is a
 \f[I]logical\f[R] figure: dedupe shares logical extents but frees

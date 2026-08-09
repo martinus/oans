@@ -152,9 +152,7 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 		printf("Start\t\tFilename\n");
 		list_for_each_entry(extent, &dext->de_extents, e_list) {
 			const char *name = extent->e_file->filename;
-			/* sanitize_ctrl() never expands: its worst case is two
-			 * input bytes -> one '?'. */
-			size_t need = strlen(name) + 1;
+			size_t need = SANITIZE_CTRL_MAX * strlen(name) + 1;
 
 			if (need > clean_sz) {
 				char *grown = realloc(clean, need);
@@ -548,9 +546,16 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			}
 		}
 
-		vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
-			g_thread_self(), extent->e_file->filename,
-			pretty_size(extent->e_loff), extent->e_file->fd);
+		if (verbose) {
+			_cleanup_(freep) char *disp =
+				path_for_display(extent->e_file->filename);
+
+			vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
+				g_thread_self(),
+				disp ? disp : extent->e_file->filename,
+				pretty_size(extent->e_loff),
+				extent->e_file->fd);
+		}
 
 		if (ctxt == NULL) {
 			if (tgt_extent == NULL) {
@@ -669,6 +674,9 @@ run_dedupe:
 		 */
 		if (ctxt->num_queued) {
 			if (verbose) {
+				_cleanup_(freep) char *disp = path_for_display(
+					ctxt->ioctl_file->filename);
+
 				g_mutex_lock(&console_mutex);
 				printf("[%p] Dedupe %u extents (id: ",
 				       g_thread_self(), ctxt->num_queued);
@@ -677,7 +685,7 @@ run_dedupe:
 				       "\"%s\"\n",
 				       pretty_size(ctxt->orig_file_off),
 				       pretty_size(ctxt->orig_len),
-				       ctxt->ioctl_file->filename);
+				       disp ? disp : ctxt->ioctl_file->filename);
 				g_mutex_unlock(&console_mutex);
 			}
 

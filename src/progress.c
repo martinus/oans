@@ -470,7 +470,10 @@ static bool slot_is_idle(struct pscan_thread *t)
 static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 {
 	char buf[BUF_LEN];
-	char path[PATH_MAX + 4], clean[PATH_MAX + 1];
+	/* An escaped path can be several times its own length, and the row is
+	 * ellipsized to the terminal width afterwards anyway - so size `clean`
+	 * for the worst case rather than truncate a name into a different one. */
+	char path[PATH_MAX + 4], clean[SANITIZE_CTRL_MAX * PATH_MAX + 1];
 	char m_plain[160], m_col[512];
 	const char *word = status_word(t->status);
 	const char *wcol = status_color(t->status);

@@ -402,6 +402,32 @@ roots are known (`apply_storage_defaults()` in `oans.c`).
   timer, replaying the stored config. Guide: `docs/nas-quickstart.md`.
 - The `fdupes` mode was **removed** — don't reintroduce it.
 
+## File names are untrusted input (#202)
+
+Anyone who can create a file inside a scanned tree picks bytes oans writes to
+the admin's terminal, so **every path oans prints goes through
+`sanitize_ctrl()`/`path_for_display()`** (`src/util.c`) — C0 controls, DEL and
+the UTF-8 C1 controls become `\t`/`\n`/`\r`/`\xNN`. A `\r` in a name rewrites
+the line above it (the summary, a progress row); `ESC[2J` clears the screen.
+
+- **Escape at the print site, never in the stored string.** The path is what
+  oans opens, stats and stores; only the display copy is escaped. The idiom is
+  `_cleanup_(freep) char *disp = path_for_display(p);` then `disp ? disp : p` —
+  deliberately not a macro, since a `_cleanup_` inside a statement expression is
+  freed before the `printf` reads it.
+- **On the hot path, allocate inside the branch that prints.** `check_file()`
+  runs per file; `probe_fs()` runs per root, so it escapes once at the top.
+- Worst-case expansion is `SANITIZE_CTRL_MAX` (4) bytes per input byte — both
+  fixed-buffer callers (the progress row, `print_dupes_table`) size for it.
+  `sanitize_ctrl()` truncates at the last *complete* escape, never half of one.
+- `--json` (`print_json_str`) escapes the same set as `\u00NN`; that is the
+  supported machine-readable output, so nothing there is left raw either.
+- Pinned by `tests/integration/test_escape_names.py` (non-tty, asserts no raw
+  `\x1b`/`\r`/`\x07`/`\x7f` reaches either stream in any report mode) and
+  `test_progress_tty.py::test_a_crafted_name_cannot_inject_ansi_into_the_block`.
+  A test that only checks a plain name proves nothing — assert on the *bytes*,
+  with `text=False`.
+
 ## --exclude matching (src/glob.{c,h})
 
 `.gitignore` syntax — the one git/ripgrep/fd use — not POSIX `fnmatch`. Bare

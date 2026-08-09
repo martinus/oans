@@ -122,11 +122,37 @@ static inline void closefd(int *fd)
 void debug_print_uuid(uuid_t uuid);
 
 /*
- * Copy `in` to `out` (up to out_sz bytes, always NUL-terminated), replacing
- * terminal control characters with '?': C0 controls (< 0x20), DEL (0x7f), and
- * the two-byte UTF-8 encodings of the C1 controls (U+0080..U+009F). Some
- * terminals act on these when a filename is printed verbatim (#353).
+ * Copy `in` to `out` (up to out_sz bytes, always NUL-terminated), escaping the
+ * bytes a terminal would act on rather than print: C0 controls (< 0x20), DEL
+ * (0x7f), and the two-byte UTF-8 encodings of the C1 controls (U+0080..U+009F).
+ * Tab, newline and carriage return become `\t`, `\n`, `\r`; everything else
+ * becomes `\xNN`. Valid multi-byte UTF-8 passes through untouched.
+ *
+ * File names are untrusted input - anyone who can create a file inside a
+ * scanned tree chooses bytes that reach the administrator's terminal - and a
+ * crafted name can corrupt the display, overwrite the line above it with a
+ * `\r`, or spoof output entirely (#353, #202). So a name is escaped wherever it
+ * is printed, tty or not: machine consumers use --json.
+ *
+ * The escape is for reading, not for round-tripping: a backslash in the name
+ * itself is passed through, so `\x07` in the output may be either the byte or
+ * those four characters. Nothing here is meant to be parsed back into a path;
+ * a name that needs no escaping is unchanged, which is every real one.
+ *
+ * An escape is never split across the end of the buffer: `out` is truncated at
+ * the last complete one that fit.
  */
 void sanitize_ctrl(const char *in, char *out, size_t out_sz);
+
+/* Longest output sanitize_ctrl() can produce for one input byte ("\xNN"). */
+#define SANITIZE_CTRL_MAX	4
+
+/*
+ * sanitize_ctrl() into a freshly allocated string sized to hold the whole
+ * escaped path, for the print sites that have no buffer to spare and must not
+ * truncate. Returns NULL only if the allocation fails; callers print the raw
+ * pointer's fallback rather than losing the message.
+ */
+char *path_for_display(const char *path);
 
 #endif	/* __UTIL_H__ */
