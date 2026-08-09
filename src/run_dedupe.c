@@ -501,6 +501,21 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	if (whole_file_dedup && !dext->de_anchored)
 		pick_dedupe_target(dext);
 
+	if (dedupe_trace && whole_file_dedup) {
+		struct extent *head = list_first_entry(&dext->de_extents,
+						       struct extent, e_list);
+		uint64_t poff = 0;
+
+		if (filerec_open(head->e_file, true) == 0) {
+			fiemap_first_extent_poff(head->e_file->fd, head->e_loff,
+						 extent_len(head), &poff);
+			filerec_close(head->e_file);
+		}
+		eprintf("TRACE group members=%u anchored=%d target=%s poff=%"PRIu64"\n",
+			dext->de_num_dupes, (int)dext->de_anchored,
+			head->e_file->filename, poff);
+	}
+
 	/*
 	 * Remove any extents which have already been deduped. This
 	 * will free dext for us if the number of available extents

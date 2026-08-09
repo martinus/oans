@@ -1929,6 +1929,9 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	/* TEMPORARY (#197): see debug.h. */
+	dedupe_trace = getenv("DUPEREMOVE_DEDUPE_TRACE") != NULL;
+
 	ret = scan_files(roots, numfiles, db, &files_scanned, scan_skips);
 	if (ret)
 		goto out;

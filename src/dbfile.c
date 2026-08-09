@@ -2391,6 +2391,8 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 		return ret;
 	}
 
+	unsigned int trace_rows = 0, trace_anchors = 0;
+
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
 		unsigned int seq;
 		bool is_anchor;
@@ -2411,6 +2413,13 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 				return ENOMEM;
 		}
 
+		trace_rows++;
+		trace_anchors += is_anchor;
+		if (dedupe_trace && trace_rows <= 3)
+			eprintf("TRACE load win(%u,%u] row %u: %s seq=%u anchor=%d\n",
+				seq_lo, seq_hi, trace_rows,
+				(const char *)filename, seq, (int)is_anchor);
+
 		ret = insert_one_result(res, digest, file, 0, size, 0, is_anchor);
 		if (ret)
 			return ENOMEM;
@@ -2419,6 +2428,10 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 		perror_sqlite(ret, "looking up hash");
 		return ret;
 	}
+
+	if (dedupe_trace)
+		eprintf("TRACE load win(%u,%u] rows=%u anchors=%u\n",
+			seq_lo, seq_hi, trace_rows, trace_anchors);
 
 	return 0;
 }

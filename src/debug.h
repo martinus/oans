@@ -24,6 +24,13 @@
 #include "progress.h"
 
 extern int verbose;
+/*
+ * TEMPORARY (#197): DUPEREMOVE_DEDUPE_TRACE=1 logs how each dedupe window
+ * loads its group and which member becomes the target. Here to catch an
+ * intermittent cross-pass convergence failure that only reproduces on CI;
+ * remove once that is understood.
+ */
+extern int dedupe_trace;
 extern int debug;
 extern int quiet;
 

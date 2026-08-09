@@ -22,7 +22,12 @@ class CrossPassTest(DuperemoveTest):
         paths = [self.write(f"tree/c{i:03d}", data) for i in range(120)]
         self.sync()
 
-        self.dm("-rd", *self.BOPT, self.path("tree"), env=self.ENV)
+        # DUPEREMOVE_DEDUPE_TRACE is temporary (#197): it makes each window
+        # report how it loaded the group and which member it targeted, so the
+        # failure message below carries the evidence. Only on this test - the
+        # other two do not assert on convergence.
+        self.dm("-rd", *self.BOPT, self.path("tree"),
+                env=dict(self.ENV, DUPEREMOVE_DEDUPE_TRACE="1"))
         self.assertDmOk()
         self.sync()
 
@@ -45,6 +50,8 @@ class CrossPassTest(DuperemoveTest):
                 f"all 120 copies converge to one extent, got {len(clusters)}"
                 f"\n  clusters: {shape}"
                 f"\n  oans said:\n{self.out.strip()}")
+
+    # Kept next to the assertion it feeds: see #197.
 
         # Data intact.
         for p in (paths[0], paths[60], paths[-1]):

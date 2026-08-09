@@ -18,5 +18,6 @@
 #include "debug.h"
 
 int verbose = 0;
+int dedupe_trace = 0;
 int debug = 0;
 int quiet = 0;
