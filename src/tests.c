@@ -7,6 +7,7 @@
 #include "opt.c"
 #include "util.c"
 #include "debug.c"
+#include "interrupt.c"
 #include "csum.c"
 #include "threads.c"
 #include "btrfs-util.c"

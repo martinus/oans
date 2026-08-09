@@ -628,6 +628,11 @@ This is the status an unattended job should alarm on \(em the run looks
 healthy otherwise, and would previously have exited \f[B]0\f[R].
 See \f[I]EXAMPLES\f[R] for an \f[CR]OnFailure=\f[R] setup.
 .RE
+.TP
+\f[B]130\f[R], \f[B]143\f[R]
+Interrupted by \f[B]SIGINT\f[R] (Ctrl\-C) or \f[B]SIGTERM\f[R].
+Work already done was committed to the hashfile; re\-run to continue
+where it stopped.
 .PP
 Skips the user asked for do \f[B]not\f[R] affect the exit status:
 \f[B]\-\-exclude\f[R] matches, files under \f[B]\-\-min\-filesize\f[R],
@@ -703,12 +708,21 @@ hash another tree\(cqs files.
 What does not carry over is anything not yet written to the hashfile.
 To keep a scan of millions of files from committing once per file,
 results are batched and written every ten seconds, and additionally at
-each checkpoint; a run killed before its first commit contributes
-nothing.
-Ctrl\-C is no gentler than a crash here \(em it is not trapped, so it
-discards the batch in progress too.
-In practice this only matters if runs are being cut short after a few
-seconds, which makes no progress however often it is repeated.
+each checkpoint; a run killed outright before its first commit
+contributes nothing.
+.PP
+\f[B]Ctrl\-C and \f[CB]systemctl stop\f[B] are handled\f[R], so they do
+not lose that batch.
+On \f[B]SIGINT\f[R] or \f[B]SIGTERM\f[R], \f[CR]oans\f[R] stops taking
+new work, lets what is in flight finish, writes a checkpoint for any
+large file it was in the middle of, commits the batch, and exits
+\f[B]130\f[R] or \f[B]143\f[R] (128 plus the signal, as a shell reports
+for any signalled program).
+A second signal is not trapped and kills at once.
+\f[CR]SIGKILL\f[R] still discards the batch, as it must.
+An interrupted run is deliberately \f[B]not\f[R] added to
+\f[B]\-\-history\f[R]: it covered whatever part of the tree it reached,
+and recording it would make a partial scan read as a complete one.
 .PP
 A checkpoint is only used if the file\(cqs size and modification time
 are still what they were, which is the same test \f[CR]oans\f[R] applies

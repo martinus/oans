@@ -332,11 +332,9 @@ run picks the file up there.
   loops forever at zero progress**. Pre-existing, and this change strictly
   improves it: at 1.4 s kills v1.9.1 persisted 0 files over six rounds, where
   this code reached 1875 before stalling, because a checkpoint force-commits the
-  whole shared batch. **There is no signal handler anywhere in the tree**, so
-  Ctrl-C discards the open batch exactly as `SIGKILL` does (measured: both
-  persisted 0 at 3 s). "Ctrl-C is safe" means the hashfile is not corrupted, not
-  that the run's work is kept. A SIGINT handler that flushes would raise the
-  floor; nobody has built one.
+  whole shared batch. **SIGINT/SIGTERM now flush the open batch** (#201), which
+  raises that floor from `COMMIT_INTERVAL_SEC` to "whatever finished hashing";
+  only `SIGKILL` still discards it.
 - Test hooks: `DUPEREMOVE_CHECKPOINT_BYTES` lowers the interval,
   `DUPEREMOVE_CHECKPOINT_STOP=N` abandons a file after N checkpoints — an
   interrupted run, deterministically, rather than racing a signal against a read.
@@ -345,6 +343,42 @@ run picks the file up there.
   **identical to one straight-through scan**; that is the property that matters,
   since nothing downstream could tell a wrong digest from a file with no
   duplicate.
+
+## SIGINT/SIGTERM flush the batch (#201)
+
+`src/interrupt.{c,h}`. The handler **only sets a flag** (SQLite and GLib are not
+async-signal-safe); every loop that owns state polls it and unwinds through its
+ordinary exit path, and `filescan_free()` → `scan_writer_close()` already
+commits the batch on the way out. So nothing new is made durable — the loops
+just have to *reach* it. Measured on a 3000-file tree, SIGINT at 0.5 s:
+v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
+
+- `sigaction` with **`SA_RESTART`** (a walker blocked in `read()` resumes, so no
+  error path has to learn about EINTR) and **`SA_RESETHAND`** — the kernel puts
+  the default action back on delivery, so the second Ctrl-C kills with no work
+  in the handler. Verified by watching `SigCgt` in `/proc/PID/status` drop the
+  SIGINT bit.
+- **Four checkpoints, one per loop that would otherwise run to completion:** the
+  walkers still call `dirq_finished()` for every directory they skip (leaving
+  `walk_dir_pending` non-zero means `WALK_STOP` is never pushed and the consumer
+  blocks forever); the consumer stops calling `__scan_file`; the csum workers
+  *drop* queued files rather than hash them (the queue holds thousands — working
+  through it is not a shutdown); `csum_whole_file` abandons the file it is on
+  after writing an off-interval checkpoint, so a 1 TiB file costs one buffer of
+  latency instead of hours.
+- **The dedupe phase stops admitting batches and nothing else.** No new drain
+  points: in-flight batches reap normally, `FIDEDUPERANGE` is atomic, and the
+  generation-ordered watermark already guarantees `dedupe_seq` names only
+  fully-processed generations.
+- **An interrupted run is not written to `run_history`** — it would read as a
+  complete scan of the tree, skip counters and all. Exit is `128 + signo`, set
+  last and only over a success.
+- **Test hooks `DUPEREMOVE_INTERRUPT_AFTER=N` / `_AFTER_BATCHES=N` /
+  `DUPEREMOVE_INTERRUPT_SIGNAL=TERM`** raise the *real* signal at a named point,
+  the same way `DUPEREMOVE_CHECKPOINT_STOP` does for #159. A `sleep N; kill`
+  race needs a tree too big for the suite (~500 MB/s of scan) and still
+  coin-flips on faster storage; `test_signal_flush.py` keeps one real-signal
+  test, which skips rather than fails if the scan won the race.
 
 ## io-threads default (storage heuristic)
 

@@ -534,6 +534,10 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
     healthy otherwise, and would previously have exited **0**. See *EXAMPLES*
     for an `OnFailure=` setup.
 
+**130**, **143**
+  ~ Interrupted by **SIGINT** (Ctrl-C) or **SIGTERM**. Work already done was
+    committed to the hashfile; re-run to continue where it stopped.
+
 Skips the user asked for do **not** affect the exit status: **\--exclude**
 matches, files under **\--min-filesize**, non-regular files, and read-only
 subvolumes are all reported but are not failures. Neither are files met during
@@ -599,10 +603,17 @@ never causes one run to hash another tree's files.
 What does not carry over is anything not yet written to the hashfile. To keep a
 scan of millions of files from committing once per file, results are batched and
 written every ten seconds, and additionally at each checkpoint; a run killed
-before its first commit contributes nothing. Ctrl-C is no gentler than a crash
-here — it is not trapped, so it discards the batch in progress too. In practice
-this only matters if runs are being cut short after a few seconds, which makes
-no progress however often it is repeated.
+outright before its first commit contributes nothing.
+
+**Ctrl-C and `systemctl stop` are handled**, so they do not lose that batch.
+On **SIGINT** or **SIGTERM**, `oans` stops taking new work, lets what is in
+flight finish, writes a checkpoint for any large file it was in the middle of,
+commits the batch, and exits **130** or **143** (128 plus the signal, as a shell
+reports for any signalled program). A second signal is not trapped and kills at
+once. `SIGKILL` still discards the batch, as it must. An interrupted run is
+deliberately **not** added to **\--history**: it covered whatever part of the
+tree it reached, and recording it would make a partial scan read as a complete
+one.
 
 A checkpoint is only used if the file's size and modification time are still
 what they were, which is the same test `oans` applies to every file in a
