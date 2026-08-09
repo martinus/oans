@@ -59,6 +59,7 @@ struct stmts {
 	sqlite3_stmt *write_checkpoint;
 	sqlite3_stmt *select_checkpoint;
 	sqlite3_stmt *delete_checkpoint;
+	sqlite3_stmt *select_checkpointed_files;
 	sqlite3_stmt *update_dedupe_seq;
 };
 
@@ -366,6 +367,24 @@ int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
 bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
 			    struct scan_checkpoint *cp);
 int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid);
+
+/*
+ * Every file a checkpoint is waiting on, biggest remainder first. A scan hands
+ * these to the hashing pool up front rather than waiting for the walk to
+ * rediscover them, which on a large tree takes minutes (#159). Caller frees.
+ */
+struct checkpointed_file {
+	int64_t		id;
+	char		*filename;
+	uint64_t	ino;
+	uint64_t	subvol;
+	uint64_t	size;
+	uint64_t	mtime;
+};
+int dbfile_load_checkpointed_files(struct dbhandle *db,
+				   struct checkpointed_file **out,
+				   unsigned int *count);
+void dbfile_free_checkpointed_files(struct checkpointed_file *v, unsigned int n);
 /* Put a resumed file in this run's dedupe generation, leaving its row (and so
  * its checkpoint and stored hashes) otherwise intact. */
 int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq);

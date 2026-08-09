@@ -963,6 +963,18 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	dbfile_prepare_stmt(delete_checkpoint, DELETE_CHECKPOINT);
 
 	/*
+	 * Every file left partly hashed, so a run can pick them up immediately
+	 * instead of waiting for the walk to rediscover them (#159). Ordered
+	 * biggest-remainder first, which is the order the csum queue wants them
+	 * in anyway.
+	 */
+#define SELECT_CHECKPOINTED_FILES					\
+"select f.id, f.filename, f.ino, f.subvol, f.size, f.mtime "		\
+"from scan_checkpoints c join files f on f.id = c.fileid "		\
+"order by f.size - c.loff desc;"
+	dbfile_prepare_stmt(select_checkpointed_files, SELECT_CHECKPOINTED_FILES);
+
+	/*
 	 * Move a resumed file into this run's generation (#159). An update, not
 	 * the usual upsert: replacing the row would cascade away the very
 	 * checkpoint and hashes the resume is built on.
@@ -1987,6 +1999,67 @@ bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
 		memcpy(cp->ext_state, sqlite3_column_blob(stmt, 6), len);
 
 	return true;
+}
+
+void dbfile_free_checkpointed_files(struct checkpointed_file *v, unsigned int n)
+{
+	if (!v)
+		return;
+	for (unsigned int i = 0; i < n; i++)
+		free(v[i].filename);
+	free(v);
+}
+
+int dbfile_load_checkpointed_files(struct dbhandle *db,
+				   struct checkpointed_file **out,
+				   unsigned int *count)
+{
+	int ret;
+	unsigned int n = 0, cap = 8;
+	struct checkpointed_file *v = calloc(cap, sizeof(*v));
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt =
+		db->stmts.select_checkpointed_files;
+
+	*out = NULL;
+	*count = 0;
+	if (!v)
+		return -ENOMEM;
+
+	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		if (n == cap) {
+			struct checkpointed_file *bigger =
+				realloc(v, cap * 2 * sizeof(*v));
+
+			if (!bigger)
+				goto oom;
+			v = bigger;
+			memset(v + cap, 0, cap * sizeof(*v));
+			cap *= 2;
+		}
+		v[n].id = sqlite3_column_int64(stmt, 0);
+		v[n].filename = strdup((const char *)sqlite3_column_text(stmt, 1));
+		if (!v[n].filename)
+			goto oom;
+		v[n].ino = sqlite3_column_int64(stmt, 2);
+		v[n].subvol = sqlite3_column_int64(stmt, 3);
+		v[n].size = sqlite3_column_int64(stmt, 4);
+		v[n].mtime = sqlite3_column_int64(stmt, 5);
+		n++;
+	}
+
+	if (ret != SQLITE_DONE) {
+		perror_sqlite(ret, "listing checkpointed files");
+		dbfile_free_checkpointed_files(v, n);
+		return ret;
+	}
+
+	*out = v;
+	*count = n;
+	return 0;
+
+oom:
+	dbfile_free_checkpointed_files(v, n);
+	return -ENOMEM;
 }
 
 int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid)

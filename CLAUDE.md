@@ -305,6 +305,26 @@ run picks the file up there.
   Extent rows are only ever written by a checkpoint, so none exist past one;
   block rows flush on their own batch cadence (#161) and can, hence
   `dbfile_remove_hashes_from()` on resume.
+- **Checkpointed files are handed to the pool before the walk starts**
+  (`seed_checkpointed_files()`, from `filescan_walk_run()`). The walk would find
+  them eventually, but on a large tree "eventually" is minutes — measured on a
+  120k-file tree with the file six directories down, time-to-resume went
+  **0.73 s → 0.02 s**, and the seeded figure doesn't grow with the tree. Three
+  constraints, each with a test:
+  - **Only under this run's roots, and only if `check_file()` accepts it.** One
+    hashfile may cover several trees scanned on different days; seeding outside
+    the named roots would hash terabytes nobody asked for. `scan_root_paths`
+    exists solely for this (prefix match, guarding against `/data` vs
+    `/database`).
+  - **Mark it seen (`mark_inode_seen` + `mark_file_seen`) or the walk queues it
+    twice** and two workers hash one file at once. Pinned by asserting
+    `run_history.files_scanned`, which is 2 instead of 1 when this is dropped.
+  - **Seed *after* the walker handles are open, before the consume loop.** The
+    csum pool is already running, so a seeded file produces a write transaction
+    immediately, and every `dbfile_open_handle()` runs `CREATE TABLE IF NOT
+    EXISTS` — which then can't get the write lock and aborts on `!wdb`. Seeding
+    also force-flushes for the same reason. (Ordinary per-file writes never hit
+    this: by then the walkers are long connected.)
 - **Restarting converges, but only above the commit interval.** Measured on a
   30 GiB / 6006-file tree with repeated `SIGKILL`s: everything ends up hashed,
   no checkpoints left. The floor is `COMMIT_INTERVAL_SEC` (10 s) — nothing is

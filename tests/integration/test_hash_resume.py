@@ -252,6 +252,72 @@ class HashResumeTest(DuperemoveTest):
         self.assertDmOk("run that finishes the hashing")
         self.assertShared(a, b, "the resumed files were never deduped")
 
+    def test_a_checkpointed_file_is_resumed_before_the_walk(self):
+        """Partly-hashed files go to the pool up front, not when the walk gets
+        to them.
+
+        On a tree of millions of files the walk takes minutes to reach a file
+        buried a few directories down, and a nearly-finished 50 GiB image is
+        the one thing most worth finishing - waiting for rediscovery is another
+        few minutes in which an interruption costs its tail. Measured on a
+        120k-file tree, this took the delay from 0.73 s to 0.02 s, and the
+        seeded figure does not grow with the tree.
+
+        It must also not queue the file *twice*: the walk meets it as well, so
+        the run's own file count is what pins that.
+        """
+        deep = "tree/aa/bb/cc/dd/big.bin"
+        self.write(deep, os.urandom(6 * MiB))
+        for i in range(20):
+            self.write(f"tree/small{i}.bin", os.urandom(64 * KiB))
+        self.sync()
+        tree = self.path("tree")
+
+        self.dm("-r", tree, env=STOP)
+        self.assertDmOk("interrupted scan")
+        self.assertEqual(1, self.hf_count("scan_checkpoints"))
+
+        self.dm("-rv", tree, env=CKPT, quiet=False)
+        self.assertDmOk("resumed scan")
+        self.assertIn("partially hashed file", self.out,
+                      "the checkpointed file was not seeded before the walk")
+
+        # 21 files exist and 20 were finished by the first run, so this run
+        # hashed exactly one. Seeding it *and* letting the walk queue it would
+        # make that two - and have two workers hashing one file at once.
+        self.assertEqual(1, self.hf_scalar(
+            "select files_scanned from run_history order by rowid desc limit 1"),
+            "the resumed file was queued more than once")
+        self.assertEqual(0, self.hf_count("scan_checkpoints"))
+        self.assertEqual(0, self.hf_scalar(
+            "select count(*) from files where digest is null"))
+
+    def test_a_checkpoint_outside_the_scanned_roots_is_left_alone(self):
+        """One hashfile may cover several trees scanned on different days.
+        Seeding must not reach into a tree this run was not pointed at - that
+        would be hashing terabytes nobody asked for."""
+        self.write("other/big.bin", os.urandom(6 * MiB))
+        self.write("tree/a.bin", os.urandom(64 * KiB))
+        self.sync()
+
+        self.dm("-r", self.path("other"), env=STOP)
+        self.assertDmOk("interrupted scan of the other tree")
+        self.assertEqual(1, self.hf_count("scan_checkpoints"))
+        stopped_at = self.hf_scalar("select loff from scan_checkpoints")
+
+        self.dm("-rv", self.path("tree"), env=CKPT, quiet=False)
+        self.assertDmOk("scan of the requested tree")
+        self.assertNotIn("partially hashed file", self.out)
+        self.assertNotIn("other/big.bin", self.out)
+
+        # Untouched: same checkpoint, still no digest, ready for the day that
+        # tree is scanned again.
+        self.assertEqual(stopped_at,
+                         self.hf_scalar("select loff from scan_checkpoints"),
+                         "a checkpoint outside the scanned roots was consumed")
+        self.assertEqual(1, self.hf_scalar(
+            "select count(*) from files where digest is null"))
+
     def test_without_a_hashfile_nothing_is_checkpointed(self):
         """There would be nowhere to resume from - the database dies with the
         process - so an in-memory run must not pay for checkpoints, and must

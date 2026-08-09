@@ -77,6 +77,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
 static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 static void mark_file_seen(int64_t id);
+static void seed_checkpointed_files(struct dbhandle *db);
 struct buffer;
 static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			    struct pscan_thread *tprogress);
@@ -509,6 +510,54 @@ static unsigned int nr_roots_seeded;
  * the skip.
  */
 static unsigned int nr_roots_unusable;
+
+/*
+ * The realpath'd roots this run was pointed at, in the order given.
+ *
+ * Only the checkpoint seeder reads them: a hashfile may hold checkpoints for
+ * trees this run was not asked to look at (one hashfile, several roots on
+ * different days), and hashing those would be scanning what the user did not
+ * ask for. The walk does not need this - it only ever descends from a root.
+ *
+ * Built on the main thread by scan_file() before any walker exists, read on the
+ * same thread by the seeder, so no lock.
+ */
+static GPtrArray *scan_root_paths;
+
+static void scan_roots_reset(void)
+{
+	if (scan_root_paths)
+		g_ptr_array_free(scan_root_paths, TRUE);
+	scan_root_paths = g_ptr_array_new_with_free_func(g_free);
+}
+
+static void scan_roots_add(const char *path)
+{
+	if (scan_root_paths)
+		g_ptr_array_add(scan_root_paths, g_strdup(path));
+}
+
+/* True if `path` is one of the roots, or lives underneath one. */
+static bool path_under_a_root(const char *path)
+{
+	if (!scan_root_paths)
+		return false;
+
+	for (guint i = 0; i < scan_root_paths->len; i++) {
+		const char *root = g_ptr_array_index(scan_root_paths, i);
+		size_t len = strlen(root);
+
+		if (strncmp(path, root, len) != 0)
+			continue;
+		/* Either the root itself, or a child of it - never a sibling
+		 * that merely shares a prefix ("/data" vs "/database"). */
+		if (path[len] == '\0' || path[len] == '/' ||
+		    (len == 1 && root[0] == '/'))
+			return true;
+	}
+	return false;
+}
+
 
 unsigned int filescan_roots_unusable(void)
 {
@@ -1432,6 +1481,7 @@ void filescan_walk_begin(void)
 		if (n >= 1)
 			walk_nthreads = (unsigned int)n;
 	}
+	scan_roots_reset();
 	walk_dirq = g_async_queue_new();
 	walk_fileq = g_async_queue_new();
 	walk_dir_pending = 1;	/* seeding token; released by filescan_walk_run() */
@@ -1460,6 +1510,16 @@ int filescan_walk_run(struct dbhandle *db)
 		dbfile_set_cache_kb(wdb, DB_CACHE_KB_WALKER);
 		threads[i] = g_thread_new("walker", walk_thread, wdb);
 	}
+
+	/*
+	 * Only now that every walker has its connection: seeding queues files,
+	 * the csum pool is already running and picks them up at once, and the
+	 * write transaction that follows would block the CREATE TABLE IF NOT
+	 * EXISTS each dbfile_open_handle() above runs. Still before the consume
+	 * loop below, so the seen-sets are set up before the first walked file
+	 * reaches __scan_file() and nothing gets queued twice.
+	 */
+	seed_checkpointed_files(db);
 
 	/*
 	 * Release the seeding token now the roots are queued. If nothing was
@@ -1554,6 +1614,33 @@ static int64_t store_file_row(struct file *dbfile, char *path, bool file_renamed
 }
 
 /*
+ * Per-run scan state, shared by the walk's consumer (__scan_file) and the
+ * checkpoint seeder - both run on the single consumer thread, so neither needs
+ * a lock. `scan_seq` is the dedupe generation this run stamps on everything it
+ * hashes; `scan_position` only ever feeds the progress display.
+ */
+static unsigned int scan_seq, scan_seq_count;
+static uint64_t scan_position;
+
+/*
+ * The dedupe generation for the next file this run hashes. Starts one above the
+ * stored watermark and steps every --batchsize files, so a long scan is broken
+ * into generations the dedupe phase can process incrementally.
+ */
+static unsigned int scan_next_seq(void)
+{
+	if (scan_seq == 0)
+		scan_seq = dedupe_seq + 1;
+
+	if (options.batch_size != 0 &&
+	    ++scan_seq_count >= options.batch_size) {
+		scan_seq++;
+		scan_seq_count = 0;
+	}
+	return scan_seq;
+}
+
+/*
  * Take up hashing a file where an interrupted run left off (#159).
  *
  * True only if there is a checkpoint, it describes the file as it is now, and
@@ -1570,7 +1657,8 @@ static int64_t store_file_row(struct file *dbfile, char *path, bool file_renamed
  * batch cadence (#161), so a run killed between two checkpoints can leave
  * blocks beyond the last one.
  */
-static bool resume_scan(struct dbhandle *db, struct file *dbfile,
+static bool resume_scan(struct dbhandle *db, int64_t fileid, uint64_t size,
+			uint64_t mtime, const char *name,
 			struct scan_resume *resume)
 {
 	size_t cap = running_checksum_state_size();
@@ -1583,11 +1671,11 @@ static bool resume_scan(struct dbhandle *db, struct file *dbfile,
 	if (!file_state || !ext_state)
 		return false;
 
-	if (!dbfile_load_checkpoint(db, dbfile->id, &cp))
+	if (!dbfile_load_checkpoint(db, fileid, &cp))
 		return false;
 
-	if (cp.size == dbfile->size && cp.mtime == dbfile->mtime &&
-	    cp.loff > 0 && cp.loff < dbfile->size) {
+	if (cp.size == size && cp.mtime == mtime &&
+	    cp.loff > 0 && cp.loff < size) {
 		resume->csum = running_checksum_restore(cp.file_state, cap);
 		if (cp.has_ext_state)
 			resume->ext_csum = running_checksum_restore(cp.ext_state,
@@ -1606,15 +1694,15 @@ static bool resume_scan(struct dbhandle *db, struct file *dbfile,
 		return false;
 	}
 	if (usable)
-		dbfile_remove_hashes_from(scan_writer, dbfile->id, cp.loff);
+		dbfile_remove_hashes_from(scan_writer, fileid, cp.loff);
 	else
-		dbfile_remove_checkpoint(scan_writer, dbfile->id);
+		dbfile_remove_checkpoint(scan_writer, fileid);
 	scan_write_end();
 	dbfile_unlock();
 
 	if (!usable) {
 		vprintf("Discarding an unusable checkpoint for %s; hashing it "
-			"from the start\n", dbfile->filename);
+			"from the start\n", name);
 		return false;
 	}
 
@@ -1622,8 +1710,127 @@ static bool resume_scan(struct dbhandle *db, struct file *dbfile,
 	resume->ext_loff = cp.ext_loff;
 	resume->ext_len = cp.ext_len;
 	vprintf("Resuming %s at %"PRIu64" of %"PRIu64" bytes\n",
-		dbfile->filename, cp.loff, (uint64_t)dbfile->size);
+		name, cp.loff, size);
 	return true;
+}
+
+/*
+ * Hand a file to the hashing pool. Takes over `resume` (zeroed for the ordinary
+ * case of hashing from the start); the worker frees the request when done.
+ */
+static void queue_file_for_scan(const char *path, int64_t fileid,
+				uint64_t filesize, uint64_t mtime,
+				struct scan_resume *resume)
+{
+	struct file_to_scan *file = malloc(sizeof(*file));
+
+	abort_on(!file);
+	file->path = strdup(path);
+	abort_on(!file->path);
+	file->fileid = fileid;
+	file->filesize = filesize;
+	file->mtime = mtime;
+	file->resume = *resume;
+	resume->csum = resume->ext_csum = NULL;	/* the request owns them now */
+	file->file_position = ++scan_position;
+	file->next = NULL;
+
+	/* Only the bytes still to be read are this run's work. */
+	pscan_set_progress(1, filesize - file->resume.off);
+	scan_workq_push(file);
+}
+
+/*
+ * Hand every file a checkpoint is waiting on straight to the hashing pool,
+ * before the walk starts (#159).
+ *
+ * The walk would find them eventually, but "eventually" on a tree of millions
+ * of files is minutes - and a 53 GiB image that is already 90% hashed is the
+ * one file most worth finishing, both because it is nearly done and because
+ * every minute it waits is another minute an interruption costs its tail. The
+ * largest-first queue cannot help: it only orders what has been discovered.
+ *
+ * A checkpoint is only honoured for a file under one of this run's roots and
+ * acceptable to check_file() - the hashfile may describe trees this run was not
+ * asked about, and hashing those would be doing work the user did not request.
+ * Anything skipped here is simply left for the walk, which applies the same
+ * rules; nothing is lost by declining.
+ *
+ * Runs on the consumer thread with no walker alive, so the seen-sets and the
+ * generation counter are unsynchronised exactly as they are during the walk.
+ */
+static void seed_checkpointed_files(struct dbhandle *db)
+{
+	struct checkpointed_file *cps;
+	unsigned int n, seeded = 0;
+
+	/* No hashfile, no checkpoints. */
+	if (!options.hashfile)
+		return;
+	if (dbfile_load_checkpointed_files(db, &cps, &n))
+		return;
+
+	for (unsigned int i = 0; i < n; i++) {
+		struct checkpointed_file *cp = &cps[i];
+		struct scan_resume resume = {0,};
+		struct statx st;
+
+		if (!path_under_a_root(cp->filename))
+			continue;
+		/* longpath-ok: seeding is only a shortcut, so declining is
+		 * always safe - a path over PATH_MAX fails here and is left to
+		 * the walk, which reaches it from a directory fd (#117). */
+		if (statx(AT_FDCWD, cp->filename, 0, STATX_BASIC_STATS, &st) ||
+		    !(st.stx_mask & STATX_BASIC_STATS) ||
+		    !S_ISREG(st.stx_mode))
+			continue;
+		/* parent_checked: a root that failed to lock has already been
+		 * reported, and a file here is never a top-level seed. */
+		if (!check_file(db, cp->filename, &st, true))
+			continue;
+		/* Changed since the checkpoint - let the walk rescan it whole,
+		 * which also clears the stale checkpoint. */
+		if (st.stx_size != cp->size ||
+		    timestamp_to_nano(st.stx_mtime) != cp->mtime)
+			continue;
+
+		if (!resume_scan(db, cp->id, cp->size, cp->mtime,
+				 cp->filename, &resume))
+			continue;
+
+		dbfile_lock();
+		if (scan_write_begin() == 0) {
+			dbfile_update_dedupe_seq(scan_writer, cp->id,
+						 scan_next_seq());
+			scan_write_end();
+		}
+		dbfile_unlock();
+
+		/* The walk will meet this file too; both marks make it skip
+		 * over rather than queue it a second time. */
+		mark_file_seen(cp->id);
+		mark_inode_seen(cp->ino, cp->subvol);
+
+		queue_file_for_scan(cp->filename, cp->id, cp->size, cp->mtime,
+				    &resume);
+		seeded++;
+	}
+
+	/*
+	 * Commit before returning: the walkers are about to open their own
+	 * connections, and every open runs CREATE TABLE IF NOT EXISTS, which
+	 * wants the write lock this batch would otherwise still be holding.
+	 * Ordinary per-file writes never hit this because the walkers are
+	 * already connected by the time the first one happens.
+	 */
+	dbfile_lock();
+	scan_write_flush();
+	dbfile_unlock();
+
+	if (seeded)
+		vprintf("Resuming %u partially hashed file%s before the walk\n",
+			seeded, seeded == 1 ? "" : "s");
+	dbfile_free_checkpointed_files(cps, n);
 }
 
 /*
@@ -1636,20 +1843,9 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 {
 	int ret;
 	_cleanup_(file_cleanup) struct file dbfile = {0,};
-	static unsigned int seq = 0, counter = 0;
-	struct file_to_scan *file;
 	int64_t fileid = 0;
 	bool file_renamed, unchanged, resumed = false;
 	struct scan_resume resume = {0,};
-	static uint64_t position = 0;
-
-	/*
-	 * The first call initializes the static variable
-	 * from the global dedupe_seq
-	 * The subsequents calls will increase it every <batchsize> times
-	 */
-	if (seq == 0)
-		seq = dedupe_seq + 1;
 
 	abort_on(!S_ISREG(st->stx_mode));
 
@@ -1711,13 +1907,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		return 0;
 	}
 
-	if (options.batch_size != 0) {
-		counter += 1;
-		if (counter >= options.batch_size) {
-			seq++;
-			counter = 0;
-		}
-	}
+	unsigned int seq = scan_next_seq();
 
 	dbfile.ino = st->stx_ino;
 	dbfile.size = st->stx_size;
@@ -1737,7 +1927,8 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	 * checkpoint and the hashes already stored straight back out.
 	 */
 	if (dbfile.id && unchanged && !dbfile.digest_valid && !file_renamed)
-		resumed = resume_scan(db, &dbfile, &resume);
+		resumed = resume_scan(db, dbfile.id, dbfile.size,
+				      dbfile.mtime, dbfile.filename, &resume);
 
 	/*
 	 * Resuming keeps the existing row - replacing it would cascade away the
@@ -1766,22 +1957,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	/* Remember this inode so later hardlinks to it are skipped. */
 	mark_inode_seen(dbfile.ino, dbfile.subvol);
 
-	/* Schedule the file for scan */
-	file = malloc(sizeof(struct file_to_scan)); /* Freed by csum_whole_file() */
-
-	file->path = strdup(path);
-	file->fileid = fileid;
-	file->filesize = st->stx_size;
-	file->mtime = dbfile.mtime;
-	file->resume = resume;		/* zeroed unless we are resuming */
-
-	/* Only the bytes still to be read are this run's work. */
-	pscan_set_progress(1, st->stx_size - resume.off);
-	position++;
-	file->file_position = position;
-
-	scan_workq_push(file);
-
+	queue_file_for_scan(path, fileid, st->stx_size, dbfile.mtime, &resume);
 	return 0;
 }
 
@@ -1860,6 +2036,7 @@ int scan_file(char *in_path, struct dbhandle *db)
 	if (!check_file(db, path, &st, false))
 		return 0;
 
+	scan_roots_add(path);
 	if (S_ISREG(st.stx_mode))
 		fileq_push(path, &st);
 	else

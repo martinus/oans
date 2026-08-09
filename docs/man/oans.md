@@ -589,6 +589,13 @@ next run picks it up where the last one stopped instead of reading it again
 from the start. Checkpoints need a **\--hashfile** to live in, and are dropped
 automatically once the file is fully hashed.
 
+A file left partly hashed is picked up at the very start of the next run,
+before the directory walk begins, rather than when the walk happens to reach
+it — on a large tree that can be minutes later, and a nearly-finished large
+file is the one most worth completing. Only files under the roots named on that
+command line are resumed this way, so a hashfile shared between several trees
+never causes one run to hash another tree's files.
+
 What does not carry over is anything not yet written to the hashfile. To keep a
 scan of millions of files from committing once per file, results are batched and
 written every ten seconds, and additionally at each checkpoint; a run killed
