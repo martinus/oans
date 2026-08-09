@@ -422,6 +422,21 @@ class DuperemoveTest(unittest.TestCase):
             "from files order by filename")
         return hashlib.sha256(repr(rows).encode()).hexdigest()
 
+    def blocks_fingerprint(self):
+        rows = self.hf_query(
+            "select f.filename, b.loff, quote(b.digest) from blocks b "
+            "join files f on f.id = b.fileid order by f.filename, b.loff")
+        return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+    def drop_hashfile(self):
+        """Delete the hashfile and its WAL sidecars, so the next run starts
+        from nothing. Removing only the .db leaves a -wal SQLite will replay."""
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(self.hf + suffix)
+            except FileNotFoundError:
+                pass
+
     def extents_fingerprint(self):
         rows = self.hf_query(
             "select f.filename, e.loff, e.len, quote(e.digest) from extents e "

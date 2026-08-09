@@ -37,10 +37,7 @@ def _run_in_pty(argv, env=None):
     pid, fd = pty.fork()
     if pid == 0:                                  # child
         try:
-            if env is None:
-                os.execvp(argv[0], argv)
-            else:
-                os.execvpe(argv[0], argv, env)
+            os.execvpe(argv[0], argv, os.environ if env is None else env)
         finally:                                  # execvp raises, never returns
             os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -60,15 +57,23 @@ def _run_in_pty(argv, env=None):
     return b"".join(chunks)
 
 
-def _worker_rows(data, name):
-    """Every worker row naming `name` that was ever drawn, in order.
+def _worker_rows(data, name, status="hashing"):
+    """Every worker row naming `name` drawn in `status`, in order.
 
     _render() rebuilds the *final* screen, and the block is wiped before exit -
     so a row that only existed mid-run has to be read out of the raw stream.
+
+    Filtering on the status matters: the same slot also renders the file while
+    mapping and committing, and those rows carry "(size: N)" instead of the
+    done/total the callers here are asking about.
     """
     text = _ANSI_TEXT.sub("", data.decode("utf-8", "replace"))
-    return [ln.strip() for ln in re.split(r"[\r\n]", text)
-            if name in ln and "hashing" in ln]
+    rows = []
+    for ln in re.split(r"[\r\n]", text):
+        m = WORKER_ROW.match(ln)
+        if m and m.group(1) == status and name in ln:
+            rows.append(ln.strip())
+    return rows
 
 
 def _render(data):

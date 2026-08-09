@@ -159,9 +159,17 @@ struct file_to_scan {
 	size_t filesize;
 	uint64_t mtime;		/* stamped into any checkpoint this file writes */
 
-	/* Owned by whoever holds this file_to_scan, until the worker adopts
-	 * the checksums into its scan context. */
-	struct scan_resume resume;
+	/*
+	 * NULL for the ordinary case of hashing from the start, which is every
+	 * file in almost every run - hence a pointer rather than the struct
+	 * inline. A scan queues one of these per listed file and the walk runs
+	 * far ahead of the hashing, so this is 32 bytes per *listed* file of
+	 * resident memory, ~17 MB on a half-million-file tree.
+	 *
+	 * Owned by whoever holds this file_to_scan, until the worker adopts the
+	 * checksums into its scan context.
+	 */
+	struct scan_resume *resume;
 
 	/*
 	 * Used to record the current file position in the scan queue,

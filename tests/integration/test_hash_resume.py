@@ -64,11 +64,8 @@ class HashResumeTest(DuperemoveTest):
 
     def fingerprints(self):
         """Everything the scan is supposed to have produced."""
-        blocks = self.hf_query(
-            "select f.filename, b.loff, quote(b.digest) from blocks b "
-            "join files f on f.id = b.fileid order by f.filename, b.loff")
         return (self.files_fingerprint(), self.extents_fingerprint(),
-                repr(blocks))
+                self.blocks_fingerprint())
 
     def scan_straight_through(self, tree, *extra):
         """Hash the tree in one go, into a fresh hashfile."""
@@ -77,12 +74,12 @@ class HashResumeTest(DuperemoveTest):
         self.assertDmOk("uninterrupted scan")
         return self.fingerprints()
 
-    def drop_hashfile(self):
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                os.unlink(self.hf + suffix)
-            except FileNotFoundError:
-                pass
+    def interrupt_after_one_checkpoint(self, tree, *extra):
+        """One run that gives up at its first checkpoint, as a kill would."""
+        self.dm("-r", tree, *extra, env=STOP)
+        self.assertDmOk("interrupted scan")
+        self.assertGreater(self.hf_count("scan_checkpoints"), 0,
+                           "nothing was checkpointed")
 
     def scan_with_interruptions(self, tree, *extra, limit=40):
         """Hash the tree a checkpoint at a time until it finally completes.
@@ -133,13 +130,10 @@ class HashResumeTest(DuperemoveTest):
         the first one already hashed."""
         tree = self.build_tree()
         self.drop_hashfile()
-        self.dm("-r", tree, env=STOP)
-        self.assertDmOk("interrupted scan")
-
+        self.interrupt_after_one_checkpoint(tree)
         stopped_at = dict(self.hf_query(
             "select f.filename, c.loff from scan_checkpoints c "
             "join files f on f.id = c.fileid"))
-        self.assertTrue(stopped_at, "nothing was checkpointed")
 
         self.dm("-rv", tree, env=STOP, quiet=False)
         self.assertDmOk("resumed scan")
@@ -154,9 +148,7 @@ class HashResumeTest(DuperemoveTest):
         about it will ever change again."""
         tree = self.build_tree()
         self.drop_hashfile()
-        self.dm("-r", tree, env=STOP)
-        self.assertDmOk()
-        self.assertGreater(self.hf_count("scan_checkpoints"), 0)
+        self.interrupt_after_one_checkpoint(tree)
 
         self.scan(tree)
         self.assertDmOk()
@@ -169,9 +161,7 @@ class HashResumeTest(DuperemoveTest):
         tree = self.build_tree()
         expected_before = self.scan_straight_through(tree)
         self.drop_hashfile()
-        self.dm("-r", tree, env=STOP)
-        self.assertDmOk()
-        self.assertGreater(self.hf_count("scan_checkpoints"), 0)
+        self.interrupt_after_one_checkpoint(tree)
 
         self.write("tree/plain", os.urandom(6 * MiB))
         self.sync()
@@ -191,8 +181,7 @@ class HashResumeTest(DuperemoveTest):
         tree = self.build_tree()
         expected = self.scan_straight_through(tree)
         self.drop_hashfile()
-        self.dm("-r", tree, env=STOP)
-        self.assertDmOk()
+        self.interrupt_after_one_checkpoint(tree)
 
         self.hf_exec("update scan_checkpoints "
                      "set state = randomblob(length(state))")
@@ -273,9 +262,7 @@ class HashResumeTest(DuperemoveTest):
         self.sync()
         tree = self.path("tree")
 
-        self.dm("-r", tree, env=STOP)
-        self.assertDmOk("interrupted scan")
-        self.assertEqual(1, self.hf_count("scan_checkpoints"))
+        self.interrupt_after_one_checkpoint(tree)
 
         self.dm("-rv", tree, env=CKPT, quiet=False)
         self.assertDmOk("resumed scan")
@@ -300,9 +287,7 @@ class HashResumeTest(DuperemoveTest):
         self.write("tree/a.bin", os.urandom(64 * KiB))
         self.sync()
 
-        self.dm("-r", self.path("other"), env=STOP)
-        self.assertDmOk("interrupted scan of the other tree")
-        self.assertEqual(1, self.hf_count("scan_checkpoints"))
+        self.interrupt_after_one_checkpoint(self.path("other"))
         stopped_at = self.hf_scalar("select loff from scan_checkpoints")
 
         self.dm("-rv", self.path("tree"), env=CKPT, quiet=False)

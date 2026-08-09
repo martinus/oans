@@ -160,10 +160,7 @@ class ProgressBytesTest(DuperemoveTest):
         self.sync()
 
         # Fresh hashfile forces a full re-analysis of the (already shared) tree.
-        os.unlink(self.hf)
-        for sidecar in (self.hf + "-wal", self.hf + "-shm"):
-            if os.path.exists(sidecar):
-                os.unlink(sidecar)
+        self.drop_hashfile()
 
         _p, events = self._run("-rd", self.path("tree"))
         dedupe = self._dedupe_evs(events)

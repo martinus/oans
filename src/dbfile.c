@@ -962,17 +962,6 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 #define DELETE_CHECKPOINT "delete from scan_checkpoints where fileid = ?1;"
 	dbfile_prepare_stmt(delete_checkpoint, DELETE_CHECKPOINT);
 
-	/*
-	 * Every file left partly hashed, so a run can pick them up immediately
-	 * instead of waiting for the walk to rediscover them (#159). Ordered
-	 * biggest-remainder first, which is the order the csum queue wants them
-	 * in anyway.
-	 */
-#define SELECT_CHECKPOINTED_FILES					\
-"select f.id, f.filename, f.ino, f.subvol, f.size, f.mtime "		\
-"from scan_checkpoints c join files f on f.id = c.fileid "		\
-"order by f.size - c.loff desc;"
-	dbfile_prepare_stmt(select_checkpointed_files, SELECT_CHECKPOINTED_FILES);
 
 	/*
 	 * Move a resumed file into this run's generation (#159). An update, not
@@ -1799,27 +1788,34 @@ static int step_done(sqlite3_stmt *stmt)
 	return ret;
 }
 
-/* Run a statement taking a fileid, and optionally a logical offset. */
-static int run_by_fileid(sqlite3_stmt *stmt, int64_t fileid, const uint64_t *loff)
+/* Run a statement whose only parameter is a fileid. */
+static int run_by_fileid(sqlite3_stmt *stmt, int64_t fileid)
 {
-	int ret;
+	int ret = sqlite3_bind_int64(stmt, 1, fileid);
 
-	ret = sqlite3_bind_int64(stmt, 1, fileid);
-	if (!ret && loff)
-		ret = sqlite3_bind_int64(stmt, 2, *loff);
 	if (ret) {
 		perror_sqlite(ret, "binding values");
 		return ret;
 	}
-
 	return step_done(stmt);
+}
+
+/* ... and one that takes a second value after it. */
+static int run_by_fileid_arg(sqlite3_stmt *stmt, int64_t fileid, uint64_t arg)
+{
+	int ret = sqlite3_bind_int64(stmt, 2, arg);
+
+	if (ret) {
+		perror_sqlite(ret, "binding values");
+		return ret;
+	}
+	return run_by_fileid(stmt, fileid);
 }
 
 int dbfile_remove_extent_hashes(struct dbhandle *db, int64_t fileid)
 {
-	uint64_t all = 0;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.remove_extent_hashes;
-	return run_by_fileid(stmt, fileid, &all);
+	return run_by_fileid_arg(stmt, fileid, 0);
 }
 
 int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff)
@@ -1828,10 +1824,10 @@ int dbfile_remove_hashes_from(struct dbhandle *db, int64_t fileid, uint64_t loff
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *b = db->stmts.remove_block_hashes;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *e = db->stmts.remove_extent_hashes;
 
-	ret = run_by_fileid(b, fileid, &loff);
+	ret = run_by_fileid_arg(b, fileid, loff);
 	if (ret)
 		return ret;
-	return run_by_fileid(e, fileid, &loff);
+	return run_by_fileid_arg(e, fileid, loff);
 }
 
 int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid)
@@ -2001,77 +1997,28 @@ bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
 	return true;
 }
 
-void dbfile_free_checkpointed_files(struct checkpointed_file *v, unsigned int n)
+int dbfile_load_checkpointed_paths(struct dbhandle *db, char ***out, int *nout)
 {
-	if (!v)
-		return;
-	for (unsigned int i = 0; i < n; i++)
-		free(v[i].filename);
-	free(v);
-}
-
-int dbfile_load_checkpointed_files(struct dbhandle *db,
-				   struct checkpointed_file **out,
-				   unsigned int *count)
-{
-	int ret;
-	unsigned int n = 0, cap = 8;
-	struct checkpointed_file *v = calloc(cap, sizeof(*v));
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt =
-		db->stmts.select_checkpointed_files;
-
-	*out = NULL;
-	*count = 0;
-	if (!v)
-		return -ENOMEM;
-
-	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		if (n == cap) {
-			struct checkpointed_file *bigger =
-				realloc(v, cap * 2 * sizeof(*v));
-
-			if (!bigger)
-				goto oom;
-			v = bigger;
-			memset(v + cap, 0, cap * sizeof(*v));
-			cap *= 2;
-		}
-		v[n].id = sqlite3_column_int64(stmt, 0);
-		v[n].filename = strdup((const char *)sqlite3_column_text(stmt, 1));
-		if (!v[n].filename)
-			goto oom;
-		v[n].ino = sqlite3_column_int64(stmt, 2);
-		v[n].subvol = sqlite3_column_int64(stmt, 3);
-		v[n].size = sqlite3_column_int64(stmt, 4);
-		v[n].mtime = sqlite3_column_int64(stmt, 5);
-		n++;
-	}
-
-	if (ret != SQLITE_DONE) {
-		perror_sqlite(ret, "listing checkpointed files");
-		dbfile_free_checkpointed_files(v, n);
-		return ret;
-	}
-
-	*out = v;
-	*count = n;
-	return 0;
-
-oom:
-	dbfile_free_checkpointed_files(v, n);
-	return -ENOMEM;
+	/*
+	 * Biggest remainder first, which is the order the csum queue wants them
+	 * in anyway - though the queue re-sorts, so this is only a tie-break.
+	 */
+	return load_string_rows(db->db,
+				"select f.filename from scan_checkpoints c "
+				"join files f on f.id = c.fileid "
+				"order by f.size - c.loff desc;", out, nout);
 }
 
 int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid)
 {
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.delete_checkpoint;
-	return run_by_fileid(stmt, fileid, NULL);
+	return run_by_fileid(stmt, fileid);
 }
 
 int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
 {
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
-	return run_by_fileid(stmt, fileid, &seq);
+	return run_by_fileid_arg(stmt, fileid, seq);
 }
 
 int dbfile_store_extent_hashes(struct dbhandle *db, int64_t fileid,
