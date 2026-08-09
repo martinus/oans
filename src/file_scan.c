@@ -3037,6 +3037,12 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * once here rather than twice under the write lock below.
 	 */
 	bool inlined = is_inlined(&ctxt);
+	/*
+	 * Recorded now, while the fd is open, because the dedupe phase needs a
+	 * value that cannot change between its generation windows (#197). The
+	 * probe is cached per device, so this is a hash lookup per file.
+	 */
+	bool rdonly_subvol = filescan_fd_is_readonly_subvol(ctxt.fd);
 
 	tprogress->status = thread_waiting_lock;
 	dbfile_lock();
@@ -3071,7 +3077,9 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * of needless work: https://github.com/markfasheh/duperemove/issues/316
 	 */
 	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
-			inlined ? FILE_INLINED : 0);
+			(inlined ? FILE_INLINED : 0) |
+			(rdonly_subvol ? FILE_RO_SUBVOL : 0),
+			ctxt.fiemap->fm_mapped_extents);
 	if (ret) {
 		scan_write_abort();
 		dbfile_unlock();

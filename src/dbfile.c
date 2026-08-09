@@ -410,6 +410,17 @@ static int create_tables(sqlite3 *db)
 	 * after the first hits it - so the error is discarded rather than
 	 * probed for with a PRAGMA table_info round-trip.
 	 */
+	/*
+	 * Extent count as of the scan that recorded the file. The dedupe phase
+	 * ranks a group's members on it to choose a target, and that ranking has
+	 * to give the same answer in every generation window - a live fiemap
+	 * does not, which is #197. Additive, so per CLAUDE.md no DB_FILE_MINOR
+	 * bump: an old hashfile gets the column with 0 everywhere, which ranks
+	 * purely by id, and an older binary never selects it.
+	 */
+	sqlite3_exec(db, "ALTER TABLE files ADD COLUMN nr_extents INTEGER NOT NULL DEFAULT 0",
+		     NULL, NULL, NULL);
+
 	static const char * const run_history_adds[] = {
 		"ALTER TABLE run_history ADD COLUMN skip_permission INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE run_history ADD COLUMN skip_unreadable INTEGER NOT NULL DEFAULT 0",
@@ -758,7 +769,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	dbfile_prepare_stmt(insert_extent, INSERT_EXTENTS);
 
 #define UPDATE_SCANNED_FILE						\
-"UPDATE files SET digest = ?1, flags = ?2 where id = ?3;"
+"UPDATE files SET digest = ?1, flags = ?2, nr_extents = ?4 where id = ?3;"
 	dbfile_prepare_stmt(update_scanned_file, UPDATE_SCANNED_FILE);
 
 #define	UPDATE_EXTENT_POFF						\
@@ -878,6 +889,23 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * mutually shared from their own pass - never need reloading. `grp` is the set
  * of qualifying groups (a member in range, and >1 member overall).
  */
+/*
+ * A generation window's whole-file duplicates: the members new this pass, plus
+ * the group's *target*.
+ *
+ * The target is computed here rather than chosen by the worker, from columns
+ * fixed at scan time, over every member of the group - not just this window's.
+ * That is what makes it the same file in every window (#197). It was previously
+ * min(id) among earlier members, with the first window free to elect someone
+ * else by live fiemap; the two disagreed, so a window could dedupe into a file
+ * that an overlapping earlier window was still relocating, stranding a cluster.
+ *
+ * Ranking: a read-only member first (the kernel will not write one, so it is
+ * the copy that must be the source), then fewest extents as of its scan, then
+ * lowest id to break ties. Every window sees the same rows, so every window
+ * reaches the same answer, and since the target is never a destination it never
+ * moves underneath anyone.
+ */
 #define GET_DUPLICATE_FILES							\
 "with grp(digest, size) as ( "							\
 "	select digest, size from files "				\
@@ -885,17 +913,21 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "		select digest, size from files "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2 "			\
 "		and not (flags & 1)) "						\
-"	group by digest, size having count(*) > 1) "			\
-"select id, size, digest, filename, dedupe_seq from files "			\
-"where not (flags & 1) "						\
-"and (digest, size) in (select digest, size from grp) and ( "		\
-"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
-"	or id in ( "							\
-"		select min(id) from files "				\
-"		where dedupe_seq <= ?1 and not (flags & 1) "		\
-"		and (digest, size) in (select digest, size from grp) "	\
-"		group by digest, size)) "				\
-"order by (dedupe_seq > ?1), id;"
+"	group by digest, size having count(*) > 1), "			\
+"tgt(digest, size, fileid) as ( "					\
+"	select digest, size, id from ( "				\
+"		select digest, size, id, row_number() over ( "		\
+"			partition by digest, size "			\
+"			order by (flags & 2) desc, nr_extents, id) rn "	\
+"		from files where not (flags & 1) "			\
+"		and (digest, size) in (select digest, size from grp)) "	\
+"	where rn = 1) "							\
+"select f.id, f.size, f.digest, f.filename, f.dedupe_seq, "		\
+"       (f.id = t.fileid) as is_target "					\
+"from files f join tgt t on t.digest = f.digest and t.size = f.size "	\
+"where not (f.flags & 1) and ( "					\
+"	(f.dedupe_seq > ?1 and f.dedupe_seq <= ?2) or f.id = t.fileid) "	\
+"order by is_target desc, f.id;"
 	dbfile_prepare_stmt(get_duplicate_files, GET_DUPLICATE_FILES);
 
 #define GET_NONDUPE_EXTENTS						\
@@ -1875,7 +1907,8 @@ out_error:
 }
 
 int dbfile_update_scanned_file(struct dbhandle *db, int64_t fileid,
-				unsigned char *digest, unsigned int flags)
+				unsigned char *digest, unsigned int flags,
+				unsigned int nr_extents)
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_scanned_file;
@@ -1890,6 +1923,10 @@ int dbfile_update_scanned_file(struct dbhandle *db, int64_t fileid,
 		goto bind_error;
 
 	ret = sqlite3_bind_int64(stmt, 3, fileid);
+	if (ret)
+		goto bind_error;
+
+	ret = sqlite3_bind_int64(stmt, 4, nr_extents);
 	if (ret)
 		goto bind_error;
 
@@ -2392,17 +2429,15 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 	}
 
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		unsigned int seq;
 		bool is_anchor;
 
 		fileid = sqlite3_column_int64(stmt, 0);
 		size = sqlite3_column_int64(stmt, 1);
 		digest = (unsigned char *)sqlite3_column_blob(stmt, 2);
 		filename = sqlite3_column_text(stmt, 3);
-		seq = sqlite3_column_int64(stmt, 4);
-		/* A member from an earlier pass (seq <= seq_lo) is the anchor:
-		 * the group must keep it as target so copies keep converging. */
-		is_anchor = seq <= seq_lo;
+		/* The query elects the group's target and sorts it first; the
+		 * worker must not re-elect one (#197). */
+		is_anchor = sqlite3_column_int(stmt, 5) != 0;
 
 		file = filerec_find(fileid);
 		if (!file) {

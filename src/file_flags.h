@@ -13,4 +13,13 @@
  */
 #define FILE_INLINED		0x0001
 
+/*
+ * File lives in a read-only btrfs subvolume, as of the scan that recorded it.
+ * Stored so the dedupe phase can prefer such a file as a group's *source*
+ * without probing the filesystem: the choice has to be identical in every
+ * generation window or the windows disagree about the target (#197), and a
+ * live probe is not (a subvolume can be flipped mid-run).
+ */
+#define FILE_RO_SUBVOL		0x0002
+
 #endif

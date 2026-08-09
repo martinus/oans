@@ -358,56 +358,6 @@ static void clean_deduped(struct dupe_extents **ret_dext,
  * it to the front of the list; the loop below always dedupes against the first
  * entry. Extent-dedupe members are single extents, so this is skipped there.
  */
-static void pick_dedupe_target(struct dupe_extents *dext)
-{
-	struct extent *extent, *best = NULL;
-	unsigned int best_extents = 0;
-	bool best_rdonly = false;
-
-	list_for_each_entry(extent, &dext->de_extents, e_list) {
-		unsigned int n;
-		bool rdonly;
-
-		if (filerec_open(extent->e_file, true))
-			continue;
-		/* Count-only fiemap: we need the extent count, not the map. */
-		n = fiemap_count_extents(extent->e_file->fd, extent->e_loff,
-					 extent_len(extent));
-		/* n == 0 means the fiemap failed; ignore that candidate before
-		 * paying for anything else. */
-		if (!n) {
-			filerec_close(extent->e_file);
-			continue;
-		}
-		rdonly = filescan_fd_is_readonly_subvol(extent->e_file->fd);
-		filerec_close(extent->e_file);
-
-		/*
-		 * Rank on (read-only, then fewest extents).
-		 *
-		 * The kernel is happy to dedupe *into* a read-only subvolume -
-		 * content is byte-verified and never changes, only which
-		 * extents back it - and people rely on that to shrink snapshot
-		 * backups, so this is a preference and never a refusal. What it
-		 * buys: where the destination is reached through a read-only
-		 * *mount* the ioctl does fail (mnt_want_write_file), and
-		 * electing the read-only member as the source is the direction
-		 * that still works. It also leaves snapshots alone in favour of
-		 * rewriting the writable copy, which is the less surprising
-		 * outcome. Among equals the least-fragmented copy still wins.
-		 */
-		if (best == NULL || rdonly > best_rdonly ||
-		    (rdonly == best_rdonly && n < best_extents)) {
-			best = extent;
-			best_extents = n;
-			best_rdonly = rdonly;
-		}
-	}
-
-	if (best)
-		list_move(&best->e_list, &dext->de_extents);
-}
-
 /* Show this group on the thread's status line: target path (the group's first
  * member) plus the bytes the kernel still has to byte-verify as work total. */
 static void slot_show_group(struct pscan_thread *slot, struct dupe_extents *dext)
@@ -488,19 +438,15 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	shared_prev = shared_post = 0ULL;
 
 	/*
-	 * Settle the target first: it is the head of the list, and everything
-	 * below is relative to it. Ordering matters - clean_deduped() culls
-	 * against the target, so a later reorder would leave it having culled
-	 * against the wrong one.
+	 * The target is the head of the list, and everything below is relative
+	 * to it - clean_deduped() culls against it, so nothing may reorder the
+	 * list from here on.
 	 *
-	 * Only for whole files, and only when the group has no anchor from an
-	 * earlier pass - an anchored group must keep its anchor (loaded first)
-	 * as target so every pass converges the copies onto the same physical
-	 * extent. See pick_dedupe_target() for how the target is chosen.
+	 * Whole-file groups get their target elected by the loader, from data
+	 * fixed at scan time, so that every generation window picks the same
+	 * one; electing it here from a live fiemap made windows disagree and
+	 * strand a cluster (#197). See GET_DUPLICATE_FILES.
 	 */
-	if (whole_file_dedup && !dext->de_anchored)
-		pick_dedupe_target(dext);
-
 	/*
 	 * Remove any extents which have already been deduped. This
 	 * will free dext for us if the number of available extents
