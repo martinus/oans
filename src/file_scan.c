@@ -2502,7 +2502,10 @@ static inline bool is_inlined(struct scan_ctxt *ctxt)
 static void scan_workq_push(struct file_to_scan *file)
 {
 	struct scan_workq *q = &scan_workq;
-	unsigned b = scan_bucket(file->filesize);
+	/* Bucket on the work left, not the file's size: a 53 GiB image resumed
+	 * with 1 GiB to go is a small job, and sorting it as a huge one is
+	 * exactly the straggler the largest-first order exists to avoid. */
+	unsigned b = scan_bucket(file->filesize - file->resume.off);
 
 	file->next = NULL;
 	g_mutex_lock(&q->lock);
@@ -2647,13 +2650,20 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	abort_on(!tprogress);
 	tprogress->status = thread_mapping;	/* open + do_fiemap: no bytes yet */
 	/*
-	 * Resuming, the bytes an earlier run already hashed are not this run's
-	 * work: __scan_file() left them out of the global total, so leave them
-	 * out here too or the file would reconcile against a total it was never
-	 * going to reach.
+	 * A resumed file shows its real size with the bytes an earlier run
+	 * already hashed credited up front, so its line reads "3.9 GiB/18.4 GiB
+	 * (21%)" and carries on from there. Reporting only the remainder made
+	 * the line restart near 0% *and* understate the file - a 18.4 GiB movie
+	 * resumed at 3 GiB displayed as 15.4 GiB - which reads exactly like the
+	 * resume having failed.
+	 *
+	 * The global counters are unaffected: this credit never reaches
+	 * total_scanned_bytes, which accrues only bytes actually read, and
+	 * pscan_finish_file() reconciles against the same real size that
+	 * __scan_file() left out of the run-wide total.
 	 */
-	pscan_set_file(tprogress, file->path,
-		       file->filesize - file->resume.off);
+	pscan_set_file(tprogress, file->path, file->filesize);
+	tprogress->file_scanned_bytes = file->resume.off;
 	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
 
 	/* Dummy variables used to trigger the cleanup code */
