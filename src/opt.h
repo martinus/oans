@@ -46,6 +46,7 @@ struct options {
 	unsigned int batch_size;
 	char *hashfile;
 	uint64_t min_filesize;	/* skip regular files smaller than this */
+	uint64_t max_filesize;	/* skip regular files larger than this; 0 = no limit */
 	bool progress_json : 1;	/* stream JSONL progress to stderr, no ANSI UI */
 };
 

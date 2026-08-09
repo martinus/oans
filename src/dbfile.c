@@ -1303,7 +1303,8 @@ int dbfile_store_scan_config(struct dbhandle *dbh, const struct scan_config *sc)
 	    (ret = sync_config_int(stmt, "opt_only_whole_files", sc->only_whole_files)) ||
 	    (ret = sync_config_int(stmt, "opt_do_block_hash", sc->do_block_hash)) ||
 	    (ret = sync_config_int(stmt, "opt_dedupe_same_file", sc->dedupe_same_file)) ||
-	    (ret = sync_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)))
+	    (ret = sync_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)) ||
+	    (ret = sync_config_int(stmt, "opt_max_filesize", (int64_t)sc->max_filesize)))
 		goto err;
 
 	ret = replace_string_rows(db,
@@ -1408,6 +1409,18 @@ int dbfile_load_scan_config(struct dbhandle *dbh, struct scan_config *sc)
 		if (ret)
 			return ret;
 		sc->min_filesize = (uint64_t)mfs;
+
+		/*
+		 * Additive key: a hashfile written before --max-filesize
+		 * existed has no row, and get_config_int64() then leaves the
+		 * caller's value alone - 0, "no upper bound", which is the
+		 * behaviour those runs had.
+		 */
+		mfs = 0;
+		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+		if (ret)
+			return ret;
+		sc->max_filesize = (uint64_t)mfs;
 	}
 
 	ret = load_string_rows(db, "select path from scan_roots order by rowid;",

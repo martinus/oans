@@ -124,6 +124,8 @@ static char *scan_config_options_str(const struct scan_config *sc)
 		g_string_append(s, "--skip-readonly-subvols ");
 	if (sc->min_filesize > 1)
 		g_string_append_printf(s, "--min-filesize=%"PRIu64" ", sc->min_filesize);
+	if (sc->max_filesize)
+		g_string_append_printf(s, "--max-filesize=%"PRIu64" ", sc->max_filesize);
 
 	if (sc->only_whole_files)
 		dtok[nd++] = "only_whole_files";
@@ -769,6 +771,7 @@ enum {
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
+	MAX_FILESIZE_OPTION,
 	STATS_OPTION,
 	PRUNE_BLOCKS_OPTION,
 	HISTORY_OPTION,
@@ -838,6 +841,7 @@ static void help(void)
 "  -b SIZE                     hashing block size, 4K-1M (default 128K)\n"
 "  -B, --batchsize=N           dedupe every N scanned files (default 1024)\n"
 "  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
+"      --max-filesize=SIZE     skip files larger than SIZE (default: no limit)\n"
 "      --skip-zeroes           detect and skip all-zero blocks\n"
 "      --exclude=PATTERN       exclude matching paths (may be repeated)\n"
 "      --dedupe-options=OPT    [no]same, [no]partial, [no]only_whole_files\n"
@@ -894,6 +898,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
+		{ "max-filesize", 1, NULL, MAX_FILESIZE_OPTION },
 		{ "stats", 0, NULL, STATS_OPTION },
 		{ "prune-block-hashes", 0, NULL, PRUNE_BLOCKS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
@@ -1011,6 +1016,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 				return EINVAL;
 			}
 			break;
+		case MAX_FILESIZE_OPTION:
+			options.max_filesize = parse_size(optarg);
+			if (options.max_filesize == 0) {
+				eprintf("Error: --max-filesize must be greater than zero\n");
+				return EINVAL;
+			}
+			break;
 		case EXCLUDE_OPTION:
 			/*
 			 * A rejected pattern is a typo in the command line, and
@@ -1063,6 +1075,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	*filelist_idx = optind;
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
+
+	if (options.max_filesize && options.max_filesize < options.min_filesize) {
+		eprintf("Error: --max-filesize (%"PRIu64") is below "
+			"--min-filesize (%"PRIu64"); no file could be "
+			"scanned.\n", options.max_filesize, options.min_filesize);
+		return 1;
+	}
 
 	/* -L/-R/--stats/--history/--json are mutually exclusive report modes. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
@@ -1628,6 +1647,7 @@ static int apply_scan_config(const struct scan_config *sc)
 	options.do_block_hash = sc->do_block_hash;
 	options.dedupe_same_file = sc->dedupe_same_file;
 	options.min_filesize = sc->min_filesize;
+	options.max_filesize = sc->max_filesize;
 
 	/*
 	 * A stored pattern that no longer parses must stop the run, for the
@@ -1751,6 +1771,7 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	sc.do_block_hash = options.do_block_hash;
 	sc.dedupe_same_file = options.dedupe_same_file;
 	sc.min_filesize = options.min_filesize;
+	sc.max_filesize = options.max_filesize;
 	sc.roots = abs;
 	sc.excludes = user_excludes;
 	sc.nexcludes = n_user_excludes;

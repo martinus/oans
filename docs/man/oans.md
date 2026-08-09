@@ -146,6 +146,24 @@ file is recorded once.
     accepted). Trees full of tiny files scan much faster this way, since such
     files rarely dedupe usefully. Default **1**, which skips only empty files.
 
+<!-- Keep the blank line between this term and its `~` body below: without it
+     pandoc >=3.9 collapses this multi-paragraph definition into a single block. -->
+**\--max-filesize**=*SIZE*
+
+  ~ Skip regular files larger than *SIZE* bytes (suffixes `K`/`M`/`G`
+    accepted). By default there is no upper bound. Use it to leave VM images or
+    backup archives to other tooling, or to bound the worst-case time spent on
+    a single file. A file of exactly *SIZE* bytes is still scanned. It is an
+    error to give a *SIZE* below **\--min-filesize**, since nothing could then
+    be scanned.
+
+    <!-- -->
+
+    Like **\--min-filesize**, this shapes only what is *scanned*. A file hashed
+    by an earlier run and excluded by a later **\--max-filesize** keeps its rows
+    until it is deleted from disk — pruning is by existence, not by whether a
+    run covered the file — so it is simply not re-scanned, and never re-deduped.
+
 **\--skip-zeroes**
   ~ Detect and skip all-zero blocks while reading. Speeds up scanning of sparse
     or zero-filled data, at the cost of not deduplicating runs of zeroes.
