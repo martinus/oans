@@ -305,6 +305,18 @@ run picks the file up there.
   Extent rows are only ever written by a checkpoint, so none exist past one;
   block rows flush on their own batch cadence (#161) and can, hence
   `dbfile_remove_hashes_from()` on resume.
+- **Restarting converges, but only above the commit interval.** Measured on a
+  30 GiB / 6006-file tree with repeated `SIGKILL`s: everything ends up hashed,
+  no checkpoints left. The floor is `COMMIT_INTERVAL_SEC` (10 s) — nothing is
+  durable until the batched writer commits, so **killing more often than that
+  loops forever at zero progress**. Pre-existing, and this change strictly
+  improves it: at 1.4 s kills v1.9.1 persisted 0 files over six rounds, where
+  this code reached 1875 before stalling, because a checkpoint force-commits the
+  whole shared batch. **There is no signal handler anywhere in the tree**, so
+  Ctrl-C discards the open batch exactly as `SIGKILL` does (measured: both
+  persisted 0 at 3 s). "Ctrl-C is safe" means the hashfile is not corrupted, not
+  that the run's work is kept. A SIGINT handler that flushes would raise the
+  floor; nobody has built one.
 - Test hooks: `DUPEREMOVE_CHECKPOINT_BYTES` lowers the interval,
   `DUPEREMOVE_CHECKPOINT_STOP=N` abandons a file after N checkpoints — an
   interrupted run, deterministically, rather than racing a signal against a read.
