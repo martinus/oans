@@ -81,10 +81,12 @@ struct dbfile_config dbfile_cfg;
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
+	declare_display_path(disp, filename);
+
 	if (verbose)
-		printf("%s\t%s\t%s\n", filename, ino, subvol);
+		printf("%s\t%s\t%s\n", disp, ino, subvol);
 	else
-		printf("%s\n", filename);
+		printf("%s\n", disp);
 }
 
 /* Human duration for the timing lines: ms under a second, else seconds. */
@@ -266,18 +268,26 @@ static int print_hashfile_stats(char *filename)
 		if (dbfile_load_scan_config(db, &sc) > 0) {
 			char *opts = scan_config_options_str(&sc);
 
+			/* escape-ok: the hashfile is oans's own --hashfile
+			 * argument, not a name found in a scanned tree. */
 			printf("\n%s%sstored scan%s   %s(replayed by: oans --hashfile=%s)%s\n",
 			       col_bold, col_blue, col_reset, col_dim, filename, col_reset);
 			printf("  %soptions%s         %s\n", col_dim, col_reset, opts);
 			free(opts);
-			for (i = 0; i < sc.nroots; i++)
+			for (i = 0; i < sc.nroots; i++) {
+				declare_display_path(disp, sc.roots[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "paths      " : "           ",
-				       col_reset, sc.roots[i]);
-			for (i = 0; i < sc.nexcludes; i++)
+				       col_reset, disp);
+			}
+			for (i = 0; i < sc.nexcludes; i++) {
+				declare_display_path(disp, sc.excludes[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "excludes   " : "           ",
-				       col_reset, sc.excludes[i]);
+				       col_reset, disp);
+			}
 			fflush(stdout);
 			scan_config_free(&sc);
 		}
@@ -380,8 +390,11 @@ static int print_hashfile_stats(char *filename)
 		snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(top[i].size),
 			 top[i].count);
 		snprintf(wb, sizeof(wb), "%s", human_size(top[i].waste));
+		const char *raw = top[i].path ? top[i].path : "";
+		declare_display_path(example, raw);
+
 		printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb, col_reset,
-		       top[i].path ? top[i].path : "");
+		       example);
 		free(top[i].path);
 	}
 	fflush(stdout);
@@ -400,14 +413,20 @@ static void print_json_str(const char *s)
 {
 	putchar('"');
 	for (; *s; s++) {
-		unsigned char c = (unsigned char)*s;
+		unsigned char c = (unsigned char)*s, cp;
+		/* Same policy as sanitize_ctrl(), a different rendering: JSON
+		 * spells a dangerous byte \u00NN. Asking one classifier keeps
+		 * the two from drifting apart. */
+		size_t n = ctrl_seq_len((const unsigned char *)s, &cp);
 
-		if (c == '"' || c == '\\')
+		if (n) {
+			printf("\\u%04x", cp);
+			s += n - 1;
+		} else if (c == '"' || c == '\\') {
 			printf("\\%c", c);
-		else if (c < 0x20)
-			printf("\\u%04x", c);
-		else
+		} else {
 			putchar(c);
+		}
 	}
 	putchar('"');
 }
@@ -688,10 +707,14 @@ static int rm_db_files(int numfiles, char **files)
 			continue;
 		}
 
-		if (dbfile_remove_file(db, name))
+		if (dbfile_remove_file(db, name)) {
 			ret = -1;
-		else
-			vprintf("Removed \"%s\" from hashfile.\n", name);
+		} else if (verbose) {
+			declare_display_path(disp, name);
+
+			vprintf("Removed \"%s\" from hashfile.\n",
+				disp);
+		}
 	}
 	return ret;
 }
@@ -782,7 +805,10 @@ enum {
 static int add_one_stdin_file(char *path, void *db)
 {
 	if (scan_file(path, db)) {
-		eprintf("Error: cannot add %s into the lookup list\n", path);
+		declare_display_path(disp, path);
+
+		eprintf("Error: cannot add %s into the lookup list\n",
+			disp);
 		return 1;
 	}
 	return 0;
@@ -1689,8 +1715,11 @@ static int apply_scan_config(const struct scan_config *sc)
 		eprintf("         Re-run once with -d and the paths to update "
 			"it:\n           oans -%sd --hashfile=%s",
 			sc->recurse ? "r" : "", options.hashfile);
-		for (i = 0; i < sc->nroots; i++)
-			eprintf(" %s", sc->roots[i]);
+		for (i = 0; i < sc->nroots; i++) {
+			declare_display_path(root, sc->roots[i]);
+
+			eprintf(" %s", root);
+		}
 		eprintf("\n");
 	}
 
@@ -1717,8 +1746,10 @@ static int drop_missing_roots(struct scan_config *sc, int *dropped)
 		if (stat(sc->roots[i], &st) == 0) {
 			sc->roots[live++] = sc->roots[i];
 		} else {
+			declare_display_path(disp, sc->roots[i]);
+
 			eprintf("Warning: stored path \"%s\" no longer exists, "
-				"skipping.\n", sc->roots[i]);
+				"skipping.\n", disp);
 			free(sc->roots[i]);
 			(*dropped)++;
 		}
@@ -1758,9 +1789,11 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 		 * and the "all roots gone" guard never fires, because the root
 		 * was never stored to go missing.
 		 */
+		declare_display_path(root, roots[i]);
+
 		eprintf("Warning: not storing root \"%s\" in the hashfile: %s. "
 			"A later replay of this hashfile will not cover it.\n",
-			roots[i], strerror(errno));
+			root, strerror(errno));
 	}
 
 	sc.run_dedupe = options.run_dedupe;

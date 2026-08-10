@@ -116,16 +116,6 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 	struct dupe_extents *dext;
 	struct extent *extent;
 	char *kind;
-	/*
-	 * Grown to fit the longest path in the report rather than fixed at
-	 * PATH_MAX: a path may now exceed it (#117), and this report is what a
-	 * user feeds back to -R. A fixed buffer truncated such a path to a
-	 * string that still looked valid but named the parent directory, making
-	 * two distinct members of a group print identically. One buffer for the
-	 * whole report, not one allocation per printed line.
-	 */
-	_cleanup_(freep) char *clean = NULL;
-	size_t clean_sz = 0;
 
 	if (whole_file)
 		kind = "files";
@@ -151,26 +141,17 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 		printf("\n");
 		printf("Start\t\tFilename\n");
 		list_for_each_entry(extent, &dext->de_extents, e_list) {
-			const char *name = extent->e_file->filename;
-			/* sanitize_ctrl() never expands: its worst case is two
-			 * input bytes -> one '?'. */
-			size_t need = strlen(name) + 1;
+			/*
+			 * Sized to the whole escaped name rather than a fixed
+			 * buffer: a path may exceed PATH_MAX (#117), and this
+			 * report is what a user feeds back to -R - truncating
+			 * one to a valid-looking parent directory made two
+			 * distinct members of a group print identically.
+			 */
+			declare_display_path(name, extent->e_file->filename);
 
-			if (need > clean_sz) {
-				char *grown = realloc(clean, need);
-
-				if (!grown) {
-					eprintf("Memory allocation failed\n");
-					return;
-				}
-				clean = grown;
-				clean_sz = need;
-			}
-			/* Default (non-quiet) output: keep control bytes in a
-			 * filename from reaching the terminal (#353). */
-			sanitize_ctrl(name, clean, clean_sz);
 			printf("%s\t\"%s\"\n",
-			       pretty_size(extent->e_loff), clean);
+			       pretty_size(extent->e_loff), name);
 		}
 
 		node = rb_next(node);
@@ -231,10 +212,13 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 				status_str = strerror(-target_status);
 			atomic_fetch_add(&dedupe_dest_errors, 1);
 		}
-		vprintf("[%p] Dedupe for file \"%s\" had status (%d) "
-			"\"%s\".\n",
-			g_thread_self(), f->filename, target_status,
-			status_str);
+		if (verbose) {
+			declare_display_path(disp, f->filename);
+
+			vprintf("[%p] Dedupe for file \"%s\" had status (%d) "
+				"\"%s\".\n", g_thread_self(), disp,
+				target_status, status_str);
+		}
 	}
 }
 
@@ -330,9 +314,12 @@ static void clean_deduped(struct dupe_extents **ret_dext,
 		    disk_extent_grew(dext, extent))
 			continue;
 
-		dprintf("Remove extent (\"%s\", %"PRIu64", %"PRIu64")\n",
-			extent->e_file->filename, extent_poff(extent),
-			extent_plen(extent));
+		if (debug) {
+			declare_display_path(disp, extent->e_file->filename);
+
+			dprintf("Remove extent (\"%s\", %"PRIu64", %"PRIu64")\n",
+				disp, extent_poff(extent), extent_plen(extent));
+		}
 
 		g_mutex_lock(&mutex);
 		/* Cascades to a full free once fewer than two members remain. */
@@ -534,13 +521,18 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			     (uint64_t)st.st_size != len :
 			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
 				atomic_fetch_add(&dedupe_dest_changed, 1);
-				vprintf("%s: size changed since the scan (now "
-					"%llu bytes, needs at least %llu). "
-					"Skipped - the next scan will re-hash "
-					"it.\n",
-					extent->e_file->filename,
-					(unsigned long long)st.st_size,
-					(unsigned long long)(extent->e_loff + len));
+				if (verbose) {
+					declare_display_path(disp,
+						extent->e_file->filename);
+
+					vprintf("%s: size changed since the "
+						"scan (now %llu bytes, needs at "
+						"least %llu). Skipped - the next "
+						"scan will re-hash it.\n", disp,
+						(unsigned long long)st.st_size,
+						(unsigned long long)
+						(extent->e_loff + len));
+				}
 				/* stays on open_files; closed with the group */
 				if (ctxt && last)
 					goto run_dedupe;
@@ -548,9 +540,15 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			}
 		}
 
-		vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
-			g_thread_self(), extent->e_file->filename,
-			pretty_size(extent->e_loff), extent->e_file->fd);
+		if (verbose) {
+			declare_display_path(disp, extent->e_file->filename);
+
+			vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
+				g_thread_self(),
+				disp,
+				pretty_size(extent->e_loff),
+				extent->e_file->fd);
+		}
 
 		if (ctxt == NULL) {
 			if (tgt_extent == NULL) {
@@ -669,6 +667,8 @@ run_dedupe:
 		 */
 		if (ctxt->num_queued) {
 			if (verbose) {
+				declare_display_path(disp, ctxt->ioctl_file->filename);
+
 				g_mutex_lock(&console_mutex);
 				printf("[%p] Dedupe %u extents (id: ",
 				       g_thread_self(), ctxt->num_queued);
@@ -677,7 +677,7 @@ run_dedupe:
 				       "\"%s\"\n",
 				       pretty_size(ctxt->orig_file_off),
 				       pretty_size(ctxt->orig_len),
-				       ctxt->ioctl_file->filename);
+				       disp);
 				g_mutex_unlock(&console_mutex);
 			}
 

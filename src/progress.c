@@ -470,7 +470,11 @@ static bool slot_is_idle(struct pscan_thread *t)
 static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 {
 	char buf[BUF_LEN];
-	char path[PATH_MAX + 4], clean[PATH_MAX + 1];
+	/* An escaped path can be several times its own length, and the row is
+	 * ellipsized to the terminal width afterwards anyway - so size `clean`
+	 * for the worst case rather than truncate a name into a different one. */
+	char path[PATH_MAX + 4], clean[SANITIZE_CTRL_MAX * PATH_MAX + 1];
+	const char *src = t->file_path;
 	char m_plain[160], m_col[512];
 	const char *word = status_word(t->status);
 	const char *wcol = status_color(t->status);
@@ -526,9 +530,18 @@ static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 	 */
 	termw = (int)(w_col == UINT_MAX ? 80 : w_col);
 	avail = termw - WORKER_LEFT_W - (int)strlen(m_plain) - 2;	/* -2: gap before metrics */
-	/* Never emit raw control bytes from a filename to the terminal (#353). */
-	sanitize_ctrl(t->file_path, clean, sizeof(clean));
-	ellipsize_path(clean, path, sizeof(path), avail);
+	/*
+	 * Never emit raw control bytes from a filename to the terminal (#353).
+	 * This runs per worker row per redraw (~10 Hz), so a name that needs
+	 * nothing done to it - every real one - skips the copy entirely.
+	 * Escape before ellipsizing, not after: escaping widens the string, so
+	 * budgeting on the raw path could wrap the row.
+	 */
+	if (has_ctrl(t->file_path)) {
+		sanitize_ctrl(t->file_path, clean, sizeof(clean));
+		src = clean;
+	}
+	ellipsize_path(src, path, sizeof(path), avail);
 
 	snprintf(buf, BUF_LEN, "%s%3u%s  %s%-*s%s  %s  %s",
 		 col_dim, slot, col_reset,

@@ -169,12 +169,16 @@ integration-valgrind: oans
 	fi; \
 	echo "valgrind: no findings"
 
-# Guard the long-path invariant (#117): no syscall may take a scanned file's
-# path as a single argument, or it silently ENAMETOOLONGs and drops the file.
-# See scripts/lint-longpath.py for the waiver syntax.
+# Source invariants that a compiler cannot express, each with its own waiver
+# syntax (see the scripts):
+#   longpath (#117) - no syscall may take a scanned file's path as a single
+#     argument, or it silently ENAMETOOLONGs and the file is dropped;
+#   escape (#202) - no scanned file's name may be printed unescaped, or a
+#     crafted name rewrites the terminal.
 .PHONY: lint
 lint:
 	@python3 scripts/lint-longpath.py
+	@python3 scripts/lint-escape.py
 
 .PHONY: check
 check: lint test integration

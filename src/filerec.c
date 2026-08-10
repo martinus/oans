@@ -255,9 +255,13 @@ int filerec_open(struct filerec *file, bool quiet)
 		fd = longpath_open(file->filename, O_RDONLY);
 		if (fd == -1) {
 			ret = errno;
-			if (ret != ENOENT || !quiet)
+			if (ret != ENOENT || !quiet) {
+				declare_display_path(disp, file->filename);
+
 				eprintf("Error %d: %s while opening \"%s\"\n",
-					ret, strerror(ret), file->filename);
+					ret, strerror(ret),
+					disp);
+			}
 			goto out_unlock;
 		}
 

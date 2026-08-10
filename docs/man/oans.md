@@ -462,6 +462,20 @@ reports as shared — and counts the surviving copy as shared too, so for pairs 
 is about twice **Reclaimed**. Scripts that parsed this line from upstream
 duperemove continue to work.
 
+## File names in output
+
+A file name is untrusted input: anyone who can create a file inside a scanned
+tree chooses bytes that `oans` then writes to your terminal. So wherever a path
+is printed — reports, the **-L** listing, **\--stats**, error messages and the
+live progress display — control characters in it are escaped: tab, newline and
+carriage return as `\t`, `\n`, `\r`, every other C0 control, DEL and the C1
+controls as `\xNN`. Valid UTF-8 is untouched, so ordinary names print exactly as
+they are. Escaping is unconditional, whether or not output is a terminal.
+
+The escape is meant to be read, not parsed back into a path: a name containing a
+literal backslash is passed through unchanged. **\--json** escapes the same
+characters as `\u00NN`, per JSON.
+
 On a **compressed** btrfs, **Reclaimed** is a *logical* figure: dedupe shares
 logical extents but frees compressed blocks, so the real on-disk saving is
 smaller, roughly by your compression ratio. For ground truth compare `compsize`
