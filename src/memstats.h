@@ -17,6 +17,8 @@
 #ifndef	__MEMSTATS_H__
 #define	__MEMSTATS_H__
 
+#include <stdbool.h>
+
 #include "glib.h"
 
 /*
@@ -107,5 +109,12 @@ declare_alloc_tracking_header(filerec_token);
 declare_alloc_tracking_header(file_hash_head);
 /* Can be called anywhere we want to dump the above statistics */
 void print_mem_stats(void);
+
+/*
+ * DUPEREMOVE_MEM_STATS=1: print an RSS attribution at each phase boundary
+ * (#208). Off by default and read once, so an unset run pays one branch.
+ */
+bool mem_stats_wanted(void);
+void print_mem_breakdown(const char *when);
 
 #endif	/* __MEMSTATS_H__ */

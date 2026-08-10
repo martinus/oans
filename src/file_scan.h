@@ -198,6 +198,23 @@ void filescan_free(void);
 void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits);
 
 /*
+ * What the scan's own per-file tables cost, for the DUPEREMOVE_MEM_STATS
+ * breakdown (#208). Both are proportional to the tree, so they are the two
+ * candidates for "where does the RSS of a multi-million-file scan go".
+ */
+struct scan_mem_stats {
+	uint64_t seen_inodes;		/* entries in the hardlink-guard set */
+	uint64_t seen_inodes_bytes;	/* its slots + occupancy bitmap */
+	uint64_t seen_files_bytes;	/* the prune bitmap, 1 bit per file id */
+	uint64_t walk_queued;		/* peak files listed but not yet consumed */
+	uint64_t walk_item_bytes;	/* ... at this much each, plus the path */
+	uint64_t csum_queued;		/* peak files queued but not yet hashed */
+	uint64_t csum_item_bytes;
+};
+
+void filescan_get_mem_stats(struct scan_mem_stats *st);
+
+/*
  * Diagnostic ETA-calibration counters (DUPEREMOVE_SCAN_STATS): summed per-file
  * overhead (setup + finalize + DB write) and read+hash time, with their file
  * and byte counts. overhead/file over hash/byte is the ideal ETA file weight.

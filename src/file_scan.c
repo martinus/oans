@@ -139,12 +139,15 @@ _Static_assert(63 - (SCAN_BUCKET_FLOOR_LOG2 - 1) < SCAN_NBUCKETS,
 struct scan_workq {
 	GMutex lock;
 	GCond cond;			/* signalled on push and on drain */
+	GCond drained;			/* signalled when a pop frees a slot */
 	struct file_to_scan *head[SCAN_NBUCKETS];	/* per-bucket FIFO */
 	struct file_to_scan *tail[SCAN_NBUCKETS];
 	uint64_t occupied;		/* bit b set iff bucket b is non-empty */
 	GThread **workers;
 	unsigned int nworkers;
 	bool draining;			/* no more pushes; drain, then workers exit */
+	uint64_t queued;		/* live items, for the memory breakdown */
+	uint64_t queued_max;		/* ... and its high-water mark (#208) */
 };
 static struct scan_workq scan_workq;
 
@@ -1273,6 +1276,47 @@ static GAsyncQueue	*walk_fileq;	/* struct scan_item* for the consumer */
  */
 static gint		walk_dir_pending;
 static unsigned int	walk_nthreads;
+/*
+ * Depth of walk_fileq and its high-water mark. The walk runs far ahead of the
+ * single __scan_file() consumer, so this backlog - a whole statx plus a path
+ * per listed file - is a memory term nobody had measured (#208). Written by
+ * many walkers and one consumer, so atomic; the max is only a diagnostic, so a
+ * racing update losing to another is fine.
+ */
+static _Atomic uint64_t	walk_fileq_depth;
+static _Atomic uint64_t	walk_fileq_max;
+static GMutex		walk_fileq_lock;	/* guards the backpressure wait */
+static GCond		walk_fileq_cond;
+
+/*
+ * How far the walk may run ahead of the single __scan_file() consumer, and the
+ * consumer ahead of the csum pool (#208).
+ *
+ * Both queues used to be unbounded, and on a large tree that is where the
+ * memory went: measured on 1.2M files, the walk queue peaked at 828k items
+ * (~200 MiB of statx + path) and the csum queue at 1.04M (~130 MiB of request
+ * + strdup'd path), against 32 MiB for seen_inodes and 67 MiB for every SQLite
+ * page cache put together.
+ *
+ * Running further ahead buys nothing: the consumer is the serial stage, so a
+ * backlog beyond "enough to never starve" is pure resident memory. A few
+ * thousand files is seconds of work at the ~13k files/s the consumer sustains.
+ */
+#define WALK_QUEUE_MAX	8192
+
+static unsigned int walk_queue_max = WALK_QUEUE_MAX;
+
+/*
+ * Wake blocked producers only once the queue is half empty, not on the first
+ * slot to free. Without the hysteresis a queue held at the cap signals on every
+ * single pop - one wakeup per file, which showed up as ~40% more sys time on
+ * the tiny-file profiles for no wall-clock gain. Refilling in batches costs
+ * nothing: the consumer still has half a queue in hand while the walkers run.
+ */
+static inline unsigned int queue_wake_at(void)
+{
+	return walk_queue_max / 2;
+}
 
 static void dirq_stop_walkers(void)
 {
@@ -1309,6 +1353,24 @@ static void fileq_push(const char *path, struct statx *st)
 	}
 	it->st = *st;
 	memcpy(it->path, path, n);
+
+	/*
+	 * Backpressure. Safe from any walker: the consumer never waits on a
+	 * walker, it only pops - so a full queue always drains. The WALK_STOP
+	 * sentinel bypasses this, since nothing would ever drain it.
+	 */
+	g_mutex_lock(&walk_fileq_lock);
+	while (atomic_load(&walk_fileq_depth) >= walk_queue_max)
+		g_cond_wait(&walk_fileq_cond, &walk_fileq_lock);
+	g_mutex_unlock(&walk_fileq_lock);
+
+	{
+		uint64_t d = atomic_fetch_add(&walk_fileq_depth, 1) + 1;
+
+		if (d > atomic_load_explicit(&walk_fileq_max, memory_order_relaxed))
+			atomic_store_explicit(&walk_fileq_max, d,
+					      memory_order_relaxed);
+	}
 	g_async_queue_push(walk_fileq, it);
 }
 
@@ -1513,6 +1575,11 @@ int filescan_walk_run(struct dbhandle *db)
 
 		if (it == WALK_STOP)
 			break;
+		if (atomic_fetch_sub(&walk_fileq_depth, 1) == queue_wake_at() + 1) {
+			g_mutex_lock(&walk_fileq_lock);
+			g_cond_broadcast(&walk_fileq_cond);
+			g_mutex_unlock(&walk_fileq_lock);
+		}
 		if (!ret)
 			ret = __scan_file(it->path, db, &it->st);
 		free(it);
@@ -2643,12 +2710,21 @@ static void scan_workq_push(struct file_to_scan *file)
 
 	file->next = NULL;
 	g_mutex_lock(&q->lock);
+	/*
+	 * Same bound, same reasoning: the workers only ever pop, so waiting
+	 * here cannot deadlock. Bounding this narrows the window the
+	 * largest-first order sorts over; measured neutral (see #208).
+	 */
+	while (q->queued >= walk_queue_max)
+		g_cond_wait(&q->drained, &q->lock);
 	if (q->occupied & (1ULL << b))
 		q->tail[b]->next = file;
 	else
 		q->head[b] = file;
 	q->tail[b] = file;
 	q->occupied |= (1ULL << b);
+	if (++q->queued > q->queued_max)
+		q->queued_max = q->queued;
 	g_cond_signal(&q->cond);
 	g_mutex_unlock(&q->lock);
 }
@@ -2670,6 +2746,8 @@ static struct file_to_scan *scan_workq_pop(struct scan_workq *q)
 		return NULL;		/* draining and empty: worker exits */
 	}
 	b = highest_set_bit(q->occupied);	/* biggest non-empty bucket */
+	if (q->queued-- == queue_wake_at() + 1)
+		g_cond_broadcast(&q->drained);
 	file = q->head[b];
 	q->head[b] = file->next;
 	if (!q->head[b]) {
@@ -3384,6 +3462,27 @@ static void seen_inodes_free(void)
 	seen_count = 0;
 }
 
+void filescan_get_mem_stats(struct scan_mem_stats *st)
+{
+	g_mutex_lock(&scan_workq.lock);
+	st->csum_queued = scan_workq.queued_max;
+	g_mutex_unlock(&scan_workq.lock);
+	/*
+	 * The walk queue holds a struct scan_item per listed-but-not-consumed
+	 * file - a whole statx plus the path - and the csum queue a
+	 * file_to_scan per queued-but-not-hashed one. Both are backlogs of the
+	 * *walk running ahead of the single consumer*, so both scale with how
+	 * far ahead it gets, not with the tree.
+	 */
+	st->walk_queued = atomic_load(&walk_fileq_max);
+	st->walk_item_bytes = sizeof(struct scan_item);
+	st->csum_item_bytes = sizeof(struct file_to_scan);
+	st->seen_inodes = seen_count;
+	st->seen_inodes_bytes = seen_cap * sizeof(*seen_slots) +
+				((seen_cap + 63) / 64) * sizeof(*seen_used);
+	st->seen_files_bytes = seen_files_nwords * sizeof(uint64_t);
+}
+
 void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
 {
 	*pops = atomic_load_explicit(&scan_pop_total, memory_order_relaxed);
@@ -3409,6 +3508,18 @@ void filescan_init(void)
 
 		if (v > 0)
 			checkpoint_interval = v;
+	}
+
+	{
+		/* Bench hook for the #208 A/B; 0 restores the old unbounded
+		 * queues. Not a user-facing knob. */
+		const char *q = getenv("DUPEREMOVE_QUEUE_MAX");
+
+		if (q) {
+			unsigned long v = strtoul(q, NULL, 10);
+
+			walk_queue_max = v ? (unsigned int)v : UINT_MAX;
+		}
 	}
 
 	if (stop_env) {

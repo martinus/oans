@@ -16,13 +16,20 @@
  */
 
 
+#include <malloc.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
+#include <unistd.h>
 #include <sqlite3.h>
 
 #include "memstats.h"
+#include "debug.h"
+#include "file_scan.h"
+#include "filerec.h"
+#include "util.h"
 
 void print_mem_stats(void)
 {
@@ -40,4 +47,71 @@ void print_mem_stats(void)
 	sqlite3_memused = sqlite3_memory_used();
 	printf("Sqlite3 used: %"PRIu64"  highwater: %"PRIu64"\n",
 	       sqlite3_memused, sqlite3_highwater);
+}
+
+/* Resident set size, in bytes, from /proc/self/statm (field 2, in pages). */
+static uint64_t rss_bytes(void)
+{
+	unsigned long long total, resident = 0;
+	FILE *f = fopen("/proc/self/statm", "re");
+
+	if (!f)
+		return 0;
+	if (fscanf(f, "%llu %llu", &total, &resident) != 2)
+		resident = 0;
+	fclose(f);
+	return (uint64_t)resident * (uint64_t)sysconf(_SC_PAGESIZE);
+}
+
+bool mem_stats_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0)
+		wanted = getenv("DUPEREMOVE_MEM_STATS") != NULL;
+	return wanted == 1;
+}
+
+/*
+ * One line per source of memory, at the moment `when` names (#208).
+ *
+ * Attribution, not a total: RSS is what the kernel charges the process, and the
+ * lines below are what oans can account for. The gap between them is glibc's
+ * arenas holding freed chunks, thread stacks, and the binary itself - which is
+ * exactly what has to be measured before deciding whether any of the per-file
+ * structures is worth shrinking.
+ *
+ * sqlite is asked for its high-water mark as well as its current use, because
+ * the page caches fill toward their per-connection cap and then stay: the peak
+ * is the figure a memory budget has to be built from.
+ */
+void print_mem_breakdown(const char *when)
+{
+	struct scan_mem_stats scan;
+	struct mallinfo2 mi = mallinfo2();
+	uint64_t rss = rss_bytes();
+	uint64_t sql = (uint64_t)sqlite3_memory_used();
+	uint64_t sql_peak = (uint64_t)sqlite3_memory_highwater(0);
+
+	filescan_get_mem_stats(&scan);
+
+	eprintf("mem-stats [%s]\n", when);
+	eprintf("  rss                 %10s\n", human_size(rss));
+	eprintf("  malloc in use       %10s (arena %s, mmap %s)\n",
+		human_size(mi.uordblks), human_size(mi.arena),
+		human_size(mi.hblkhd));
+	eprintf("  sqlite now/peak     %10s / %s\n",
+		human_size(sql), human_size(sql_peak));
+	eprintf("  walk queue peak    ~%10s (%"PRIu64" items)\n",
+		human_size(scan.walk_queued * scan.walk_item_bytes),
+		scan.walk_queued);
+	eprintf("  csum queue peak    ~%10s (%"PRIu64" items)\n",
+		human_size(scan.csum_queued * scan.csum_item_bytes),
+		scan.csum_queued);
+	eprintf("  seen_inodes         %10s (%"PRIu64" entries)\n",
+		human_size(scan.seen_inodes_bytes), scan.seen_inodes);
+	eprintf("  seen_files bitmap   %10s\n",
+		human_size(scan.seen_files_bytes));
+	eprintf("  filerecs            %10s (%llu live)\n",
+		human_size(num_filerecs * sizeof(struct filerec)), num_filerecs);
 }

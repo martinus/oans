@@ -168,6 +168,48 @@ in `tests/`; no shell tests.
 
 ## Hashfile / SQLite gotchas
 
+## Where a multi-million-file scan's memory actually goes (#208)
+
+Measured on a **1.2M-file** tree, cold (`DUPEREMOVE_MEM_STATS=1`, which prints an
+RSS attribution at each phase boundary — `src/memstats.c`):
+
+| | at end of scan |
+|---|---|
+| **walk queue peak** | **828k items, ~200 MiB** |
+| **csum queue peak** | **1.04M items, ~130 MiB** with paths |
+| SQLite (all connections) | 67 MiB (171 MiB peak incl. dedupe) |
+| `seen_inodes` | 32 MiB (1.2M entries = **28 B/file**) |
+| `seen_files` bitmap | 256 KiB |
+
+**The dominant per-file term was the walk running ahead of the single
+`__scan_file()` consumer**, which nobody had measured — not `seen_inodes`, and
+not the page caches. Both queues are now bounded (`WALK_QUEUE_MAX`, 8192 items
+each): peak RSS **463-473 → 227 MiB (-52%)** and wall **110-113 → 102-103 s**
+(*faster*: less allocator churn and ~8 s less `sys`). Hashfile byte-identical.
+
+- **Running further ahead buys nothing.** The consumer is the serial stage, so
+  backlog past "enough to never starve" is pure resident memory. Confirmed on
+  the profiles: `realistic` 5.93 vs 5.90 s, `many` 11.02 vs 10.95 s, `mixed`
+  9.83 vs 9.83, and `bigfile` (io-threads=2, the largest-first idle-tail case a
+  narrower sort window could wreck) **5.54 vs 5.55 s median over 7 rounds**.
+  - At 3 rounds `bigfile` looked like a 3x regression. It was cold-cache noise
+    hitting both variants (`max` 17.74 for each). This is what the "lone
+    surprising result" rule is about — take the median, and add rounds.
+- **Backpressure needs hysteresis.** Waking producers on the first freed slot is
+  one wakeup per file once the queue sits at the cap: ~40% more `sys` on the
+  tiny-file profiles for no wall gain. Waking at half the cap made it free.
+- **Deadlock-free by shape, not by care:** the consumer only ever *pops* from
+  the walk queue and the csum workers only ever pop from theirs, so a full queue
+  always drains. `WALK_STOP` bypasses the bound (nothing would drain it).
+- **`DUPEREMOVE_QUEUE_MAX`** sets the cap; **0 restores the old unbounded
+  queues**, which is what the A/B was run against. Bench hook, not a user knob.
+- **Tasks 2 and 3 of #208 were already done** when it was filed, and the issue's
+  numbers for them are stale: `seen_inodes` is already an open-addressing table
+  of packed 16-byte `{ino, subvol}` slots with an occupancy bitmap — 28 B/file
+  measured, not ~50 — and `DB_CACHE_KB_WALKER` (2 MB) / `DB_CACHE_KB_SEARCH`
+  (32 MB) already differentiate the handles. **Don't redo either.** All of
+  SQLite is 67 MiB at end of scan, so there is nothing left there.
+
 - **`cache_size = -65536` (64 MB per connection).** Applied to every connection
   (listing handle, batched writer, one per walker), so it dominates peak RSS on
   a large hashfile (a NAS user hit ~870 MB on 1.7M files). Measured on 174k-file
