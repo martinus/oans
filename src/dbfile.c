@@ -1003,6 +1003,32 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 #define UPDATE_DEDUPE_SEQ "update files set dedupe_seq = ?2 where id = ?1;"
 	dbfile_prepare_stmt(update_dedupe_seq, UPDATE_DEDUPE_SEQ);
 
+	/* Snapshot-aware scan (#206). The donor's stored extent rows are the
+	 * record array its fiemap reported, so they double as the exact
+	 * re-check behind the layout key's hash. */
+#define SELECT_LAYOUT							\
+"select loff, poff, len from extents where fileid = ?1 order by loff;"
+	dbfile_prepare_stmt(select_layout, SELECT_LAYOUT);
+
+#define COPY_EXTENT_HASHES						\
+"insert into extents (fileid, loff, poff, len, digest) "		\
+"select ?1, loff, poff, len, digest from extents where fileid = ?2;"
+	dbfile_prepare_stmt(copy_extent_hashes, COPY_EXTENT_HASHES);
+
+#define COPY_BLOCK_HASHES						\
+"insert into blocks (fileid, loff, digest) "				\
+"select ?1, loff, digest from blocks where fileid = ?2;"
+	dbfile_prepare_stmt(copy_block_hashes, COPY_BLOCK_HASHES);
+
+	/* nr_extents comes from the donor because the two layouts were just
+	 * proved identical; flags do not, since FILE_RO_SUBVOL describes where
+	 * *this* file lives, not what it contains. */
+#define COPY_SCANNED_FILE						\
+"update files set digest = (select digest from files where id = ?2), "	\
+"nr_extents = (select nr_extents from files where id = ?2), "		\
+"flags = ?3 where id = ?1;"
+	dbfile_prepare_stmt(copy_scanned_file, COPY_SCANNED_FILE);
+
 #define RENAME_FILE							\
 "update or replace files set filename = ?1, path_hash = ?2 where id = ?3;"
 	dbfile_prepare_stmt(rename_file, RENAME_FILE);
@@ -2050,6 +2076,73 @@ int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid)
 {
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.delete_checkpoint;
 	return run_by_fileid(stmt, fileid);
+}
+
+int dbfile_layout_matches(struct dbhandle *db, int64_t donor,
+			  const struct fiemap *fm)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.select_layout;
+	unsigned int i = 0;
+	int ret;
+
+	ret = sqlite3_bind_int64(stmt, 1, donor);
+	if (ret) {
+		perror_sqlite(ret, "binding values");
+		return -1;
+	}
+
+	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const struct fiemap_extent *e;
+
+		if (i >= fm->fm_mapped_extents)
+			return 0;		/* donor has more records */
+		e = &fm->fm_extents[i++];
+		if ((uint64_t)sqlite3_column_int64(stmt, 0) != e->fe_logical ||
+		    (uint64_t)sqlite3_column_int64(stmt, 1) != e->fe_physical ||
+		    (uint64_t)sqlite3_column_int64(stmt, 2) != e->fe_length)
+			return 0;
+	}
+
+	if (ret != SQLITE_DONE) {
+		perror_sqlite(ret, "reading a donor's extent layout");
+		return -1;
+	}
+
+	/* Zero rows means the donor stored no extents at all - nothing to
+	 * verify against, so decline. */
+	return i == fm->fm_mapped_extents && i > 0;
+}
+
+int dbfile_copy_scanned_file(struct dbhandle *db, int64_t dst, int64_t donor,
+			     unsigned int flags)
+{
+	sqlite3_stmt *stmts[3] = { db->stmts.copy_extent_hashes,
+				   db->stmts.copy_block_hashes,
+				   db->stmts.copy_scanned_file };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(stmts); i++) {
+		_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = stmts[i];
+		int ret = sqlite3_bind_int64(stmt, 1, dst);
+
+		if (!ret)
+			ret = sqlite3_bind_int64(stmt, 2, donor);
+		/* Only the last statement has a ?3; binding an index a
+		 * statement does not declare is an error, not a no-op. */
+		if (!ret && stmt == db->stmts.copy_scanned_file)
+			ret = sqlite3_bind_int64(stmt, 3, flags);
+		if (ret) {
+			perror_sqlite(ret, "binding values");
+			return ret;
+		}
+		ret = sqlite3_step(stmt);
+		if (ret != SQLITE_DONE) {
+			perror_sqlite(ret, "copying a donor's hashes");
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)

@@ -8,6 +8,8 @@
 #include <sys/types.h>
 #include <uuid/uuid.h>
 
+#include <linux/fiemap.h>
+
 #include "util.h"
 #include "csum.h"
 #include "threads.h"
@@ -60,6 +62,10 @@ struct stmts {
 	sqlite3_stmt *select_checkpoint;
 	sqlite3_stmt *delete_checkpoint;
 	sqlite3_stmt *update_dedupe_seq;
+	sqlite3_stmt *select_layout;
+	sqlite3_stmt *copy_extent_hashes;
+	sqlite3_stmt *copy_block_hashes;
+	sqlite3_stmt *copy_scanned_file;
 };
 
 struct dbhandle {
@@ -91,6 +97,33 @@ struct file {
 	bool		digest_valid;
 	unsigned int	flags;
 };
+
+/*
+ * Snapshot-aware scan (#206). Two files with identical physical layouts hold
+ * identical bytes, so the second one's hashes can be copied from the first
+ * instead of read off the disk again.
+ *
+ * dbfile_layout_matches() re-checks a candidate donor record-for-record
+ * against `fm`: fiemap_layout_key() only produces a hash, and a hash collision
+ * must not become a wrong digest. The stored extent rows carry the very
+ * (loff, poff, len) triples the donor's fiemap reported, so the check needs no
+ * extra state and no second look at the donor on disk. Returns 1 on an exact
+ * match, 0 on any difference (including a donor with no extent rows, e.g. one
+ * scanned under --dedupe-options=only_whole_files), negative on error.
+ *
+ * dbfile_copy_scanned_file() copies the donor's extent rows, block rows and
+ * content digest onto `dst`, which is everything hashing it would have
+ * produced. `flags` is the destination's own - FILE_RO_SUBVOL describes where
+ * a file lives, not what it holds.
+ *
+ * Both must run on the connection that wrote the donor's rows - the scan's
+ * shared writer - so a donor hashed moments ago in the still-open batch is
+ * visible; a different connection would not see it until commit.
+ */
+int dbfile_layout_matches(struct dbhandle *db, int64_t donor,
+			  const struct fiemap *fm);
+int dbfile_copy_scanned_file(struct dbhandle *db, int64_t dst, int64_t donor,
+			     unsigned int flags);
 
 struct dbhandle *dbfile_open_handle(char *filename);
 /* Read-only open for report modes: no writes, safe to run while another oans

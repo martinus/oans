@@ -198,6 +198,13 @@ void filescan_free(void);
 void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits);
 
 /*
+ * Files whose hashes were copied from an already-scanned file with an identical
+ * physical layout (#206), and the bytes not read because of it. Read after the
+ * scan, like the skip counters.
+ */
+void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes);
+
+/*
  * Diagnostic ETA-calibration counters (DUPEREMOVE_SCAN_STATS): summed per-file
  * overhead (setup + finalize + DB write) and read+hash time, with their file
  * and byte counts. overhead/file over hash/byte is the ideal ETA file weight.

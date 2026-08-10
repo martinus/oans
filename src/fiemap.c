@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
+#include "csum.h"
 #include "debug.h"
 #include "fiemap.h"
 #include "util.h"
@@ -464,4 +465,52 @@ uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
 	if (fresh)
 		phys_set_merge(seen, fresh, sort_uniq(fresh, n_fresh));
 	return unshared;
+}
+
+/* Flags that make a record's physical address meaningless or unstable. */
+#define LAYOUT_REJECT_FLAGS	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
+				 FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_DATA_ENCRYPTED)
+/* Flags that say nothing about content. */
+#define LAYOUT_IGNORE_FLAGS	(FIEMAP_EXTENT_SHARED | FIEMAP_EXTENT_LAST)
+
+bool fiemap_layout_key(const struct fiemap *fm, uint64_t size,
+		       unsigned char *key)
+{
+	struct running_checksum *csum;
+	uint64_t header[2];
+	unsigned int i;
+
+	if (!fm || fm->fm_mapped_extents == 0)
+		return false;
+
+	for (i = 0; i < fm->fm_mapped_extents; i++) {
+		if (fm->fm_extents[i].fe_flags & LAYOUT_REJECT_FLAGS)
+			return false;
+	}
+
+	csum = start_running_checksum();
+	if (!csum)
+		return false;
+
+	/*
+	 * Size and extent count go in first, so a layout that is a prefix of
+	 * another cannot hash the same, and the size covers a trailing hole -
+	 * which fiemap does not report at all.
+	 */
+	header[0] = size;
+	header[1] = fm->fm_mapped_extents;
+	add_to_running_checksum(csum, (unsigned char *)header, sizeof(header));
+
+	for (i = 0; i < fm->fm_mapped_extents; i++) {
+		const struct fiemap_extent *e = &fm->fm_extents[i];
+		uint64_t rec[4] = {
+			e->fe_logical, e->fe_physical, e->fe_length,
+			e->fe_flags & ~(uint64_t)LAYOUT_IGNORE_FLAGS,
+		};
+
+		add_to_running_checksum(csum, (unsigned char *)rec, sizeof(rec));
+	}
+
+	finish_running_checksum(csum, key);
+	return true;
 }
