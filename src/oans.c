@@ -1396,11 +1396,24 @@ static void process_duplicates(struct dbhandle *db)
 	 *   - estimate the dup-group total so the bar and ETA have a scale.
 	 * The pdedupe_set_activity() calls are harmless no-ops without a live block.
 	 */
-	if (options.run_dedupe)
-		pdedupe_begin(passes);
-
 	if (options.hashfile)
 		qprintf("Hashfile \"%s\" written\n", options.hashfile);
+
+	/*
+	 * An interrupted scan stops here. The batch is already committed
+	 * (filescan_free, on the way out of scan_files), so everything below is
+	 * work for a run that is going to continue - and none of it is cheap on
+	 * a large hashfile: the prune walks every row, the index build is the
+	 * one deferred from the scan, and the group analysis is the query that
+	 * measured ~9 s on 2M files. Doing it anyway made Ctrl-C look ignored,
+	 * because the run visibly moved on to the dedupe phase and then claimed
+	 * "Nothing to deduplicate" when it had simply stopped looking.
+	 */
+	if (interrupted())
+		return;
+
+	if (options.run_dedupe)
+		pdedupe_begin(passes);
 
 	pdedupe_set_activity("checking for deleted files");
 	{
@@ -1660,9 +1673,15 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		 * runs when deduping on an interactive, non-verbose tty. Tell the
 		 * scan to leave its worker block in place for it; otherwise (incl.
 		 * JSON mode) the area is wiped clean.
+		 *
+		 * An interrupted run has no dedupe phase to hand the block to
+		 * (process_duplicates returns before pdedupe_begin), so it must be
+		 * wiped here or the worker rows are stranded on screen - the #179
+		 * failure, which is what "a live block" and "a live printer" being
+		 * different things keeps producing.
 		 */
 		bool dedupe_live = options.run_dedupe && !verbose &&
-				   !options.progress_json &&
+				   !options.progress_json && !interrupted() &&
 				   isatty(STDOUT_FILENO);
 
 		pscan_join(dedupe_live);
@@ -2084,8 +2103,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Reclaim space if a prune this run left the hashfile mostly free. */
-	if (options.hashfile)
+	/*
+	 * Reclaim space if a prune this run left the hashfile mostly free - but
+	 * never on the way out of a Ctrl-C. A VACUUM rewrites the whole file and
+	 * cannot be interrupted, so it is the longest thing an interrupted run
+	 * could still do, and the run that was asked to stop is the last one that
+	 * should do it. The next complete run compacts instead.
+	 */
+	if (options.hashfile && !interrupted())
 		dbfile_maybe_vacuum(db);
 
 	/*

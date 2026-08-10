@@ -190,6 +190,30 @@ class ProgressTtyTest(DuperemoveTest):
             any("2 permission denied" in ln for ln in screen),
             f"the scan-skip report was erased by the block:\n  {shown}")
 
+    def test_an_interrupted_scan_leaves_nothing_behind_either(self):
+        """The same invariant, on the path that has no dedupe phase.
+
+        The scan hands its block straight to the dedupe phase rather than
+        wiping it (pscan_join(continues=true)), so whoever decides there is no
+        such phase also owns wiping the block. An interrupted run stops before
+        pdedupe_begin(), so if it still claimed the hand-off the worker rows
+        would sit on screen for the rest of the session - #179 exactly, reached
+        from the other side.
+        """
+        for i in range(8):
+            self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 256 * 1024)
+        tree = os.path.join(self.work, "tree")
+
+        screen = _render(_run_in_pty(
+            [DUPEREMOVE, "-dr", "--hashfile", self.hf, tree],
+            env={"DUPEREMOVE_INTERRUPT_AFTER": "4"}))
+        shown = "\n  ".join(screen)
+
+        stranded = [ln for ln in screen if WORKER_ROW.match(ln)]
+        self.assertEqual([], stranded,
+                         f"worker rows left on screen after an interrupt:"
+                         f"\n  {chr(10).join(stranded)}\n\nfull screen:\n  {shown}")
+
     def test_a_crafted_name_cannot_inject_ansi_into_the_block(self):
         """The worker rows are drawn straight to the tty (#202).
 

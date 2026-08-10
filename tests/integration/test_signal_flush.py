@@ -82,6 +82,51 @@ class SignalFlushTest(DuperemoveTest):
         self.assertDmOk()
         self.assertEqual(1, self.hf_count("run_history"))
 
+    @requires_reflink
+    def test_an_interrupted_scan_does_not_go_on_to_the_dedupe_phase(self):
+        """Ctrl-C during hashing stops; it does not carry on into dedupe.
+
+        The interrupt check used to live only inside the dedupe *batch loop*,
+        so an interrupted scan still ran everything before it: the deleted-file
+        prune, the find-dupes index build, and the group analysis - seconds to
+        minutes each on a large hashfile - and then a VACUUM on the way out,
+        which rewrites the whole file and cannot itself be interrupted.
+
+        None of it produced any dedupe (the loop broke at once), so the only
+        visible result was a run that ignored the Ctrl-C for a long time and
+        then announced "Nothing to deduplicate" when it had stopped looking.
+        """
+        for i in range(40):
+            self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 128 * KiB)
+        self.sync()
+        tree = self.path("tree")
+
+        # This tree is 80 files, so it needs its own stop count rather than
+        # interrupt_scan()'s STOP_AFTER, which it would never reach.
+        self.dm("-rd", tree, env={"DUPEREMOVE_INTERRUPT_AFTER": "40"})
+        self.assertEqual(130, self.rc, self.out)
+
+        # The phase announces itself either way - it never deduped anything
+        # here, so its summary is the tell that it ran at all.
+        self.assertNotIn("Nothing to deduplicate", self.out,
+                         "the dedupe phase ran after an interrupted scan")
+        self.assertNotIn("net change in shared extents", self.out,
+                         "the dedupe phase ran after an interrupted scan")
+        self.assertNotIn("Compacting", self.out,
+                         "an interrupted run vacuumed the hashfile")
+
+        # Durability is unchanged: stopping earlier must not drop the batch.
+        self.assertGreater(
+            self.hf_scalar("select count(*) from files where digest is not null"),
+            0, "the interrupted scan persisted nothing")
+
+        # And the work is merely deferred - the next complete run does it.
+        self.dm("-rd", tree, quiet=False)
+        self.assertDmOk("run after an interrupted scan")
+        summary = self.reclaimed_summary()
+        self.assertTrue(summary and summary[0] != "0 B",
+                        f"the follow-up run found nothing to do; got {summary}")
+
     def test_resuming_matches_one_straight_through_scan(self):
         """The property that matters: an interrupted-then-resumed hashfile is
         indistinguishable from one produced in a single run.
