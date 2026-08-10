@@ -44,6 +44,7 @@
 #include "debug.h"
 #include "progress.h"
 #include "file_scan.h"
+#include "interrupt.h"
 #include "find_dupes.h"
 #include "run_dedupe.h"
 #include "storage.h"
@@ -1327,11 +1328,24 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 		unsigned int hi = i + stride < max ? i + stride : max;
 		struct dedupe_batch *batch;
 
+		/*
+		 * Interrupted: load no further batches. In-flight ones finish
+		 * their groups - FIDEDUPERANGE is atomic, and stopping a worker
+		 * mid-group would buy nothing - and dedupe_phase_end() reaps
+		 * them in generation order, so the durable dedupe_seq still
+		 * names only fully-processed generations.
+		 */
+		if (interrupted()) {
+			interrupt_report();
+			break;
+		}
+
 		dedupe_await_slot();		/* bound to 2 batches in flight */
 		pdedupe_set_batch(++pass);
 		batch = dedupe_begin_batch(hi);
 		stream_load_batch(pdb, inmem, batch, i, hi);
 		dedupe_seal_batch(batch);
+		interrupt_test_batch_tick();
 	}
 
 	dedupe_phase_end();
@@ -1432,6 +1446,9 @@ static void process_duplicates(struct dbhandle *db)
 	} else {
 		for (unsigned int i = first_seq; i < max; i += stride) {
 			unsigned int hi = i + stride < max ? i + stride : max;
+
+			if (interrupted())
+				break;
 
 			/* Report path is sequential; drop the previous window's
 			 * filerecs, which report_duplicates() recreates. */
@@ -1897,6 +1914,14 @@ int main(int argc, char **argv)
 	progress_set_json(options.progress_json);
 	start_timer();
 
+	/*
+	 * From here on a SIGINT/SIGTERM unwinds the run through its normal exit
+	 * path instead of killing it, so the open write batch is committed
+	 * rather than discarded (#201). Installed after option parsing: nothing
+	 * before this point has produced work worth saving.
+	 */
+	interrupt_install();
+
 	/* Allow larger than unusal amount of open files. On linux
 	 * this should bw increase form 1K to 512K open files
 	 * simultaneously.
@@ -2009,8 +2034,14 @@ int main(int argc, char **argv)
 		 * hashfile-only history record so in-memory runs report it too. */
 		pscan_json_done(files_scanned, groups, reclaimed);
 
-		/* Append this run to the hashfile's history (fuels --history/--json). */
-		if (options.hashfile) {
+		/*
+		 * Append this run to the hashfile's history (fuels
+		 * --history/--json) - but not an interrupted one, which covered
+		 * an arbitrary prefix of the tree. Recording it would make
+		 * --history read as a completed scan of everything, and its
+		 * skip counters would look like a healthy run's.
+		 */
+		if (options.hashfile && !interrupted()) {
 			struct run_record rec = {
 				.ts = time(NULL),
 				.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
@@ -2047,6 +2078,15 @@ int main(int argc, char **argv)
 		ret = EXIT_INCOMPLETE;
 
 out:
+	/*
+	 * What a shell reports for a signalled child, so a wrapper sees
+	 * "interrupted" rather than a distinct oans failure. Last, and only over
+	 * a success: a real error found on the way out is the more useful
+	 * status, and it is not the signal's doing.
+	 */
+	if (interrupted() && !ret)
+		ret = 128 + interrupt_signo();
+
 	scan_config_free(&replay);
 	free_all_filerecs();
 	/* Outlives filescan_free(): the dedupe phase queries it. */

@@ -51,6 +51,7 @@
 #include "ioctl.h"
 #include "debug.h"
 #include "file_scan.h"
+#include "interrupt.h"
 #include "dbfile.h"
 #include "util.h"
 #include "opt.h"
@@ -1502,7 +1503,14 @@ static gpointer walk_thread(gpointer arg)
 
 		if (path == WALK_STOP)
 			break;
-		process_dir(path, db);
+		/*
+		 * Interrupted: drain the queue instead of walking it. Skipping
+		 * dirq_finished() would leave walk_dir_pending non-zero, so
+		 * WALK_STOP would never be pushed and the consumer would block
+		 * on an empty queue forever - the counter still has to unwind.
+		 */
+		if (!interrupted())
+			process_dir(path, db);
 		free(path);
 		dirq_finished();
 	}
@@ -1577,8 +1585,11 @@ int filescan_walk_run(struct dbhandle *db)
 
 		if (it == WALK_STOP)
 			break;
-		if (!ret)
+		if (!ret && !interrupted()) {
 			ret = __scan_file(it->path, db, &it->st);
+		} else {
+			interrupt_report();
+		}
 		free(it);
 	}
 
@@ -2255,9 +2266,11 @@ static int write_checkpoint(struct hashes *hashes, struct scan_ctxt *ctxt,
 }
 
 /*
- * Release a queued file. Its resume checksums are dropped too: they belong to
- * the file_to_scan until adopt_resume() hands them to the scan context, and
- * every early return before that point comes through here.
+ * Release a queued file - path included, so this is the whole request and a
+ * caller that only wants to throw one away needs nothing else. Its resume
+ * checksums are dropped too: they belong to the file_to_scan until
+ * adopt_resume() hands them to the scan context, and every early return before
+ * that point comes through here.
  */
 static void free_file_to_scan(struct file_to_scan **filep)
 {
@@ -2269,6 +2282,7 @@ static void free_file_to_scan(struct file_to_scan **filep)
 		scan_resume_drop(file->resume);
 		free(file->resume);
 	}
+	free(file->path);
 	free(file);
 }
 
@@ -2798,6 +2812,10 @@ static gpointer scan_worker(gpointer arg)
 		pscan_slot_waiting(slot, false);
 		if (!file)
 			break;
+		if (interrupted()) {
+			free_file_to_scan(&file);
+			continue;
+		}
 		if (!slot)
 			slot = pscan_claim_slot(gettid(), thread_scanning);
 		csum_whole_file(file, &buffer, slot);
@@ -2884,8 +2902,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	tprogress->file_scanned_bytes = file_resume_off(file);
 	_cleanup_(pscan_finish_file) struct pscan_thread *finish = tprogress;
 
-	/* Dummy variables used to trigger the cleanup code */
-	_cleanup_(freep) char *path = file->path;
+	/* Dummy variable used to trigger the cleanup code */
 	_cleanup_(free_file_to_scan) struct file_to_scan *clean_file = file;
 
 	/*
@@ -3087,6 +3104,19 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		}
 		last_checkpoint = ctxt.off;
 
+		/*
+		 * Interrupted mid-file. A 1 TiB file must not hold the shutdown
+		 * for hours, so give up here - but check-point first, off the
+		 * usual interval, or everything since the last one is re-read
+		 * next run. That checkpoint force-commits the shared batch, so
+		 * it also makes every other file in it durable (#159, #201).
+		 */
+		if (interrupted()) {
+			if (checkpoints_enabled && ctxt.off > last_checkpoint)
+				write_checkpoint(&hashes, &ctxt, file->mtime);
+			return;
+		}
+
 		/* Test hook: stand in for the kill this exists to survive. */
 		if (checkpoint_stop_after &&
 		    ++checkpoints >= checkpoint_stop_after) {
@@ -3216,6 +3246,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	atomic_fetch_add(&scan_hash_ns, t_done - t_hash);
 	atomic_fetch_add(&scan_hashed_files, 1);
 	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
+
+	/* Test hook, last: this file's rows are in the batch now, so an
+	 * interrupt raised here is one the flush is meant to save. */
+	interrupt_test_file_tick();
 }
 
 static struct glob_set *excludes_get(void)
