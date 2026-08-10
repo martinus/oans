@@ -5,6 +5,7 @@
  */
 
 #include <signal.h>
+#include <assert.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -14,19 +15,28 @@
 #include "interrupt.h"
 
 /*
- * The only thing the handler touches. sig_atomic_t because nothing else is
- * guaranteed to be written indivisibly with respect to a signal, and volatile
- * so the polling loops re-read it rather than hoisting it out.
+ * The only thing the handler touches.
  *
- * Readers are on other threads, which strictly speaking wants an atomic load;
- * in practice this is a single aligned int written once and read repeatedly,
- * and the worst a stale read can do is check one more file before stopping.
+ * A lock-free atomic rather than the traditional `volatile sig_atomic_t`,
+ * because the readers are on *other threads*: the handler runs on whichever
+ * thread took the signal, and the csum workers and walkers poll from theirs.
+ * `volatile` orders nothing across threads, so that is a data race however
+ * benign it looks - ThreadSanitizer flags it, and is right to. C11 lets a
+ * signal handler touch a lock-free atomic object, which is what makes this
+ * both race-free and async-signal-safe; the static assertion below is what
+ * keeps that true.
+ *
+ * Relaxed on both sides: there is nothing to order against. The flag carries
+ * no data, and the worst a stale read can do is check one more file before
+ * stopping.
  */
-static volatile sig_atomic_t caught_signal;
+static _Atomic int caught_signal;
+static_assert(ATOMIC_INT_LOCK_FREE == 2,
+	      "the signal handler needs a lock-free atomic");
 
 static void interrupt_handler(int signo)
 {
-	caught_signal = signo;
+	atomic_store_explicit(&caught_signal, signo, memory_order_relaxed);
 }
 
 void interrupt_install(void)
@@ -55,12 +65,12 @@ void interrupt_install(void)
 
 bool interrupted(void)
 {
-	return caught_signal != 0;
+	return atomic_load_explicit(&caught_signal, memory_order_relaxed) != 0;
 }
 
 int interrupt_signo(void)
 {
-	return (int)caught_signal;
+	return atomic_load_explicit(&caught_signal, memory_order_relaxed);
 }
 
 void interrupt_report(void)

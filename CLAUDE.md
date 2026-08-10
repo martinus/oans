@@ -353,6 +353,12 @@ commits the batch on the way out. So nothing new is made durable — the loops
 just have to *reach* it. Measured on a 3000-file tree, SIGINT at 0.5 s:
 v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
 
+- **The flag is a lock-free `_Atomic int`, not `volatile sig_atomic_t`.** The
+  readers are on *other* threads (csum workers, walkers), and `volatile` orders
+  nothing across threads — ThreadSanitizer flags it, and is right to. C11 lets a
+  handler touch a lock-free atomic, which is what makes it both race-free and
+  async-signal-safe; a `static_assert` on `ATOMIC_INT_LOCK_FREE` keeps that
+  true. Relaxed on both sides: the flag carries no data.
 - `sigaction` with **`SA_RESTART`** (a walker blocked in `read()` resumes, so no
   error path has to learn about EINTR) and **`SA_RESETHAND`** — the kernel puts
   the default action back on delivery, so the second Ctrl-C kills with no work
