@@ -2898,13 +2898,6 @@ static int64_t layout_donor_find(const unsigned char *key)
 	return found;
 }
 
-/* Bytes the donor table holds, for the memory breakdown. */
-uint64_t filescan_layout_donor_bytes(void)
-{
-	return donor_cap * sizeof(*donor_slots) +
-	       ((donor_cap + 63) / 64) * sizeof(*donor_used);
-}
-
 void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes)
 {
 	*files = atomic_load(&layout_copied_files);

@@ -204,8 +204,6 @@ void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits);
  * scan, like the skip counters.
  */
 void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes);
-/* Bytes the donor table holds, for the RSS breakdown (#208). */
-uint64_t filescan_layout_donor_bytes(void);
 
 /*
  * Diagnostic ETA-calibration counters (DUPEREMOVE_SCAN_STATS): summed per-file
