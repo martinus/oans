@@ -390,6 +390,8 @@ file is recorded once.
     `{"event":"done","elapsed_sec":...,"files_scanned":...,"groups_deduped":...,"reclaimed_bytes":...}`.
     Fields that are not yet known (an ETA, a rate) are omitted; a consumer
     reading a line at a time can ignore any line that is not valid JSON.
+    Diagnostics share standard error with the stream (an unreadable file, a
+    failed ioctl), so such lines do occur.
 
     Combine with **-q** to silence the human stdout too, e.g.
     `oans -qd --progress=json --hashfile=FILE /srv/data 2>progress.jsonl`.

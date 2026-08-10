@@ -728,10 +728,16 @@ what belongs here is when it bites:
   drives a real pty and replays the stream through a small ANSI emulator:
   `tests/integration/test_progress_tty.py`. Its invariant — *no worker-slot row
   may survive the end of a run* — catches the whole class, not just this site.
-- **Known gap, not yet fixed:** a routed `eprintf` lands on **stdout**, because
-  `print_above_block()` only knows the stream the block lives on. So an error's
-  destination depends on whether a block happened to be up. Pre-existing; fixing
-  it means flushing across the two streams mid-redraw.
+- **Routing honors the caller's stream (#203).** `print_above_block()` takes the
+  `FILE *` and writes the message there, so an `eprintf` reaches stderr whether
+  or not a block was up (it used to always land on stdout, and `2>errors.log`
+  lost exactly the errors raised mid-run). The block itself is still stdout-only,
+  so the erase must be `fflush`ed before the message and the message flushed
+  before the redraw — otherwise the two streams' buffers interleave and the
+  message lands inside the block. Don't drop those flushes.
+  - Consequence for `--progress=json`: the JSON stream is **stderr**, so
+    diagnostics share it. That was already true for anything printed outside the
+    printer's lifetime; a consumer must skip lines that don't parse.
 
 ## Valgrind
 

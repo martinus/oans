@@ -32,11 +32,20 @@ _CSI = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
 _ANSI_TEXT = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def _run_in_pty(argv, env=None):
-    """Run argv on a COLS x ROWS pty; return its raw output bytes."""
+def _run_in_pty(argv, env=None, stderr_path=None):
+    """Run argv on a COLS x ROWS pty; return its raw output bytes.
+
+    With `stderr_path`, the child's stderr is redirected to that file while
+    stdout stays on the pty - the `2>errors.log` case of #203.
+    """
     pid, fd = pty.fork()
     if pid == 0:                                  # child
         try:
+            if stderr_path is not None:
+                efd = os.open(stderr_path,
+                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                os.dup2(efd, 2)
+                os.close(efd)
             os.execvpe(argv[0], argv, os.environ if env is None else env)
         finally:                                  # execvp raises, never returns
             os._exit(127)
@@ -180,6 +189,41 @@ class ProgressTtyTest(DuperemoveTest):
         self.assertTrue(
             any("2 permission denied" in ln for ln in screen),
             f"the scan-skip report was erased by the block:\n  {shown}")
+
+    def test_routed_errors_follow_the_redirected_stderr(self):
+        """`2>errors.log` must catch errors raised while a block is live (#203).
+
+        An unreadable file fails open() inside a csum worker, so its eprintf is
+        raised mid-hash with the block on screen - precisely the messages that
+        used to be forced onto stdout and vanish from the redirect.
+        """
+        for i in range(8):
+            self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 256 * 1024)
+        for i in range(2):
+            os.chmod(self.mkrand(f"tree/locked/{i}.bin", 64 * 1024), 0)
+        tree = os.path.join(self.work, "tree")
+        errlog = os.path.join(self.work, "errors.log")
+
+        raw = _run_in_pty([DUPEREMOVE, "-dr", "--hashfile", self.hf, tree],
+                          stderr_path=errlog)
+        with open(errlog, encoding="utf-8", errors="replace") as f:
+            errors = f.read()
+        screen = "\n  ".join(_render(raw))
+
+        for i in range(2):
+            self.assertIn(f"{i}.bin", errors,
+                          f"the open error never reached stderr:\n{errors}")
+        self.assertIn("while opening file", errors)
+        self.assertNotIn("while opening file", screen,
+                         f"a redirected error was still printed to the tty:"
+                         f"\n  {screen}")
+
+        # The block still cleans up around the routed message, and stdout keeps
+        # the report that is genuinely stdout's (the #179 invariant).
+        stranded = [ln for ln in _render(raw) if WORKER_ROW.match(ln)]
+        self.assertEqual([], stranded,
+                         f"worker rows left on screen:\n  {screen}")
+        self.assertIn("2 permission denied", screen)
 
     # Depends on hashing outlasting one REDRAW_MS (100 ms) tick, so the row
     # exists at a redraw. Kept CPU-bound (4K blocks, partial mode) rather than
