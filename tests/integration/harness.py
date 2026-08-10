@@ -283,13 +283,18 @@ class DuperemoveTest(unittest.TestCase):
 
     # -- running oans ------------------------------------------------
 
-    def dm(self, *args, hashfile=True, stdin=None, env=None, quiet=True):
+    def dm(self, *args, hashfile=True, stdin=None, env=None, quiet=True,
+           text=True):
         """Run oans; capture combined output in self.out and code in self.rc.
 
         Pass stdin=<str> to feed the process on standard input (e.g. a "-"
         file list), or env={...} to add environment variables for this run.
         Runs with -q by default (terse output); pass quiet=False to get the
         full human summary block (e.g. to assert on the 'Reclaimed' line).
+
+        text=False leaves self.out as raw bytes, for the tests that assert on
+        exactly which bytes reached the terminal (#202) - decoding would hide
+        the thing under test.
         """
         _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
@@ -302,7 +307,7 @@ class DuperemoveTest(unittest.TestCase):
         if env:
             run_env = dict(os.environ, **env)
         proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True, env=run_env)
+                              stderr=subprocess.STDOUT, text=text, env=run_env)
         self.out = proc.stdout
         self.rc = proc.returncode
         return self.out

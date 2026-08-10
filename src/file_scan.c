@@ -663,7 +663,11 @@ static int is_excluded(const char *name, bool is_dir)
 	if (!excludes || !glob_set_match(excludes, name, is_dir, &which))
 		return 0;
 
-	vprintf("Excluding: %s (matches %s)\n", name, which);
+	if (verbose) {
+		declare_display_path(disp, name);
+
+		vprintf("Excluding: %s (matches %s)\n", disp, which);
+	}
 	return 1;
 }
 
@@ -917,8 +921,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 	/* Every message below names the path, and this runs once per root (or
 	 * per fs), not per file - so escape it once here rather than in each
 	 * branch. */
-	_cleanup_(freep) char *disp = path_for_display(path);
-	const char *dpath = disp ? disp : path;
+	declare_display_path(dpath, path);
 
 	struct libmnt_fs *dev = NULL;
 
@@ -1049,19 +1052,27 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	}
 
 	if (!S_ISREG(st->stx_mode) && !S_ISDIR(st->stx_mode)) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		/* check_file() runs per directory entry, and escaping
+		 * allocates - so pay it only when -v will actually print.
+		 * Same for every other skip message in this function. */
+		if (verbose) {
+			declare_display_path(disp, path);
 
-		vprintf("Skipping non-regular/non-directory file %s\n",
-			disp ? disp : path);
+			vprintf("Skipping non-regular/non-directory file %s\n",
+				disp);
+		}
 		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
 		return false;
 	}
 
 	if (S_ISREG(st->stx_mode) && st->stx_size < options.min_filesize) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		if (verbose) {
+			declare_display_path(disp, path);
 
-		vprintf("Skipping file below --min-filesize: %s (%llu < %"PRIu64")\n",
-			disp ? disp : path, st->stx_size, options.min_filesize);
+			vprintf("Skipping file below --min-filesize: %s "
+				"(%llu < %"PRIu64")\n", disp, st->stx_size,
+				options.min_filesize);
+		}
 		filescan_count_skip(SCAN_SKIP_TOO_SMALL);
 		return false;
 	}
@@ -1090,9 +1101,11 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	 */
 	if (locked_fs.is_btrfs && options.skip_readonly_subvols &&
 	    dev_is_readonly_subvol(stx_to_dev(st), path)) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		if (verbose) {
+			declare_display_path(disp, path);
 
-		vprintf("Skipping read-only subvolume: %s\n", disp ? disp : path);
+			vprintf("Skipping read-only subvolume: %s\n", disp);
+		}
 		return false;
 	}
 
@@ -1133,11 +1146,11 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		 * rejected root does not pollute the lock for later roots.
 		 */
 		if (!probe.supported) {
-			_cleanup_(freep) char *disp = path_for_display(path);
+			declare_display_path(disp, path);
 
 			eprintf("Skipping %s: its filesystem is not btrfs or XFS, "
 				"which oans needs to deduplicate.\n",
-				disp ? disp : path);
+				disp);
 			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return seed_reject(parent_checked);
 		}
@@ -1159,9 +1172,9 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 			return seed_reject(parent_checked);
 
 		if (uuid_compare(probe.uuid, locked_fs.uuid) != 0) {
-			_cleanup_(freep) char *disp = path_for_display(path);
+			declare_display_path(disp, path);
 
-			eprintf("%s lives on fs ", disp ? disp : path);
+			eprintf("%s lives on fs ", disp);
 			debug_print_uuid(probe.uuid);
 			eprintf(" will we are locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
@@ -1229,12 +1242,12 @@ static int get_dirent_type(struct dirent *entry, int fd, const char *path)
 	 */
 	ret = statx(fd, entry->d_name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &st);
 	if (ret || !(st.stx_mask & STATX_BASIC_STATS)) {
-		_cleanup_(freep) char *disp = path_for_display(path);
-		_cleanup_(freep) char *dname = path_for_display(entry->d_name);
+		declare_display_path(disp, path);
+		declare_display_path(dname, entry->d_name);
 
 		eprintf("Error %d: %s while getting type of file %s/%s. "
 			"Skipping.\n", errno, strerror(errno),
-			disp ? disp : path, dname ? dname : entry->d_name);
+			disp, dname);
 		filescan_count_errno_skip(errno);
 		return DT_UNKNOWN;
 	}
@@ -1324,9 +1337,9 @@ static void fileq_push(const char *path, struct statx *st)
 	struct scan_item *it = malloc(sizeof(*it) + n);
 
 	if (!it) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		declare_display_path(disp, path);
 
-		eprintf("scan: out of memory queuing %s\n", disp ? disp : path);
+		eprintf("scan: out of memory queuing %s\n", disp);
 		return;
 	}
 	it->st = *st;
@@ -1346,10 +1359,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 	/* Report before allocating anything: malloc() may leave errno set even
 	 * when it succeeds, which would misattribute the opendir failure. */
 	if (dirp == NULL) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		declare_display_path(disp, path);
 
 		eprintf("Error %d: %s while opening directory %s\n",
-			errno, strerror(errno), disp ? disp : path);
+			errno, strerror(errno), disp);
 		filescan_count_errno_skip(errno);
 		return;
 	}
@@ -1372,10 +1385,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 	dirlen = strlen(path);
 	child = calloc(1, dirlen + 1 + NAME_MAX + 1);
 	if (child == NULL) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		declare_display_path(disp, path);
 
 		eprintf("Out of memory while scanning directory %s\n",
-			disp ? disp : path);
+			disp);
 		filescan_count_skip(SCAN_SKIP_UNREADABLE);
 		return;
 	}
@@ -1392,11 +1405,11 @@ static void process_dir(const char *path, struct dbhandle *db)
 		entry = readdir(dirp);
 		if (!entry) {
 			if (errno) {
-				_cleanup_(freep) char *disp = path_for_display(path);
+				declare_display_path(disp, path);
 
 				eprintf("Error %d: %s while reading directory %s\n",
 					errno, strerror(errno),
-					disp ? disp : path);
+					disp);
 				filescan_count_errno_skip(errno);
 			}
 			break;
@@ -1428,12 +1441,12 @@ static void process_dir(const char *path, struct dbhandle *db)
 		 * child buffer can never overflow. */
 		namelen = strlen(entry->d_name);
 		if (namelen > NAME_MAX) {
-			_cleanup_(freep) char *disp = path_for_display(path);
-			_cleanup_(freep) char *dname = path_for_display(entry->d_name);
+			declare_display_path(disp, path);
+			declare_display_path(dname, entry->d_name);
 
 			eprintf("Skipping \"%s/%s\": name length %zu exceeds NAME_MAX (%d)\n",
-				disp ? disp : path,
-				dname ? dname : entry->d_name, namelen, NAME_MAX);
+				disp,
+				dname, namelen, NAME_MAX);
 			filescan_count_skip(SCAN_SKIP_PATH_TOO_LONG);
 			continue;
 		}
@@ -1448,10 +1461,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 		 */
 		if (statx(dirfd(dirp), entry->d_name, 0, STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
-			_cleanup_(freep) char *disp = path_for_display(child);
+			declare_display_path(disp, child);
 
 			eprintf("Failed to stat %s: %s\n",
-				disp ? disp : child, strerror(errno));
+				disp, strerror(errno));
 			filescan_count_errno_skip(errno);
 			continue;
 		}
@@ -1719,8 +1732,12 @@ static bool resume_scan(struct dbhandle *db, int64_t fileid, uint64_t size,
 	resume->off = cp.loff;
 	resume->ext_loff = cp.ext_loff;
 	resume->ext_len = cp.ext_len;
-	vprintf("Resuming %s at %"PRIu64" of %"PRIu64" bytes\n",
-		name, cp.loff, size);
+	if (verbose) {
+		declare_display_path(disp, name);
+
+		vprintf("Resuming %s at %"PRIu64" of %"PRIu64" bytes\n",
+			disp, cp.loff, size);
+	}
 	return true;
 }
 
@@ -1846,11 +1863,11 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		_cleanup_(closefd) int fd;
 		fd = longpath_open(path, O_RDONLY);
 		if (fd == -1) {
-			_cleanup_(freep) char *disp = path_for_display(path);
+			declare_display_path(disp, path);
 
 			eprintf("Error %d: %s while opening file \"%s\". "
 				"Skipping.\n", errno, strerror(errno),
-				disp ? disp : path);
+				disp);
 			filescan_count_errno_skip(errno);
 			return 0;
 		}
@@ -1863,11 +1880,11 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		 */
 		ret = lookup_btrfs_subvol(fd, &(dbfile.subvol));
 		if (ret) {
-			_cleanup_(freep) char *disp = path_for_display(path);
+			declare_display_path(disp, path);
 
 			eprintf("Error %d: %s while finding subvol for file "
 				"\"%s\". Skipping.\n", ret, strerror(ret),
-				disp ? disp : path);
+				disp);
 			return 0;
 		}
 
@@ -1907,10 +1924,10 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	dbfile.ino = st->stx_ino;
 	dbfile.size = st->stx_size;
 	if (file_set_filename(&dbfile, path)) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		declare_display_path(disp, path);
 
 		eprintf("Out of memory storing \"%s\". Skipping.\n",
-			disp ? disp : path);
+			disp);
 		filescan_count_skip(SCAN_SKIP_UNREADABLE);
 		return 0;
 	}
@@ -1996,22 +2013,22 @@ int scan_file(char *in_path, struct dbhandle *db)
 		 * this is instead of leaving the user with a bare ENAMETOOLONG.
 		 */
 		if (errno == ENAMETOOLONG) {
-			_cleanup_(freep) char *disp = path_for_display(in_path);
+			declare_display_path(disp, in_path);
 
 			eprintf("Skipping %s: its absolute path exceeds PATH_MAX (%d). "
 				"Files *below* a reachable root may be any depth; "
 				"only the root itself is limited. Scan a shorter "
 				"ancestor, or bind-mount this directory somewhere "
-				"shorter.\n", disp ? disp : in_path, PATH_MAX);
+				"shorter.\n", disp, PATH_MAX);
 			filescan_count_skip(SCAN_SKIP_PATH_TOO_LONG);
 			nr_roots_unusable++;
 			return 0;
 		}
-		_cleanup_(freep) char *disp = path_for_display(in_path);
+		declare_display_path(disp, in_path);
 
 		eprintf("Error %d: %s while getting path to file %s. "
 			"Skipping.\n",
-			errno, strerror(errno), disp ? disp : in_path);
+			errno, strerror(errno), disp);
 		filescan_count_errno_skip(errno);
 		nr_roots_unusable++;
 		return 0;
@@ -2020,11 +2037,11 @@ int scan_file(char *in_path, struct dbhandle *db)
 	/* longpath-ok: `path` is the realpath'd root, so it fits by construction. */
 	ret = statx(0, path, 0, STATX_BASIC_STATS, &st);
 	if (ret || !(st.stx_mask & STATX_BASIC_STATS)) {
-		_cleanup_(freep) char *disp = path_for_display(path);
+		declare_display_path(disp, path);
 
 		eprintf("Error %d: %s while stating file %s. "
 			"Skipping.\n",
-			errno, strerror(errno), disp ? disp : path);
+			errno, strerror(errno), disp);
 		filescan_count_errno_skip(errno);
 		nr_roots_unusable++;
 		return 0;
@@ -2265,11 +2282,11 @@ static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		e = get_extent(ctxt->fiemap, r->off, &ctxt->extent_cursor);
 		if (!e || e->fe_logical != r->ext_loff ||
 		    e->fe_length != r->ext_len) {
-			_cleanup_(freep) char *disp = path_for_display(file->path);
+			declare_display_path(disp, file->path);
 
 			vprintf("%s: extent layout changed since the checkpoint "
 				"at %"PRIu64" bytes; hashing from the start\n",
-				disp ? disp : file->path, r->off);
+				disp, r->off);
 			scan_resume_drop(r);
 			ctxt->extent_cursor = 0;
 
@@ -2909,11 +2926,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 
 	ctxt.fd = longpath_open(file->path, O_RDONLY);
 	if (ctxt.fd == -1) {
-		_cleanup_(freep) char *disp = path_for_display(file->path);
+		declare_display_path(disp, file->path);
 
 		eprintf("csum_whole_file: Error %d: %s while opening file \"%s\". "
 			"Skipping.\n", errno, strerror(errno),
-			disp ? disp : file->path);
+			disp);
 		filescan_count_errno_skip(errno);
 		return;
 	}
@@ -2978,10 +2995,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		ret = fill_buffer(&ctxt, buffer);
 		if (ret < 0) {
 			ret = errno;
-			_cleanup_(freep) char *disp = path_for_display(file->path);
+			declare_display_path(disp, file->path);
 
 			eprintf("Unable to read file %s: %s\n",
-				disp ? disp : file->path, strerror(ret));
+				disp, strerror(ret));
 			filescan_count_errno_skip(ret);
 			return;
 		}
@@ -3005,10 +3022,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 					    ctxt.off + bytes_processed,
 					    &hashes);
 			if (ret) {
-				_cleanup_(freep) char *disp = path_for_display(file->path);
+				declare_display_path(disp, file->path);
 
 				eprintf("Unable to process %s's last block\n",
-					disp ? disp : file->path);
+					disp);
 				return;
 			}
 
@@ -3045,11 +3062,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 
 		ret = write_checkpoint(&hashes, &ctxt, file->mtime);
 		if (ret) {
-			_cleanup_(freep) char *disp = path_for_display(file->path);
+			declare_display_path(disp, file->path);
 
 			eprintf("%s: could not checkpoint at %"PRIu64" bytes; "
 				"an interrupted run will rehash it from the "
-				"start.\n", disp ? disp : file->path,
+				"start.\n", disp,
 				(uint64_t)ctxt.off);
 			checkpoints_enabled = false;
 			continue;
@@ -3059,11 +3076,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		/* Test hook: stand in for the kill this exists to survive. */
 		if (checkpoint_stop_after &&
 		    ++checkpoints >= checkpoint_stop_after) {
-			_cleanup_(freep) char *disp = path_for_display(file->path);
+			declare_display_path(disp, file->path);
 
 			vprintf("%s: stopping after %u checkpoints at %"PRIu64
 				" bytes (DUPEREMOVE_CHECKPOINT_STOP)\n",
-				disp ? disp : file->path, checkpoints,
+				disp, checkpoints,
 				(uint64_t)ctxt.off);
 			return;
 		}
@@ -3075,12 +3092,12 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * store a hash that matches nothing.
 	 */
 	if (ctxt.off != ctxt.filesize) {
-		_cleanup_(freep) char *disp = path_for_display(file->path);
+		declare_display_path(disp, file->path);
 
 		eprintf("%s: size changed while hashing (read %"PRIu64" bytes, "
 			"expected %"PRIu64"). Skipped - it is probably still "
 			"being written; the next run will hash it.\n",
-			disp ? disp : file->path, (uint64_t)ctxt.off,
+			disp, (uint64_t)ctxt.off,
 			(uint64_t)ctxt.filesize);
 		return;
 	}

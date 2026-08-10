@@ -12,30 +12,28 @@ but NUL and '/'.
 
 import json
 import os
-import subprocess
 import unittest
 
-from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
+from harness import DuperemoveTest, requires_reflink
 
-# One name per trick: a carriage return that would rewrite the previous line, a
-# screen-clearing CSI, a BEL, and a DEL.
+# One name per trick, paired with how it must come out: a carriage return that
+# would rewrite the previous line, a screen-clearing CSI, a BEL, and a DEL. One
+# table so adding a trick is one edit, not two that can drift.
 EVIL_NAMES = [
-    b"cr\rSUCCESS-reclaimed-9-TiB.bin",
-    b"esc\x1b[2J\x1b[31mred.bin",
-    b"bel\x07.bin",
-    b"del\x7f.bin",
+    (b"cr\rSUCCESS-reclaimed-9-TiB.bin", b"cr\\rSUCCESS"),
+    (b"esc\x1b[2J\x1b[31mred.bin", b"esc\\x1b[2J"),
+    (b"bel\x07.bin", b"bel\\x07"),
+    (b"del\x7f.bin", b"del\\x7f"),
 ]
 
 
 class EscapeNamesTest(DuperemoveTest):
     def run_raw(self, *args, expect_ok=True):
         """Run oans with the output captured as raw bytes, not decoded text."""
-        p = subprocess.run(
-            [DUPEREMOVE, "--io-threads=4", "--hashfile", self.hf, *args],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = self.dm(*args, quiet=False, text=False)
         if expect_ok:
-            self.assertEqual(p.returncode, 0, p.stderr.decode(errors="replace"))
-        return p.stdout + p.stderr
+            self.assertEqual(self.rc, 0, out.decode(errors="replace"))
+        return out
 
     def assertNoControlBytes(self, out):
         """No byte a terminal acts on, other than the newlines oans writes.
@@ -50,13 +48,21 @@ class EscapeNamesTest(DuperemoveTest):
 
     def _tree(self, size=200_000):
         """A tree of duplicate pairs, every one of them evilly named."""
+        # path() makes the *parent*; these names are bytes, so the tree is
+        # built by hand rather than through write()/mkdup().
         d = self.path("tree")
         os.makedirs(d, exist_ok=True)
-        for i, name in enumerate(EVIL_NAMES):
+        for name, _escaped in EVIL_NAMES:
             data = os.urandom(size)
             for side in (b"a-", b"b-"):
                 with open(os.path.join(d.encode(), side + name), "wb") as f:
                     f.write(data)
+        return d
+
+    def _scanned_tree(self, size=8192):
+        """A scanned evil tree, for the report modes that read the hashfile."""
+        d = self._tree(size=size)
+        self.run_raw("-r", d)
         return d
 
     @requires_reflink
@@ -64,10 +70,8 @@ class EscapeNamesTest(DuperemoveTest):
         out = self.run_raw("-rdv", self._tree())
         self.assertNoControlBytes(out)
         # The names are still identifiable, just spelled safely.
-        self.assertIn(b"cr\\rSUCCESS", out)
-        self.assertIn(b"esc\\x1b[2J", out)
-        self.assertIn(b"bel\\x07", out)
-        self.assertIn(b"del\\x7f", out)
+        for _name, escaped in EVIL_NAMES:
+            self.assertIn(escaped, out)
 
     def test_scan_and_listing_escape_names(self):
         d = self._tree(size=8192)
@@ -90,13 +94,11 @@ class EscapeNamesTest(DuperemoveTest):
         self.assertNoControlBytes(out)
 
     def test_stats_escapes_stored_paths(self):
-        d = self._tree(size=8192)
-        self.run_raw("-r", d)
+        self._scanned_tree()
         self.assertNoControlBytes(self.run_raw("--stats"))
 
     def test_json_report_escapes_and_stays_parseable(self):
-        d = self._tree(size=8192)
-        self.run_raw("-r", d)
+        self._scanned_tree()
         out = self.run_raw("--json")
         self.assertNoControlBytes(out)
         json.loads(out.decode())          # still one valid object

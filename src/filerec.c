@@ -256,12 +256,11 @@ int filerec_open(struct filerec *file, bool quiet)
 		if (fd == -1) {
 			ret = errno;
 			if (ret != ENOENT || !quiet) {
-				_cleanup_(freep) char *disp =
-					path_for_display(file->filename);
+				declare_display_path(disp, file->filename);
 
 				eprintf("Error %d: %s while opening \"%s\"\n",
 					ret, strerror(ret),
-					disp ? disp : file->filename);
+					disp);
 			}
 			goto out_unlock;
 		}

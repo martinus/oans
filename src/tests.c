@@ -458,12 +458,32 @@ MU_TEST(test_sanitize_ctrl) {
 	sanitize_ctrl("ab\x1b" "cd", six, sizeof(six));
 	mu_check(strcmp(six, "ab") == 0);
 
+	/* ctrl_seq_len() is the one classifier; has_ctrl() the fast path out. */
+	unsigned char cp = 0;
+
+	mu_check(ctrl_seq_len((const unsigned char *)"a", &cp) == 0);
+	mu_check(ctrl_seq_len((const unsigned char *)"\x1b", &cp) == 1 && cp == 0x1b);
+	mu_check(ctrl_seq_len((const unsigned char *)"\x7f", &cp) == 1 && cp == 0x7f);
+	/* A C1 costs two input bytes and is named by its code point. */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x9f", &cp) == 2 && cp == 0x9f);
+	/* 0xc2 not followed by a continuation byte is ordinary UTF-8 lead. */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\xa9", &cp) == 0);
+
+	mu_check(!has_ctrl("plain.txt"));
+	mu_check(!has_ctrl("café-Β.txt"));
+	mu_check(!has_ctrl(""));
+	mu_check(has_ctrl("a\rb"));
+	mu_check(has_ctrl("Te\xc2\x9ft"));
+
 	/* path_for_display() always has room for the whole escaped path. */
 	char *dup = path_for_display("a\x1b" "b\x7f");
 	mu_check(dup && strcmp(dup, "a\\x1bb\\x7f") == 0);
 	free(dup);
 	dup = path_for_display("");
 	mu_check(dup && strcmp(dup, "") == 0);
+	free(dup);
+	dup = path_for_display("café-Β.txt");	/* the fast path: unchanged */
+	mu_check(dup && strcmp(dup, "café-Β.txt") == 0);
 	free(dup);
 }
 

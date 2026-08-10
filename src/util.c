@@ -262,19 +262,11 @@ void debug_print_uuid(uuid_t uuid)
 static size_t escape_ctrl_byte(unsigned char c, char *buf)
 {
 	static const char hex[] = "0123456789abcdef";
-	char shorthand;
 
 	switch (c) {
-	case '\t': shorthand = 't'; break;
-	case '\n': shorthand = 'n'; break;
-	case '\r': shorthand = 'r'; break;
-	default:   shorthand = 0;   break;
-	}
-
-	if (shorthand) {
-		buf[0] = '\\';
-		buf[1] = shorthand;
-		return 2;
+	case '\t': memcpy(buf, "\\t", 2); return 2;
+	case '\n': memcpy(buf, "\\n", 2); return 2;
+	case '\r': memcpy(buf, "\\r", 2); return 2;
 	}
 
 	buf[0] = '\\';
@@ -282,6 +274,32 @@ static size_t escape_ctrl_byte(unsigned char c, char *buf)
 	buf[2] = hex[c >> 4];
 	buf[3] = hex[c & 0xf];
 	return 4;
+}
+
+size_t ctrl_seq_len(const unsigned char *p, unsigned char *cp)
+{
+	if (*p < 0x20 || *p == 0x7f) {
+		*cp = *p;
+		return 1;
+	}
+	/* A C1 control, which UTF-8 spells in two bytes; name it by its code
+	 * point, not by either byte. */
+	if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
+		*cp = p[1];
+		return 2;
+	}
+	return 0;
+}
+
+bool has_ctrl(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	unsigned char cp;
+
+	for (; *p; p++)
+		if (ctrl_seq_len(p, &cp))
+			return true;
+	return false;
 }
 
 void sanitize_ctrl(const char *in, char *out, size_t out_sz)
@@ -293,36 +311,54 @@ void sanitize_ctrl(const char *in, char *out, size_t out_sz)
 		return;
 
 	while (*p) {
-		char esc[SANITIZE_CTRL_MAX];
-		size_t n;
+		unsigned char cp;
+		size_t n = ctrl_seq_len(p, &cp);
 
-		if (*p < 0x20 || *p == 0x7f) {
-			n = escape_ctrl_byte(*p, esc);
-			p++;
-		} else if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
-			/* A C1 control, which UTF-8 spells in two bytes; name
-			 * it by its code point, not by either byte. */
-			n = escape_ctrl_byte(p[1], esc);
-			p += 2;
+		if (!n) {
+			/* Copy the whole run of safe bytes at once - which for
+			 * a real name is the entire string. */
+			const unsigned char *run = p;
+			size_t len;
+
+			do {
+				p++;
+			} while (*p && !ctrl_seq_len(p, &cp));
+
+			len = (size_t)(p - run);
+			if (len > out_sz - o - 1)
+				len = out_sz - o - 1;
+			memcpy(out + o, run, len);
+			o += len;
+			if (o + 1 == out_sz)
+				break;		/* buffer full */
 		} else {
-			esc[0] = (char)*p++;
-			n = 1;
-		}
+			char esc[SANITIZE_CTRL_MAX];
+			size_t len = escape_ctrl_byte(cp, esc);
 
-		/* Stop before splitting an escape rather than emitting half. */
-		if (o + n + 1 > out_sz)
-			break;
-		memcpy(out + o, esc, n);
-		o += n;
+			/* Stop before splitting an escape rather than emitting
+			 * half of one. */
+			if (o + len + 1 > out_sz)
+				break;
+			memcpy(out + o, esc, len);
+			o += len;
+			p += n;
+		}
 	}
 	out[o] = '\0';
 }
 
 char *path_for_display(const char *path)
 {
-	size_t sz = SANITIZE_CTRL_MAX * strlen(path) + 1;
-	char *out = malloc(sz);
+	size_t sz;
+	char *out;
 
+	/* Every real name takes this exit: one exact-sized copy instead of a
+	 * 4x over-allocation and a per-byte loop. */
+	if (!has_ctrl(path))
+		return strdup(path);
+
+	sz = SANITIZE_CTRL_MAX * strlen(path) + 1;
+	out = malloc(sz);
 	if (out)
 		sanitize_ctrl(path, out, sz);
 	return out;

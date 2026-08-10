@@ -270,10 +270,10 @@ static void add_dedupe_request(struct dedupe_ctxt *ctxt,
 	same->dest_count++;
 
 	if (debug) {
-		_cleanup_(freep) char *disp = path_for_display(file->filename);
+		declare_display_path(disp, file->filename);
 
 		dprintf("add ioctl request %s, off: %llu, dest: %d\n",
-			disp ? disp : file->filename,
+			disp,
 			(unsigned long long)req->req_loff, same->dest_count);
 	}
 }
