@@ -1080,8 +1080,13 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 	if (S_ISREG(st->stx_mode) && options.max_filesize &&
 	    st->stx_size > options.max_filesize) {
-		vprintf("Skipping file above --max-filesize: %s (%llu > %"PRIu64")\n",
-			path, st->stx_size, options.max_filesize);
+		if (verbose) {
+			declare_display_path(disp, path);
+
+			vprintf("Skipping file above --max-filesize: %s "
+				"(%llu > %"PRIu64")\n", disp, st->stx_size,
+				options.max_filesize);
+		}
 		filescan_count_skip(SCAN_SKIP_TOO_LARGE);
 		return false;
 	}
