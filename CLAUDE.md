@@ -465,6 +465,29 @@ is the false premise this took two PRs to unwind:
   metadata walk — separation throws that overlap away for nothing. The one real win
   (exact ETA from a known total) is a UX gain that doesn't need serialization (the
   walk already counts files incrementally). Reverted.
+- **`STATX_CHANGE_COOKIE` is not a userspace ABI — don't plan around it (#207).**
+  It exists in `include/linux/stat.h` for in-kernel callers (NFSD's `i_version`),
+  not in the UAPI: on 7.1.3 `struct statx` has no `stx_change_cookie`,
+  `kernel-headers` does not define `STATX_CHANGE_COOKIE`, and asking for the bit
+  anyway returns a mask without it (btrfs and tmpfs alike, spare words zero). So
+  it is not privilege-gated — running as root would not help, and the filesystem
+  is irrelevant.
+  - **`ctime` closes the same hole and is already being read.** Re-measured: a
+    `chattr +C` file rewritten in place with `touch -d` restoring the mtime keeps
+    a stale digest (mtime and size both unchanged), but its ctime *does* move —
+    `utimensat()` updates ctime as a side effect, so restoring a timestamp cannot
+    hide a write. `ctime` is in `STATX_BASIC_STATS`, which the walk already asks
+    for: no new syscall, no kernel floor.
+  - **The objection that would have sunk it does not hold**: `FIDEDUPERANGE`
+    leaves ctime alone on both source and destination (measured), as does
+    `btrfs filesystem defragment` — so an incremental run would *not* re-hash
+    everything it deduped last night. What does move ctime without changing
+    content is metadata churn (`chmod`/`chown`/xattr/relabel) and a
+    `rsync -a`-style restore: one extra re-hash of that subtree, cost only.
+  - Only measured on btrfs; **re-measure the dedupe row on xfs before
+    implementing**, since that is the load-bearing one. Design sketch and the
+    full table are on #207.
+
 - **Warm rescan is single-consumer pipeline-latency-bound**, not CPU/query. A
   no-op rescan of ~174k files is ~2s wall / ~0.9s CPU, invariant to
   `--io-threads` (1..16); the serial consumer (`__scan_file` queue handoff +
