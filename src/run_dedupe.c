@@ -707,6 +707,27 @@ close_files:
 		}
 	}
 
+	/*
+	 * The loop can reach here with files still open, so close them before
+	 * asserting the list is empty (upstream #392, which aborted a whole run
+	 * on a large tree).
+	 *
+	 * close_files above reopens the target for the round that would follow,
+	 * and the member that round starts with may be both the last one and
+	 * one that gets skipped - it cannot be opened, it changed since the
+	 * scan, or it already shares the target's extents. Each of those paths
+	 * takes `if (ctxt && last) goto run_dedupe`, but a round that has only
+	 * just begun has no ctxt yet, so they fall out of the loop instead,
+	 * leaving the target behind (and the skipped member too, if it opened).
+	 *
+	 * A group therefore has to be big enough to fill an ioctl batch before
+	 * any of this is reachable: max_queable is one below
+	 * MAX_DEDUPES_PER_IOCTL, so the rounds restart at members 120, 239, ...
+	 * Snapshot and backup trees are exactly that shape - hundreds of
+	 * identical copies, some of which are routinely skipped.
+	 */
+	filerec_close_open_list(&open_files);
+
 	abort_on(ctxt != NULL);
 	abort_on(!RB_EMPTY_ROOT(&open_files.root));
 
