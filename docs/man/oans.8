@@ -177,6 +177,25 @@ Trees full of tiny files scan much faster this way, since such files
 rarely dedupe usefully.
 Default \f[B]1\f[R], which skips only empty files.
 .TP
+\f[B]\-\-max\-filesize\f[R]=\f[I]SIZE\f[R]
+Skip regular files larger than \f[I]SIZE\f[R] bytes (suffixes
+\f[CR]K\f[R]/\f[CR]M\f[R]/\f[CR]G\f[R] accepted).
+By default there is no upper bound.
+Use it to leave VM images or backup archives to other tooling, or to
+bound the worst\-case time spent on a single file.
+A file of exactly \f[I]SIZE\f[R] bytes is still scanned.
+It is an error to give a \f[I]SIZE\f[R] below
+\f[B]\-\-min\-filesize\f[R], since nothing could then be scanned.
+.RS
+.PP
+Like \f[B]\-\-min\-filesize\f[R], this shapes only what is
+\f[I]scanned\f[R].
+A file hashed by an earlier run and excluded by a later
+\f[B]\-\-max\-filesize\f[R] keeps its rows until it is deleted from disk
+\(em pruning is by existence, not by whether a run covered the file \(em
+so it is simply not re\-scanned, and never re\-deduped.
+.RE
+.TP
 \f[B]\-\-skip\-zeroes\f[R]
 Detect and skip all\-zero blocks while reading.
 Speeds up scanning of sparse or zero\-filled data, at the cost of not
@@ -478,6 +497,8 @@ The final line is
 \f[CR]{\(dqevent\(dq:\(dqdone\(dq,\(dqelapsed_sec\(dq:...,\(dqfiles_scanned\(dq:...,\(dqgroups_deduped\(dq:...,\(dqreclaimed_bytes\(dq:...}\f[R].
 Fields that are not yet known (an ETA, a rate) are omitted; a consumer
 reading a line at a time can ignore any line that is not valid JSON.
+Diagnostics share standard error with the stream (an unreadable file, a
+failed ioctl), so such lines do occur.
 .PP
 Combine with \f[B]\-q\f[R] to silence the human stdout too, e.g.
 \f[CR]oans \-qd \-\-progress=json \-\-hashfile=FILE /srv/data 2>progress.jsonl\f[R].
@@ -546,6 +567,22 @@ This \f[I]N\f[R] is a lower\-level fiemap diagnostic \(em the change in
 bytes the filesystem reports as shared \(em and counts the surviving
 copy as shared too, so for pairs it is about twice \f[B]Reclaimed\f[R].
 Scripts that parsed this line from upstream duperemove continue to work.
+.SS File names in output
+A file name is untrusted input: anyone who can create a file inside a
+scanned tree chooses bytes that \f[CR]oans\f[R] then writes to your
+terminal.
+So wherever a path is printed \(em reports, the \f[B]\-L\f[R] listing,
+\f[B]\-\-stats\f[R], error messages and the live progress display \(em
+control characters in it are escaped: tab, newline and carriage return
+as \f[CR]\(rst\f[R], \f[CR]\(rsn\f[R], \f[CR]\(rsr\f[R], every other C0
+control, DEL and the C1 controls as \f[CR]\(rsxNN\f[R].
+Valid UTF\-8 is untouched, so ordinary names print exactly as they are.
+Escaping is unconditional, whether or not output is a terminal.
+.PP
+The escape is meant to be read, not parsed back into a path: a name
+containing a literal backslash is passed through unchanged.
+\f[B]\-\-json\f[R] escapes the same characters as \f[CR]\(rsu00NN\f[R],
+per JSON.
 .PP
 On a \f[B]compressed\f[R] btrfs, \f[B]Reclaimed\f[R] is a
 \f[I]logical\f[R] figure: dedupe shares logical extents but frees
@@ -650,6 +687,11 @@ This is the status an unattended job should alarm on \(em the run looks
 healthy otherwise, and would previously have exited \f[B]0\f[R].
 See \f[I]EXAMPLES\f[R] for an \f[CR]OnFailure=\f[R] setup.
 .RE
+.TP
+\f[B]130\f[R], \f[B]143\f[R]
+Interrupted by \f[B]SIGINT\f[R] (Ctrl\-C) or \f[B]SIGTERM\f[R].
+Work already done was committed to the hashfile; re\-run to continue
+where it stopped.
 .PP
 Skips the user asked for do \f[B]not\f[R] affect the exit status:
 \f[B]\-\-exclude\f[R] matches, files under \f[B]\-\-min\-filesize\f[R],
@@ -725,12 +767,21 @@ hash another tree\(cqs files.
 What does not carry over is anything not yet written to the hashfile.
 To keep a scan of millions of files from committing once per file,
 results are batched and written every ten seconds, and additionally at
-each checkpoint; a run killed before its first commit contributes
-nothing.
-Ctrl\-C is no gentler than a crash here \(em it is not trapped, so it
-discards the batch in progress too.
-In practice this only matters if runs are being cut short after a few
-seconds, which makes no progress however often it is repeated.
+each checkpoint; a run killed outright before its first commit
+contributes nothing.
+.PP
+\f[B]Ctrl\-C and \f[CB]systemctl stop\f[B] are handled\f[R], so they do
+not lose that batch.
+On \f[B]SIGINT\f[R] or \f[B]SIGTERM\f[R], \f[CR]oans\f[R] stops taking
+new work, lets what is in flight finish, writes a checkpoint for any
+large file it was in the middle of, commits the batch, and exits
+\f[B]130\f[R] or \f[B]143\f[R] (128 plus the signal, as a shell reports
+for any signalled program).
+A second signal is not trapped and kills at once.
+\f[CR]SIGKILL\f[R] still discards the batch, as it must.
+An interrupted run is deliberately \f[B]not\f[R] added to
+\f[B]\-\-history\f[R]: it covered whatever part of the tree it reached,
+and recording it would make a partial scan read as a complete one.
 .PP
 A checkpoint is only used if the file\(cqs size and modification time
 are still what they were, which is the same test \f[CR]oans\f[R] applies

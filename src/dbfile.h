@@ -198,6 +198,7 @@ struct scan_config {
 	int		do_block_hash;
 	int		dedupe_same_file;
 	uint64_t	min_filesize;
+	uint64_t	max_filesize;	/* 0 = no upper bound */
 	char		**roots;
 	int		nroots;
 	char		**excludes;

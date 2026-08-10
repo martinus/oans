@@ -34,6 +34,7 @@
 #include "dbfile.h"
 #include "memstats.h"
 #include "debug.h"
+#include "util.h"
 #include "progress.h"
 #include "threads.h"
 #include "tsan.h"
@@ -96,9 +97,13 @@ static void record_match(struct results_tree *res, unsigned char *digest,
 		exit(ENOMEM);
 	}
 
-	dprintf("Duplicated extent of %llu blocks in files:\n%s\t\t%s\n",
-		(unsigned long long)len / blocksize, orig->filename,
-		walk->filename);
+	if (debug) {
+		declare_display_path(dorig, orig->filename);
+		declare_display_path(dwalk, walk->filename);
+
+		dprintf("Duplicated extent of %llu blocks in files:\n%s\t\t%s\n",
+			(unsigned long long)len / blocksize, dorig, dwalk);
+	}
 
 	dprintf("%llu-%llu\t\t%llu-%llu\n",
 		(unsigned long long)soff[0] / blocksize,
@@ -319,8 +324,12 @@ static void search_file_extents(struct filerec *file, struct results_tree *dupe_
 	if (ret || !num_extents)
 		return;
 
-	dprintf("search_file_extents: %s (size=%"PRIu64" ret %d num_extents: "
-		"%u\n", file->filename, file->size, ret, num_extents);
+	if (debug) {
+		declare_display_path(disp, file->filename);
+
+		dprintf("search_file_extents: %s (size=%"PRIu64" ret %d num_extents: "
+			"%u\n", disp, file->size, ret, num_extents);
+	}
 	for(i = 0; i < num_extents; i++) {
 		extent = &extents[i];
 		dprintf("search_file_extents:   nondupe extent # %d loff %"

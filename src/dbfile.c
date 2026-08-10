@@ -97,6 +97,8 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 
 	/* longpath-ok: the hashfile directory, named by the user, never scanned. */
 	if (stat(dir, &st) != 0 && errno == ENOENT) {
+		/* escape-ok: the hashfile is oans's own --hashfile argument,
+		 * not a name found in a scanned tree. */
 		eprintf("Error: cannot open hashfile \"%s\": directory \"%s\" "
 			"does not exist.\n", filename, dir);
 		if (filename[0] == '~')
@@ -109,6 +111,8 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 	}
 	/* longpath-ok: the hashfile directory. */
 	if (stat(dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
+		/* escape-ok: the hashfile is oans's own --hashfile argument,
+		 * not a name found in a scanned tree. */
 		eprintf("Error: cannot open hashfile \"%s\": \"%s\" is not a "
 			"directory.\n", filename, dir);
 		return;
@@ -122,12 +126,16 @@ static void report_db_open_error(const char *filename, sqlite3 *db)
 	if (stat(filename, &st) == 0 && access(filename, R_OK | W_OK) != 0) {
 		struct passwd *pw = getpwuid(st.st_uid);
 
+		/* escape-ok: the hashfile is oans's own --hashfile argument,
+		 * not a name found in a scanned tree. */
 		eprintf("Error: cannot open hashfile \"%s\": permission denied.\n"
 			"       It is owned by %s; run oans as that user "
 			"(e.g. with sudo).\n", filename,
 			pw ? pw->pw_name : "another user");
 		return;
 	}
+	/* escape-ok: the hashfile is oans's own --hashfile argument,
+	 * not a name found in a scanned tree. */
 	eprintf("Error opening hashfile \"%s\": %s\n", filename,
 		sqlite3_errmsg(db));
 }
@@ -255,6 +263,8 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 	 */
 	app_id = (int)dbfile_query_u64(db, "PRAGMA application_id;");
 	if (app_id != OANS_APP_ID) {
+		/* escape-ok: the hashfile is oans's own --hashfile argument,
+		 * not a name found in a scanned tree. */
 		eprintf("Hashfile %s is not an oans hashfile "
 			"(application_id 0x%08x); refusing to use it\n", path,
 			(unsigned)app_id);
@@ -269,6 +279,8 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 
 
 	if (strncasecmp(cfg->hash_type, HASH_TYPE, 8)) {
+		/* escape-ok: the hashfile is oans's own --hashfile argument,
+		 * not a name found in a scanned tree. */
 		eprintf("Error: Hashfile %s uses \"%.*s\" for checksums "
 			"but we are using %.*s.\nYou are probably "
 			"using a hashfile generated from an old version, "
@@ -1329,7 +1341,8 @@ int dbfile_store_scan_config(struct dbhandle *dbh, const struct scan_config *sc)
 	    (ret = sync_config_int(stmt, "opt_only_whole_files", sc->only_whole_files)) ||
 	    (ret = sync_config_int(stmt, "opt_do_block_hash", sc->do_block_hash)) ||
 	    (ret = sync_config_int(stmt, "opt_dedupe_same_file", sc->dedupe_same_file)) ||
-	    (ret = sync_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)))
+	    (ret = sync_config_int(stmt, "opt_min_filesize", (int64_t)sc->min_filesize)) ||
+	    (ret = sync_config_int(stmt, "opt_max_filesize", (int64_t)sc->max_filesize)))
 		goto err;
 
 	ret = replace_string_rows(db,
@@ -1434,6 +1447,18 @@ int dbfile_load_scan_config(struct dbhandle *dbh, struct scan_config *sc)
 		if (ret)
 			return ret;
 		sc->min_filesize = (uint64_t)mfs;
+
+		/*
+		 * Additive key: a hashfile written before --max-filesize
+		 * existed has no row, and get_config_int64() then leaves the
+		 * caller's value alone - 0, "no upper bound", which is the
+		 * behaviour those runs had.
+		 */
+		mfs = 0;
+		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+		if (ret)
+			return ret;
+		sc->max_filesize = (uint64_t)mfs;
 	}
 
 	ret = load_string_rows(db, "select path from scan_roots order by rowid;",
@@ -2408,7 +2433,11 @@ int dbfile_remove_file(struct dbhandle *db, const char *filename)
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.delete_file;
 
-	dprintf("Remove file \"%s\" from the db\n", filename);
+	if (debug) {
+		declare_display_path(disp, filename);
+
+		dprintf("Remove file \"%s\" from the db\n", disp);
+	}
 
 	ret = sqlite3_bind_int64(stmt, 1, csum_path(filename));
 	if (ret) {

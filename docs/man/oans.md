@@ -146,6 +146,24 @@ file is recorded once.
     accepted). Trees full of tiny files scan much faster this way, since such
     files rarely dedupe usefully. Default **1**, which skips only empty files.
 
+<!-- Keep the blank line between this term and its `~` body below: without it
+     pandoc >=3.9 collapses this multi-paragraph definition into a single block. -->
+**\--max-filesize**=*SIZE*
+
+  ~ Skip regular files larger than *SIZE* bytes (suffixes `K`/`M`/`G`
+    accepted). By default there is no upper bound. Use it to leave VM images or
+    backup archives to other tooling, or to bound the worst-case time spent on
+    a single file. A file of exactly *SIZE* bytes is still scanned. It is an
+    error to give a *SIZE* below **\--min-filesize**, since nothing could then
+    be scanned.
+
+    <!-- -->
+
+    Like **\--min-filesize**, this shapes only what is *scanned*. A file hashed
+    by an earlier run and excluded by a later **\--max-filesize** keeps its rows
+    until it is deleted from disk — pruning is by existence, not by whether a
+    run covered the file — so it is simply not re-scanned, and never re-deduped.
+
 **\--skip-zeroes**
   ~ Detect and skip all-zero blocks while reading. Speeds up scanning of sparse
     or zero-filled data, at the cost of not deduplicating runs of zeroes.
@@ -398,6 +416,8 @@ file is recorded once.
     `{"event":"done","elapsed_sec":...,"files_scanned":...,"groups_deduped":...,"reclaimed_bytes":...}`.
     Fields that are not yet known (an ETA, a rate) are omitted; a consumer
     reading a line at a time can ignore any line that is not valid JSON.
+    Diagnostics share standard error with the stream (an unreadable file, a
+    failed ioctl), so such lines do occur.
 
     Combine with **-q** to silence the human stdout too, e.g.
     `oans -qd --progress=json --hashfile=FILE /srv/data 2>progress.jsonl`.
@@ -462,6 +482,20 @@ This *N* is a lower-level fiemap diagnostic — the change in bytes the filesyst
 reports as shared — and counts the surviving copy as shared too, so for pairs it
 is about twice **Reclaimed**. Scripts that parsed this line from upstream
 duperemove continue to work.
+
+## File names in output
+
+A file name is untrusted input: anyone who can create a file inside a scanned
+tree chooses bytes that `oans` then writes to your terminal. So wherever a path
+is printed — reports, the **-L** listing, **\--stats**, error messages and the
+live progress display — control characters in it are escaped: tab, newline and
+carriage return as `\t`, `\n`, `\r`, every other C0 control, DEL and the C1
+controls as `\xNN`. Valid UTF-8 is untouched, so ordinary names print exactly as
+they are. Escaping is unconditional, whether or not output is a terminal.
+
+The escape is meant to be read, not parsed back into a path: a name containing a
+literal backslash is passed through unchanged. **\--json** escapes the same
+characters as `\u00NN`, per JSON.
 
 On a **compressed** btrfs, **Reclaimed** is a *logical* figure: dedupe shares
 logical extents but frees compressed blocks, so the real on-disk saving is
@@ -555,6 +589,10 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
     healthy otherwise, and would previously have exited **0**. See *EXAMPLES*
     for an `OnFailure=` setup.
 
+**130**, **143**
+  ~ Interrupted by **SIGINT** (Ctrl-C) or **SIGTERM**. Work already done was
+    committed to the hashfile; re-run to continue where it stopped.
+
 Skips the user asked for do **not** affect the exit status: **\--exclude**
 matches, files under **\--min-filesize**, non-regular files, and read-only
 subvolumes are all reported but are not failures. Neither are files met during
@@ -620,10 +658,17 @@ never causes one run to hash another tree's files.
 What does not carry over is anything not yet written to the hashfile. To keep a
 scan of millions of files from committing once per file, results are batched and
 written every ten seconds, and additionally at each checkpoint; a run killed
-before its first commit contributes nothing. Ctrl-C is no gentler than a crash
-here — it is not trapped, so it discards the batch in progress too. In practice
-this only matters if runs are being cut short after a few seconds, which makes
-no progress however often it is repeated.
+outright before its first commit contributes nothing.
+
+**Ctrl-C and `systemctl stop` are handled**, so they do not lose that batch.
+On **SIGINT** or **SIGTERM**, `oans` stops taking new work, lets what is in
+flight finish, writes a checkpoint for any large file it was in the middle of,
+commits the batch, and exits **130** or **143** (128 plus the signal, as a shell
+reports for any signalled program). A second signal is not trapped and kills at
+once. `SIGKILL` still discards the batch, as it must. An interrupted run is
+deliberately **not** added to **\--history**: it covered whatever part of the
+tree it reached, and recording it would make a partial scan read as a complete
+one.
 
 A checkpoint is only used if the file's size and modification time are still
 what they were, which is the same test `oans` applies to every file in a

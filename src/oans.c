@@ -44,6 +44,7 @@
 #include "debug.h"
 #include "progress.h"
 #include "file_scan.h"
+#include "interrupt.h"
 #include "find_dupes.h"
 #include "run_dedupe.h"
 #include "storage.h"
@@ -81,10 +82,12 @@ struct dbfile_config dbfile_cfg;
 
 static void print_file(char *filename, char *ino, char *subvol)
 {
+	declare_display_path(disp, filename);
+
 	if (verbose)
-		printf("%s\t%s\t%s\n", filename, ino, subvol);
+		printf("%s\t%s\t%s\n", disp, ino, subvol);
 	else
-		printf("%s\n", filename);
+		printf("%s\n", disp);
 }
 
 /* Human duration for the timing lines: ms under a second, else seconds. */
@@ -124,6 +127,8 @@ static char *scan_config_options_str(const struct scan_config *sc)
 		g_string_append(s, "--skip-readonly-subvols ");
 	if (sc->min_filesize > 1)
 		g_string_append_printf(s, "--min-filesize=%"PRIu64" ", sc->min_filesize);
+	if (sc->max_filesize)
+		g_string_append_printf(s, "--max-filesize=%"PRIu64" ", sc->max_filesize);
 
 	if (sc->only_whole_files)
 		dtok[nd++] = "only_whole_files";
@@ -264,18 +269,26 @@ static int print_hashfile_stats(char *filename)
 		if (dbfile_load_scan_config(db, &sc) > 0) {
 			char *opts = scan_config_options_str(&sc);
 
+			/* escape-ok: the hashfile is oans's own --hashfile
+			 * argument, not a name found in a scanned tree. */
 			printf("\n%s%sstored scan%s   %s(replayed by: oans --hashfile=%s)%s\n",
 			       col_bold, col_blue, col_reset, col_dim, filename, col_reset);
 			printf("  %soptions%s         %s\n", col_dim, col_reset, opts);
 			free(opts);
-			for (i = 0; i < sc.nroots; i++)
+			for (i = 0; i < sc.nroots; i++) {
+				declare_display_path(disp, sc.roots[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "paths      " : "           ",
-				       col_reset, sc.roots[i]);
-			for (i = 0; i < sc.nexcludes; i++)
+				       col_reset, disp);
+			}
+			for (i = 0; i < sc.nexcludes; i++) {
+				declare_display_path(disp, sc.excludes[i]);
+
 				printf("  %s%s%s %s\n", col_dim,
 				       i == 0 ? "excludes   " : "           ",
-				       col_reset, sc.excludes[i]);
+				       col_reset, disp);
+			}
 			fflush(stdout);
 			scan_config_free(&sc);
 		}
@@ -378,8 +391,11 @@ static int print_hashfile_stats(char *filename)
 		snprintf(szb, sizeof(szb), "%s x %"PRIu64, human_size(top[i].size),
 			 top[i].count);
 		snprintf(wb, sizeof(wb), "%s", human_size(top[i].waste));
+		const char *raw = top[i].path ? top[i].path : "";
+		declare_display_path(example, raw);
+
 		printf("    %-18s %s%10s%s  %s\n", szb, col_dim, wb, col_reset,
-		       top[i].path ? top[i].path : "");
+		       example);
 		free(top[i].path);
 	}
 	fflush(stdout);
@@ -398,14 +414,20 @@ static void print_json_str(const char *s)
 {
 	putchar('"');
 	for (; *s; s++) {
-		unsigned char c = (unsigned char)*s;
+		unsigned char c = (unsigned char)*s, cp;
+		/* Same policy as sanitize_ctrl(), a different rendering: JSON
+		 * spells a dangerous byte \u00NN. Asking one classifier keeps
+		 * the two from drifting apart. */
+		size_t n = ctrl_seq_len((const unsigned char *)s, &cp);
 
-		if (c == '"' || c == '\\')
+		if (n) {
+			printf("\\u%04x", cp);
+			s += n - 1;
+		} else if (c == '"' || c == '\\') {
 			printf("\\%c", c);
-		else if (c < 0x20)
-			printf("\\u%04x", c);
-		else
+		} else {
 			putchar(c);
+		}
 	}
 	putchar('"');
 }
@@ -686,10 +708,14 @@ static int rm_db_files(int numfiles, char **files)
 			continue;
 		}
 
-		if (dbfile_remove_file(db, name))
+		if (dbfile_remove_file(db, name)) {
 			ret = -1;
-		else
-			vprintf("Removed \"%s\" from hashfile.\n", name);
+		} else if (verbose) {
+			declare_display_path(disp, name);
+
+			vprintf("Removed \"%s\" from hashfile.\n",
+				disp);
+		}
 	}
 	return ret;
 }
@@ -769,6 +795,7 @@ enum {
 	BATCH_SIZE_OPTION,
 	NO_COLOR_OPTION,
 	MIN_FILESIZE_OPTION,
+	MAX_FILESIZE_OPTION,
 	STATS_OPTION,
 	PRUNE_BLOCKS_OPTION,
 	HISTORY_OPTION,
@@ -779,7 +806,10 @@ enum {
 static int add_one_stdin_file(char *path, void *db)
 {
 	if (scan_file(path, db)) {
-		eprintf("Error: cannot add %s into the lookup list\n", path);
+		declare_display_path(disp, path);
+
+		eprintf("Error: cannot add %s into the lookup list\n",
+			disp);
 		return 1;
 	}
 	return 0;
@@ -838,6 +868,7 @@ static void help(void)
 "  -b SIZE                     hashing block size, 4K-1M (default 128K)\n"
 "  -B, --batchsize=N           dedupe every N scanned files (default 1024)\n"
 "  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
+"      --max-filesize=SIZE     skip files larger than SIZE (default: no limit)\n"
 "      --skip-zeroes           detect and skip all-zero blocks\n"
 "      --exclude=PATTERN       exclude matching paths (may be repeated)\n"
 "      --dedupe-options=OPT    [no]same, [no]partial, [no]only_whole_files\n"
@@ -894,6 +925,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
 		{ "no-color", 0, NULL, NO_COLOR_OPTION },
 		{ "min-filesize", 1, NULL, MIN_FILESIZE_OPTION },
+		{ "max-filesize", 1, NULL, MAX_FILESIZE_OPTION },
 		{ "stats", 0, NULL, STATS_OPTION },
 		{ "prune-block-hashes", 0, NULL, PRUNE_BLOCKS_OPTION },
 		{ "history", 0, NULL, HISTORY_OPTION },
@@ -1011,6 +1043,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 				return EINVAL;
 			}
 			break;
+		case MAX_FILESIZE_OPTION:
+			options.max_filesize = parse_size(optarg);
+			if (options.max_filesize == 0) {
+				eprintf("Error: --max-filesize must be greater than zero\n");
+				return EINVAL;
+			}
+			break;
 		case EXCLUDE_OPTION:
 			/*
 			 * A rejected pattern is a typo in the command line, and
@@ -1063,6 +1102,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	*filelist_idx = optind;
 	if (numfiles == 1 && strcmp(argv[optind], "-") == 0)
 		stdin_filelist = 1;
+
+	if (options.max_filesize && options.max_filesize < options.min_filesize) {
+		eprintf("Error: --max-filesize (%"PRIu64") is below "
+			"--min-filesize (%"PRIu64"); no file could be "
+			"scanned.\n", options.max_filesize, options.min_filesize);
+		return 1;
+	}
 
 	/* -L/-R/--stats/--history/--json are mutually exclusive report modes. */
 	unsigned int report_count = list_only_opt + rm_only_opt + stats_only_opt
@@ -1282,11 +1328,24 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 		unsigned int hi = i + stride < max ? i + stride : max;
 		struct dedupe_batch *batch;
 
+		/*
+		 * Interrupted: load no further batches. In-flight ones finish
+		 * their groups - FIDEDUPERANGE is atomic, and stopping a worker
+		 * mid-group would buy nothing - and dedupe_phase_end() reaps
+		 * them in generation order, so the durable dedupe_seq still
+		 * names only fully-processed generations.
+		 */
+		if (interrupted()) {
+			interrupt_report();
+			break;
+		}
+
 		dedupe_await_slot();		/* bound to 2 batches in flight */
 		pdedupe_set_batch(++pass);
 		batch = dedupe_begin_batch(hi);
 		stream_load_batch(pdb, inmem, batch, i, hi);
 		dedupe_seal_batch(batch);
+		interrupt_test_batch_tick();
 	}
 
 	dedupe_phase_end();
@@ -1387,6 +1446,9 @@ static void process_duplicates(struct dbhandle *db)
 	} else {
 		for (unsigned int i = first_seq; i < max; i += stride) {
 			unsigned int hi = i + stride < max ? i + stride : max;
+
+			if (interrupted())
+				break;
 
 			/* Report path is sequential; drop the previous window's
 			 * filerecs, which report_duplicates() recreates. */
@@ -1653,6 +1715,7 @@ static int apply_scan_config(const struct scan_config *sc)
 	options.do_block_hash = sc->do_block_hash;
 	options.dedupe_same_file = sc->dedupe_same_file;
 	options.min_filesize = sc->min_filesize;
+	options.max_filesize = sc->max_filesize;
 
 	/*
 	 * A stored pattern that no longer parses must stop the run, for the
@@ -1694,8 +1757,11 @@ static int apply_scan_config(const struct scan_config *sc)
 		eprintf("         Re-run once with -d and the paths to update "
 			"it:\n           oans -%sd --hashfile=%s",
 			sc->recurse ? "r" : "", options.hashfile);
-		for (i = 0; i < sc->nroots; i++)
-			eprintf(" %s", sc->roots[i]);
+		for (i = 0; i < sc->nroots; i++) {
+			declare_display_path(root, sc->roots[i]);
+
+			eprintf(" %s", root);
+		}
 		eprintf("\n");
 	}
 
@@ -1722,8 +1788,10 @@ static int drop_missing_roots(struct scan_config *sc, int *dropped)
 		if (stat(sc->roots[i], &st) == 0) {
 			sc->roots[live++] = sc->roots[i];
 		} else {
+			declare_display_path(disp, sc->roots[i]);
+
 			eprintf("Warning: stored path \"%s\" no longer exists, "
-				"skipping.\n", sc->roots[i]);
+				"skipping.\n", disp);
 			free(sc->roots[i]);
 			(*dropped)++;
 		}
@@ -1763,9 +1831,11 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 		 * and the "all roots gone" guard never fires, because the root
 		 * was never stored to go missing.
 		 */
+		declare_display_path(root, roots[i]);
+
 		eprintf("Warning: not storing root \"%s\" in the hashfile: %s. "
 			"A later replay of this hashfile will not cover it.\n",
-			roots[i], strerror(errno));
+			root, strerror(errno));
 	}
 
 	sc.run_dedupe = options.run_dedupe;
@@ -1776,6 +1846,7 @@ static void persist_scan_config(struct dbhandle *db, char **roots, int nroots)
 	sc.do_block_hash = options.do_block_hash;
 	sc.dedupe_same_file = options.dedupe_same_file;
 	sc.min_filesize = options.min_filesize;
+	sc.max_filesize = options.max_filesize;
 	sc.roots = abs;
 	sc.excludes = user_excludes;
 	sc.nexcludes = n_user_excludes;
@@ -1867,6 +1938,14 @@ int main(int argc, char **argv)
 	color_init(opt_no_color);
 	progress_set_json(options.progress_json);
 	start_timer();
+
+	/*
+	 * From here on a SIGINT/SIGTERM unwinds the run through its normal exit
+	 * path instead of killing it, so the open write batch is committed
+	 * rather than discarded (#201). Installed after option parsing: nothing
+	 * before this point has produced work worth saving.
+	 */
+	interrupt_install();
 
 	/* Allow larger than unusal amount of open files. On linux
 	 * this should bw increase form 1K to 512K open files
@@ -1980,8 +2059,14 @@ int main(int argc, char **argv)
 		 * hashfile-only history record so in-memory runs report it too. */
 		pscan_json_done(files_scanned, groups, reclaimed);
 
-		/* Append this run to the hashfile's history (fuels --history/--json). */
-		if (options.hashfile) {
+		/*
+		 * Append this run to the hashfile's history (fuels
+		 * --history/--json) - but not an interrupted one, which covered
+		 * an arbitrary prefix of the tree. Recording it would make
+		 * --history read as a completed scan of everything, and its
+		 * skip counters would look like a healthy run's.
+		 */
+		if (options.hashfile && !interrupted()) {
 			struct run_record rec = {
 				.ts = time(NULL),
 				.duration_ms = (int64_t)(elapsed_seconds() * 1000.0),
@@ -2018,6 +2103,15 @@ int main(int argc, char **argv)
 		ret = EXIT_INCOMPLETE;
 
 out:
+	/*
+	 * What a shell reports for a signalled child, so a wrapper sees
+	 * "interrupted" rather than a distinct oans failure. Last, and only over
+	 * a success: a real error found on the way out is the more useful
+	 * status, and it is not the signal's doing.
+	 */
+	if (interrupted() && !ret)
+		ret = 128 + interrupt_signo();
+
 	scan_config_free(&replay);
 	free_all_filerecs();
 	/* Outlives filescan_free(): the dedupe phase queries it. */

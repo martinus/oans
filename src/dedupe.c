@@ -32,6 +32,7 @@
 #include "filerec.h"
 #include "dedupe.h"
 #include "debug.h"
+#include "util.h"
 
 /*
  * Used to determine if requests must be aligned with the underlying block size
@@ -268,8 +269,13 @@ static void add_dedupe_request(struct dedupe_ctxt *ctxt,
 	info->bytes_deduped = 0;
 	same->dest_count++;
 
-	dprintf("add ioctl request %s, off: %llu, dest: %d\n", file->filename,
-		(unsigned long long)req->req_loff, same->dest_count);
+	if (debug) {
+		declare_display_path(disp, file->filename);
+
+		dprintf("add ioctl request %s, off: %llu, dest: %d\n",
+			disp,
+			(unsigned long long)req->req_loff, same->dest_count);
+	}
 }
 
 /*

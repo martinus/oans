@@ -56,6 +56,7 @@ class SelfDescribingConfigTest(DuperemoveTest):
         # adding a new one without wiring persist_scan_config fails here.
         d = self._seed_tree(contents=b"x" * 16384)
         self.dm("-rd", "--skip-zeroes", "--min-filesize=8192",
+                "--max-filesize=1M",
                 "--dedupe-options=nosame,only_whole_files", d)
         self.assertDmOk()
         self.assertEqual(self._opt("opt_run_dedupe"), 1)
@@ -65,6 +66,7 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertEqual(self._opt("opt_dedupe_same_file"), 0)   # nosame
         self.assertEqual(self._opt("opt_do_block_hash"), 0)      # not requested
         self.assertEqual(self._opt("opt_min_filesize"), 8192)
+        self.assertEqual(self._opt("opt_max_filesize"), 1024 * 1024)
 
     def test_bare_run_without_stored_config_errors(self):
         # Fresh hashfile, no arguments: nothing to replay.

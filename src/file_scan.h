@@ -75,6 +75,7 @@ enum scan_skip_bucket {
 	SCAN_SKIP_UNSUPPORTED_FS,	/* not btrfs/XFS, or a foreign fs */
 	SCAN_SKIP_EXCLUDED,		/* --exclude matched */
 	SCAN_SKIP_TOO_SMALL,		/* below --min-filesize */
+	SCAN_SKIP_TOO_LARGE,		/* above --max-filesize */
 	SCAN_SKIP_NOT_REGULAR,		/* neither a regular file nor a directory */
 	SCAN_SKIP_READONLY_SUBVOL,	/* read-only btrfs subvolume, see #156 */
 	SCAN_SKIP__COUNT

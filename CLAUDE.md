@@ -332,11 +332,9 @@ run picks the file up there.
   loops forever at zero progress**. Pre-existing, and this change strictly
   improves it: at 1.4 s kills v1.9.1 persisted 0 files over six rounds, where
   this code reached 1875 before stalling, because a checkpoint force-commits the
-  whole shared batch. **There is no signal handler anywhere in the tree**, so
-  Ctrl-C discards the open batch exactly as `SIGKILL` does (measured: both
-  persisted 0 at 3 s). "Ctrl-C is safe" means the hashfile is not corrupted, not
-  that the run's work is kept. A SIGINT handler that flushes would raise the
-  floor; nobody has built one.
+  whole shared batch. **SIGINT/SIGTERM now flush the open batch** (#201), which
+  raises that floor from `COMMIT_INTERVAL_SEC` to "whatever finished hashing";
+  only `SIGKILL` still discards it.
 - Test hooks: `DUPEREMOVE_CHECKPOINT_BYTES` lowers the interval,
   `DUPEREMOVE_CHECKPOINT_STOP=N` abandons a file after N checkpoints — an
   interrupted run, deterministically, rather than racing a signal against a read.
@@ -345,6 +343,57 @@ run picks the file up there.
   **identical to one straight-through scan**; that is the property that matters,
   since nothing downstream could tell a wrong digest from a file with no
   duplicate.
+
+## SIGINT/SIGTERM flush the batch (#201)
+
+`src/interrupt.{c,h}`. The handler **only sets a flag** (SQLite and GLib are not
+async-signal-safe); every loop that owns state polls it and unwinds through its
+ordinary exit path, and `filescan_free()` → `scan_writer_close()` already
+commits the batch on the way out. So nothing new is made durable — the loops
+just have to *reach* it. Measured on a 3000-file tree, SIGINT at 0.5 s:
+v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
+
+- **The flag is a lock-free `_Atomic int`, not `volatile sig_atomic_t`.** The
+  readers are on *other* threads (csum workers, walkers), and `volatile` orders
+  nothing across threads — ThreadSanitizer flags it, and is right to. C11 lets a
+  handler touch a lock-free atomic, which is what makes it both race-free and
+  async-signal-safe; a `static_assert` on `ATOMIC_INT_LOCK_FREE` keeps that
+  true. Relaxed on both sides: the flag carries no data.
+- `sigaction` with **`SA_RESTART`** (a walker blocked in `read()` resumes, so no
+  error path has to learn about EINTR) and **`SA_RESETHAND`** — the kernel puts
+  the default action back on delivery, so the second Ctrl-C kills with no work
+  in the handler. Verified by watching `SigCgt` in `/proc/PID/status` drop the
+  SIGINT bit.
+- **Four checkpoints, one per loop that would otherwise run to completion:** the
+  walkers still call `dirq_finished()` for every directory they skip (leaving
+  `walk_dir_pending` non-zero means `WALK_STOP` is never pushed and the consumer
+  blocks forever); the consumer stops calling `__scan_file`; the csum workers
+  *drop* queued files rather than hash them (the queue holds thousands — working
+  through it is not a shutdown); `csum_whole_file` abandons the file it is on
+  after writing an off-interval checkpoint, so a 1 TiB file costs one buffer of
+  latency instead of hours.
+- **The dedupe phase stops admitting batches and nothing else.** No new drain
+  points: in-flight batches reap normally, `FIDEDUPERANGE` is atomic, and the
+  generation-ordered watermark already guarantees `dedupe_seq` names only
+  fully-processed generations.
+- **An interrupted run is not written to `run_history`** — it would read as a
+  complete scan of the tree, skip counters and all. Exit is `128 + signo`, set
+  last and only over a success.
+- **Test hooks `DUPEREMOVE_INTERRUPT_AFTER=N` / `_AFTER_BATCHES=N` /
+  `DUPEREMOVE_INTERRUPT_SIGNAL=TERM`** count files that have **finished
+  hashing**, not files queued — so when the signal lands, N files are already in
+  the open batch and the durability assertion is exact. Counting queued files
+  let a loaded CI runner finish *none* of them, and the test asserted `> 0`
+  against 0. Two more traps in that hook: it is ticked from the csum workers, so
+  the counter is atomic and only the thread that crosses the limit raises
+  (`==`, not `>=` — with `SA_RESETHAND` a second `raise()` kills outright), and
+  the env is read once in `interrupt_install()` on the main thread, since a lazy
+  first-tick read races between workers. They raise the *real* signal at a named
+  point,
+  the same way `DUPEREMOVE_CHECKPOINT_STOP` does for #159. A `sleep N; kill`
+  race needs a tree too big for the suite (~500 MB/s of scan) and still
+  coin-flips on faster storage; `test_signal_flush.py` keeps one real-signal
+  test, which skips rather than fails if the scan won the race.
 
 ## io-threads default (storage heuristic)
 
@@ -401,6 +450,48 @@ roots are known (`apply_storage_defaults()` in `oans.c`).
   kept out of `make install`) run `oans --hashfile=/var/cache/oans/%i.hash` on a
   timer, replaying the stored config. Guide: `docs/nas-quickstart.md`.
 - The `fdupes` mode was **removed** — don't reintroduce it.
+
+## File names are untrusted input (#202)
+
+Anyone who can create a file inside a scanned tree picks bytes oans writes to
+the admin's terminal, so **every path oans prints goes through
+`sanitize_ctrl()`/`path_for_display()`** (`src/util.c`) — C0 controls, DEL and
+the UTF-8 C1 controls become `\t`/`\n`/`\r`/`\xNN`. A `\r` in a name rewrites
+the line above it (the summary, a progress row); `ESC[2J` clears the screen.
+
+- **`make lint` enforces it — `scripts/lint-escape.py`.** The rule is otherwise
+  prose, and prose rots: it was violated **eleven** times in the commit that
+  introduced it, three found by review and eight more by the lint. It flags a
+  path-shaped identifier passed to a printf-family macro; waive with
+  `escape-ok: <why>` (the only legitimate reason so far is the hashfile path,
+  which is oans's own argument rather than something found in a walk). Modelled
+  on `lint-longpath.py`, and wired into the same `make lint` CI job.
+- **Escape at the print site, never in the stored string.** The path is what
+  oans opens, stats and stores; only the display copy is escaped. The idiom is
+  `declare_display_path(disp, p);` then print `disp` — a *declaration* macro, in
+  the shape of `declare_alloc_tracking()`. It cannot be a statement expression
+  (`({ ... })` ends the cleanup scope, so the string is freed before `printf`
+  reads it) and it cannot use a fixed thread-local buffer like `pretty_size()`
+  does, because a path may exceed `PATH_MAX` (#117) and a truncated one names a
+  different file.
+- **On the hot path, escape inside the branch that prints, under the same guard
+  the print macro has.** `check_file()` and `is_excluded()` run per directory
+  entry, so their `-v` skip messages sit inside `if (verbose)` — `vprintf`'s own
+  guard is too late, the allocation would already have happened. `probe_fs()`
+  runs per root, so it escapes once at the top.
+- **One classifier, many renderings.** `ctrl_seq_len()` is the single definition
+  of *which* bytes are dangerous; `sanitize_ctrl()` spells them `\xNN` and
+  `print_json_str()` spells them `\u00NN`. Adding U+2028 or another C1 encoding
+  is then one edit, not two that can drift.
+- Every real name takes the `has_ctrl()` fast path — one exact-sized `strdup`
+  instead of a 4x over-allocation and a per-byte loop — and the progress row
+  skips the copy entirely. Worst-case expansion is `SANITIZE_CTRL_MAX` (4) bytes
+  per input byte; `sanitize_ctrl()` truncates at the last *complete* escape.
+- Pinned by `tests/integration/test_escape_names.py` (non-tty, asserts no raw
+  `\x1b`/`\r`/`\x07`/`\x7f` reaches either stream in any report mode) and
+  `test_progress_tty.py::test_a_crafted_name_cannot_inject_ansi_into_the_block`.
+  A test that only checks a plain name proves nothing — assert on the *bytes*,
+  with `text=False`.
 
 ## --exclude matching (src/glob.{c,h})
 
@@ -524,6 +615,29 @@ medians, same RSS.
   metadata walk — separation throws that overlap away for nothing. The one real win
   (exact ETA from a known total) is a UX gain that doesn't need serialization (the
   walk already counts files incrementally). Reverted.
+- **`STATX_CHANGE_COOKIE` is not a userspace ABI — don't plan around it (#207).**
+  It exists in `include/linux/stat.h` for in-kernel callers (NFSD's `i_version`),
+  not in the UAPI: on 7.1.3 `struct statx` has no `stx_change_cookie`,
+  `kernel-headers` does not define `STATX_CHANGE_COOKIE`, and asking for the bit
+  anyway returns a mask without it (btrfs and tmpfs alike, spare words zero). So
+  it is not privilege-gated — running as root would not help, and the filesystem
+  is irrelevant.
+  - **`ctime` closes the same hole and is already being read.** Re-measured: a
+    `chattr +C` file rewritten in place with `touch -d` restoring the mtime keeps
+    a stale digest (mtime and size both unchanged), but its ctime *does* move —
+    `utimensat()` updates ctime as a side effect, so restoring a timestamp cannot
+    hide a write. `ctime` is in `STATX_BASIC_STATS`, which the walk already asks
+    for: no new syscall, no kernel floor.
+  - **The objection that would have sunk it does not hold**: `FIDEDUPERANGE`
+    leaves ctime alone on both source and destination (measured), as does
+    `btrfs filesystem defragment` — so an incremental run would *not* re-hash
+    everything it deduped last night. What does move ctime without changing
+    content is metadata churn (`chmod`/`chown`/xattr/relabel) and a
+    `rsync -a`-style restore: one extra re-hash of that subtree, cost only.
+  - Only measured on btrfs; **re-measure the dedupe row on xfs before
+    implementing**, since that is the load-bearing one. Design sketch and the
+    full table are on #207.
+
 - **Warm rescan is single-consumer pipeline-latency-bound**, not CPU/query. A
   no-op rescan of ~174k files is ~2s wall / ~0.9s CPU, invariant to
   `--io-threads` (1..16); the serial consumer (`__scan_file` queue handoff +
@@ -764,10 +878,16 @@ what belongs here is when it bites:
   drives a real pty and replays the stream through a small ANSI emulator:
   `tests/integration/test_progress_tty.py`. Its invariant — *no worker-slot row
   may survive the end of a run* — catches the whole class, not just this site.
-- **Known gap, not yet fixed:** a routed `eprintf` lands on **stdout**, because
-  `print_above_block()` only knows the stream the block lives on. So an error's
-  destination depends on whether a block happened to be up. Pre-existing; fixing
-  it means flushing across the two streams mid-redraw.
+- **Routing honors the caller's stream (#203).** `print_above_block()` takes the
+  `FILE *` and writes the message there, so an `eprintf` reaches stderr whether
+  or not a block was up (it used to always land on stdout, and `2>errors.log`
+  lost exactly the errors raised mid-run). The block itself is still stdout-only,
+  so the erase must be `fflush`ed before the message and the message flushed
+  before the redraw — otherwise the two streams' buffers interleave and the
+  message lands inside the block. Don't drop those flushes.
+  - Consequence for `--progress=json`: the JSON stream is **stderr**, so
+    diagnostics share it. That was already true for anything printed outside the
+    printer's lifetime; a consumer must skip lines that don't parse.
 
 ## Valgrind
 
