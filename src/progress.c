@@ -1207,12 +1207,13 @@ void pscan_slot_waiting(struct pscan_thread *slot, bool waiting)
 
 /* Erase the live block, print where it sat (that row becomes scrollback), then
  * redraw the block below the message. */
-static void print_above_block(const char *fmt, va_list args)
+static void print_above_block(FILE *stream, const char *fmt, va_list args)
 {
-	/* JSON mode draws no block (and the progress stream is on stderr), so a
-	 * routed message is just a plain stdout print. */
+	/* JSON mode draws no block, so a routed message is just a plain print
+	 * on the caller's stream. */
 	if (progress_json) {
-		vfprintf(stdout, fmt, args);
+		vfprintf(stream, fmt, args);
+		fflush(stream);
 		return;
 	}
 
@@ -1222,7 +1223,16 @@ static void print_above_block(const char *fmt, va_list args)
 	progress_wipe();
 	drawn_lines = 0;
 
-	vfprintf(stdout, fmt, args);
+	/*
+	 * The block lives on stdout; `stream` may be another descriptor pointing
+	 * at the same tty. Flush the erase before writing the message, or the
+	 * two streams' buffers interleave and the message lands inside the block
+	 * it was supposed to replace. When stderr is redirected instead, the
+	 * erase+redraw is a harmless wipe/redraw cycle on the tty.
+	 */
+	fflush(stdout);
+	vfprintf(stream, fmt, args);
+	fflush(stream);
 
 	print_progress();
 	g_mutex_unlock(&pscan.mutex);
@@ -1230,8 +1240,10 @@ static void print_above_block(const char *fmt, va_list args)
 
 /*
  * Print a message without disturbing the live block (see block_live()). The
- * message lands above the block and scrolls away as history; `stream` is used
- * only when there is no block to work around.
+ * message lands above the block and scrolls away as history, and always on the
+ * caller's `stream`: routing used to force every message to stdout, so whether
+ * an eprintf() reached stderr depended on whether a block happened to be up,
+ * and `2>errors.log` silently lost exactly the errors raised mid-run (#203).
  *
  * Two states count as "a block to work around", and missing either one is what
  * #179 was: a printer thread is animating it, *or* one is simply sitting there
@@ -1250,7 +1262,7 @@ void progress_printf(FILE *stream, const char *fmt, ...)
 
 	va_start(args, fmt);
 	if (printer || block_live())
-		print_above_block(fmt, args);
+		print_above_block(stream, fmt, args);
 	else
 		vfprintf(stream, fmt, args);
 	va_end(args);

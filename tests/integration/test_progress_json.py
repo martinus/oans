@@ -9,6 +9,7 @@ output. This lets scheduled and non-interactive runs be monitored.
 import json
 import os
 import subprocess
+import unittest
 
 from harness import DuperemoveTest, requires_reflink, DUPEREMOVE
 
@@ -145,6 +146,29 @@ class ProgressJsonTest(DuperemoveTest):
         self.assertNotIn("⣿".encode(), out)  # ⣿, a filled bar cell
         # The JSON stream, ending with a done event, is on stderr.
         self.assertIn('"event":"done"', err)
+
+    @unittest.skipIf(os.geteuid() == 0,
+                     "running as root defeats the chmod 000 unreadable file")
+    def test_errors_go_to_stderr_not_the_report_stream(self):
+        """A mid-run error must not land on stdout in JSON mode either (#203).
+
+        The progress printer runs for the whole run here, so every message is
+        routed - which used to mean forced onto stdout, mixing diagnostics into
+        the stream that carries the human/compat report.
+        """
+        for i in range(4):
+            self.mkdup(f"tree/a{i}", f"tree/b{i}", 200_000)
+        os.chmod(self.mkrand("tree/locked.bin", 65536), 0)
+        d = os.path.join(self.work, "tree")
+
+        p = subprocess.run(
+            [DUPEREMOVE, "--io-threads=4", "--hashfile", self.hf,
+             "--progress=json", "-rd", d],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("while opening file", p.stderr)
+        self.assertNotIn("while opening file", p.stdout)
+        self.assertNotIn("locked.bin", p.stdout)
 
     def test_invalid_progress_value_is_rejected(self):
         p = subprocess.run(

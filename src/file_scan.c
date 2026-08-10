@@ -192,6 +192,7 @@ static const struct {
 	[SCAN_SKIP_UNSUPPORTED_FS]= { "unsupported_fs",	"unsupported filesystem", true },
 	[SCAN_SKIP_EXCLUDED]	  = { "excluded",	"excluded",		false },
 	[SCAN_SKIP_TOO_SMALL]	  = { "too_small",	"below --min-filesize",	false },
+	[SCAN_SKIP_TOO_LARGE]	  = { "too_large",	"above --max-filesize",	false },
 	[SCAN_SKIP_NOT_REGULAR]	  = { "not_regular",	"not a regular file",	false },
 	[SCAN_SKIP_READONLY_SUBVOL] = { "readonly_subvol",
 					"read-only subvolume",		false },
@@ -1074,6 +1075,14 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 				options.min_filesize);
 		}
 		filescan_count_skip(SCAN_SKIP_TOO_SMALL);
+		return false;
+	}
+
+	if (S_ISREG(st->stx_mode) && options.max_filesize &&
+	    st->stx_size > options.max_filesize) {
+		vprintf("Skipping file above --max-filesize: %s (%llu > %"PRIu64")\n",
+			path, st->stx_size, options.max_filesize);
+		filescan_count_skip(SCAN_SKIP_TOO_LARGE);
 		return false;
 	}
 

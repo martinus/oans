@@ -98,10 +98,19 @@ class CrossPassTest(DuperemoveTest):
             self.write(f"tree/{name}", data)
         self.sync()
 
+        # Whether flushed writes actually split extents is the allocator's
+        # call, not ours: xfs coalesces them behind delayed allocation and
+        # speculative preallocation, and btrfs under valgrind is slow enough to
+        # do the same. When it doesn't fragment there is no disagreement
+        # between the two candidate rules left to observe, so the run below
+        # would pass whichever rule target election used - i.e. prove nothing.
+        # Skip loudly rather than fail on a precondition, or assert nothing.
         frag = len(phys_extents(self.path("tree/c000")))
         tidy = len(phys_extents(self.path("tree/c001")))
-        self.assertGreater(frag, tidy,
-                           "setup failed: c000 was meant to be the fragmented one")
+        if frag <= tidy:
+            self.skipTest(f"this filesystem coalesced the flushed writes "
+                          f"({frag} extents vs {tidy}); nothing to tell the "
+                          f"two target rules apart")
         target_phys = phys_extents(self.path("tree/c001"))
 
         self.dm("-rd", *self.BOPT, self.path("tree"), env=self.ENV)
