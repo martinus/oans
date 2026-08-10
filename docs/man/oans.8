@@ -177,6 +177,25 @@ Trees full of tiny files scan much faster this way, since such files
 rarely dedupe usefully.
 Default \f[B]1\f[R], which skips only empty files.
 .TP
+\f[B]\-\-max\-filesize\f[R]=\f[I]SIZE\f[R]
+Skip regular files larger than \f[I]SIZE\f[R] bytes (suffixes
+\f[CR]K\f[R]/\f[CR]M\f[R]/\f[CR]G\f[R] accepted).
+By default there is no upper bound.
+Use it to leave VM images or backup archives to other tooling, or to
+bound the worst\-case time spent on a single file.
+A file of exactly \f[I]SIZE\f[R] bytes is still scanned.
+It is an error to give a \f[I]SIZE\f[R] below
+\f[B]\-\-min\-filesize\f[R], since nothing could then be scanned.
+.RS
+.PP
+Like \f[B]\-\-min\-filesize\f[R], this shapes only what is
+\f[I]scanned\f[R].
+A file hashed by an earlier run and excluded by a later
+\f[B]\-\-max\-filesize\f[R] keeps its rows until it is deleted from disk
+\(em pruning is by existence, not by whether a run covered the file \(em
+so it is simply not re\-scanned, and never re\-deduped.
+.RE
+.TP
 \f[B]\-\-skip\-zeroes\f[R]
 Detect and skip all\-zero blocks while reading.
 Speeds up scanning of sparse or zero\-filled data, at the cost of not
