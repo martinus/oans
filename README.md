@@ -43,6 +43,7 @@ Summary
 | Feature | What you get |
 |---|---|
 | ⚡ **Fast where it counts** | Re-runs skip everything already hashed *and* already shared — rescanning a deduped 2M-file / 230 GiB tree takes **~92 s vs ~11 min for duperemove 0.15.2** (~7×). And when the tree is **larger than RAM** (the usual NAS/backup case), even a first-run dedupe is **~13× faster** (14 s vs 180 s): oans prefetches the data the kernel re-reads cold — [benchmark](docs/benchmarks.md#larger-than-ram-dedupe). |
+| 📸 **Snapshots are close to free** | Hashing N snapshots of a subvolume used to read N× the data. Two files whose physical layout is identical are backed by the same stored bytes, so the second one's hashes are **copied instead of recomputed** — a 4-snapshot tree scans **2.36 s → 0.65 s** cold (3.6×, against a ceiling of 4×). The digest still means the same thing — the hash of the file's bytes — so no existing hashfile is invalidated, and a copy only happens after three independent checks agree. Trees without snapshots are unaffected. |
 | 🪄 **Zero-config re-runs** | The hashfile remembers your options, paths and excludes. After the first run, `oans --hashfile=FILE` — nothing else — replays it incrementally. |
 | ⏰ **Scheduling built in** | `sudo make install-systemd`, then `systemctl enable --now oans@data.timer`. Weekly dedupe at idle I/O priority, no cron scripts. |
 | 📊 **Observability** | `--stats` shows what a hashfile holds and how much is duplicated; `--history` shows space actually reclaimed over time; `--json` exports metrics for dashboards; `--progress=json` streams live per-phase progress for monitoring scheduled runs. |
@@ -151,6 +152,7 @@ commands and comparison binary are documented in the
 | Change | Effect |
 |---|---|
 | Skip already-shared files up front | Warm re-run **~11 min → ~92 s** vs upstream (best case; cold first runs gain less) |
+| Copy hashes when a file's physical layout is one already hashed | Snapshot tree scan **2.36 s → 0.65 s (3.6×)** on 4 snapshots of 7.5 GiB, cold; the ceiling is the number of copies. Flat on trees without snapshots |
 | Streaming dedupe pipeline + page-cache prefetch | Larger-than-RAM dedupe **179.7 s → 13.8 s (~13×)** at **~2× lower peak RSS**, doing byte-for-byte identical work — [details](docs/benchmarks.md#larger-than-ram-dedupe) |
 | No cross-generation reprocessing of duplicate groups | Dedupe phase **~294 s → ~188 s (~36 %)**, kernel dedupe traffic halved, accurate accounting |
 | Batched SQLite transactions (~10 s cadence) | **~24 % faster rescans**; hundreds of thousands of file-lock syscalls collapsed to a few hundred |
