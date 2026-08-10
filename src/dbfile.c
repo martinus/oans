@@ -2116,33 +2116,22 @@ int dbfile_layout_matches(struct dbhandle *db, int64_t donor,
 int dbfile_copy_scanned_file(struct dbhandle *db, int64_t dst, int64_t donor,
 			     unsigned int flags)
 {
-	sqlite3_stmt *stmts[3] = { db->stmts.copy_extent_hashes,
-				   db->stmts.copy_block_hashes,
-				   db->stmts.copy_scanned_file };
-	unsigned int i;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *ext = db->stmts.copy_extent_hashes;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *blk = db->stmts.copy_block_hashes;
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *row = db->stmts.copy_scanned_file;
+	int ret;
 
-	for (i = 0; i < ARRAY_SIZE(stmts); i++) {
-		_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = stmts[i];
-		int ret = sqlite3_bind_int64(stmt, 1, dst);
-
-		if (!ret)
-			ret = sqlite3_bind_int64(stmt, 2, donor);
-		/* Only the last statement has a ?3; binding an index a
-		 * statement does not declare is an error, not a no-op. */
-		if (!ret && stmt == db->stmts.copy_scanned_file)
-			ret = sqlite3_bind_int64(stmt, 3, flags);
-		if (ret) {
-			perror_sqlite(ret, "binding values");
-			return ret;
-		}
-		ret = sqlite3_step(stmt);
-		if (ret != SQLITE_DONE) {
-			perror_sqlite(ret, "copying a donor's hashes");
-			return ret;
-		}
-	}
-
-	return 0;
+	/* ?1 = destination, ?2 = donor - run_by_fileid_arg()'s shape exactly. */
+	ret = run_by_fileid_arg(ext, dst, donor);
+	if (!ret)
+		ret = run_by_fileid_arg(blk, dst, donor);
+	if (!ret)
+		ret = sqlite3_bind_int64(row, 3, flags);
+	if (!ret)
+		ret = run_by_fileid_arg(row, dst, donor);
+	if (ret)
+		perror_sqlite(ret, "copying a donor's hashes");
+	return ret;
 }
 
 int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)

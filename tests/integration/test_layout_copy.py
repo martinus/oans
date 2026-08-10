@@ -38,10 +38,6 @@ class LayoutCopyTest(DuperemoveTest):
                 f.write(os.urandom(size))
         self.sync()
 
-    def fingerprints(self):
-        return (self.files_fingerprint(), self.extents_fingerprint(),
-                self.blocks_fingerprint())
-
     def _scan_both_ways(self, *extra):
         """Scan the scratch tree with the copy on, then off; return both prints.
 
@@ -147,13 +143,31 @@ class LayoutCopyTest(DuperemoveTest):
         self.assertDmOk("second dedupe")
         self.assertReclaimedNothing("the tree is already deduped")
 
-    def test_without_a_hashfile_nothing_is_copied(self):
-        # The copy reads the donor's rows back out of the database; an
-        # in-memory run has no --hashfile to point at.
+    @requires_reflink
+    def test_it_works_without_a_hashfile_too(self):
+        """No --hashfile is not "no database" - it is an in-memory one.
+
+        The donor's rows are read back through the same handle the scan wrote
+        them with, so the copy works there exactly as it does on disk. What
+        matters is that the outcome is identical either way.
+        """
+        self._fill(n=2)
+        self.snapshot(self.live, "snap", readonly=False)
+        # An independently written pair, so the run has something to reclaim.
+        self.mkdup("live/dupA.bin", "live/dupB.bin", SIZE)
+        self.sync()
+
+        self.dm("-r", "--io-threads=1", self.work, hashfile=False, quiet=False)
+        self.assertDmOk()
+        self.assertGreater(self.layout_copies(), 0,
+                           "no --hashfile should not switch the copy off")
+
+    def test_the_kill_switch_is_the_only_thing_that_disables_it(self):
         self._fill(n=2)
         self.snapshot(self.live, "snap")
         self.sync()
 
-        self.dm("-r", "--io-threads=1", self.work, hashfile=False, quiet=False)
+        self.dm("-r", "--io-threads=1", self.work, quiet=False,
+                env={"DUPEREMOVE_NO_LAYOUT_COPY": "1"})
         self.assertDmOk()
         self.assertEqual(0, self.layout_copies())

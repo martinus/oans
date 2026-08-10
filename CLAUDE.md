@@ -488,10 +488,20 @@ medians, same RSS.
   inside the open batch, so a donor hashed seconds ago is visible before any
   commit. (The issue anticipated needing a fallback for this; a different
   connection *would* need one.)
-- **`LAYOUT_COPY_MIN_SIZE = READ_BUF_LEN` (1 MiB).** The map is one entry per
-  candidate donor, so on a multi-million-file tree it would be tens of MB of RSS
-  for nothing (see #208). Below one read buffer the file is a single I/O and the
-  bookkeeping costs more than it saves.
+- **`LAYOUT_COPY_MIN_SIZE = READ_BUF_LEN` (1 MiB), checked *before* the key is
+  built.** The map is one entry per candidate donor, so on a multi-million-file
+  tree it would be tens of MB of RSS for nothing (see #208); below one read
+  buffer the file is a single I/O and the bookkeeping costs more than it saves.
+  Gating after the key — as the first cut did — meant every small file, and
+  every file at all under the kill switch, paid for a hash that could never
+  match, since the size is part of the key.
+- **The donor table is open-addressed with inline slots, like `seen_inodes`** —
+  a `GHashTable` node plus a malloc per entry is ~50 B where the entry is 24,
+  and there is one per large file. Same reason that set stopped using one.
+- **Nothing gates this on `--hashfile`.** A run without one keeps its rows in an
+  in-memory database that the copy reads and writes identically; measured, the
+  dedupe outcome is the same with and without. Only `DUPEREMOVE_NO_LAYOUT_COPY`
+  turns it off.
 - **A hit needs the donor to have *finished*.** With N workers, a file and its
   snapshot are often hashed side by side and neither can donate — measured 74-82%
   hit rate on small trees, and it only improves with tree size. Fine in

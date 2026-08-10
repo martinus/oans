@@ -2654,90 +2654,157 @@ struct layout_donor {
 	int64_t		fileid;
 };
 
-static GHashTable	*layout_donors;		/* key -> struct layout_donor */
-static GMutex		layout_donors_lock;
-static bool		layout_copy_enabled;
-static _Atomic uint64_t	layout_copied_files;
-static _Atomic uint64_t	layout_copied_bytes;
+/*
+ * Open-addressed, slots inline, occupancy in a bitmap - the same shape as
+ * seen_inodes below, and for the same reason: a GHashTable node plus a malloc
+ * per entry is ~50 B where the entry itself is 24, and there is one entry per
+ * large file in the tree. Guarded by a mutex because the csum workers share it,
+ * unlike seen_inodes, which the single consumer owns.
+ */
+static struct layout_donor	*donor_slots;
+static uint64_t			*donor_used;	/* 1 bit per slot */
+static size_t			donor_cap;	/* power of two, 0 == off */
+static size_t			donor_count;
+static GMutex			donor_lock;
+static _Atomic uint64_t		layout_copied_files;
+static _Atomic uint64_t		layout_copied_bytes;
 
-static guint layout_key_hash(gconstpointer p)
+static inline bool donor_slot_used(size_t i)
 {
-	const struct layout_donor *d = p;
-	guint h;
-
-	/* The key is already a digest; fold it rather than hash it again. */
-	memcpy(&h, d->key, sizeof(h));
-	return h;
+	return (donor_used[i >> 6] >> (i & 63)) & 1;
 }
 
-static gboolean layout_key_equal(gconstpointer a, gconstpointer b)
+/* The key is already a digest; take a machine word of it as the index. */
+static inline size_t donor_hash(const unsigned char *key)
 {
-	const struct layout_donor *x = a, *y = b;
+	uint64_t h;
 
-	return memcmp(x->key, y->key, DIGEST_LEN) == 0;
+	memcpy(&h, key, sizeof(h));
+	return (size_t)h;
+}
+
+/* Insert into a table known to have a free slot (caller ensures capacity). */
+static void donor_insert(const unsigned char *key, int64_t fileid)
+{
+	size_t mask = donor_cap - 1;
+	size_t i;
+
+	for (i = donor_hash(key) & mask; donor_slot_used(i); i = (i + 1) & mask)
+		if (memcmp(donor_slots[i].key, key, DIGEST_LEN) == 0)
+			return;			/* first donor wins */
+	memcpy(donor_slots[i].key, key, DIGEST_LEN);
+	donor_slots[i].fileid = fileid;
+	donor_used[i >> 6] |= (uint64_t)1 << (i & 63);
+	donor_count++;
+}
+
+/* Double the table, rehashing; returns false (old table intact) on OOM. */
+static bool donor_grow(void)
+{
+	struct layout_donor *old = donor_slots;
+	uint64_t *oldused = donor_used;
+	size_t oldcap = donor_cap, newcap = donor_cap * 2, i;
+	struct layout_donor *ns = calloc(newcap, sizeof(*ns));
+	uint64_t *nu = calloc((newcap + 63) / 64, sizeof(*nu));
+
+	if (!ns || !nu) {
+		free(ns);
+		free(nu);
+		return false;
+	}
+	donor_slots = ns;
+	donor_used = nu;
+	donor_cap = newcap;
+	donor_count = 0;
+	for (i = 0; i < oldcap; i++)
+		if ((oldused[i >> 6] >> (i & 63)) & 1)
+			donor_insert(old[i].key, old[i].fileid);
+	free(old);
+	free(oldused);
+	return true;
 }
 
 static void layout_donors_init(void)
 {
 	/*
-	 * Off without a hashfile: the copy reads the donor's rows back out of
-	 * the database, and an in-memory db is discarded at exit anyway.
 	 * DUPEREMOVE_NO_LAYOUT_COPY is the kill switch a bisect or an A/B
-	 * measurement needs - with it set, every file is hashed the old way and
-	 * the hashfile must come out byte-identical.
+	 * measurement needs: with it set, every file is hashed the old way and
+	 * the hashfile must come out byte-identical. Nothing else gates this -
+	 * a run without --hashfile keeps its rows in an in-memory database that
+	 * this reads and writes exactly the same way.
 	 */
-	layout_copy_enabled = options.hashfile &&
-			      !getenv("DUPEREMOVE_NO_LAYOUT_COPY");
-	if (!layout_copy_enabled)
+	if (getenv("DUPEREMOVE_NO_LAYOUT_COPY"))
 		return;
-	layout_donors = g_hash_table_new_full(layout_key_hash, layout_key_equal,
-					      g_free, NULL);
+
+	donor_cap = 1024;
+	donor_count = 0;
+	donor_slots = calloc(donor_cap, sizeof(*donor_slots));
+	donor_used = calloc((donor_cap + 63) / 64, sizeof(*donor_used));
+	if (!donor_slots || !donor_used) {
+		free(donor_slots);
+		free(donor_used);
+		donor_slots = NULL;
+		donor_used = NULL;
+		donor_cap = 0;		/* an optimisation, not state: run on */
+	}
 }
 
 static void layout_donors_free(void)
 {
-	g_clear_pointer(&layout_donors, g_hash_table_destroy);
-	layout_copy_enabled = false;
+	free(donor_slots);
+	donor_slots = NULL;
+	free(donor_used);
+	donor_used = NULL;
+	donor_cap = 0;
+	donor_count = 0;
+}
+
+/*
+ * Is this file worth keying at all? Asked before the key is built, so a run
+ * with the feature off - or a file too small to ever match, since donors are
+ * only registered at LAYOUT_COPY_MIN_SIZE and the size is part of the key -
+ * pays one compare rather than a hash of the record array.
+ */
+static inline bool layout_copy_wanted(uint64_t filesize)
+{
+	return donor_cap && filesize >= LAYOUT_COPY_MIN_SIZE;
 }
 
 /* Offer a freshly hashed file as a donor for the rest of this run. */
-static void layout_donor_add(const unsigned char *key, int64_t fileid,
-			     uint64_t size)
+static void layout_donor_add(const unsigned char *key, int64_t fileid)
 {
-	struct layout_donor *d;
-
-	if (!layout_copy_enabled || size < LAYOUT_COPY_MIN_SIZE)
-		return;
-
-	d = malloc(sizeof(*d));
-	if (!d)
-		return;			/* a donor is an optimisation, not state */
-	memcpy(d->key, key, DIGEST_LEN);
-	d->fileid = fileid;
-
-	g_mutex_lock(&layout_donors_lock);
-	/* First one wins: any file with this layout will do, and replacing the
-	 * entry would only churn. */
-	if (!g_hash_table_contains(layout_donors, d))
-		g_hash_table_add(layout_donors, d);
-	else
-		free(d);
-	g_mutex_unlock(&layout_donors_lock);
+	g_mutex_lock(&donor_lock);
+	/* Grow at ~70% load to keep probes short; on OOM just stop taking
+	 * donors, which costs hashing and nothing else. */
+	if ((donor_count + 1) * 10 >= donor_cap * 7 && !donor_grow())
+		goto out;
+	donor_insert(key, fileid);
+out:
+	g_mutex_unlock(&donor_lock);
 }
 
 /* The file id registered for `key`, or 0 if none. */
 static int64_t layout_donor_find(const unsigned char *key)
 {
-	struct layout_donor probe, *found;
+	size_t mask, i;
+	int64_t found = 0;
 
-	if (!layout_copy_enabled)
-		return 0;
+	g_mutex_lock(&donor_lock);
+	mask = donor_cap - 1;
+	for (i = donor_hash(key) & mask; donor_slot_used(i); i = (i + 1) & mask)
+		if (memcmp(donor_slots[i].key, key, DIGEST_LEN) == 0) {
+			found = donor_slots[i].fileid;
+			break;
+		}
+	g_mutex_unlock(&donor_lock);
+	return found;
+}
 
-	memcpy(probe.key, key, DIGEST_LEN);
-	g_mutex_lock(&layout_donors_lock);
-	found = g_hash_table_lookup(layout_donors, &probe);
-	g_mutex_unlock(&layout_donors_lock);
-	return found ? found->fileid : 0;
+/* Bytes the donor table holds, for the memory breakdown. */
+uint64_t filescan_layout_donor_bytes(void)
+{
+	return donor_cap * sizeof(*donor_slots) +
+	       ((donor_cap + 63) / 64) * sizeof(*donor_used);
 }
 
 void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes)
@@ -2758,17 +2825,12 @@ void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes)
  */
 static bool try_layout_copy(struct scan_ctxt *ctxt, struct file_to_scan *file,
 			    struct pscan_thread *tprogress, struct dbhandle *db,
-			    unsigned char *key_out, bool *key_valid)
+			    const unsigned char *key)
 {
-	int64_t donor;
+	int64_t donor = layout_donor_find(key);
 	unsigned int flags;
 	int ret;
 
-	*key_valid = fiemap_layout_key(ctxt->fiemap, ctxt->filesize, key_out);
-	if (!*key_valid)
-		return false;
-
-	donor = layout_donor_find(key_out);
 	if (!donor || donor == file->fileid)
 		return false;
 
@@ -3083,8 +3145,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * rows to reconcile, and the case this exists for - a fresh snapshot -
 	 * never has either.
 	 */
-	if (!file->resume &&
-	    try_layout_copy(&ctxt, file, tprogress, db, layout_key, &has_layout_key))
+	has_layout_key = layout_copy_wanted(ctxt.filesize) &&
+			 fiemap_layout_key(ctxt.fiemap, ctxt.filesize, layout_key);
+	if (has_layout_key && !file->resume &&
+	    try_layout_copy(&ctxt, file, tprogress, db, layout_key))
 		return;
 
 	if (!allocate_hashes(&hashes, &ctxt)) {
@@ -3328,7 +3392,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * declines.
 	 */
 	if (has_layout_key)
-		layout_donor_add(layout_key, file->fileid, ctxt.filesize);
+		layout_donor_add(layout_key, file->fileid);
 
 	/* Calibration: overhead is everything but the byte-proportional read+hash
 	 * loop (setup + finalize + DB write). */
