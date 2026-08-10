@@ -376,6 +376,19 @@ v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
   points: in-flight batches reap normally, `FIDEDUPERANGE` is atomic, and the
   generation-ordered watermark already guarantees `dedupe_seq` names only
   fully-processed generations.
+- **An interrupt during the *scan* skips the dedupe phase outright**
+  (`process_duplicates` returns right after the "Hashfile written" line), and
+  the run does not `dbfile_maybe_vacuum()` on the way out. The batch-loop check
+  above is too late: everything *before* it still ran — the deleted-file prune,
+  the find-dupes index build, the ~9 s group analysis — and then a VACUUM that
+  rewrites the whole file and cannot itself be interrupted. It deduped nothing
+  (the loop broke at once), so the only effect was a Ctrl-C that looked ignored
+  for minutes and then printed `Nothing to deduplicate`.
+  - **Wiping the progress block is part of it.** The scan hands its block to
+    the dedupe phase (`pscan_join(continues=true)`), so `dedupe_live` must also
+    test `!interrupted()` — without it the early return strands the worker rows
+    on screen for the rest of the session, which is #179 from the other side.
+    Pinned by `test_progress_tty.py::…_an_interrupted_scan_leaves_nothing_behind`.
 - **An interrupted run is not written to `run_history`** — it would read as a
   complete scan of the tree, skip counters and all. Exit is `128 + signo`, set
   last and only over a success.
