@@ -181,34 +181,31 @@ RSS attribution at each phase boundary — `src/memstats.c`):
 | `seen_inodes` | 32 MiB (1.2M entries = **28 B/file**) |
 | `seen_files` bitmap | 256 KiB |
 
-**The dominant per-file term was the walk running ahead of the single
-`__scan_file()` consumer**, which nobody had measured — not `seen_inodes`, and
-not the page caches. Both queues are now bounded (`WALK_QUEUE_MAX`, 8192 items
-each): peak RSS **463-473 → 227 MiB (-52%)** and wall **110-113 → 102-103 s**
-(*faster*: less allocator churn and ~8 s less `sys`). Hashfile byte-identical.
+Peak RSS over the whole run: **463-473 MiB**. So the dominant per-file term is
+**the walk running ahead of the single `__scan_file()` consumer** — not
+`seen_inodes`, and not the page caches.
 
-- **Running further ahead buys nothing.** The consumer is the serial stage, so
-  backlog past "enough to never starve" is pure resident memory. Confirmed on
-  the profiles: `realistic` 5.93 vs 5.90 s, `many` 11.02 vs 10.95 s, `mixed`
-  9.83 vs 9.83, and `bigfile` (io-threads=2, the largest-first idle-tail case a
-  narrower sort window could wreck) **5.54 vs 5.55 s median over 7 rounds**.
-  - At 3 rounds `bigfile` looked like a 3x regression. It was cold-cache noise
-    hitting both variants (`max` 17.74 for each). This is what the "lone
-    surprising result" rule is about — take the median, and add rounds.
-- **Backpressure needs hysteresis.** Waking producers on the first freed slot is
-  one wakeup per file once the queue sits at the cap: ~40% more `sys` on the
-  tiny-file profiles for no wall gain. Waking at half the cap made it free.
-- **Deadlock-free by shape, not by care:** the consumer only ever *pops* from
-  the walk queue and the csum workers only ever pop from theirs, so a full queue
-  always drains. `WALK_STOP` bypasses the bound (nothing would drain it).
-- **`DUPEREMOVE_QUEUE_MAX`** sets the cap; **0 restores the old unbounded
-  queues**, which is what the A/B was run against. Bench hook, not a user knob.
+- **Bounding those queues is a measured dead end — don't.** It works, and the
+  numbers are tempting: peak RSS **463 → 227 MiB (-52%)** and ~8% *faster*, with
+  a byte-identical hashfile and flat `bench.py` medians. **But the walk running
+  ahead is what makes the progress display mean anything.** The listing has to
+  finish early so `pscan_finish_listing()` can hand hashing a known total;
+  throttle it and listing and hashing proceed in lockstep for the whole run, so
+  the denominator never settles and there is no real percentage or ETA.
+  Measured on the 1.2M-file tree: unbounded, listing completes at ~15 s and
+  hashing then runs against `files_total = 1200000`; bounded at 8192 items, the
+  walk was still at 681k examined at 21 s and had never entered the hashing
+  phase. All the `-q`/`bench.py` measurement in the world misses this, because
+  none of it renders the block.
 - **Tasks 2 and 3 of #208 were already done** when it was filed, and the issue's
   numbers for them are stale: `seen_inodes` is already an open-addressing table
   of packed 16-byte `{ino, subvol}` slots with an occupancy bitmap — 28 B/file
   measured, not ~50 — and `DB_CACHE_KB_WALKER` (2 MB) / `DB_CACHE_KB_SEARCH`
   (32 MB) already differentiate the handles. **Don't redo either.** All of
   SQLite is 67 MiB at end of scan, so there is nothing left there.
+- The queue-depth counters behind the table are only maintained under
+  `DUPEREMOVE_MEM_STATS`, so an ordinary run keeps two atomics off the per-file
+  walk path.
 
 - **`cache_size = -65536` (64 MB per connection).** Applied to every connection
   (listing handle, batched writer, one per walker), so it dominates peak RSS on

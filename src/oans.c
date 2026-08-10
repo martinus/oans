@@ -1567,8 +1567,7 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	/* Before filescan_free(), which drops the very tables being measured. */
-	if (mem_stats_wanted())
-		print_mem_breakdown("end of scan");
+	print_mem_breakdown("end of scan");
 	filescan_free();
 	if (want_progress) {
 		/*
@@ -1977,8 +1976,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (mem_stats_wanted())
-		print_mem_breakdown("end of dedupe");
+	print_mem_breakdown("end of dedupe");
 
 	/* Reclaim space if a prune this run left the hashfile mostly free. */
 	if (options.hashfile)

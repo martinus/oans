@@ -111,10 +111,9 @@ declare_alloc_tracking_header(file_hash_head);
 void print_mem_stats(void);
 
 /*
- * DUPEREMOVE_MEM_STATS=1: print an RSS attribution at each phase boundary
- * (#208). Off by default and read once, so an unset run pays one branch.
+ * DUPEREMOVE_MEM_STATS=1: print an RSS attribution at the phase boundary named
+ * by `when` (#208). A no-op without the variable, checked inside.
  */
-bool mem_stats_wanted(void);
 void print_mem_breakdown(const char *when);
 
 #endif	/* __MEMSTATS_H__ */

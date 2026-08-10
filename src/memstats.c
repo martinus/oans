@@ -63,15 +63,6 @@ static uint64_t rss_bytes(void)
 	return (uint64_t)resident * (uint64_t)sysconf(_SC_PAGESIZE);
 }
 
-bool mem_stats_wanted(void)
-{
-	static int wanted = -1;
-
-	if (wanted < 0)
-		wanted = getenv("DUPEREMOVE_MEM_STATS") != NULL;
-	return wanted == 1;
-}
-
 /*
  * One line per source of memory, at the moment `when` names (#208).
  *
@@ -88,11 +79,17 @@ bool mem_stats_wanted(void)
 void print_mem_breakdown(const char *when)
 {
 	struct scan_mem_stats scan;
-	struct mallinfo2 mi = mallinfo2();
-	uint64_t rss = rss_bytes();
-	uint64_t sql = (uint64_t)sqlite3_memory_used();
-	uint64_t sql_peak = (uint64_t)sqlite3_memory_highwater(0);
+	struct mallinfo2 mi;
+	uint64_t rss, sql, sql_peak;
 
+	/* Gated here rather than at the call sites, like report_scan_stats(). */
+	if (!getenv("DUPEREMOVE_MEM_STATS"))
+		return;
+
+	mi = mallinfo2();
+	rss = rss_bytes();
+	sql = (uint64_t)sqlite3_memory_used();
+	sql_peak = (uint64_t)sqlite3_memory_highwater(0);
 	filescan_get_mem_stats(&scan);
 
 	eprintf("mem-stats [%s]\n", when);
@@ -103,11 +100,9 @@ void print_mem_breakdown(const char *when)
 	eprintf("  sqlite now/peak     %10s / %s\n",
 		human_size(sql), human_size(sql_peak));
 	eprintf("  walk queue peak    ~%10s (%"PRIu64" items)\n",
-		human_size(scan.walk_queued * scan.walk_item_bytes),
-		scan.walk_queued);
+		human_size(scan.walk_peak_bytes), scan.walk_queued);
 	eprintf("  csum queue peak    ~%10s (%"PRIu64" items)\n",
-		human_size(scan.csum_queued * scan.csum_item_bytes),
-		scan.csum_queued);
+		human_size(scan.csum_peak_bytes), scan.csum_queued);
 	eprintf("  seen_inodes         %10s (%"PRIu64" entries)\n",
 		human_size(scan.seen_inodes_bytes), scan.seen_inodes);
 	eprintf("  seen_files bitmap   %10s\n",
