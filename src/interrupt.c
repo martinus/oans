@@ -34,6 +34,8 @@ static _Atomic int caught_signal;
 static_assert(ATOMIC_INT_LOCK_FREE == 2,
 	      "the signal handler needs a lock-free atomic");
 
+static void read_hooks(void);
+
 static void interrupt_handler(int signo)
 {
 	atomic_store_explicit(&caught_signal, signo, memory_order_relaxed);
@@ -61,6 +63,8 @@ void interrupt_install(void)
 
 	for (i = 0; i < (int)(sizeof(signals) / sizeof(signals[0])); i++)
 		sigaction(signals[i], &sa, NULL);
+
+	read_hooks();
 }
 
 bool interrupted(void)
@@ -86,13 +90,16 @@ void interrupt_report(void)
 }
 
 /*
- * Test-hook state. Read on first tick rather than at install time so a test can
- * see the same defaults as production when the variables are absent.
+ * Test-hook state, read once by interrupt_install() - on the main thread,
+ * before any worker exists, so the ticks below only ever read it. Reading it
+ * lazily on the first tick was a data race: the csum workers tick
+ * concurrently, so whichever got there first wrote these while the others read
+ * them.
  */
-static unsigned long tick_files, tick_batches;
+static _Atomic unsigned long tick_files;
+static unsigned long tick_batches;
 static unsigned long limit_files, limit_batches;
 static int test_signal = SIGINT;
-static bool hooks_read;
 
 static void read_hooks(void)
 {
@@ -100,7 +107,6 @@ static void read_hooks(void)
 	const char *f = getenv("DUPEREMOVE_INTERRUPT_AFTER");
 	const char *b = getenv("DUPEREMOVE_INTERRUPT_AFTER_BATCHES");
 
-	hooks_read = true;
 	if (f)
 		limit_files = strtoul(f, NULL, 10);
 	if (b)
@@ -109,22 +115,27 @@ static void read_hooks(void)
 		test_signal = SIGTERM;
 }
 
-static void tick(unsigned long *count, unsigned long limit)
-{
-	if (!hooks_read)
-		read_hooks();
-	if (!limit || interrupted())
-		return;
-	if (++*count >= limit)
-		raise(test_signal);
-}
-
 void interrupt_test_file_tick(void)
 {
-	tick(&tick_files, limit_files);
+	if (!limit_files || interrupted())
+		return;
+	/*
+	 * Ticked by the csum workers, so atomic - unlike the batch counter,
+	 * which the single dedupe producer owns.
+	 *
+	 * Exactly the thread that crosses the limit raises, hence == and not
+	 * >=: with SA_RESETHAND the disposition is back to the default by the
+	 * time a second raise() lands, so two workers crossing together would
+	 * kill the process outright - the very thing being tested against.
+	 */
+	if (atomic_fetch_add(&tick_files, 1) + 1 == limit_files)
+		raise(test_signal);
 }
 
 void interrupt_test_batch_tick(void)
 {
-	tick(&tick_batches, limit_batches);
+	if (!limit_batches || interrupted())
+		return;
+	if (++tick_batches >= limit_batches)
+		raise(test_signal);
 }

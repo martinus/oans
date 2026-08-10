@@ -50,13 +50,19 @@ void interrupt_report(void);
  * a point the test names, exactly as DUPEREMOVE_CHECKPOINT_STOP stands in for
  * the kill that #159 exists to survive.
  *
- *   DUPEREMOVE_INTERRUPT_AFTER=N          after N files handed to the csum pool
+ *   DUPEREMOVE_INTERRUPT_AFTER=N          after N files have finished hashing
  *   DUPEREMOVE_INTERRUPT_AFTER_BATCHES=N  after N dedupe generation batches
  *   DUPEREMOVE_INTERRUPT_SIGNAL=TERM      raise SIGTERM instead of SIGINT
  *
- * Both counters are ticked from a single thread (the scan consumer, the dedupe
- * producer), so neither needs a lock. Unset - the normal case - they cost one
- * predictable branch.
+ * Counting *hashed* files rather than queued ones is what makes the durability
+ * assertion exact: when the signal is raised, N files have already been written
+ * to the open batch, so the shutdown either commits them or does not. Counting
+ * queued files instead left the pool free to have finished none of them, which
+ * is what a loaded CI runner did.
+ *
+ * The file counter is ticked by the csum workers, so it is atomic; the batch
+ * counter belongs to the single dedupe producer. Unset - the normal case - both
+ * cost one predictable branch.
  */
 void interrupt_test_file_tick(void);
 void interrupt_test_batch_tick(void);

@@ -380,7 +380,16 @@ v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
   complete scan of the tree, skip counters and all. Exit is `128 + signo`, set
   last and only over a success.
 - **Test hooks `DUPEREMOVE_INTERRUPT_AFTER=N` / `_AFTER_BATCHES=N` /
-  `DUPEREMOVE_INTERRUPT_SIGNAL=TERM`** raise the *real* signal at a named point,
+  `DUPEREMOVE_INTERRUPT_SIGNAL=TERM`** count files that have **finished
+  hashing**, not files queued — so when the signal lands, N files are already in
+  the open batch and the durability assertion is exact. Counting queued files
+  let a loaded CI runner finish *none* of them, and the test asserted `> 0`
+  against 0. Two more traps in that hook: it is ticked from the csum workers, so
+  the counter is atomic and only the thread that crosses the limit raises
+  (`==`, not `>=` — with `SA_RESETHAND` a second `raise()` kills outright), and
+  the env is read once in `interrupt_install()` on the main thread, since a lazy
+  first-tick read races between workers. They raise the *real* signal at a named
+  point,
   the same way `DUPEREMOVE_CHECKPOINT_STOP` does for #159. A `sleep N; kill`
   race needs a tree too big for the suite (~500 MB/s of scan) and still
   coin-flips on faster storage; `test_signal_flush.py` keeps one real-signal

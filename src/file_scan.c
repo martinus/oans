@@ -1523,7 +1523,6 @@ int filescan_walk_run(struct dbhandle *db)
 			break;
 		if (!ret && !interrupted()) {
 			ret = __scan_file(it->path, db, &it->st);
-			interrupt_test_file_tick();
 		} else {
 			interrupt_report();
 		}
@@ -3146,6 +3145,10 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	atomic_fetch_add(&scan_hash_ns, t_done - t_hash);
 	atomic_fetch_add(&scan_hashed_files, 1);
 	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
+
+	/* Test hook, last: this file's rows are in the batch now, so an
+	 * interrupt raised here is one the flush is meant to save. */
+	interrupt_test_file_tick();
 }
 
 static struct glob_set *excludes_get(void)

@@ -24,8 +24,9 @@ from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
 
 KiB = 1 << 10
 
-# Two thirds of the way through the tree: enough files behind it that some have
-# certainly finished hashing, enough ahead that the run is genuinely cut short.
+# The hook counts files that have *finished hashing*, so STOP_AFTER of them are
+# in the open batch when the signal lands - that is the exact figure the flush
+# either saves or loses. The rest leave the run genuinely cut short.
 FILES = 300
 STOP_AFTER = 200
 
@@ -57,7 +58,8 @@ class SignalFlushTest(DuperemoveTest):
         # every one of these rows was discarded with the process.
         hashed = self.hf_scalar(
             "select count(*) from files where digest is not null")
-        self.assertGreater(hashed, 0, "the open write batch was discarded")
+        self.assertGreaterEqual(hashed, STOP_AFTER,
+                                "the open write batch was discarded")
         self.assertLess(hashed, FILES, "the run was not actually cut short")
 
     def test_sigterm_persists_what_was_hashed(self):
@@ -65,8 +67,9 @@ class SignalFlushTest(DuperemoveTest):
         self.interrupt_scan(tree, "TERM")
 
         self.assertEqual(143, self.rc, self.out)
-        self.assertGreater(
-            self.hf_scalar("select count(*) from files where digest is not null"), 0)
+        self.assertGreaterEqual(
+            self.hf_scalar("select count(*) from files where digest is not null"),
+            STOP_AFTER)
 
     def test_an_interrupted_run_is_not_recorded_as_a_completed_one(self):
         """--history must not show a partial scan as a finished one."""
@@ -140,19 +143,15 @@ class SignalFlushTest(DuperemoveTest):
         self.assertDmOk("convergence run")
         self.assertReclaimedNothing("the tree is already deduped")
 
-    def test_a_real_signal_flushes_too(self):
+    def test_a_real_signal_is_handled_like_the_hook(self):
         """The hook raises a real signal, but nothing beats sending one.
 
-        Sized so the scan is still running after the delay; if a fast enough
-        box finishes first there is nothing to assert, and saying so is better
-        than a flaky failure.
+        Scoped to what an external signal can guarantee on unknown hardware:
+        that it is *caught* - the run exits 130 rather than dying on the
+        default action - and that it exits promptly. How much got hashed first
+        is a race with the disk, so the durability claim is left to the
+        hook-driven tests above, which pin it exactly.
         """
-        # Under make integration-valgrind, DUPEREMOVE is a shell wrapper: the
-        # signal would reach the script, not oans. The hook-driven tests above
-        # cover the same code there, and they do run under memcheck.
-        with open(DUPEREMOVE, "rb") as f:
-            if f.read(2) == b"#!":
-                self.skipTest("DUPEREMOVE is a wrapper script, not the binary")
         for i in range(2000):
             self.write(f"tree/f{i:04d}.bin", os.urandom(64 * KiB))
         self.sync()
@@ -162,7 +161,7 @@ class SignalFlushTest(DuperemoveTest):
              "--dedupe-options=partial", "--hashfile", self.hf,
              "-r", self.path("tree")],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
+        time.sleep(0.1)
         try:
             p.send_signal(signal.SIGINT)
         except ProcessLookupError:
@@ -171,7 +170,6 @@ class SignalFlushTest(DuperemoveTest):
 
         if rc == 0:
             self.skipTest("the scan finished before the signal was sent")
-        self.assertEqual(130, rc)
-        self.assertGreater(
-            self.hf_scalar("select count(*) from files where digest is not null"),
-            0, "a real SIGINT discarded the open write batch")
+        # Not -2: a negative code means the default action killed it, which is
+        # the behaviour this whole change replaces.
+        self.assertEqual(130, rc, "a real SIGINT was not handled")
