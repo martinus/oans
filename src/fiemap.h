@@ -98,4 +98,42 @@ uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
  * whole file. Returns 0 on error.
  */
 unsigned int fiemap_count_extents(int fd, uint64_t start, uint64_t length);
+
+/*
+ * Identity of a file's physical layout, for the snapshot-aware scan (#206).
+ *
+ * Two files whose fiemaps describe the same records - same logical offset,
+ * same physical address, same length, same flags, for every record, over the
+ * same file size - are backed by exactly the same stored bytes, so one's
+ * content digest describes the other. This condenses that record array into a
+ * DIGEST_LEN key, so a scan can recognise "I have already hashed these very
+ * extents" without keeping the array around.
+ *
+ * The direction of the error matters: a miss costs one redundant hash, a false
+ * hit stores a digest of bytes the file never had. So this refuses rather than
+ * guesses -
+ *
+ *   - no extents at all (a hole-only file has no layout to speak of),
+ *   - any record the kernel says it cannot pin down: UNKNOWN, DELALLOC (still
+ *     in page cache, no stable address), DATA_INLINE (lives in the metadata, so
+ *     `fe_physical` names nothing), or DATA_ENCRYPTED (equal ciphertext
+ *     addresses need not mean equal plaintext).
+ *
+ * COMPRESSED/ENCODED extents are fine, because this only ever compares
+ * `fe_physical` for equality and never does arithmetic on it - on a compressed
+ * extent the address names the extent as a whole, so equality is meaningful
+ * where an offset into it is not (see fiemap_maps_share()).
+ *
+ * SHARED and LAST are masked out of the key: the first is a refcount property
+ * that changes when an unrelated file is deduped, the second is positional.
+ * Neither says anything about content.
+ *
+ * The key is a hash, so it cannot be the whole test. The caller must still
+ * compare the records themselves before trusting a hit.
+ *
+ * Returns false (and leaves `key` untouched) when no key can be formed.
+ */
+bool fiemap_layout_key(const struct fiemap *fm, uint64_t size,
+		       unsigned char *key);
+
 #endif	/* __FIEMAP_H__ */

@@ -393,9 +393,17 @@ any other directory.
 Turn it on where your snapshots are near\-copies of the live subvolume,
 which is the shape a snapper/Timeshift desktop has.
 A fresh snapshot already shares every extent with the subvolume it came
-from, so reading and hashing it reclaims nothing, and the waste scales
-with snapshot count: 20 snapshots of a 1 TiB tree means reading \(ti20
-TiB to reclaim nothing from 19 of them.
+from, so reading and hashing it reclaims nothing.
+.PP
+That cost is much smaller than it used to be.
+Within a run, \f[CR]oans\f[R] recognises a file whose extents are
+exactly those of a file it has already hashed \(em the normal case for a
+snapshot \(em and takes over that file\(cqs hashes instead of reading it
+a second time.
+The summary reports those as \f[I]Same layout\f[R], with the volume not
+read.
+So a snapshot tree is now mostly free to scan, and this option is worth
+reaching for only when even that is too much.
 .PP
 Leave it off for a backup target \(em an
 rsync\-into\-a\-subvolume\-then\-snapshot setup, say \(em where each
@@ -519,6 +527,20 @@ Summary
   Elapsed        92.1s
   Already shared 350708 files skipped (no work needed)
 .EE
+.PP
+A scan over a tree containing snapshots also prints:
+.IP
+.EX
+  Same layout    18432 files matched an already\-hashed layout (1.4 TiB not read)
+.EE
+.PP
+Those files were not read.
+Their content was proved identical to a file already hashed in the same
+run \(em every extent at the same physical address, over the same file
+size \(em so their hashes were taken over rather than recomputed.
+The digests are exactly what reading them would have produced; a layout
+that differs in any way, including the same storage described with
+different extent boundaries, is simply hashed normally.
 .PP
 \f[B]Reclaimed\f[R] is the disk space actually freed: for a group of
 \f[I]N\f[R] identical copies, \f[CR]oans\f[R] keeps one physical copy

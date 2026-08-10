@@ -328,8 +328,16 @@ file is recorded once.
     Turn it on where your snapshots are near-copies of the live subvolume, which
     is the shape a snapper/Timeshift desktop has. A fresh snapshot already shares
     every extent with the subvolume it came from, so reading and hashing it
-    reclaims nothing, and the waste scales with snapshot count: 20 snapshots of a
-    1 TiB tree means reading ~20 TiB to reclaim nothing from 19 of them.
+    reclaims nothing.
+
+    <!-- -->
+
+    That cost is much smaller than it used to be. Within a run, `oans`
+    recognises a file whose extents are exactly those of a file it has already
+    hashed — the normal case for a snapshot — and takes over that file's hashes
+    instead of reading it a second time. The summary reports those as *Same
+    layout*, with the volume not read. So a snapshot tree is now mostly free to
+    scan, and this option is worth reaching for only when even that is too much.
 
     Leave it off for a backup target — an rsync-into-a-subvolume-then-snapshot
     setup, say — where each snapshot holds independently written copies of
@@ -438,6 +446,19 @@ Summary
   Elapsed        92.1s
   Already shared 350708 files skipped (no work needed)
 ```
+
+A scan over a tree containing snapshots also prints:
+
+```
+  Same layout    18432 files matched an already-hashed layout (1.4 TiB not read)
+```
+
+Those files were not read. Their content was proved identical to a file already
+hashed in the same run — every extent at the same physical address, over the
+same file size — so their hashes were taken over rather than recomputed. The
+digests are exactly what reading them would have produced; a layout that differs
+in any way, including the same storage described with different extent
+boundaries, is simply hashed normally.
 
 **Reclaimed** is the disk space actually freed: for a group of *N* identical
 copies, `oans` keeps one physical copy and frees the other *N*−1, so this is the

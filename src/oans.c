@@ -1479,6 +1479,13 @@ static void report_scan_stats(void)
 
 	filescan_get_workq_stats(&pops, &empty_waits);
 	dbfile_get_lock_stats(&lock_total, &lock_contended, &lock_wait_ns);
+	{
+		uint64_t copies, saved;
+
+		filescan_get_layout_copies(&copies, &saved);
+		eprintf("scan-stats: layout-copies files=%"PRIu64" bytes-not-read=%"PRIu64"\n",
+			copies, saved);
+	}
 
 	/* eprintf, not fprintf: this lands while the scan block is still on
 	 * screen, and an unrouted line strands a row of it (#179). */
@@ -1578,6 +1585,24 @@ static void report_scan_skips(const uint64_t *skips)
 		}
 		if (*sep)
 			g_string_append_c(out, '\n');
+	}
+
+	/*
+	 * Snapshot-aware scan (#206). Worth a line outside -v for the same
+	 * reason the read-only-subvolume count is: it says the run did much
+	 * less work than the file count suggests, which otherwise looks like
+	 * something went wrong.
+	 */
+	{
+		uint64_t copies, bytes;
+
+		filescan_get_layout_copies(&copies, &bytes);
+		if (copies)
+			g_string_append_printf(out,
+				"  %sSame layout%s    %"PRIu64" file%s matched an "
+				"already-hashed layout %s(%s not read)%s\n",
+				col_dim, col_reset, copies, copies == 1 ? "" : "s",
+				col_dim, human_size(bytes), col_reset);
 	}
 
 	if (out->len)

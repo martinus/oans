@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
+#include "csum.h"
 #include "debug.h"
 #include "fiemap.h"
 #include "util.h"
@@ -464,4 +465,68 @@ uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
 	if (fresh)
 		phys_set_merge(seen, fresh, sort_uniq(fresh, n_fresh));
 	return unshared;
+}
+
+/* Flags that make a record's physical address meaningless or unstable. */
+#define LAYOUT_REJECT_FLAGS	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
+				 FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_DATA_ENCRYPTED)
+/* Flags that say nothing about content. */
+#define LAYOUT_IGNORE_FLAGS	(FIEMAP_EXTENT_SHARED | FIEMAP_EXTENT_LAST)
+
+/* Extents whose records fit here are keyed without touching the heap; a real
+ * file has one. The fragmented case falls back to a single allocation. */
+#define LAYOUT_KEY_STACK_EXTENTS	32
+
+bool fiemap_layout_key(const struct fiemap *fm, uint64_t size,
+		       unsigned char *key)
+{
+	uint64_t stack_rec[2 + 4 * LAYOUT_KEY_STACK_EXTENTS];
+	_cleanup_(freep) uint64_t *heap_rec = NULL;
+	uint64_t *rec = stack_rec;
+	size_t words, bytes;
+	unsigned int i;
+
+	if (!fm || fm->fm_mapped_extents == 0)
+		return false;
+
+	words = 2 + 4 * (size_t)fm->fm_mapped_extents;
+	bytes = words * sizeof(*rec);
+	/* checksum_block() takes an int length. Nothing real gets here, and a
+	 * miss costs only a redundant hash. */
+	if (bytes > INT_MAX)
+		return false;
+
+	if (words > ARRAY_SIZE(stack_rec)) {
+		heap_rec = malloc(bytes);
+		if (!heap_rec)
+			return false;
+		rec = heap_rec;
+	}
+
+	/*
+	 * Size and extent count go in first, so a layout that is a prefix of
+	 * another cannot hash the same, and the size covers a trailing hole -
+	 * which fiemap does not report at all.
+	 */
+	rec[0] = size;
+	rec[1] = fm->fm_mapped_extents;
+
+	for (i = 0; i < fm->fm_mapped_extents; i++) {
+		const struct fiemap_extent *e = &fm->fm_extents[i];
+		uint64_t *r = &rec[2 + 4 * i];
+
+		if (e->fe_flags & LAYOUT_REJECT_FLAGS)
+			return false;
+
+		r[0] = e->fe_logical;
+		r[1] = e->fe_physical;
+		r[2] = e->fe_length;
+		r[3] = e->fe_flags & ~(uint64_t)LAYOUT_IGNORE_FLAGS;
+	}
+
+	/* One shot rather than the streaming API: this runs per file, and
+	 * start_running_checksum() would mean two allocations and a 576-byte
+	 * clear of an XXH3 state to hash the 48 bytes a one-extent file has. */
+	checksum_block((char *)rec, (int)bytes, key);
+	return true;
 }

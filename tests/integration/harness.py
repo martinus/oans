@@ -433,6 +433,17 @@ class DuperemoveTest(unittest.TestCase):
             "join files f on f.id = b.fileid order by f.filename, b.loff")
         return hashlib.sha256(repr(rows).encode()).hexdigest()
 
+    def fingerprints(self):
+        """Everything a scan is supposed to have produced, as three digests.
+
+        The comparison for "this hashfile is byte-identical to one built some
+        other way" - an interrupted-then-resumed scan (#159, #201), a copied
+        layout (#206), a bounded queue (#208). A wrong digest is invisible
+        downstream, so nothing weaker than this catches one.
+        """
+        return (self.files_fingerprint(), self.extents_fingerprint(),
+                self.blocks_fingerprint())
+
     def drop_hashfile(self):
         """Delete the hashfile and its WAL sidecars, so the next run starts
         from nothing. Removing only the .db leaves a -wal SQLite will replay."""

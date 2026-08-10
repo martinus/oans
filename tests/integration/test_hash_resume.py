@@ -62,11 +62,6 @@ class HashResumeTest(DuperemoveTest):
         self.sync()
         return self.path("tree")
 
-    def fingerprints(self):
-        """Everything the scan is supposed to have produced."""
-        return (self.files_fingerprint(), self.extents_fingerprint(),
-                self.blocks_fingerprint())
-
     def scan_straight_through(self, tree, *extra):
         """Hash the tree in one go, into a fresh hashfile."""
         self.drop_hashfile()

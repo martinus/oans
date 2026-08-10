@@ -2719,6 +2719,259 @@ static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 	return buffer->dl_len;
 }
 
+/*
+ * Snapshot-aware scan (#206): hashing N snapshots of a subvolume reads N times
+ * the data for nothing, because a snapshot shares the live subvolume's extents.
+ * Two files whose fiemaps describe the same records are backed by the same
+ * stored bytes, so the second one's digest, extent hashes and block hashes can
+ * be copied from the first without reading a byte.
+ *
+ * The direction of the error is what shapes this: a miss costs one redundant
+ * hash, a false hit stores a digest of bytes the file never had. So a hit has
+ * to clear three separate bars - fiemap_layout_key() refuses any record whose
+ * address it cannot vouch for, the key itself is a 128-bit digest of every
+ * record, and dbfile_layout_matches() then re-checks the donor's stored
+ * (loff, poff, len) triples one by one. Nothing here ever normalises or merges
+ * records to chase more hits: the same storage described with different record
+ * boundaries (see #186) must read as a miss.
+ *
+ * Donors are only files hashed by *this* run, which is what makes the copied
+ * rows safe to reuse: the block size, --skip-zeroes and the rest of the hashing
+ * options are then the same by construction, where an older hashfile's rows
+ * might have been produced under different ones.
+ *
+ * Lives entirely in memory, and the entry is small (a key and a file id), but
+ * there is one per candidate donor - so only files worth the saving are
+ * registered. Below one read buffer, hashing a file is a single I/O and the
+ * bookkeeping would cost more than it saves.
+ */
+#define LAYOUT_COPY_MIN_SIZE	READ_BUF_LEN
+
+struct layout_donor {
+	unsigned char	key[DIGEST_LEN];
+	int64_t		fileid;
+};
+
+/*
+ * Open-addressed, slots inline, occupancy in a bitmap - the same shape as
+ * seen_inodes below, and for the same reason: a GHashTable node plus a malloc
+ * per entry is ~50 B where the entry itself is 24, and there is one entry per
+ * large file in the tree. Guarded by a mutex because the csum workers share it,
+ * unlike seen_inodes, which the single consumer owns.
+ */
+static struct layout_donor	*donor_slots;
+static uint64_t			*donor_used;	/* 1 bit per slot */
+static size_t			donor_cap;	/* power of two, 0 == off */
+static size_t			donor_count;
+static GMutex			donor_lock;
+static _Atomic uint64_t		layout_copied_files;
+static _Atomic uint64_t		layout_copied_bytes;
+
+static inline bool donor_slot_used(size_t i)
+{
+	return (donor_used[i >> 6] >> (i & 63)) & 1;
+}
+
+/* The key is already a digest; take a machine word of it as the index. */
+static inline size_t donor_hash(const unsigned char *key)
+{
+	uint64_t h;
+
+	memcpy(&h, key, sizeof(h));
+	return (size_t)h;
+}
+
+/* Insert into a table known to have a free slot (caller ensures capacity). */
+static void donor_insert(const unsigned char *key, int64_t fileid)
+{
+	size_t mask = donor_cap - 1;
+	size_t i;
+
+	for (i = donor_hash(key) & mask; donor_slot_used(i); i = (i + 1) & mask)
+		if (memcmp(donor_slots[i].key, key, DIGEST_LEN) == 0)
+			return;			/* first donor wins */
+	memcpy(donor_slots[i].key, key, DIGEST_LEN);
+	donor_slots[i].fileid = fileid;
+	donor_used[i >> 6] |= (uint64_t)1 << (i & 63);
+	donor_count++;
+}
+
+/* Double the table, rehashing; returns false (old table intact) on OOM. */
+static bool donor_grow(void)
+{
+	struct layout_donor *old = donor_slots;
+	uint64_t *oldused = donor_used;
+	size_t oldcap = donor_cap, newcap = donor_cap * 2, i;
+	struct layout_donor *ns = calloc(newcap, sizeof(*ns));
+	uint64_t *nu = calloc((newcap + 63) / 64, sizeof(*nu));
+
+	if (!ns || !nu) {
+		free(ns);
+		free(nu);
+		return false;
+	}
+	donor_slots = ns;
+	donor_used = nu;
+	donor_cap = newcap;
+	donor_count = 0;
+	for (i = 0; i < oldcap; i++)
+		if ((oldused[i >> 6] >> (i & 63)) & 1)
+			donor_insert(old[i].key, old[i].fileid);
+	free(old);
+	free(oldused);
+	return true;
+}
+
+static void layout_donors_init(void)
+{
+	/*
+	 * DUPEREMOVE_NO_LAYOUT_COPY is the kill switch a bisect or an A/B
+	 * measurement needs: with it set, every file is hashed the old way and
+	 * the hashfile must come out byte-identical. Nothing else gates this -
+	 * a run without --hashfile keeps its rows in an in-memory database that
+	 * this reads and writes exactly the same way.
+	 */
+	if (getenv("DUPEREMOVE_NO_LAYOUT_COPY"))
+		return;
+
+	donor_cap = 1024;
+	donor_count = 0;
+	donor_slots = calloc(donor_cap, sizeof(*donor_slots));
+	donor_used = calloc((donor_cap + 63) / 64, sizeof(*donor_used));
+	if (!donor_slots || !donor_used) {
+		free(donor_slots);
+		free(donor_used);
+		donor_slots = NULL;
+		donor_used = NULL;
+		donor_cap = 0;		/* an optimisation, not state: run on */
+	}
+}
+
+static void layout_donors_free(void)
+{
+	free(donor_slots);
+	donor_slots = NULL;
+	free(donor_used);
+	donor_used = NULL;
+	donor_cap = 0;
+	donor_count = 0;
+}
+
+/*
+ * Is this file worth keying at all? Asked before the key is built, so a run
+ * with the feature off - or a file too small to ever match, since donors are
+ * only registered at LAYOUT_COPY_MIN_SIZE and the size is part of the key -
+ * pays one compare rather than a hash of the record array.
+ */
+static inline bool layout_copy_wanted(uint64_t filesize)
+{
+	return donor_cap && filesize >= LAYOUT_COPY_MIN_SIZE;
+}
+
+/* Offer a freshly hashed file as a donor for the rest of this run. */
+static void layout_donor_add(const unsigned char *key, int64_t fileid)
+{
+	g_mutex_lock(&donor_lock);
+	/* Grow at ~70% load to keep probes short; on OOM just stop taking
+	 * donors, which costs hashing and nothing else. */
+	if ((donor_count + 1) * 10 >= donor_cap * 7 && !donor_grow())
+		goto out;
+	donor_insert(key, fileid);
+out:
+	g_mutex_unlock(&donor_lock);
+}
+
+/* The file id registered for `key`, or 0 if none. */
+static int64_t layout_donor_find(const unsigned char *key)
+{
+	size_t mask, i;
+	int64_t found = 0;
+
+	g_mutex_lock(&donor_lock);
+	mask = donor_cap - 1;
+	for (i = donor_hash(key) & mask; donor_slot_used(i); i = (i + 1) & mask)
+		if (memcmp(donor_slots[i].key, key, DIGEST_LEN) == 0) {
+			found = donor_slots[i].fileid;
+			break;
+		}
+	g_mutex_unlock(&donor_lock);
+	return found;
+}
+
+void filescan_get_layout_copies(uint64_t *files, uint64_t *bytes)
+{
+	*files = atomic_load(&layout_copied_files);
+	*bytes = atomic_load(&layout_copied_bytes);
+}
+
+/*
+ * Take over an already-hashed file's results when this file is backed by
+ * exactly the same extents (#206). Returns true when the hashes were copied
+ * and there is nothing left to do for this file.
+ *
+ * Runs before a single byte is read, and everything it needs is already in
+ * hand: csum_whole_file() has the fiemap because it hashes per extent, so the
+ * miss path costs one key over the record array and one hash-table probe -
+ * no extra ioctl, no extra I/O.
+ */
+static bool try_layout_copy(struct scan_ctxt *ctxt, struct file_to_scan *file,
+			    struct pscan_thread *tprogress, struct dbhandle *db,
+			    const unsigned char *key)
+{
+	int64_t donor = layout_donor_find(key);
+	unsigned int flags;
+	int ret;
+
+	if (!donor || donor == file->fileid)
+		return false;
+
+	/* Where the file lives is this file's business, not the donor's. */
+	flags = filescan_fd_is_readonly_subvol(ctxt->fd) ? FILE_RO_SUBVOL : 0;
+
+	tprogress->status = thread_waiting_lock;
+	dbfile_lock();
+	tprogress->status = thread_committing;
+
+	/*
+	 * The re-check and the copy share the writer connection *and* the open
+	 * transaction, so a donor hashed seconds ago is visible even though
+	 * nothing has been committed yet - and the two cannot see different
+	 * states of the donor's rows.
+	 */
+	ret = dbfile_layout_matches(db, donor, ctxt->fiemap);
+	if (ret <= 0)
+		goto decline;
+
+	ret = scan_write_begin();
+	if (ret)
+		goto decline;
+
+	ret = dbfile_copy_scanned_file(db, file->fileid, donor, flags);
+	if (ret) {
+		scan_write_abort();
+		goto decline;
+	}
+
+	ret = scan_write_end();
+	dbfile_unlock();
+	if (ret)
+		return false;		/* the batch is gone; hash it instead */
+
+	/*
+	 * Credit the whole file: nothing was read, so pscan_finish_file() would
+	 * otherwise fake-fill it, and the per-file row would sit at 0%.
+	 */
+	tprogress->file_scanned_bytes = ctxt->filesize;
+	atomic_fetch_add(&layout_copied_files, 1);
+	atomic_fetch_add(&layout_copied_bytes, ctxt->filesize);
+	atomic_fetch_add(&scan_hashed_files, 1);
+	return true;
+
+decline:
+	dbfile_unlock();
+	return false;
+}
+
 static inline bool is_inlined(struct scan_ctxt *ctxt)
 {
 	struct fiemap_extent *extent;
@@ -2931,6 +3184,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	hashes.db = db;
 	hashes.fileid = file->fileid;
 
+	/* Computed once from the fiemap below, then reused to register this
+	 * file as a donor if it hashes cleanly. */
+	unsigned char layout_key[DIGEST_LEN];
+	bool has_layout_key = false;
+
 	uint64_t t_start = mono_ns(), t_hash = 0, t_done = 0;	/* calibration */
 
 	if (!(buffer->buf)) {
@@ -2977,6 +3235,18 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (file->resume &&
 	    !adopt_resume(&ctxt, file, tprogress, db))
 		last_checkpoint = 0;	/* declined, and the row is already gone */
+
+	/*
+	 * Another file this run may already have hashed these very extents.
+	 * Skipped for a resumed file: it has a running checksum and partial
+	 * rows to reconcile, and the case this exists for - a fresh snapshot -
+	 * never has either.
+	 */
+	has_layout_key = layout_copy_wanted(ctxt.filesize) &&
+			 fiemap_layout_key(ctxt.fiemap, ctxt.filesize, layout_key);
+	if (has_layout_key && !file->resume &&
+	    try_layout_copy(&ctxt, file, tprogress, db, layout_key))
+		return;
 
 	if (!allocate_hashes(&hashes, &ctxt)) {
 		eprintf("allocate_hashes failed\n");
@@ -3238,6 +3508,15 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	}
 
 	dbfile_unlock();
+
+	/*
+	 * Offer this file to the rest of the run. After the rows are written,
+	 * so a hit always finds something to verify against - and if the batch
+	 * is later aborted, the donor's rows go with it and the re-check simply
+	 * declines.
+	 */
+	if (has_layout_key)
+		layout_donor_add(layout_key, file->fileid);
 
 	/* Calibration: overhead is everything but the byte-proportional read+hash
 	 * loop (setup + finalize + DB write). */
@@ -3573,6 +3852,7 @@ void filescan_init(void)
 		}
 	}
 
+	layout_donors_init();
 	scan_workq_start(options.io_threads);
 }
 
@@ -3585,6 +3865,7 @@ void filescan_free(void)
 	subvol_cache_free();
 	verified_dev_free();
 	seen_inodes_free();
+	layout_donors_free();
 
 	g_clear_pointer(&excludes, glob_set_free);
 }

@@ -211,6 +211,82 @@ static bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
  * described with different record boundaries, or the same file is resubmitted
  * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
  */
+/* Same records, same size -> same key; anything that changes the bytes doesn't. */
+static bool key_of(const struct fm_rec *recs, unsigned int n, uint64_t size,
+		   unsigned char *out)
+{
+	struct fiemap *fm = mkmap(recs, n);
+	bool ok = fiemap_layout_key(fm, size, out);
+
+	free(fm);
+	return ok;
+}
+
+MU_TEST(test_fiemap_layout_key) {
+	const uint32_t SH = FIEMAP_EXTENT_SHARED;
+	const uint32_t ENC = FIEMAP_EXTENT_ENCODED;
+	unsigned char a[DIGEST_LEN], b[DIGEST_LEN];
+
+	struct fm_rec two[] = {{0, 4096, 8192, 0}, {8192, 65536, 4096, 0}};
+
+	mu_check(key_of(two, 2, 12288, a));
+
+	/* The same layout, described identically, keys the same. */
+	mu_check(key_of(two, 2, 12288, b));
+	mu_check(memcmp(a, b, DIGEST_LEN) == 0);
+
+	/* SHARED is a refcount property - deduping an unrelated file must not
+	 * change what this file's content is. Same for the positional LAST. */
+	struct fm_rec shared[] = {{0, 4096, 8192, SH},
+				  {8192, 65536, 4096, SH | FIEMAP_EXTENT_LAST}};
+
+	mu_check(key_of(shared, 2, 12288, b));
+	mu_check(memcmp(a, b, DIGEST_LEN) == 0);
+
+	/* Different storage, same shape: different key. */
+	struct fm_rec moved[] = {{0, 4096, 8192, 0}, {8192, 69632, 4096, 0}};
+
+	mu_check(key_of(moved, 2, 12288, b));
+	mu_check(memcmp(a, b, DIGEST_LEN) != 0);
+
+	/* Same records, different file size - a trailing hole fiemap never
+	 * reports, and content the digest does cover. */
+	mu_check(key_of(two, 2, 16384, b));
+	mu_check(memcmp(a, b, DIGEST_LEN) != 0);
+
+	/* A prefix of the same records must not collide with the whole. */
+	mu_check(key_of(two, 1, 12288, b));
+	mu_check(memcmp(a, b, DIGEST_LEN) != 0);
+
+	/* Compressed extents are fine: the address is only ever compared. */
+	struct fm_rec enc[] = {{0, 4096, 8192, ENC}};
+
+	mu_check(key_of(enc, 1, 8192, b));
+
+	/* Records whose address means nothing, or nothing stable, are refused. */
+	struct fm_rec inl[] = {{0, 0, 512, FIEMAP_EXTENT_DATA_INLINE}};
+	struct fm_rec delalloc[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
+	struct fm_rec unknown[] = {{0, 0, 8192, FIEMAP_EXTENT_UNKNOWN}};
+	struct fm_rec crypt[] = {{0, 4096, 8192, FIEMAP_EXTENT_DATA_ENCRYPTED}};
+
+	mu_check(!key_of(inl, 1, 512, b));
+	mu_check(!key_of(delalloc, 1, 8192, b));
+	mu_check(!key_of(unknown, 1, 8192, b));
+	mu_check(!key_of(crypt, 1, 8192, b));
+
+	/* One bad record poisons the whole file, not just itself. */
+	struct fm_rec mixed[] = {{0, 4096, 8192, 0},
+				 {8192, 0, 4096, FIEMAP_EXTENT_DELALLOC}};
+
+	mu_check(!key_of(mixed, 2, 12288, b));
+
+	/* A file with no extents at all has no layout to speak of. */
+	struct fiemap *empty = mkmap(two, 0);
+
+	mu_check(!fiemap_layout_key(empty, 0, b));
+	free(empty);
+}
+
 MU_TEST(test_fiemap_maps_share) {
 	const uint32_t SH = FIEMAP_EXTENT_SHARED;
 	const uint32_t ENC = FIEMAP_EXTENT_ENCODED;
@@ -1169,6 +1245,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_is_file_renamed);
 	MU_RUN_TEST(test_seen_inode);
 	MU_RUN_TEST(test_get_extent);
+	MU_RUN_TEST(test_fiemap_layout_key);
 	MU_RUN_TEST(test_fiemap_maps_share);
 	MU_RUN_TEST(test_fiemap_unshared_bytes);
 	MU_RUN_TEST(test_fiemap_unshared_bytes_accumulates);
