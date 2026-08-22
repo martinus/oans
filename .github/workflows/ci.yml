@@ -191,3 +191,50 @@ jobs:
         run: make integration
         env:
           DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
+
+  # Do the tests notice when the code breaks? `make test` going green says every
+  # line ran; this replays real oans bugs -- #147, #159, #186, #187, #191, #202,
+  # one block per file in scripts/mutate/bugs/ -- and fails if any of them
+  # survives the suite. #186 and #187 between them had oans reporting gigabytes
+  # reclaimed on a tree whose free space never moved, for months, because
+  # nothing in the suite could tell the difference; a test quietly weakened or
+  # deleted looks exactly the same from here.
+  #
+  # Cheap enough to gate on, unlike the same idea in the other two repositories
+  # that share this tool: a mutant is one compile of src/tests.c and one run of
+  # a suite that takes a third of a second. It needs no scratch filesystem,
+  # which is why it is one job and not a matrix.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/apt-deps
+        with:
+          leg: build
+
+      # The vendored core against its recorded hash, and the adapter against
+      # the core. Both are silent failures otherwise: a drifted core means this
+      # repository runs something no suite covers, and an adapter that no longer
+      # fits makes the pre-filter reject every mutant, which reports the whole
+      # run as `compiler` -- a verdict in the flattering direction.
+      - name: Lint
+        run: make lint
+
+      # `--lanes 2` because the runner has two cores and each lane wants a
+      # compile to itself; the default would take one per hardware thread and
+      # spend the difference on contention. `--baseline-runs 1` because this
+      # suite is deterministic - a fixed property seed included - so the second
+      # green run the tool insists on by default buys nothing here.
+      - name: Replay known bugs
+        run: |
+          status=0
+          for bugs in scripts/mutate/bugs/*.txt; do
+            src="src/$(basename "$bugs" .txt).c"
+            [ "$src" = src/escape.c ] && src=src/util.c
+            echo "=== $bugs -> $src ==="
+            python3 scripts/mutate/mutate.py --file "$src" --bugs "$bugs" \
+              --lanes 2 --baseline-runs 1 || status=1
+          done
+          exit $status

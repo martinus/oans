@@ -1,0 +1,86 @@
+# The guarantee of #202: a file name is untrusted input, and nothing that
+# reaches the admin's terminal may still act on it.
+#
+#     scripts/mutate/mutate.py --file src/util.c --bugs scripts/mutate/bugs/escape.txt
+#
+# Anyone who can create a file inside a scanned tree picks these bytes. A `\r`
+# in a name rewrites the line above it - the summary, a progress row - and
+# `ESC[2J` clears the screen. So this is a security claim, and the tests behind
+# it have to be able to fail.
+
+# the C1 controls stop being recognised
+# UTF-8 spells them in two bytes, so a byte-at-a-time classifier walks straight
+# past them and the terminal receives them intact. This is the encoding a
+# hand-written test is least likely to think of, which is why it is here.
+<<<
+	if (p[0] == 0xc2 && p[1] >= 0x80 && p[1] <= 0x9f) {
+		*cp = p[1];
+		return 2;
+	}
+===
+>>>
+
+# DEL stops being recognised
+<<<
+	if (*p < 0x20 || *p == 0x7f) {
+===
+	if (*p < 0x20) {
+>>>
+
+# ESC is let through because the range is off by one
+# 0x1b is what starts every terminal escape sequence, so this one alone is the
+# whole vulnerability.
+<<<
+	if (*p < 0x20 || *p == 0x7f) {
+===
+	if (*p < 0x1b || *p == 0x7f) {
+>>>
+
+# an escape is split across the end of the buffer
+# Half of `\xNN` is two characters of something else - and worse, the check
+# that stops it is the only thing keeping this from writing past the
+# allocation, since a path may be longer than PATH_MAX (#117).
+<<<
+			if (o + len + 1 > out_sz)
+				break;
+===
+			if (o > out_sz)
+				break;
+>>>
+
+# the run of safe bytes is copied without checking what is left
+# The fast path exists because every real name takes it; it also has to be the
+# path that respects the buffer.
+<<<
+			if (len > out_sz - o - 1)
+				len = out_sz - o - 1;
+===
+>>>
+
+# the result is not terminated
+<<<
+	out[o] = '\0';
+===
+>>>
+
+# path_for_display sizes its buffer for the input rather than the output
+# Worst-case expansion is SANITIZE_CTRL_MAX bytes per input byte. Sizing for
+# one is a heap overflow on the first crafted name - except that sanitize_ctrl
+# truncates instead, so what actually ships is a *wrong path* printed as though
+# it were the file oans opened.
+<<<
+	sz = SANITIZE_CTRL_MAX * strlen(path) + 1;
+===
+	sz = strlen(path) + 1;
+>>>
+
+# the fast path is taken for every name, escaped or not
+# has_ctrl() decides whether there is anything to do. Inverted, or removed, a
+# crafted name is handed to the terminal verbatim and every ordinary one pays
+# for a copy - so the cheap half of the change is what still works.
+<<<
+	if (!has_ctrl(path))
+		return strdup(path);
+===
+	return strdup(path);
+>>>

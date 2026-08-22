@@ -101,6 +101,79 @@ in `tests/`; no shell tests.
   before trusting any before/after. (The `~/git` tree, ~174k files on btrfs, is
   the usual benchmark target.)
 
+## Mutation & property testing (the C unit suite)
+
+Two additions to `src/tests.c`'s side of the house. Neither touches the
+integration suite, and the distinction matters for reading either of them.
+
+### `scripts/mutate/mutate.py` — does anything notice when this breaks
+
+Breaks a source file in a throwaway copy of the tree, rebuilds, runs `./test`,
+and reports whether anything went red. Coverage says a line ran; this says
+something would have noticed it misbehaving.
+
+```sh
+scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+scripts/mutate/mutate.py --file src/glob.c --diff       # only what you changed
+scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
+```
+
+- **`--file` is not optional in practice.** oans is not a single-header library,
+  so there is no file that is obviously *the* code; the default (`src/csum.c`)
+  is a starting point and a run without `--file` is usually the wrong question.
+- **`bugs/*.txt` are real oans bugs put back** — #147, #159, #186, #187, #191,
+  #202 — one block each, one file per source file. That is the everyday mode and
+  the one worth adding to: a fix without a block here has no answer to "does its
+  test earn its place". A block that stops applying means that part was
+  rewritten and the question wants re-deriving, not repairing.
+- **A `survived` is a narrower claim than it reads.** The suite is `src/tests.c`
+  alone: the end-to-end Python suite drives the *binary* and is not in the loop,
+  so for the dedupe phase, the scan pipeline and the progress block a survivor
+  means nothing at all. The tool says so in its own fingerprint.
+- **No sanitizer by default**, so a mutant that reads one slot too far only
+  shows up if it corrupts something a test checks. Re-run a surprising survivor
+  with `--make-arg SANITIZE=address,undefined --make-arg CC=clang`.
+- **`make test-build` exists for this** and only this: `make test` builds *and
+  runs*, so a mutant the tests caught would exit nonzero at the build step and
+  be scored `compiler` — the compiler credited with protection the tests
+  provided. Don't merge the two targets back together.
+- **`mutate_core.py` is vendored** from unordered_dense, where its own hermetic
+  suite (`scripts/test_mutate.py`) lives; nanobench holds the same copy. Never
+  edit it here — change it there, run that suite, re-copy into all three and
+  update each `mutate_core.sha256`. `make lint` fails if this copy has drifted.
+  Only `scripts/mutate/mutate.py` (the ~130-line adapter) is oans's.
+- A mutant costs one compile of `src/tests.c` (~4.5 s) — every source is
+  `#include`d into it, so there is no incremental build and ccache cannot help.
+  The `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of
+  that.
+
+### `src/proptest.h` — properties, not tables
+
+An ordinary test names an input and its answer; a property names a relationship
+that must hold for *every* input and generates inputs looking for a
+counterexample. No dependencies, one header, minunit-compatible.
+
+- **The seed is fixed on purpose** (`make test` is reproducible, CI can trust
+  it); `OANS_PROPTEST_SEED=random ./test` goes looking and prints what it chose,
+  and every failure names the seed and case number to replay. Each property
+  draws from its own stream, mixed from the seed and the test's name, so adding
+  one does not renumber the cases in all the others.
+- **There is no shrinking**, which is most of what a real property-testing
+  library is. The substitute is generators that only produce small inputs, so a
+  counterexample is already readable. A property needing a large input to mean
+  anything should be an ordinary test with a fixture.
+- **Keep the suite fast, for a reason beyond taste.** The mutation tool derives
+  a mutant's hang timeout from how long a green run takes, so a slow suite
+  reclassifies slow mutants as `hang` instead of letting a test catch them —
+  measured: at 1.2 s two glob mutants moved from `caught`/`survived` to `hang`.
+  The glob properties compile a `GRegex` per pattern, which is nearly all of
+  what they cost, so they try `PROP_GLOB_PATHS` paths per compile. The whole
+  suite is ~0.3 s for ~1M assertions; keep it there.
+- **They are not a replacement for the tables and did not behave like one.**
+  Written for #202's escaping they found nothing the fixed tests had missed;
+  written for `fiemap_phys_set` they were the *only* thing that caught leaving
+  the address set unsorted. Expect that unevenness rather than a uniform lift.
+
 ## Profiling & measurement — read before optimizing
 
 - **`scripts/perf-profile.sh`** runs an oans command under `perf` and prints the

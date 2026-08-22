@@ -1,0 +1,123 @@
+# Invariants of the fiemap arithmetic, each broken on purpose, and what notices.
+#
+#     scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+#
+# A sweep asks "would anything notice this token changing". This asks the other
+# question: here is a mistake that was actually made in this file, does the
+# suite say so now. Every block below is a shipped bug, not an invented one -
+# #186 and #187 between them had oans reporting 6.6 GiB reclaimed on a tree
+# where the free space did not move, run after run, for months.
+#
+# A snapshot against the code as it was: a block that stops applying means that
+# part has been rewritten and the question wants re-deriving rather than
+# repairing.
+
+# ---------------------------------------------------------------- #186
+
+# a split tail reads as "not shared", so the file is resubmitted forever
+# The destination's last record was split by an earlier dedupe stopping on a
+# block boundary, where the target has one record. Requiring the two to end
+# together is the record-for-record comparison #186 was about: nothing is
+# freed, and the summary still reports the bytes the kernel compared.
+<<<
+		if (ra != rb && pos < len)
+			return false;
+===
+		if (ra != rb)
+			return false;
+>>>
+
+# matching holes stop counting as shared
+# fiemap omits holes, so a sparse file is mostly gaps. A hole facing a hole is
+# the same absence of storage on both sides; reading it as a difference makes
+# every sparse file permanently unconverged. A browser cache is mostly hole.
+<<<
+		if (ha || hb) {
+			/* A hole facing data is a real difference. */
+			if (ha != hb)
+				return false;
+			pos += ha;
+			continue;
+		}
+===
+		if (ha || hb)
+			return false;
+>>>
+
+# the physical address is compared with an offset added to it
+# On a compressed extent fe_physical addresses the extent as a whole, so
+# arithmetic on it is meaningless - the comment above this line says so. The
+# result is two ranges declared shared that are not, and a dedupe skipped that
+# was real.
+<<<
+		if (pa != pb || ea->fe_physical != eb->fe_physical)
+			return false;
+===
+		if (ea->fe_physical + pa != eb->fe_physical + pb)
+			return false;
+>>>
+
+# a record with no usable address is compared anyway
+# DELALLOC data is still in the page cache and has no stable address; UNKNOWN
+# and inline records have none at all. Comparing them means comparing zeroes,
+# and two files with an unwritten extent each would read as sharing it.
+<<<
+		if ((ea->fe_flags | eb->fe_flags) & FIEMAP_NO_PHYS)
+			return false;
+===
+>>>
+
+# ---------------------------------------------------------------- #187
+
+# the whole compared length is credited as space freed
+# What FIDEDUPERANGE reports is the length it byte-compared, whether or not the
+# range already shared the target's storage. Summing that is what claimed 6.6
+# GiB per run on a tree that never lost a byte of free space.
+<<<
+		if (addressable && seen->n &&
+		    bsearch(&e->fe_physical, seen->v, seen->n, sizeof(*seen->v),
+			    cmp_u64))
+			continue;	/* already accounted for */
+===
+>>>
+
+# a record with no address is credited as a saving rather than as duplicated
+# The direction matters: this figure is a saving, so guessing high is the one
+# way to be wrong that a user cannot check.
+<<<
+		bool addressable = !(e->fe_flags & FIEMAP_NO_PHYS);
+===
+		bool addressable = true;
+>>>
+
+# ---------------------------------------------------------------- #191
+
+# the destination's own storage never joins the accounted-for set
+# Two destinations of one group can already share an extent with each other.
+# Crediting both in full claims twice what releasing that one extent frees.
+<<<
+	if (fresh)
+		phys_set_merge(seen, fresh, sort_uniq(fresh, n_fresh));
+	return unshared;
+===
+	return unshared;
+>>>
+
+# records are counted whole instead of clipped to the range
+# A dedupe submits a range, not a file. An extent overhanging either end would
+# be credited for its whole length, so a 1 GiB extent touched by a 4 KiB dedupe
+# reports a gigabyte freed.
+<<<
+		if (end > dest_end)
+			end = dest_end;
+===
+>>>
+
+# the set is left unsorted, so the membership test starts missing addresses
+# bsearch over an unsorted array is not slow, it is wrong - and wrong in the
+# direction that credits storage twice, which is #191 again by another route.
+<<<
+	set->n = sort_uniq(set->v, n);
+===
+	set->n = n;
+>>>

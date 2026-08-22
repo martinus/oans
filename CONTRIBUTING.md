@@ -42,6 +42,60 @@ Before opening a PR, run the full pre-flight gate:
 scripts/verify.sh   # build + make check + a valgrind scan/dedupe/replay smoke
 ```
 
+### Mutation testing
+
+Coverage says a line ran; it does not say anything would have noticed it
+misbehaving. `scripts/mutate/mutate.py` asks the second question: it breaks a
+source file in a throwaway copy of the tree, rebuilds, runs the C unit suite and
+reports whether anything went red.
+
+```sh
+scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+scripts/mutate/mutate.py --file src/glob.c --diff        # only what you changed
+scripts/mutate/mutate.py --file src/util.c --dry-run     # how many, and how long
+```
+
+The everyday use is the first one: the bug files in `scripts/mutate/bugs/` are
+real oans bugs — #147, #159, #186, #187, #191, #202 — put back one at a time, so
+"does this test earn its place" has an answer. Add a block whenever you fix
+something, and check that the fix's own test is what catches it.
+
+Two things it cannot see, both worth knowing before reading a `survived`:
+
+- **it runs the C unit suite only** (`src/tests.c`), not the end-to-end Python
+  suite, which drives the binary rather than linking its code. For the dedupe
+  phase, the scan pipeline and the progress block, a survivor means nothing.
+- **it builds without a sanitizer by default**, so a mutant that reads one slot
+  too far is only caught if it corrupts something a test checks. Re-run a
+  surprising survivor with `--make-arg SANITIZE=address,undefined --make-arg
+  CC=clang`.
+
+`mutate_core.py` beside the adapter is **vendored** from unordered_dense, which
+is where its own test suite lives, and nanobench holds the same copy. Do not
+edit it here: change it there, run that repository's `scripts/test_mutate.py`,
+copy it into all three and update each `mutate_core.sha256`. `make lint` fails
+if this copy has drifted.
+
+### Property-based tests
+
+`src/proptest.h` is a small generator harness for the C unit suite — no
+dependencies, one header. An ordinary test names an input and its answer; a
+property names a relationship that must hold for *every* input and then goes
+looking, which reaches cases nobody sits down and writes (a `0xc2` immediately
+before the terminator, a buffer that runs out one byte into an escape).
+
+The seed is fixed, so `make test` runs the same cases every time and CI can
+trust it. To go looking for more:
+
+```sh
+OANS_PROPTEST_SEED=random ./test    # prints the seed it chose
+OANS_PROPTEST_SEED=12345 ./test     # replay one
+```
+
+A failure always names the seed and the case number. Write properties for pure
+functions with a stated invariant; where one needs a large input to mean
+anything, write an ordinary test with a fixture instead.
+
 ### Sanitizer builds
 
 The suites also run under clang's AddressSanitizer and UndefinedBehaviorSanitizer

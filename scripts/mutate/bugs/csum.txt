@@ -1,0 +1,78 @@
+# What a checkpoint promises (#159), broken on purpose.
+#
+#     scripts/mutate/mutate.py --file src/csum.c --bugs scripts/mutate/bugs/csum.txt
+#
+# The failure mode this file guards against is the quietest one in oans: a
+# resumed hash that produces a digest of bytes that never existed. Nothing
+# downstream can tell that from a file with no duplicate - not the summary, not
+# the dedupe, not the user. So restore refuses anything it cannot vouch for,
+# and the cost of being wrong about a checkpoint is a rehash.
+
+# the saved state is trusted across an xxhash upgrade
+# xxhash publishes no serialization, so this copies XXH3_state_t verbatim -
+# legitimate within one build and meaningless across two. A distro upgrade is
+# what actually delivers this bug.
+<<<
+	if (hdr.magic != CSUM_STATE_MAGIC ||
+	    hdr.xxh_version != XXH_versionNumber() ||
+	    hdr.state_size != sizeof(XXH3_state_t))
+		return NULL;
+===
+	if (hdr.magic != CSUM_STATE_MAGIC)
+		return NULL;
+>>>
+
+# any blob at all is accepted
+<<<
+	if (hdr.magic != CSUM_STATE_MAGIC ||
+	    hdr.xxh_version != XXH_versionNumber() ||
+	    hdr.state_size != sizeof(XXH3_state_t))
+		return NULL;
+===
+>>>
+
+# a short blob is read anyway
+# The row came out of the hashfile; a truncated one must not be reinterpreted
+# as a valid state whose tail happens to be whatever was next in the buffer.
+<<<
+	if (len != running_checksum_state_size())
+		return NULL;
+===
+	if (len == 0)
+		return NULL;
+>>>
+
+# the restored state keeps the saved secret pointer
+# XXH3_state_t holds a pointer to the library's static default secret, which
+# means nothing in the process that reads it back. Following it is a wrong
+# digest at best.
+<<<
+	secret = c->state->extSecret;
+	memcpy(c->state, (const char *)buf + sizeof(hdr), sizeof(XXH3_state_t));
+	c->state->extSecret = secret;
+===
+	memcpy(c->state, (const char *)buf + sizeof(hdr), sizeof(XXH3_state_t));
+>>>
+
+# the checkpoint records a state nothing was ever fed into
+# What a resume then picks up is a hash of the tail alone, and the digest that
+# comes out describes bytes no file ever held. The shape of a refactor that
+# saves the wrong object - and invisible everywhere downstream, because a wrong
+# digest is indistinguishable from a file with no duplicate.
+<<<
+	memcpy((char *)buf + sizeof(hdr), c->state, sizeof(XXH3_state_t));
+===
+	{
+		XXH3_state_t empty;
+
+		XXH3_64bits_reset(&empty);
+		memcpy((char *)buf + sizeof(hdr), &empty, sizeof(empty));
+	}
+>>>
+
+# a buffer too small to hold the state is written into anyway
+<<<
+	if (len < running_checksum_state_size())
+		return -EINVAL;
+===
+>>>

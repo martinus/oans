@@ -1,0 +1,118 @@
+# What --exclude promises (glob.h), broken on purpose.
+#
+#     scripts/mutate/mutate.py --file src/glob.c --bugs scripts/mutate/bugs/glob.txt
+#
+# The failure mode this file is about is silence. An exclude pattern that
+# matches nothing does not fail; the scan just takes longer and hashes things
+# it was told not to. That is #147: for years `--exclude node_modules` was
+# fnmatch'd against the full path and matched at most one literal directory,
+# usually none, and nobody could tell from the output.
+#
+# The other direction is worse and quieter still: a pattern that matches too
+# much silently drops files from the scan, so they are never deduplicated and
+# the summary reports a smaller number that looks fine.
+
+# a bare name is anchored at the root instead of matching the basename
+# The #147 semantics exactly: `node_modules` then matches `/node_modules` and
+# nothing else, which on any real tree is nothing at all.
+<<<
+	else
+		g_string_append(re, "(?:^|/)");		/* basename */
+===
+	else
+		g_string_append_c(re, '^');
+>>>
+
+# a bare name matches anywhere in a path component, not just whole ones
+# `@eaDir` would then match `/srv/@eaDirectory` - excluding a directory the
+# user never named, and its whole subtree with it, since an excluded directory
+# prunes the walk.
+<<<
+	else
+		g_string_append(re, "(?:^|/)");		/* basename */
+===
+	else
+		g_string_append(re, "");
+>>>
+
+# '*' crosses directory separators
+# `*.iso` would match `/data/x.iso/anything` and, worse, `/a/b.iso/c/d`. The
+# distinction between `*` and `**` is the whole of the difference between
+# gitignore syntax and shell globbing.
+<<<
+			if (stars == 1) {
+				g_string_append(re, "[^/]*");
+			} else if (i + stars < len && pat[i + stars] == '/') {
+===
+			if (stars == 1) {
+				g_string_append(re, ".*");
+			} else if (i + stars < len && pat[i + stars] == '/') {
+>>>
+
+# '?' crosses directory separators
+<<<
+			g_string_append(re, "[^/]");
+===
+			g_string_append(re, ".");
+>>>
+
+# the pattern is not anchored at its end
+# `cache` would match `/var/cache-of-something`, and the pruning walk would
+# take the subtree with it.
+<<<
+	g_string_append_c(re, '$');
+===
+>>>
+
+# a metacharacter in the pattern text is passed through to PCRE2 unescaped
+# The patterns are compiled into one combined regex, so a stray '(' or '+' in a
+# file name is not a wrong match - it is a regex that fails to compile, or one
+# whose grouping runs past the end of its own fragment into the next pattern's.
+<<<
+			char one[2] = { (c == '\\' && i + 1 < len) ? pat[++i] : c, 0 };
+			char *esc = g_regex_escape_string(one, 1);
+
+			g_string_append(re, esc);
+			g_free(esc);
+===
+			g_string_append_c(re, c);
+>>>
+
+# a trailing '/' no longer restricts the pattern to directories
+# `cache/` would then exclude every *file* called cache as well, which is the
+# opposite of what the user wrote and looks like it worked.
+<<<
+		if (!gp->re || (gp->dir_only && !is_dir))
+===
+		if (!gp->re)
+>>>
+
+# the trailing '/' is left on the pattern instead of being stripped
+# It is then a literal '/' before the end anchor, so the pattern matches
+# nothing whatsoever - #147's silence again, from the other end.
+<<<
+	while (len > 0 && pat[len - 1] == '/') {
+		*dir_only = true;
+		len--;
+	}
+===
+	if (len > 0 && pat[len - 1] == '/')
+		*dir_only = true;
+>>>
+
+# an added literal path is treated as a pattern
+# oans adds its own hashfile and the two WAL sidecars this way. A hashfile
+# called `db[1].hash` would become a character class - excluding `db1.hash`,
+# which is somebody's file, and not excluding the hashfile, which is the point.
+<<< additive
+void glob_set_add_literal(struct glob_set *gs, const char *path)
+{
+===
+void glob_set_add_literal(struct glob_set *gs, const char *path)
+{
+	char *ignored = NULL;
+
+	if (!glob_set_add(gs, path, &ignored))
+		return;
+	g_free(ignored);
+>>>
