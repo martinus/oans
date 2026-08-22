@@ -148,10 +148,12 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     oans's heap along with the cached-thread residue it was written for.
     Measured: deleting one `g_free()` from `glob_set_free()` leaks 769,200
     bytes in 32,050 allocations, LSan names `glob_set_new()` as the site, and
-    the run still exits **0**. Measured over a whole `src/glob.c` sweep under
-    `SANITIZE=address`: **66 survivors with the broad file, 54 with the narrow
-    one**, and all 13 of the difference are a deleted `g_free`/`g_string_free`/
-    `g_regex_unref` or an early `return` that skips one. `tests/lsan.supp` now names three
+    the run still exits **0**. Measured over a whole `src/glob.c` sweep, all
+    three on one tree: **plain 64 survivors, ASAN with this file 50, ASAN with
+    the module-wide pattern 64** — so under the broad file the sanitizer leg was
+    worth *nothing at all* over a plain build on this file, and narrowing
+    recovers 14, every one a deleted `g_free`/`g_string_free`/`g_regex_unref` or
+    an early `return` that skips one. `tests/lsan.supp` now names three
     GLib functions and nothing wider, for **both** legs. A handful of
     deallocation mutants still survive it, on error paths the suite never
     reaches — untested code, not an untested leak.

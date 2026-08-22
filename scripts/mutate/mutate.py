@@ -132,10 +132,11 @@ class Oans(mutate_core.Project):
         That file names three GLib functions and nothing wider. It used to
         carry a module-wide `leak:libglib-2.0`, which - since oans keeps nearly
         everything in GLib containers - suppressed most of oans's own heap:
-        a `SANITIZE=address` sweep of src/glob.c came back with 66 survivors
-        under it and 54 without, all 13 of the difference a deleted free or
-        unref. If a survivor here is a missing deallocation, check what this
-        file is matching before believing it.
+        a `SANITIZE=address` sweep of src/glob.c came back with 64 survivors
+        under it and 50 without - the same 64 a plain build gives, so the
+        sanitizer was buying nothing - and all 14 of the difference are a
+        deleted free or unref. If a survivor here is a missing deallocation,
+        check what this file is matching before believing it.
 
         UBSAN_OPTIONS is deliberately not here; the core owns it, and setting it
         would drop the `halt_on_error=1` that makes UBSan fail a run rather than

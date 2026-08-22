@@ -15,11 +15,18 @@
 # is nearly all of oans's heap, since it holds everything in GPtrArray,
 # GHashTable, GRegex and GString. Measured: delete one `g_free()` from
 # glob_set_free() and the suite leaks 769,200 bytes in 32,050 allocations,
-# LeakSanitizer names glob_set_new() as the site, and the run still exits 0. A
-# mutation sweep of src/glob.c under SANITIZE=address found 66 survivors with
-# that pattern and 54 without it, all 13 of the difference a deleted free, unref
-# or string-free. A suppression that broad turns the ASAN leg into a slower copy
-# of the plain one.
+# LeakSanitizer names glob_set_new() as the site, and the run still exits 0.
+#
+# Measured over a whole src/glob.c mutation sweep, all three on one tree:
+#
+#     plain build                     64 survivors
+#     SANITIZE=address, this file     50
+#     SANITIZE=address, module-wide   64
+#
+# So with the broad pattern the sanitizer leg was worth *nothing* over a plain
+# build on this file - a slower copy of it - and narrowing recovers 14 mutants,
+# every one a deleted g_free/g_string_free/g_regex_unref or an early return
+# that skips one.
 #
 # The three below did not fire at all when this was measured (GLib 2.80,
 # `LSAN_OPTIONS=print_suppressions=1` over a scan and a dedupe: no suppressions
