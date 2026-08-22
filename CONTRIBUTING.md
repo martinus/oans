@@ -60,6 +60,14 @@ real oans bugs — #147, #159, #186, #187, #191, #202 — put back one at a time
 "does this test earn its place" has an answer. Add a block whenever you fix
 something, and check that the fix's own test is what catches it.
 
+**Read the survivors by function, not as a total.** The first sweep of
+`src/util.c` reported 213 of 413 surviving, which sounds damning and says
+nothing: survival was 5-9% everywhere a test existed and 85-94% in four pure
+functions that had none. Writing tests for those four took it to 94, and what
+remains is code no unit test can reach (`setrlimit`, `sysconf`,
+`clock_gettime`), `parse_size`'s `exit()` paths, and a few provably equivalent
+mutants. The tool cannot tell an absent test from a weak one; the grouping can.
+
 Two things it cannot see, both worth knowing before reading a `survived`:
 
 - **it runs the C unit suite only** (`src/tests.c`), not the end-to-end Python

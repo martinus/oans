@@ -146,6 +146,27 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   `#include`d into it, so there is no incremental build and ccache cannot help.
   The `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of
   that.
+- **Read a survivor count by function, never as a total.** The first sweep of
+  `src/util.c` came back 213 survivors of 413 and that number says nothing:
+  grouped by function it was 5-9% survival everywhere a test existed
+  (`ctrl_seq_len` 2/37, `sanitize_ctrl` 4/58) and 85-94% in four pure functions
+  that had *no test at all* — `parse_size`, `human_size_snprintf`,
+  `human_duration_snprintf`, `num_digits`, together 113 of the 213. Writing
+  those took it to 94. So the tool measures absent tests and weak tests with
+  the same number, and only the grouping tells them apart.
+  - `parse_size` is why it mattered: a ladder of `switch` fallthroughs, so one
+    missing `mult *= 1024` makes `--max-filesize=10G` mean ten megabytes on a
+    run that otherwise looks right. The integration suite passes `1K` and `1M`,
+    which left `g`/`t`/`p`/`e` unexercised anywhere.
+- **Triage the residue rather than reporting it.** What was left at 94 is
+  ~61 mutants in `setrlimit`/`sysconf`/`clock_gettime`/`backtrace` code no unit
+  test can reach, 14 on `parse_size`'s `exit()` paths (a test that reaches them
+  takes the suite with it), and a handful that are provably equivalent —
+  `memcpy(buf, "\\t", 3)` copies the literal's own NUL into a scratch buffer
+  whose third byte is never read; `u < ARRAY_SIZE(units) - 1` cannot differ
+  from `<=` because `v >= 1024.0` fails first, UINT64_MAX being 16 EiB. Check
+  the equivalents rather than assuming them: three that looked equivalent were
+  not, and one of those wrote a byte past a buffer.
 
 ### `src/proptest.h` — properties, not tables
 
@@ -169,6 +190,15 @@ counterexample. No dependencies, one header, minunit-compatible.
   The glob properties compile a `GRegex` per pattern, which is nearly all of
   what they cost, so they try `PROP_GLOB_PATHS` paths per compile. The whole
   suite is ~0.3 s for ~1M assertions; keep it there.
+- **A property phrased in terms of the function under test cannot see that
+  function being wrong**, only being inconsistent. The escaping property asserts
+  `!has_ctrl(out)` — and `has_ctrl` *is* `ctrl_seq_len`, which is also what the
+  escaper calls, so a mutation inside the classifier leaves both sides agreeing.
+  Measured: narrowing the C1 test from `>= 0x80` to `> 0x80` was caught by
+  nothing there, while U+0080 reached the terminal unescaped. The property now
+  also checks the raw bytes, spelled out rather than delegated. Reach for a
+  second, independent phrasing wherever the obvious property is a tautology
+  waiting to happen.
 - **They are not a replacement for the tables, and the lift is uneven.**
   Measured, same 413-mutant sweep of `src/util.c` with the properties removed
   and restored: **213 survivors → 203**, and every one of the ten is a
