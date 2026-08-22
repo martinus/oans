@@ -140,11 +140,14 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     oans's heap along with the cached-thread residue it was written for.
     Measured: deleting one `g_free()` from `glob_set_free()` leaks 769,200
     bytes in 32,050 allocations, LSan names `glob_set_new()` as the site, and
-    the run still exits **0**. Fourteen deletions of a free or an unref in
-    `src/glob.c` survived a `SANITIZE=address` sweep for that reason alone.
-    The unit leg now takes `tests/lsan-unit.supp` (the three thread-cache
-    entries by function), which catches all of them; the suite is in fact
-    leak-clean with no suppressions at all. **The end-to-end leg still takes
+    the run still exits **0**. Measured over a whole `src/glob.c` sweep under
+    `SANITIZE=address`: **66 survivors with the broad file, 54 with the narrow
+    one**, and all 13 of the difference are a deleted `g_free`/`g_string_free`/
+    `g_regex_unref` or an early `return` that skips one. The unit leg now takes
+    `tests/lsan-unit.supp` (the three thread-cache entries by function); the
+    suite is in fact leak-clean with no suppressions at all. A handful of
+    deallocation mutants still survive it, on error paths the suite never
+    reaches — untested code, not an untested leak. **The end-to-end leg still takes
     the broad file** — it drives the binary, whose GLib thread pools are what
     the suppression was written for, and that leg cannot be run without a
     btrfs or XFS scratch dir. Narrowing it too is one CI run away from being
