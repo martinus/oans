@@ -1663,17 +1663,26 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		ret = filescan_walk_run(db);
 
 	/*
-	 * Nothing could be locked onto a supported filesystem, so the walk saw
-	 * no files. Fail loudly rather than printing a misleading "Nothing to
+	 * Nothing could be locked onto a usable filesystem, so the walk saw no
+	 * files. Fail loudly rather than printing a misleading "Nothing to
 	 * deduplicate" and exiting 0. The most common cause is XFS on a kernel
 	 * older than 6.4 scanned without root (its UUID needs libblkid).
 	 */
 	if (!ret && filescan_seed_failed()) {
 		eprintf("Error: none of the given paths are on a filesystem oans "
-			"can deduplicate. Deduplication needs btrfs or XFS; for "
-			"XFS on a kernel older than 6.4, run oans as root.\n");
+			"can deduplicate. It needs FIDEDUPERANGE, which btrfs "
+			"and XFS provide; for XFS on a kernel older than 6.4, "
+			"run oans as root.\n");
 		ret = 1;
 	}
+
+	/*
+	 * The walk ended without establishing that this filesystem supports
+	 * FIDEDUPERANGE. Nothing was proved, so say so rather than exiting 0 on
+	 * a filesystem that may well be unusable.
+	 */
+	if (!ret && filescan_report_fs_unusable())
+		ret = 1;
 
 	/* Only once the walk actually ran: after a failure every pattern would
 	 * trivially have "matched nothing" and would bury the real error. */

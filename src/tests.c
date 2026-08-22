@@ -25,6 +25,7 @@
 #include "storage.c"
 #include "longpath.c"
 #include "glob.c"
+#include "dedupe.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -2482,6 +2483,64 @@ MU_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else) {
 	}
 }
 
+/*
+ * The FIDEDUPERANGE probe's answer taxonomy (#224). Worth testing directly and
+ * exhaustively: the probe's whole job is turning one ioctl result into a
+ * verdict, and what a filesystem returns is exactly what a test host cannot
+ * vary. Both wrong answers are bad in different ways -- a wrong NO silently
+ * skips a whole tree, a wrong YES brings back per-file dedupe errors -- so
+ * anything that is not a clear statement about the filesystem stays UNKNOWN.
+ */
+MU_TEST(test_dedupe_classify_probe)
+{
+	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0, 1));
+	/* errno is meaningless on success and must not be consulted. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES,
+			 dedupe_classify_probe(0, EINVAL, 0));
+
+	/* A stacking filesystem puts the lower filesystem's refusal in status
+	 * and leaves rc/errno clean - the case dedupe_probe_fd documents. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(0, 0, -EINVAL));
+	/* A status that does name the filesystem is still an answer. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(0, 0, -EOPNOTSUPP));
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(0, 0, -ENOTTY));
+
+	/* Answers about the filesystem from the ioctl itself. EOPNOTSUPP is
+	 * what ext4 returns (measured); ENOTTY is a kernel that does not know
+	 * the ioctl. status is not filled in when the ioctl fails. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(-1, EOPNOTSUPP, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(-1, ENOTTY, 0));
+
+	/*
+	 * Answers about this file or this caller. EINVAL is the important one:
+	 * it is documented for "the filesystem does not support deduplicating
+	 * the ranges of the given files" *and* for ordinary per-file
+	 * conditions, so reading it as NO would condemn a filesystem on the
+	 * evidence of one awkward file.
+	 */
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EINVAL, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EACCES, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EROFS, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EPERM, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EISDIR, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EBADF, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, ETXTBSY, 0));
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_running_checksum_survives_save_restore);
 	MU_RUN_TEST(test_running_checksum_repoints_the_secret_on_restore);
@@ -2522,6 +2581,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_glob_reports_matching_pattern_and_counts);
 	MU_RUN_TEST(test_glob_rejects_malformed);
 	MU_RUN_TEST(test_glob_empty_set_matches_nothing);
+	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* Property-based (src/proptest.h). Grouped rather than interleaved: they
 	 * are a different question about the same code, and a failure here names
