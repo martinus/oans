@@ -2139,6 +2139,7 @@ MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
 	memset(&out, 0, sizeof(out));
 	out.roots = roots;
 	out.nroots = 2;
+	out.min_filesize = 4096;
 	mu_check(dbfile_store_scan_config(db, &out) == 0);
 	memset(&in, 0, sizeof(in));
 	mu_check(dbfile_load_scan_config(db, &in) == 1);
@@ -2154,11 +2155,26 @@ MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
 	 */
 	exec(db, "delete from config where keyname in "
 		 "('opt_min_filesize', 'opt_max_filesize')");
-	memset(&in, 0, sizeof(in));
-	in.min_filesize = 99;
-	in.max_filesize = 99;
+	memset(&in, 0x5a, sizeof(in));
 	mu_check(dbfile_load_scan_config(db, &in) == 1);
 	mu_check(in.min_filesize == 0 && in.max_filesize == 0);
+	mu_check(in.run_dedupe == 0 && in.nroots == 2);
+	scan_config_free(&in);
+
+	/*
+	 * Only the additive one missing, which is what a hashfile written
+	 * before --max-filesize existed actually looks like. The two limits
+	 * are read through one scratch variable, so a reset dropped between
+	 * them silently gives max_filesize the value of min - and every file
+	 * above the lower limit stops being scanned, on a run that otherwise
+	 * looks identical.
+	 */
+	mu_check(dbfile_store_scan_config(db, &out) == 0);
+	exec(db, "delete from config where keyname = 'opt_max_filesize'");
+	memset(&in, 0x5a, sizeof(in));
+	mu_check(dbfile_load_scan_config(db, &in) == 1);
+	mu_check(in.min_filesize == 4096);
+	mu_check(in.max_filesize == 0);
 	scan_config_free(&in);
 }
 
@@ -2176,11 +2192,18 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
 		.reclaimed = 4096, .groups = 2, .deduped = 1,
 		.skip_permission = 3, .skip_unreadable = 1,
 	};
+	/* Five adjacent columns read back by index, so five distinct values:
+	 * two buckets that share one cannot tell a swapped pair apart, and
+	 * a bucket left at 0 cannot tell a dropped read from a real zero. */
 	struct run_record second = {
 		.ts = 2000, .duration_ms = 700, .files_scanned = 5,
 		.reclaimed = 8192, .groups = 1, .deduped = 1,
-		.skip_permission = 0, .skip_unreadable = 0,
-		.readonly_subvols = 4,
+		.skip_permission = 11, .skip_unreadable = 22,
+		.skip_path_too_long = 33, .skip_unsupported_fs = 44,
+		.readonly_subvols = 55,
+	};
+	struct run_record third = {
+		.ts = 3000, .duration_ms = 100, .files_scanned = 1,
 	};
 	/* Deliberately not zeroed: the summary clears what it does not fill,
 	 * so a caller's stack garbage cannot be read back as a lifetime total. */
@@ -2188,6 +2211,22 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
 
 	memset(&s, 0x5a, sizeof(s));
 
+	/*
+	 * A hashfile nobody has run against yet. Every field must be zero,
+	 * which is what says the summary clears the caller's struct rather
+	 * than filling in only what its two queries return - with no rows,
+	 * they return nothing at all. (It has to be asked here: memdb()
+	 * handles all share one in-memory database, so there is no such thing
+	 * as a second, empty one within a test.)
+	 */
+	mu_check(dbfile_get_run_summary(db, &s) == 0);
+	mu_check(s.runs == 0 && s.total_reclaimed == 0 && s.total_files == 0);
+	mu_check(s.first_ts == 0 && s.last_ts == 0 && s.total_skip_errors == 0);
+	mu_check(s.last_skip_permission == 0 && s.last_skip_unreadable == 0);
+	mu_check(s.last_skip_path_too_long == 0);
+	mu_check(s.last_skip_unsupported_fs == 0 && s.last_readonly_subvols == 0);
+
+	memset(&s, 0x5a, sizeof(s));
 	mu_check(dbfile_record_run(db, &first) == 0);
 	mu_check(dbfile_record_run(db, &second) == 0);
 	mu_check(dbfile_get_run_summary(db, &s) == 0);
@@ -2197,13 +2236,28 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
 	mu_check(s.total_files == 15);
 	mu_check(s.first_ts == 1000 && s.last_ts == 2000);
 
-	/* The most recent run had no permission errors, so the alarm clears
-	 * even though an earlier run had three. */
-	mu_check(s.last_skip_permission == 0);
-	mu_check(s.last_skip_unreadable == 0);
-	mu_check(s.last_readonly_subvols == 4);
-	/* ...while the lifetime figure still remembers them. */
-	mu_check(s.total_skip_errors == 4);
+	/* Each bucket, from the most recent run only. */
+	mu_check(s.last_skip_permission == 11);
+	mu_check(s.last_skip_unreadable == 22);
+	mu_check(s.last_skip_path_too_long == 33);
+	mu_check(s.last_skip_unsupported_fs == 44);
+	mu_check(s.last_readonly_subvols == 55);
+	/* ...while the lifetime figure sums both runs. readonly_subvols is not
+	 * an error, so it is not in the total. */
+	mu_check(s.total_skip_errors == 3 + 1 + 11 + 22 + 33 + 44);
+
+	/*
+	 * A later clean run clears the alarm. A lifetime total only ever
+	 * grows, so it cannot tell "last night lost a subtree" from "one run
+	 * did, months ago" - which is the whole reason these are read
+	 * separately from the sums above.
+	 */
+	mu_check(dbfile_record_run(db, &third) == 0);
+	mu_check(dbfile_get_run_summary(db, &s) == 0);
+	mu_check(s.last_skip_permission == 0 && s.last_skip_unreadable == 0);
+	mu_check(s.last_skip_path_too_long == 0);
+	mu_check(s.last_skip_unsupported_fs == 0 && s.last_readonly_subvols == 0);
+	mu_check(s.total_skip_errors == 3 + 1 + 11 + 22 + 33 + 44);
 
 }
 
@@ -2434,11 +2488,23 @@ MU_TEST(test_dbfile_load_checkpoint_declines_what_it_cannot_vouch_for) {
 	struct scan_checkpoint cp = mkcheckpoint(state, NULL, 4096);
 	struct scan_checkpoint got = { .file_state = got_file, .ext_state = got_ext };
 
+	/* Distinct throughout: these are five adjacent columns read by index,
+	 * so two that share a value cannot tell a swapped pair apart. */
+	cp.size = 123456;
+	cp.mtime = 777;
+	cp.ext_loff = 2048;
+	cp.ext_len = 999;
+
 	/* Nothing stored yet: not an error, but not a checkpoint either. */
 	mu_check(!dbfile_load_checkpoint(db, id, &got));
 
 	mu_check(dbfile_store_checkpoint(db, id, &cp) == 0);
 	mu_check(dbfile_load_checkpoint(db, id, &got));
+	mu_check(got.loff == 4096 && got.size == 123456 && got.mtime == 777);
+	mu_check(got.ext_loff == 2048 && got.ext_len == 999);
+	mu_check(!got.has_ext_state);	/* none was stored, so none comes back */
+	/* The saved hash state itself, which is the point of the whole row. */
+	mu_check(!memcmp(got_file, state, len));
 
 	/* A file that has one tells nothing about a file that does not. */
 	int64_t other = put_unscanned_file(db, "/tree/other", 2, 1);
@@ -2510,6 +2576,42 @@ MU_TEST(test_dbfile_pruning_keeps_what_still_exists) {
 	seen_oracle_id = 0;
 	mu_check(dbfile_prune_missing_files(db, claims_seen) == 1);
 	mu_check(stats_of(db).num_files == 1);
+
+	/*
+	 * ENOTDIR, the other way a path stops naming a file: a component of it
+	 * is now a regular file rather than a directory. It is a separate
+	 * errno from ENOENT and the check names both, so a test that only
+	 * deletes files leaves half of that condition free.
+	 */
+	char under[sizeof(present) + 8];
+
+	snprintf(under, sizeof(under), "%s/child", present);
+	put_file(db, under, 4, 1);
+	mu_check(stats_of(db).num_files == 2);
+	mu_check(dbfile_prune_missing_files(db, NULL) == 1);
+	mu_check(dbfile_query_u64(db->db, "select ino from files") == 1);
+
+	/*
+	 * A stat that failed for any *other* reason is not "gone", and the row
+	 * has to survive: EACCES on a directory whose permissions changed, or
+	 * EIO on a disk going bad, would otherwise delete the hashes for files
+	 * that are still there - so the run that was meant to notice the disk
+	 * is failing rebuilds the cache instead. A symlink loop stands in for
+	 * that class, because it is the only one of them a test can produce
+	 * without being root or breaking hardware.
+	 */
+	char loop[] = "/tmp/oans-prune-loop-XXXXXX";
+
+	if (!mkdtemp(loop))
+		abort();
+	rmdir(loop);
+	if (symlink(loop, loop))
+		abort();
+	put_file(db, loop, 5, 1);
+	mu_check(stats_of(db).num_files == 2);
+	mu_check(dbfile_prune_missing_files(db, NULL) == 0);
+	mu_check(stats_of(db).num_files == 2);
+	unlink(loop);
 
 	unlink(present);
 }

@@ -191,3 +191,47 @@
 ===
 "select mtime, size, filename, id, 1 from files "			\
 >>>
+
+# the two size limits are read through one scratch variable, unreset
+# A hashfile written before --max-filesize existed has no row for it, and
+# get_config_int64() then leaves the caller's variable alone - which is the
+# value min_filesize just landed in it. So max_filesize silently becomes min,
+# every file above the lower limit stops being scanned, and the run looks
+# exactly like one that had nothing to do.
+<<<
+		mfs = 0;
+		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+===
+		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+>>>
+
+# the last run's error buckets are read one column across
+# Five adjacent columns read back by index: shift them and a monitoring
+# consumer alarms on the wrong bucket, or on a column that is not an error at
+# all. Nothing downstream can tell, because every one of them is a plausible
+# small integer.
+<<<
+		s->last_skip_permission = sqlite3_column_int64(stmt, 0);
+		s->last_skip_unreadable = sqlite3_column_int64(stmt, 1);
+		s->last_skip_path_too_long = sqlite3_column_int64(stmt, 2);
+		s->last_skip_unsupported_fs = sqlite3_column_int64(stmt, 3);
+===
+		s->last_skip_permission = sqlite3_column_int64(stmt, 1);
+		s->last_skip_unreadable = sqlite3_column_int64(stmt, 2);
+		s->last_skip_path_too_long = sqlite3_column_int64(stmt, 3);
+		s->last_skip_unsupported_fs = sqlite3_column_int64(stmt, 4);
+>>>
+
+# a resumed file's position is read one column across
+# loff, size and mtime decide where hashing restarts and whether the
+# checkpoint is trusted at all. Read the wrong column and the run resumes at
+# an offset the file never reached - and the digest that comes out describes a
+# byte string that never existed, which nothing downstream can distinguish
+# from a file with no duplicate.
+<<<
+	cp->size = sqlite3_column_int64(stmt, 1);
+	cp->mtime = sqlite3_column_int64(stmt, 2);
+===
+	cp->size = sqlite3_column_int64(stmt, 2);
+	cp->mtime = sqlite3_column_int64(stmt, 1);
+>>>
