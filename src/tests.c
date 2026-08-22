@@ -573,10 +573,30 @@ MU_TEST(test_sanitize_ctrl) {
 	mu_check(ctrl_seq_len((const unsigned char *)"a", &cp) == 0);
 	mu_check(ctrl_seq_len((const unsigned char *)"\x1b", &cp) == 1 && cp == 0x1b);
 	mu_check(ctrl_seq_len((const unsigned char *)"\x7f", &cp) == 1 && cp == 0x7f);
-	/* A C1 costs two input bytes and is named by its code point. */
+	/*
+	 * A C1 costs two input bytes and is named by its code point - at *both*
+	 * ends of the range and not just the top. Only U+009F was checked here
+	 * before, which left `>= 0x80` and `<= 0x9f` each satisfied by one
+	 * example: a sweep turned `>= 0x80` into `> 0x80` and `<= 0x9f` into
+	 * `== 0x9f` and nothing went red, so U+0080 was reaching the terminal.
+	 */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x80", &cp) == 2 && cp == 0x80);
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x8f", &cp) == 2 && cp == 0x8f);
 	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x9f", &cp) == 2 && cp == 0x9f);
+	/* One below and one above the range, which are ordinary UTF-8. */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x7f", &cp) == 0);
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\xa0", &cp) == 0);
 	/* 0xc2 not followed by a continuation byte is ordinary UTF-8 lead. */
 	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\xa9", &cp) == 0);
+	/* And the whole range survives the escaper, not only its endpoints. */
+	for (unsigned int c1 = 0x80; c1 <= 0x9f; c1++) {
+		char name[8], want[8];
+
+		snprintf(name, sizeof(name), "x\xc2%c", (char)c1);
+		snprintf(want, sizeof(want), "x\\x%02x", c1);
+		sanitize_ctrl(name, out, sizeof(out));
+		mu_check(!strcmp(out, want));
+	}
 
 	mu_check(!has_ctrl("plain.txt"));
 	mu_check(!has_ctrl("café-Β.txt"));
@@ -593,6 +613,17 @@ MU_TEST(test_sanitize_ctrl) {
 	free(dup);
 	dup = path_for_display("café-Β.txt");	/* the fast path: unchanged */
 	mu_check(dup && strcmp(dup, "café-Β.txt") == 0);
+	free(dup);
+
+	/*
+	 * A name that is *entirely* control bytes, where the allocation is
+	 * exactly SANITIZE_CTRL_MAX per byte plus the NUL and there is no slack
+	 * to absorb an arithmetic slip. A mixed name has room to spare, so the
+	 * cases above pass with the `+ 1` removed - and what ships then is a
+	 * path silently one character short, which names a different file.
+	 */
+	dup = path_for_display("\x1b\x1b\x1b");
+	mu_check(dup && strcmp(dup, "\\x1b\\x1b\\x1b") == 0);
 	free(dup);
 }
 
@@ -851,10 +882,63 @@ MU_TEST(test_group_u64) {
 	group_u64_snprintf(18446744073709551615ull, b, sizeof(b));
 	mu_check(strcmp(b, "18,446,744,073,709,551,615") == 0);
 
-	/* Truncation stays NUL-terminated and within bounds. */
+	/*
+	 * Truncation, asserted on the bytes rather than on the length. `strlen
+	 * <= 3` is satisfied by almost any arithmetic slip in the three
+	 * `str_bytes - 1` bounds, which is why sixteen mutants across those
+	 * three lines survived it.
+	 */
 	char small[4];
 	group_u64_snprintf(2505166, small, sizeof(small));
-	mu_check(small[3] == '\0' && strlen(small) <= 3);
+	mu_check(!strcmp(small, "2,5"));		/* "2,505,166" cut to fit */
+	char one[2];
+	group_u64_snprintf(2505166, one, sizeof(one));
+	mu_check(!strcmp(one, "2"));
+	char just_a_nul[1];
+	group_u64_snprintf(2505166, just_a_nul, sizeof(just_a_nul));
+	mu_check(just_a_nul[0] == '\0');
+	/* The return value is what was written, not what was wanted. */
+	mu_check(group_u64_snprintf(2505166, small, sizeof(small)) == 3);
+	mu_check(group_u64_snprintf(999, b, sizeof(b)) == 3);
+}
+
+/*
+ * Whatever the number and whatever the room, the result is a NUL-terminated
+ * prefix of the full grouping, the return value is its length, and nothing is
+ * written past the buffer. The three `str_bytes - 1` bounds are the whole of
+ * this function's difficulty and a table cannot walk every cut point.
+ */
+MU_TEST(test_prop_group_u64_truncates_to_a_prefix) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct { char before[8]; char out[30]; char after[8]; } fenced;
+		char full[32];
+		/* Log-uniform, so every digit width comes up. */
+		uint64_t n = prop_u64(&p) >> prop_below(&p, 64);
+		size_t sz = (size_t)prop_below(&p, sizeof(fenced.out) + 1);
+		int ret;
+
+		group_u64_snprintf(n, full, sizeof(full));
+		memset(&fenced, '#', sizeof(fenced));
+		ret = group_u64_snprintf(n, fenced.out, sz);
+
+		for (size_t i = 0; i < sizeof(fenced.before); i++)
+			prop_check(&p, fenced.before[i] == '#');
+		for (size_t i = 0; i < sizeof(fenced.after); i++)
+			prop_check(&p, fenced.after[i] == '#');
+		if (sz == 0) {
+			prop_check(&p, ret == 0);
+			prop_check(&p, fenced.out[0] == '#');	/* nothing written */
+			continue;
+		}
+		prop_check(&p, strlen(fenced.out) < sz);
+		prop_check(&p, (size_t)ret == strlen(fenced.out));
+		prop_check(&p, !strncmp(fenced.out, full, strlen(fenced.out)));
+		/* Truncated only when it had to be. */
+		if (strlen(full) < sz)
+			prop_check(&p, !strcmp(fenced.out, full));
+	}
 }
 
 /*
@@ -1734,10 +1818,19 @@ MU_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous) {
 		gen_hostile_name(&p, in, sizeof(in));
 		sanitize_ctrl(in, out, sizeof(out));
 		prop_check(&p, !has_ctrl(out));
-		/* An escape is spelled in characters a terminal cannot act on
-		 * either, so the result is plain printable ASCII throughout. */
-		for (const unsigned char *q = (const unsigned char *)out; *q; q++)
-			prop_check(&p, *q >= 0x20 || *q == '\t' || *q == '\n');
+		/*
+		 * And again in raw bytes, which is not the redundancy it looks
+		 * like. `has_ctrl` is `ctrl_seq_len` and so is the escaper, so
+		 * a mutation *inside the classifier* leaves the two agreeing
+		 * and this property blind to it - measured: narrowing the C1
+		 * test to `> 0x80` was caught by nothing here. A property
+		 * phrased in terms of the function under test cannot see the
+		 * function being wrong, only inconsistent.
+		 */
+		for (const unsigned char *q = (const unsigned char *)out; *q; q++) {
+			prop_check(&p, *q >= 0x20 && *q != 0x7f);
+			prop_check(&p, !(q[0] == 0xc2 && q[1] >= 0x80 && q[1] <= 0x9f));
+		}
 	}
 }
 
@@ -2421,6 +2514,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_prop_human_size_picks_a_real_unit);
 	MU_RUN_TEST(test_prop_human_duration_reads_back);
 	MU_RUN_TEST(test_prop_num_digits_matches_printf);
+	MU_RUN_TEST(test_prop_group_u64_truncates_to_a_prefix);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
