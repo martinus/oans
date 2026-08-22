@@ -45,6 +45,12 @@ void fs_get_locked_uuid(uuid_t *uuid);
  * of reporting a silent, successful no-op.
  */
 bool filescan_seed_failed(void);
+/*
+ * Say, once the walk has ended, that it never established this filesystem can
+ * be deduplicated; true when it said so (see #224). file_scan owns the verdict
+ * and the wording, the way filescan_report_excludes() does.
+ */
+bool filescan_report_fs_unusable(void);
 
 /*
  * How many scan roots named on the command line (or in a "-" stdin list) could

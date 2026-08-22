@@ -57,6 +57,7 @@
 #include "opt.h"
 #include "threads.h"
 #include "fiemap.h"
+#include "dedupe.h"
 #include "progress.h"
 #include "longpath.h"
 #include "glob.h"
@@ -75,6 +76,8 @@
 static struct glob_set *excludes;
 
 static int __scan_file(char *path, struct dbhandle *db, struct statx *st);
+static bool fs_dedupe_probe_settled(const char *path,
+				    const struct statx *st);
 static bool seen_inode(uint64_t ino, uint64_t subvol);
 static void mark_inode_seen(uint64_t ino, uint64_t subvol);
 static void mark_file_seen(int64_t id);
@@ -487,8 +490,43 @@ struct locked_fs {
 	uuid_t uuid;
 	dev_t dev;
 	bool is_btrfs;
+	/*
+	 * Whether this filesystem can be deduplicated (#224). YES straight away
+	 * for one oans knows by name; otherwise UNKNOWN until a file is asked
+	 * for FIDEDUPERANGE. Set while seeding the roots -- on the main thread,
+	 * before any walker exists -- and thereafter touched only by the single
+	 * file consumer, so it needs no lock.
+	 *
+	 * The enum rather than a bool because the three states are genuinely
+	 * different: a definite no stops the run, "not settled yet" asks the
+	 * next file, and only "never settled at all" is worth reporting once
+	 * the walk has ended.
+	 */
+	enum dedupe_support dedupe;
+	unsigned int dedupe_probe_tries;
 };
 struct locked_fs locked_fs = {0,};
+
+/*
+ * How many files may be asked before giving up on a filesystem oans does not
+ * recognise. A file can fail to answer for reasons of its own -- unreadable,
+ * unwritable, empty -- so one inconclusive result must not condemn the tree;
+ * but a filesystem that never answers must not read the whole tree first
+ * either.
+ */
+#define FS_PROBE_MAX_TRIES	16
+
+/*
+ * Test hook (DUPEREMOVE_FORCE_FS_PROBE): drop the allowlist fast path so the
+ * probe decides for btrfs and XFS too. Without it the accept branch is
+ * unreachable in tests -- the only filesystems known to answer yes are exactly
+ * the two that never reach the probe (test_fs_probe.py).
+ *
+ * Read once in filescan_init(), on the main thread: probe_fs() runs on the
+ * walker threads (the btrfs per-device recheck), and a lazy getenv() there
+ * would be a race between workers for no reason.
+ */
+static bool force_fs_probe;
 
 /*
  * Set when a seeded root (parent_checked == false) is rejected because it could
@@ -892,12 +930,22 @@ static char *extract_first_device(const char *fs_source)
 struct fs_probe {
 	uuid_t	uuid;
 	bool	is_btrfs;
-	bool	supported;
+	bool	supported;	/* on the allowlist: usable without probing */
 };
 
-/* True for a filesystem oans knows how to deduplicate on. */
-static bool is_fs_supported(const struct statfs *fs)
+/*
+ * The filesystems oans knows how to deduplicate on by name. This is a fast
+ * path, not the definition: anything else is asked directly for FIDEDUPERANGE
+ * (#224). Keeping the two named here means the validated filesystems never
+ * depend on the probe -- their behaviour is exactly what it always was.
+ */
+static bool is_fs_allowlisted(const struct statfs *fs)
 {
+	/* Test hook, read once in filescan_init(): pretend nothing is known so
+	 * the probe path runs on btrfs and XFS too. */
+	if (force_fs_probe)
+		return false;
+
 	return fs->f_type == BTRFS_SUPER_MAGIC || fs->f_type == XFS_SB_MAGIC;
 }
 
@@ -940,7 +988,7 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		return 1;
 	}
 	probe->is_btrfs = fs.f_type == BTRFS_SUPER_MAGIC;
-	probe->supported = is_fs_supported(&fs);
+	probe->supported = is_fs_allowlisted(&fs);
 
 	if (probe->is_btrfs) {
 		dprintf("probe_fs: %s lives on btrfs\n", dpath);
@@ -1150,29 +1198,23 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 			return seed_reject(parent_checked);
 
 		/*
-		 * We identified the filesystem, but if it is not one oans can
-		 * deduplicate (btrfs or XFS) refuse this root now with a clear
-		 * message. Walking it anyway would hash every file only to have
-		 * each FIEMAP/FIDEDUPERANGE fail with confusing per-file errors
-		 * and still exit 0 ("Nothing to deduplicate"). Rejecting via
-		 * seed_reject() means a run whose roots are *all* unsupported
-		 * fails loudly (filescan_seed_failed()); a mix still scans the
-		 * supported roots. Commit locked_fs only once supported, so a
-		 * rejected root does not pollute the lock for later roots.
+		 * We identified the filesystem. If it is one oans knows by name
+		 * it is usable as-is; otherwise the verdict waits for a file to
+		 * be asked for FIDEDUPERANGE (#224), because the ioctl needs a
+		 * writable regular file and a root is normally a directory.
+		 *
+		 * Deferring costs nothing that matters: the probe happens on the
+		 * first file the walk produces, long before any of it is hashed,
+		 * so an unsupported filesystem still fails in a second and with
+		 * one clear message -- not with a FIEMAP error per file and a
+		 * misleading "Nothing to deduplicate" at exit 0, which is what
+		 * the upfront rejection was there to prevent.
 		 */
-		if (!probe.supported) {
-			declare_display_path(disp, path);
-
-			eprintf("Skipping %s: its filesystem is not btrfs or XFS, "
-				"which oans needs to deduplicate.\n",
-				disp);
-			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
-			return seed_reject(parent_checked);
-		}
-
 		uuid_copy(locked_fs.uuid, probe.uuid);
 		locked_fs.dev = stx_to_dev(st);
 		locked_fs.is_btrfs = probe.is_btrfs;
+		locked_fs.dedupe = probe.supported ? DEDUPE_SUPPORT_YES
+						   : DEDUPE_SUPPORT_UNKNOWN;
 
 		return true;
 	}
@@ -1200,6 +1242,11 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 		locked_fs.dev = stx_to_dev(st);
 		locked_fs.is_btrfs = probe.is_btrfs;
+		/* Same deferral as the empty-hashfile path above: a hashfile
+		 * records the filesystem's UUID, not whether it can be deduped,
+		 * so a replay onto an unrecognised filesystem still has to ask. */
+		locked_fs.dedupe = probe.supported ? DEDUPE_SUPPORT_YES
+						   : DEDUPE_SUPPORT_UNKNOWN;
 		return true;
 	}
 
@@ -1240,6 +1287,66 @@ void fs_get_locked_uuid(uuid_t *uuid)
 bool filescan_seed_failed(void)
 {
 	return seed_fs_lock_failed && nr_roots_seeded == 0;
+}
+
+/*
+ * The one place that says this filesystem cannot be deduplicated (#224). Which
+ * of the three cases it is decides the advice, so they are worded here together
+ * rather than assembled by whoever noticed: a definite no; files asked that
+ * could not answer (the shape a stacking filesystem produces, and the one a
+ * user is least likely to guess); and a walk that ended without the question
+ * ever being put.
+ */
+static void report_fs_unusable(void)
+{
+	if (locked_fs.dedupe == DEDUPE_SUPPORT_NO)
+		eprintf("Error: this filesystem does not support "
+			"FIDEDUPERANGE.\n");
+	else if (locked_fs.dedupe_probe_tries)
+		eprintf("Error: could not determine whether this filesystem "
+			"supports FIDEDUPERANGE - %u file(s) were asked and "
+			"none could answer. A stacking filesystem such as "
+			"overlayfs reports its lower filesystem's refusal this "
+			"way.\n", locked_fs.dedupe_probe_tries);
+	else
+		eprintf("Error: no file was available to test whether this "
+			"filesystem supports FIDEDUPERANGE.\n");
+
+	eprintf("oans needs FIDEDUPERANGE to deduplicate; it is known to work "
+		"on btrfs and XFS.\n");
+}
+
+/*
+ * Report, after the walk, that it ended without ever establishing that the
+ * filesystem can be deduplicated -- an empty tree, or one whose every file was
+ * filtered out by --exclude or by size. Exiting 0 having proved nothing would
+ * be the silent no-op the upfront rejection was introduced to prevent.
+ *
+ * A definite no is not reported here: it stops the run where it is found and
+ * has already said so. Nor is an interrupted run, whose exit status belongs to
+ * the signal rather than to a question the user cut short.
+ */
+bool filescan_report_fs_unusable(void)
+{
+	if (interrupted() || locked_fs.dedupe != DEDUPE_SUPPORT_UNKNOWN)
+		return false;
+
+	report_fs_unusable();
+	return true;
+}
+
+/*
+ * Stops the walk, not just the hashing. Set by the file consumer once the
+ * filesystem is proved unusable and polled by the walker threads, so it is
+ * atomic for the reason interrupt.c documents: `volatile` orders nothing across
+ * threads and ThreadSanitizer is right to say so. Relaxed on both sides -- the
+ * flag carries no data.
+ */
+static _Atomic bool walk_abort;
+
+static bool walk_aborted(void)
+{
+	return atomic_load_explicit(&walk_abort, memory_order_relaxed);
 }
 
 static int get_dirent_type(struct dirent *entry, int fd, const char *path)
@@ -1504,12 +1611,13 @@ static gpointer walk_thread(gpointer arg)
 		if (path == WALK_STOP)
 			break;
 		/*
-		 * Interrupted: drain the queue instead of walking it. Skipping
+		 * Interrupted, or the filesystem turned out not to support dedupe
+		 * at all: drain the queue instead of walking it. Skipping
 		 * dirq_finished() would leave walk_dir_pending non-zero, so
 		 * WALK_STOP would never be pushed and the consumer would block
 		 * on an empty queue forever - the counter still has to unwind.
 		 */
-		if (!interrupted())
+		if (!interrupted() && !walk_aborted())
 			process_dir(path, db);
 		free(path);
 		dirq_finished();
@@ -1586,7 +1694,23 @@ int filescan_walk_run(struct dbhandle *db)
 		if (it == WALK_STOP)
 			break;
 		if (!ret && !interrupted()) {
-			ret = __scan_file(it->path, db, &it->st);
+			/*
+			 * On a filesystem oans does not know by name, the first
+			 * files settle whether it can be deduplicated at all,
+			 * before any of them is hashed. This belongs here and
+			 * not in __scan_file(): it is a verdict about the run,
+			 * not about the file, and this is the loop that owns
+			 * run-level control flow - interrupted() sits right
+			 * beside it. Deliberately not routed through
+			 * seed_fs_lock_failed either: that reports roots which
+			 * could never be locked at all, and only fires when
+			 * none was seeded.
+			 */
+			if (locked_fs.dedupe != DEDUPE_SUPPORT_YES &&
+			    !fs_dedupe_probe_settled(it->path, &it->st))
+				ret = 1;
+			else
+				ret = __scan_file(it->path, db, &it->st);
 		} else {
 			interrupt_report();
 		}
@@ -1863,6 +1987,61 @@ static void seed_checkpointed_files(struct dbhandle *db)
 	for (int i = 0; i < n; i++)
 		free(paths[i]);
 	free(paths);
+}
+
+/*
+ * Settle whether the locked filesystem can be deduplicated, by asking one of
+ * its files for FIDEDUPERANGE (#224). Returns false only once the answer is
+ * settled as unusable -- a definite no, or enough files having declined that
+ * continuing would mean reading the tree to learn nothing.
+ *
+ * Called from the single file consumer, so the counters need no lock. A file
+ * can fail to answer for reasons of its own, so an inconclusive result moves on
+ * to the next file rather than condemning the tree.
+ */
+static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
+{
+	/*
+	 * The ioctl's destination must be writable, so this opens O_RDWR. It
+	 * issues a real dedupe request, which cannot change anything anyone can
+	 * observe about the file (see dedupe_probe_fd). A file that cannot be
+	 * opened that way -- read-only file, read-only mount -- or that is too
+	 * small to hold the two ranges the probe compares simply cannot answer;
+	 * those are the inconclusive cases.
+	 */
+	_cleanup_(closefd) int fd = longpath_open(path, O_RDWR);
+	enum dedupe_support support = fd == -1
+		? DEDUPE_SUPPORT_UNKNOWN : dedupe_probe_fd(fd, st->stx_size);
+
+	switch (support) {
+	case DEDUPE_SUPPORT_YES:
+		locked_fs.dedupe = DEDUPE_SUPPORT_YES;
+		vprintf("Filesystem supports FIDEDUPERANGE; scanning.\n");
+		return true;
+	case DEDUPE_SUPPORT_UNKNOWN:
+		if (++locked_fs.dedupe_probe_tries < FS_PROBE_MAX_TRIES) {
+			declare_display_path(disp, path);
+
+			vprintf("Could not settle FIDEDUPERANGE support from "
+				"%s; trying another file\n", disp);
+			return true;	/* let the walk offer another file */
+		}
+		break;			/* budget spent; report what we know */
+	case DEDUPE_SUPPORT_NO:
+		locked_fs.dedupe = DEDUPE_SUPPORT_NO;
+		break;
+	}
+
+	report_fs_unusable();
+	filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
+	/*
+	 * The walkers have to stop too. Without this they readdir/statx the
+	 * whole tree after the error is already on screen - minutes of pure
+	 * metadata I/O on a big one, which reads as a hang - because the
+	 * consumer's error stops the hashing, not the walk that feeds it.
+	 */
+	atomic_store_explicit(&walk_abort, true, memory_order_relaxed);
+	return false;
 }
 
 /*
@@ -3810,6 +3989,8 @@ void filescan_init(void)
 	const char *batch_env = getenv("DUPEREMOVE_BLOCK_BATCH");
 	const char *ckpt_env = getenv("DUPEREMOVE_CHECKPOINT_BYTES");
 	const char *stop_env = getenv("DUPEREMOVE_CHECKPOINT_STOP");
+
+	force_fs_probe = getenv("DUPEREMOVE_FORCE_FS_PROBE") != NULL;
 
 	if (batch_env) {
 		unsigned long v = strtoul(batch_env, NULL, 10);
