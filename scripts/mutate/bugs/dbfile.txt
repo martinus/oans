@@ -1,0 +1,119 @@
+# file: src/dbfile.c
+#
+# Invariants of the hashfile, each broken on purpose, and what notices.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/dbfile.txt
+#
+# Everything in this file fails *silently*. A hashfile is a cache, so nothing
+# downstream validates it: a row that vanished, a digest copied from the wrong
+# donor and a replay that adopted a dead default all produce a run that exits 0
+# and looks exactly like a correct one. That is why these are worth pinning
+# even though none of them can crash.
+#
+# These run against an in-memory SQLite - `dbfile_open_handle(NULL)`, the same
+# path a run without --hashfile takes - so they need no filesystem and no btrfs.
+
+# ---------------------------------------------------------------- #182
+
+# a 1.7.x "auto" is inherited instead of resolved to today's default
+# -1 meant "the user never asked", and 1.7.x resolved it to "skip" under -d.
+# Carrying that forward means a scheduled replay silently stops scanning every
+# snapshot on the machine, and the summary looks the same as it always did.
+<<<
+	if (sc->skip_readonly_subvols < 0)
+		sc->skip_readonly_subvols = 0;
+===
+>>>
+
+# ---------------------------------------------------------------- #159
+
+# the startup prune stops sparing checkpointed rows
+# A digest is what says a file was finished, so an interrupted file's row has
+# none - and deleting it is deleting the only record that the file was ever
+# started. The 1 TiB file this feature exists for then restarts at byte zero on
+# every run, forever, which is precisely the bug #159 was filed for.
+<<<
+"delete from files where digest is NULL and "				\
+"id not in (select fileid from scan_checkpoints);"
+===
+"delete from files where digest is NULL;"
+>>>
+
+# a resumed file is put through the ordinary upsert instead of a targeted UPDATE
+# INSERT OR REPLACE deletes the row and cascades its checkpoint and every stored
+# hash away. The file keeps its name and its size, so nothing looks wrong.
+<<<
+int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
+	return run_by_fileid_arg(stmt, fileid, seq);
+}
+===
+int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
+
+	sqlite3_exec(db->db, "delete from scan_checkpoints", NULL, NULL, NULL);
+	return run_by_fileid_arg(stmt, fileid, seq);
+}
+>>>
+
+# ---------------------------------------------------------------- #206
+
+# a donor with no stored extents counts as a layout match
+# Both record counts are then zero and agree, so the digest of one file is
+# copied onto another on the strength of no evidence at all. A miss costs one
+# redundant hash; this stores a digest of bytes the file never had, and nothing
+# downstream can tell that from a file with no duplicate.
+<<<
+	return i == fm->fm_mapped_extents && i > 0;
+===
+	return i == fm->fm_mapped_extents;
+>>>
+
+# the layout re-check compares only the record count
+# The 128-bit key is a hash, so it cannot be the whole test - this is the bar
+# that actually reads the donor's stored (loff, poff, len) triples back.
+<<<
+		if ((uint64_t)sqlite3_column_int64(stmt, 0) != e->fe_logical ||
+		    (uint64_t)sqlite3_column_int64(stmt, 1) != e->fe_physical ||
+		    (uint64_t)sqlite3_column_int64(stmt, 2) != e->fe_length)
+			return 0;
+===
+>>>
+
+# copying a donor brings its extents but not its block hashes
+# The file then reads as scanned and dedupes against nothing at the block level,
+# which only shows up as --dedupe-options=partial quietly finding less.
+<<<
+	if (!ret)
+		ret = run_by_fileid_arg(blk, dst, donor);
+===
+>>>
+
+# ---------------------------------------------------------------- schema
+
+# the hash tables stop cascading when their file is dropped
+# The stat-based prune then leaves orphan hashes behind on every deleted file:
+# they match nothing, are never collected, and the hashfile grows forever.
+<<<
+"UNIQUE(fileid, loff) "							\
+"FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
+===
+"UNIQUE(fileid, loff));"
+>>>
+
+# ---------------------------------------------------------------- history
+
+# the error buckets report a lifetime total rather than the last run
+# A monitoring consumer alarms on these, so summing them means a permission
+# error fixed months ago keeps the alarm on forever - and the operator stops
+# reading it.
+<<<
+		"select skip_permission, skip_unreadable, skip_path_too_long, "
+		"skip_unsupported_fs, readonly_subvols "
+===
+		"select sum(skip_permission), sum(skip_unreadable), "
+		"sum(skip_path_too_long), sum(skip_unsupported_fs), "
+		"sum(readonly_subvols) "
+>>>

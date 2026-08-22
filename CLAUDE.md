@@ -206,6 +206,30 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   the equivalents rather than assuming them: three that looked equivalent were
   not, and one of those wrote a byte past a buffer.
 
+### The hashfile is unit-testable, in memory
+
+`dbfile_open_handle(NULL)` opens a shared-cache in-memory SQLite - the same path
+a run without `--hashfile` takes - so `dbfile.c` needs no filesystem, no btrfs
+and no scan to test. That is not a test-only seam; it is the in-memory mode
+oans already ships. Coverage went 0% → 47% on nine tests.
+
+- **What is worth testing there is what fails silently.** A hashfile is a cache,
+  so nothing downstream validates it: a row that vanished, a digest copied from
+  the wrong donor and a replay that adopted a dead default all produce a run
+  that exits 0 and looks exactly like a correct one. `bugs/dbfile.txt` puts
+  eight of those back.
+- **Three API shapes that a test gets wrong first.** `dbfile_store_file_info()`
+  writes no digest - `dbfile_update_scanned_file()` does, and the digest is
+  precisely what tells a finished file from one an interrupted run left partway,
+  so a helper that skips it builds rows the startup prune deletes.
+  `dbfile_load_scan_config()` returns **1** for "a config was stored" and 0 for
+  "none", so `== 0` reads success as failure. And `dbfile_load_checkpoint()`
+  *copies into buffers the caller owns* - a zeroed `struct scan_checkpoint` is a
+  write through NULL, which is now said in the header.
+- **`mu_check()` cannot be used in a helper that returns a value.** It expands
+  to a bare `return;`; gcc warns, clang refuses. Conditions that mean "the test
+  itself is broken" `abort()` instead, the way `gs_hit()` already did.
+
 ### `src/proptest.h` — properties, not tables
 
 An ordinary test names an input and its answer; a property names a relationship

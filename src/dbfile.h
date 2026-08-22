@@ -398,6 +398,12 @@ struct scan_checkpoint {
 
 int dbfile_store_checkpoint(struct dbhandle *db, int64_t fileid,
 			    const struct scan_checkpoint *cp);
+/*
+ * The caller owns the two state buffers and must point `file_state` and
+ * `ext_state` at running_checksum_state_size() bytes each before calling:
+ * this copies into them rather than allocating. A zeroed `struct
+ * scan_checkpoint` is therefore a write through NULL, not an empty result.
+ */
 bool dbfile_load_checkpoint(struct dbhandle *db, int64_t fileid,
 			    struct scan_checkpoint *cp);
 int dbfile_remove_checkpoint(struct dbhandle *db, int64_t fileid);
