@@ -125,3 +125,69 @@
 		"sum(skip_path_too_long), sum(skip_unsupported_fs), "
 		"sum(readonly_subvols) "
 >>>
+
+# ---------------------------------------------------------------- the prune
+
+# the prune becomes scope-based instead of stat-based
+# "delete the rows this run did not walk" is the obvious implementation and the
+# wrong one: one hashfile may cover several trees, so scanning a subdirectory
+# would drop every file outside it. Nothing says so at the time - the next full
+# scan just rehashes everything, which reads as slow rather than as broken.
+<<<
+		fn = (const char *)sqlite3_column_text(sel, 1);
+		if (!fn || longpath_stat(fn, &st) == 0)
+			continue;
+		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */
+		if (errno != ENOENT && errno != ENOTDIR)
+			continue;
+===
+>>>
+
+# a stat that failed for any other reason counts as "gone"
+# EACCES on a directory whose permissions changed, or EIO on a disk going bad,
+# then deletes the hashes for files that are still there - so the run that was
+# meant to notice the disk is failing rebuilds the cache instead.
+<<<
+		if (errno != ENOENT && errno != ENOTDIR)
+			continue;
+===
+>>>
+
+# the walk's confirmation is ignored and every row is stat'd
+# Not wrong, only slow - one extra stat per file on a tree the walk just
+# finished. It is here because it is the shape a refactor reaches for, and
+# because a test that never passes a `seen` oracle cannot tell the difference.
+<<<
+		if (seen && seen(id))
+			continue;
+===
+>>>
+
+# ---------------------------------------------------------------- #159
+
+# a checkpoint blob of the wrong length is copied out of anyway
+# The length is the only thing standing between a truncated or foreign row and
+# a memcpy into the caller's fixed buffer. A shorter blob reads past the row;
+# whatever comes back is then restored as an xxhash state and produces a digest
+# of a byte string that never existed.
+<<<
+	ext_len = sqlite3_column_bytes(stmt, 6);
+	if ((size_t)sqlite3_column_bytes(stmt, 3) != len ||
+	    (ext_len != 0 && (size_t)ext_len != len))
+		return false;
+===
+	ext_len = sqlite3_column_bytes(stmt, 6);
+>>>
+
+# ---------------------------------------------------------------- scan
+
+# change detection stops asking whether the file was ever hashed
+# A row is written with its mtime and size *before* hashing starts, so only the
+# digest tells a finished file from one an interrupted run left partway. Drop
+# the column and every started-but-unhashed file reads as up to date: it is
+# never hashed again, and it silently never takes part in dedupe.
+<<<
+"select mtime, size, filename, id, digest is not null from files "	\
+===
+"select mtime, size, filename, id, 1 from files "			\
+>>>
