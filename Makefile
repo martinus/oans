@@ -70,19 +70,10 @@ else ifdef SANITIZE
 	# LeakSanitizer at the suppressions for GLib's cached idle-thread residue
 	# (the same library false positive tests/valgrind.supp filters). Prepended
 	# by the `test`/`integration` rules; empty (a no-op) in a non-sanitized build.
-	# Which LeakSanitizer suppressions a leg runs with. The end-to-end suite
-	# drives the binary, whose GLib thread pools leave cached-thread residue,
-	# and takes the broad file; the unit suite has no pools and takes a
-	# narrow one. That is not tidiness: tests/lsan.supp carries a module-wide
-	# `leak:libglib-2.0`, and oans keeps nearly everything in GLib
-	# containers, so under that pattern a dropped g_free() in oans's own code
-	# is suppressed too. Measured - removing one from glob_set_free() leaks
-	# 769 KB and still exits 0 with the broad file, and fails with this one.
-	LSAN_SUPP ?= $(CURDIR)/tests/lsan.supp
 	SANITIZE_RUN = \
 		ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1 \
 		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-		LSAN_OPTIONS=suppressions=$(LSAN_SUPP)
+		LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp
 
 	# ThreadSanitizer needs two extra things (src/tsan.h explains why):
 	#   - the GLib annotations, -include'd rather than #include'd so they sit
@@ -155,7 +146,6 @@ test-build:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o test $(LIBRARY_FLAGS)
 
 .PHONY: test
-test: LSAN_SUPP = $(CURDIR)/tests/lsan-unit.supp
 test: test-build
 	$(SANITIZE_RUN) ./test
 

@@ -76,11 +76,10 @@ Two things it cannot see, both worth knowing before reading a `survived`:
 - **it builds without a sanitizer by default**, so a mutant that reads one slot
   too far is only caught if it corrupts something a test checks. Re-run a
   surprising survivor with `--make-arg SANITIZE=address,undefined --make-arg
-  CC=clang`. Note that the two legs carry different LeakSanitizer suppressions:
-  the unit suite uses [`tests/lsan-unit.supp`](tests/lsan-unit.supp), which
-  names the GLib thread-cache functions, while the end-to-end suite uses
-  [`tests/lsan.supp`](tests/lsan.supp), whose module-wide `leak:libglib-2.0`
-  also suppresses leaks in oans's own code.
+  CC=clang`. [`tests/lsan.supp`](tests/lsan.supp) names three GLib
+  functions and nothing wider — never widen it to `leak:libglib-2.0`, which
+  suppresses most of oans's own heap along with GLib's; the file says what that
+  cost when it did.
 
 `mutate_core.py` beside the adapter is **vendored** from unordered_dense, which
 is where its own test suite lives, and nanobench holds the same copy. Do not
@@ -121,12 +120,11 @@ make check CC=clang SANITIZE=address,undefined   # build + run both suites, inst
 hardening), and the `test`/`integration` targets automatically export the
 ASAN/UBSAN/LSAN run options that make any finding abort — so a sanitizer error
 fails the suite. LeakSanitizer's GLib false positives are filtered by
-[`tests/lsan.supp`](tests/lsan.supp) for the end-to-end suite and
-[`tests/lsan-unit.supp`](tests/lsan-unit.supp) for the unit suite (the ASAN
-analogue of `tests/valgrind.supp`). The two differ deliberately: the broad
-file's `leak:libglib-2.0` matches anything allocated through GLib, which is
-most of oans's own heap, so the unit leg names the three thread-cache functions
-instead and stays able to see a dropped `g_free()`.
+[`tests/lsan.supp`](tests/lsan.supp) (the ASAN analogue of
+`tests/valgrind.supp`), which names three GLib functions and nothing wider.
+Read its header before adding to it: a module-wide `leak:libglib-2.0` matches
+anything allocated through GLib, which is most of oans's own heap, and it hid a
+769 KB leak in oans's own code for as long as it was there.
 CI runs ASAN and UBSAN as separate legs; combining them locally as above is fine.
 
 #### ThreadSanitizer

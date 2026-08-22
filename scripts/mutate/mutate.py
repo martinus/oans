@@ -112,22 +112,20 @@ class Oans(mutate_core.Project):
         least loud. TSan is worse, because it is not loud - GLib's internals
         come back as races and every mutant reads as `caught`.
 
-        The *unit* file and not `tests/lsan.supp`, which is the end-to-end
-        suite's and carries a module-wide `leak:libglib-2.0`. oans keeps nearly
-        everything in GLib containers, so under that pattern a deleted
-        `g_free()` in oans's own code is suppressed along with GLib's residue -
-        measured: fourteen deletions of a free or an unref in src/glob.c
-        survived a `SANITIZE=address` sweep, and every one of them is caught
-        with the narrow file. A suppression that broad turns the sanitizer leg
-        into a slower copy of the plain one, which is the flattering direction.
+        That file names three GLib functions and nothing wider. It used to
+        carry a module-wide `leak:libglib-2.0`, which - since oans keeps nearly
+        everything in GLib containers - suppressed most of oans's own heap:
+        a `SANITIZE=address` sweep of src/glob.c came back with 66 survivors
+        under it and 54 without, all 13 of the difference a deleted free or
+        unref. If a survivor here is a missing deallocation, check what this
+        file is matching before believing it.
 
         UBSAN_OPTIONS is deliberately not here; the core owns it, and setting it
         would drop the `halt_on_error=1` that makes UBSan fail a run rather than
         print and exit 0.
         """
         return {
-            "LSAN_OPTIONS": "suppressions=" + os.path.join(lane.dir, "tests",
-                                                            "lsan-unit.supp"),
+            "LSAN_OPTIONS": "suppressions=" + os.path.join(lane.dir, "tests", "lsan.supp"),
             "TSAN_OPTIONS": "suppressions=" + os.path.join(lane.dir, "tests", "tsan.supp")
                             + ":halt_on_error=0:second_deadlock_stack=1",
         }

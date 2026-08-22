@@ -1,17 +1,31 @@
 # LeakSanitizer suppressions for oans (ASAN builds: make SANITIZE=address...).
 #
-# These are library-level residue, NOT leaks in oans code - the ASAN analogue
-# of tests/valgrind.supp. Point LSAN at this file with
-#   LSAN_OPTIONS=suppressions=tests/lsan.supp
-# (the Makefile's sanitizer run does this automatically).
+# Point LSAN at this file with LSAN_OPTIONS=suppressions=tests/lsan.supp; the
+# Makefile's sanitizer run does it automatically for both `test` and
+# `integration`. It is the ASAN analogue of tests/valgrind.supp.
 #
 # GLib caches idle worker threads from its thread pools (oans's walker/dedupe
 # pools and the progress thread) rather than joining them all at exit, so the
 # per-thread bookkeeping and TLS GLib allocates for them can still be live when
-# LSAN scans at exit. oans frees its pools (g_thread_pool_free with wait=TRUE);
-# the residue is GLib/glibc internal and not ours. A `leak:` line matches when
-# the substring appears anywhere in the leak's stack (module or function).
-leak:libglib-2.0
+# LSAN scans. That is what these three are for, and they are named by
+# *function* on purpose.
+#
+# **Never widen this to `leak:libglib-2.0`.** It was that for a long time, and
+# a module-wide pattern matches any leak whose stack passes through GLib - which
+# is nearly all of oans's heap, since it holds everything in GPtrArray,
+# GHashTable, GRegex and GString. Measured: delete one `g_free()` from
+# glob_set_free() and the suite leaks 769,200 bytes in 32,050 allocations,
+# LeakSanitizer names glob_set_new() as the site, and the run still exits 0. A
+# mutation sweep of src/glob.c under SANITIZE=address found 66 survivors with
+# that pattern and 54 without it, all 13 of the difference a deleted free, unref
+# or string-free. A suppression that broad turns the ASAN leg into a slower copy
+# of the plain one.
+#
+# The three below did not fire at all when this was measured (GLib 2.80,
+# `LSAN_OPTIONS=print_suppressions=1` over a scan and a dedupe: no suppressions
+# used, no leaks). They are kept as insurance against a GLib that caches more
+# eagerly rather than as a known requirement - so if one of them starts
+# matching, that is worth looking at rather than assuming.
 leak:g_thread_proxy
 leak:g_private_get
 leak:g_thread_self

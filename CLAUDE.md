@@ -143,15 +143,23 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     the run still exits **0**. Measured over a whole `src/glob.c` sweep under
     `SANITIZE=address`: **66 survivors with the broad file, 54 with the narrow
     one**, and all 13 of the difference are a deleted `g_free`/`g_string_free`/
-    `g_regex_unref` or an early `return` that skips one. The unit leg now takes
-    `tests/lsan-unit.supp` (the three thread-cache entries by function); the
-    suite is in fact leak-clean with no suppressions at all. A handful of
+    `g_regex_unref` or an early `return` that skips one. `tests/lsan.supp` now names three
+    GLib functions and nothing wider, for **both** legs. A handful of
     deallocation mutants still survive it, on error paths the suite never
-    reaches — untested code, not an untested leak. **The end-to-end leg still takes
-    the broad file** — it drives the binary, whose GLib thread pools are what
-    the suppression was written for, and that leg cannot be run without a
-    btrfs or XFS scratch dir. Narrowing it too is one CI run away from being
-    answerable, and worth doing.
+    reaches — untested code, not an untested leak.
+  - **Narrowing it for the end-to-end leg was measured, not assumed**, which
+    took getting around the missing btrfs: stub `is_fs_supported()` to `true`
+    in a throwaway tree and the binary runs its whole scan and dedupe pipeline
+    on ext4 — the ioctl fails, but the walkers, the csum pool, the dedupe pool,
+    sqlite and the progress block all run. Scan, all three dedupe modes,
+    `--io-threads=16`, `--exclude`, `--progress=json`, in-memory, replay,
+    `--stats`, `--json`: **zero leaks with no suppressions at all**, and under
+    `print_suppressions=1` the three entries never fire. They stay as insurance
+    against a GLib that caches more eagerly (measured on 2.80), so one of them
+    starting to match is worth looking at rather than assuming.
+  - What that could not reach is a *successful* `FIDEDUPERANGE`, which ext4
+    refuses — so allocations on the accepted-destination path are unverified,
+    and are one CI run on btrfs from being answered.
 - **`make test-build` exists for this** and only this: `make test` builds *and
   runs*, so a mutant the tests caught would exit nonzero at the build step and
   be scored `compiler` — the compiler credited with protection the tests
