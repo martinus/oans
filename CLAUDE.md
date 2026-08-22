@@ -311,6 +311,47 @@ sweep from **901 survivors to 785**.
   to a bare `return;`; gcc warns, clang refuses. Conditions that mean "the test
   itself is broken" `abort()` instead, the way `gs_hit()` already did.
 
+### The dedupe-phase loaders
+
+Where the hashfile meets the in-memory model. **155 mutants, 0% killed → 73%**
+(41 survivors) on ten tests, and they need *both* fixtures at once - `memdb()`
+and `mkfilerec()`/`free_all_filerecs()` - which is why they came last.
+
+- **`GET_DUPLICATE_FILES` is the richest thing in the file**, because its
+  invariants are the ones with issue numbers: the target election ranks
+  read-only first (#172 - the kernel will not write into one, so it must be the
+  source), then fewest extents, then lowest id, all from columns fixed at scan
+  time so that **every window elects the same target** (#197). Members load at
+  `poff = 0`, which is why they skip `clean_deduped()` (#186).
+- **A fixture whose winner leads on every column proves nothing.** The first
+  #197 test had one that was lowest-id *and* tidiest *and* oldest, so a
+  pre-#197 `min(id)` election passed it too. The winner must be one that only
+  the real ranking picks - and the same trap sat in the tie-break case, where
+  names, inos and ids all ascended together so a comparator with no tie-break
+  at all still answered correctly.
+- **`is_anchor` is the one C statement in `dbfile_load_same_files()` that
+  exists for #197, and nothing observed it** - deleting it left every other
+  test green. It is asserted as a pair now (`de_anchored` on the whole-file
+  group, `!de_anchored` on an extent group), which pins the asymmetry rather
+  than each half looking arbitrary. Nothing *reads* the flag in production
+  (#237); that assertion is how the disconnection would be noticed.
+- **The tool does not mutate string literals**, so the `GET_DUPLICATE_*` SQL
+  cannot be swept - a test that only exercises SQL filtering guards against
+  hand edits but moves no kill rate. `bugs/dbfile.txt` is where those go, and
+  one of them showed a fixture hole a C sweep never could: dropping the
+  inlined-file filter from the `grp` CTE is invisible with two real copies,
+  because the group qualifies on them alone. It shows only when the group
+  exists *because* of the inlined file.
+- **A helper that cannot fail hides the test.** `target_of()` wrapped
+  `list_first_entry()`, which on an empty list returns a pointer derived from
+  the head rather than NULL - so every `mu_check(t != NULL)` around it held
+  whatever the loader did. Helpers that mean "the fixture is broken" `abort()`,
+  like `gs_hit()` and `exec()`.
+- **`mu_check` returns on failure** (`minunit.h:149`), exactly like
+  `prop_check`. So an `x && ...` guard after `mu_check(x != NULL)` is dead;
+  `mu_assert_string_eq` is better still where the value matters, since it
+  prints what was actually there.
+
 ### `src/proptest.h` — properties, not tables
 
 An ordinary test names an input and its answer; a property names a relationship
