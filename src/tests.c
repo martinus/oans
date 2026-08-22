@@ -3560,6 +3560,885 @@ MU_TEST(test_prop_stored_extents_come_back_where_they_were_put) {
 	}
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The in-memory dedupe model: filerecs, the hash tree, the results tree
+ *
+ * All three are pure memory - no filesystem, no btrfs, no scan - and all three
+ * were at a 0% mutation kill rate before this: 502 mutants, nothing caught.
+ * They are also the only callers of the vendored kernel rbtree, so generated
+ * insert and *erase* orders here are what exercise that copy's rebalancing;
+ * inserting and removing in one ascending sweep would only ever walk a spine.
+ * ---------------------------------------------------------------------------
+ */
+
+#define PROP_FILES	4
+#define PROP_DIGESTS	5
+#define PROP_BLOCKS	24
+
+/*
+ * Offsets and extent lengths use their own constant rather than the global
+ * `blocksize`, which an earlier test sets to 100 and never restores. Nothing
+ * here depends on the value, only on it being fixed.
+ */
+#define PROP_LEN	4096
+
+/* A digest that differs in every byte for each n, so a comparator reading the
+ * wrong end of it still sees a difference. */
+static void digest_of(unsigned char *out, unsigned int n)
+{
+	for (unsigned int i = 0; i < DIGEST_LEN; i++)
+		out[i] = (unsigned char)(n * 7 + i * 31);
+}
+
+/* Takes the fileid it will actually have: the tests look filerecs up by id,
+ * so a helper that invented its own numbering had to be bypassed by the one
+ * property that chooses ids. */
+static struct filerec *mkfilerec(int64_t fileid)
+{
+	char name[64];
+	struct filerec *f;
+
+	snprintf(name, sizeof(name), "/tree/f%lld", (long long)fileid);
+	f = filerec_new(name, fileid, PROP_LEN * (uint64_t)fileid);
+	if (!f)
+		abort();
+	return f;
+}
+
+static void prop_shuffle_u64(struct prop *p, uint64_t *a, unsigned int n)
+{
+	for (unsigned int i = n; i > 1; i--) {
+		unsigned int j = (unsigned int)prop_below(p, i);
+		uint64_t t = a[i - 1];
+
+		a[i - 1] = a[j];
+		a[j] = t;
+	}
+}
+
+MU_TEST(test_filerec_the_registry_finds_what_was_put_in_it) {
+	struct filerec *a, *b;
+
+	/* One global registry serves every test, so each starts it over. */
+	free_all_filerecs();
+	a = mkfilerec(1);
+	b = mkfilerec(2);
+
+	mu_check(filerec_find(1) == a);
+	mu_check(filerec_find(2) == b);
+	mu_check(filerec_find(99) == NULL);	/* never inserted */
+
+	mu_check(!strcmp(a->filename, "/tree/f1"));
+	mu_check(a->size == PROP_LEN);
+	mu_check(a->fd == -1);			/* not opened yet */
+
+	free_all_filerecs();
+	mu_check(filerec_find(1) == NULL);	/* and teardown really clears */
+}
+
+/*
+ * The reference count balances, and the free that ends it takes the filerec
+ * out of the lookup tree - so a later filerec_find() cannot hand back a
+ * pointer to freed memory.
+ *
+ * Deliberately *not* claiming this pins the cross-batch lifetime rule from
+ * CLAUDE.md. That rule is about run_dedupe.c holding a ref per batch, and it
+ * is not even true of this module in isolation: free_all_filerecs() frees
+ * every filerec whatever its refs, which is what the teardown on the last
+ * line of this test does. What is testable here is the smaller claim above.
+ */
+MU_TEST(test_filerec_is_unfindable_once_its_last_reference_goes) {
+	struct filerec *f;
+
+	free_all_filerecs();
+	f = mkfilerec(1);
+	mu_check(f->refs == 0);		/* created unreferenced */
+
+	filerec_get(f);
+	filerec_get(f);
+	mu_check(f->refs == 2);
+
+	filerec_put(f);
+	mu_check(f->refs == 1);
+	mu_check(filerec_find(1) == f);	/* one holder left: still live */
+
+	filerec_put(f);
+	mu_check(filerec_find(1) == NULL);
+
+	free_all_filerecs();
+}
+
+/*
+ * Every filerec is findable by its own id and by no other, for any insertion
+ * order. The registry is an rbtree keyed on fileid, so this is what makes
+ * cmp_filerecs' answer observable: a comparator that inverts, or that reads
+ * the wrong field, still builds *a* tree - just one that cannot find things
+ * again.
+ */
+MU_TEST(test_prop_every_filerec_is_findable_by_its_own_id) {
+	declare_prop(p, 200);
+
+	while (prop_next(&p)) {
+		uint64_t ids[PROP_BLOCKS];
+		struct filerec *made[PROP_BLOCKS];
+		unsigned int n = (unsigned int)prop_range(&p, 1, ARRAY_SIZE(ids));
+		uint64_t id = 0;
+
+		free_all_filerecs();
+
+		/* Ascending with gaps makes them distinct by construction; the
+		 * shuffle is what makes the insertion order arbitrary. The gaps
+		 * double as ids to look up and miss on. */
+		for (unsigned int i = 0; i < n; i++) {
+			id += prop_range(&p, 1, 8);
+			ids[i] = id;
+		}
+		prop_shuffle_u64(&p, ids, n);
+
+		for (unsigned int i = 0; i < n; i++)
+			made[i] = mkfilerec((int64_t)ids[i]);
+
+		for (unsigned int i = 0; i < n; i++) {
+			prop_check(&p, filerec_find((int64_t)ids[i]) == made[i]);
+			prop_check(&p, made[i]->fileid == (int64_t)ids[i]);
+		}
+
+		/* Past every id inserted: not answered with a neighbour. */
+		for (uint64_t probe = id + 1; probe <= id + 4; probe++)
+			prop_check(&p, filerec_find((int64_t)probe) == NULL);
+	}
+	free_all_filerecs();
+}
+
+/*
+ * Everything the hash tree counts stays consistent with what is in it, for any
+ * mix of files, digests and offsets.
+ *
+ * Three counters must agree with three different things: tree->num_blocks with
+ * the blocks inserted, tree->num_hashes with the *distinct* digests, and each
+ * dl_num_elem with that digest's share. Nothing downstream validates them;
+ * find_dupes reads them to decide what to compare, so a count that drifts
+ * makes oans quietly compare the wrong set.
+ *
+ * The shadow model (per_digest, next_loff) is kept independently of the tree
+ * rather than read back out of it, which is what stops this being a
+ * restatement of the code under test.
+ */
+MU_TEST(test_prop_the_hash_tree_counts_what_it_holds) {
+	declare_prop(p, 120);
+	struct filerec *files[PROP_FILES];
+	unsigned char digests[PROP_DIGESTS][DIGEST_LEN];
+
+	/* Loop-invariant: the tree is torn down each iteration, and that walks
+	 * every block out of the filerecs' own trees, so these come back
+	 * clean. */
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+	for (unsigned int i = 0; i < PROP_DIGESTS; i++)
+		digest_of(digests[i], i);
+
+	while (prop_next(&p)) {
+		struct hash_tree tree;
+		unsigned int per_digest[PROP_DIGESTS] = {0};
+		unsigned int nb = (unsigned int)prop_range(&p, 1, PROP_BLOCKS);
+		unsigned int distinct = 0;
+		uint64_t next_loff[PROP_FILES] = {0};
+
+		init_hash_tree(&tree);
+
+		for (unsigned int i = 0; i < nb; i++) {
+			unsigned int f = (unsigned int)prop_below(&p, PROP_FILES);
+			unsigned int d = (unsigned int)prop_below(&p, PROP_DIGESTS);
+
+			/* Distinct offsets per file: the filerec block tree is
+			 * keyed on the offset, and two blocks of one file at one
+			 * offset is not a shape the scan produces. */
+			if (insert_hashed_block(&tree, digests[d], files[f],
+						next_loff[f]))
+				abort();
+			next_loff[f] += PROP_LEN;
+			if (per_digest[d]++ == 0)
+				distinct++;
+		}
+
+		prop_check(&p, tree.num_blocks == nb);
+		prop_check(&p, tree.num_hashes == distinct);
+
+		for (unsigned int d = 0; d < PROP_DIGESTS; d++) {
+			struct dupe_blocks_list *dl =
+				find_block_list(&tree, digests[d]);
+
+			if (!per_digest[d]) {
+				/* Never inserted: not answered with a
+				 * neighbouring digest's list. */
+				prop_check(&p, dl == NULL);
+				continue;
+			}
+			prop_check(&p, dl != NULL);
+			prop_check(&p, dl->dl_num_elem == per_digest[d]);
+			prop_check(&p, !memcmp(dl->dl_hash, digests[d], DIGEST_LEN));
+		}
+
+		for (unsigned int f = 0; f < PROP_FILES; f++) {
+			for (uint64_t off = 0; off < next_loff[f]; off += PROP_LEN) {
+				struct file_block *b =
+					find_filerec_block(files[f], off);
+
+				prop_check(&p, b != NULL);
+				prop_check(&p, b->b_loff == off);
+				prop_check(&p, b->b_file == files[f]);
+			}
+			prop_check(&p, find_filerec_block(files[f],
+							  next_loff[f]) == NULL);
+		}
+
+		free_hash_tree(&tree);
+	}
+	free_all_filerecs();
+}
+
+/*
+ * Taking blocks back out, in an order unrelated to the one they went in.
+ *
+ * Two things here that a simpler shape cannot see. remove_hashed_block answers
+ * 1 exactly when it removed the *last* block carrying that digest and freed
+ * the list - find_dupes uses that to know the group is gone, so an answer
+ * right about the tree and wrong about the verdict leaves a caller holding a
+ * freed list. And a file_hash_head is freed when *that file's* sublist drains,
+ * which with a single file would always coincide with the list itself being
+ * freed; several files make the two instants different, so dropping the head
+ * free leaks it somewhere a counter can still notice.
+ *
+ * The removal order is generated, which is also the only thing in these tests
+ * that makes the vendored rbtree rebalance on erase rather than unlink a
+ * spine.
+ */
+MU_TEST(test_prop_removing_every_block_empties_the_hash_tree) {
+	declare_prop(p, 120);
+	struct filerec *files[PROP_FILES];
+	unsigned char digests[PROP_DIGESTS][DIGEST_LEN];
+
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+	for (unsigned int i = 0; i < PROP_DIGESTS; i++)
+		digest_of(digests[i], i);
+
+	while (prop_next(&p)) {
+		struct hash_tree tree;
+		unsigned int per_digest[PROP_DIGESTS] = {0};
+		unsigned int per_pair[PROP_DIGESTS][PROP_FILES] = {{0}};
+		unsigned int wd[PROP_BLOCKS], wf[PROP_BLOCKS];
+		uint64_t order[PROP_BLOCKS];
+		unsigned int nb = (unsigned int)prop_range(&p, 1, PROP_BLOCKS);
+		unsigned int distinct = 0;
+		uint64_t next_loff[PROP_FILES] = {0};
+		uint64_t loffs[PROP_BLOCKS];
+
+		init_hash_tree(&tree);
+
+		for (unsigned int i = 0; i < nb; i++) {
+			unsigned int f = (unsigned int)prop_below(&p, PROP_FILES);
+			unsigned int d = (unsigned int)prop_below(&p, PROP_DIGESTS);
+
+			wd[i] = d;
+			wf[i] = f;
+			loffs[i] = next_loff[f];
+			order[i] = i;
+			if (insert_hashed_block(&tree, digests[d], files[f],
+						next_loff[f]))
+				abort();
+			next_loff[f] += PROP_LEN;
+			per_pair[d][f]++;
+			if (per_digest[d]++ == 0)
+				distinct++;
+		}
+
+		prop_shuffle_u64(&p, order, nb);
+
+		for (unsigned int k = 0; k < nb; k++) {
+			unsigned int i = (unsigned int)order[k];
+			unsigned int d = wd[i], f = wf[i];
+			struct dupe_blocks_list *dl =
+				find_block_list(&tree, digests[d]);
+			struct file_block *b =
+				find_filerec_block(files[f], loffs[i]);
+			bool last_of_digest = per_digest[d] == 1;
+			bool last_of_pair = per_pair[d][f] == 1;
+			int ret;
+
+			prop_check(&p, dl != NULL);
+			prop_check(&p, b != NULL);
+
+			per_digest[d]--;
+			per_pair[d][f]--;
+			ret = remove_hashed_block(&tree, b);
+			prop_check(&p, ret == (last_of_digest ? 1 : 0));
+
+			/* That file's head is gone once its share drains, while
+			 * the list itself lives on for the other files. */
+			if (!last_of_digest)
+				prop_check(&p,
+					   (find_file_hash_head(dl, files[f])
+					    == NULL) == last_of_pair);
+
+			if (last_of_digest)
+				distinct--;
+			prop_check(&p, tree.num_hashes == distinct);
+			prop_check(&p, tree.num_blocks == nb - k - 1);
+			prop_check(&p, find_filerec_block(files[f],
+							  loffs[i]) == NULL);
+		}
+
+		prop_check(&p, tree.num_blocks == 0 && tree.num_hashes == 0);
+		prop_check(&p, RB_EMPTY_ROOT(&tree.root));
+		free_hash_tree(&tree);
+	}
+	free_all_filerecs();
+}
+
+/*
+ * find_dupes walks each file's blocks under a hash expecting increasing
+ * offsets, and says so where sort_file_hash_heads is declared. The blocks
+ * arrive that way only because the scan happens to produce them so, which is
+ * why the sort exists - and why a fixture that inserts in order cannot tell a
+ * working sort from no sort at all. Hence a shuffled insertion order.
+ *
+ * Two digests, not one: the sort is two nested walks, and with a single block
+ * list the outer one runs exactly once for the life of the property, so a
+ * mutant that stops after the first list would be invisible.
+ */
+MU_TEST(test_prop_sorting_puts_every_hash_head_in_offset_order) {
+	declare_prop(p, 120);
+	struct filerec *files[PROP_FILES];
+	unsigned char digests[2][DIGEST_LEN];
+
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+	digest_of(digests[0], 0);
+	digest_of(digests[1], 1);
+
+	while (prop_next(&p)) {
+		struct hash_tree tree;
+		uint64_t offs[PROP_BLOCKS];
+		unsigned int nb = (unsigned int)prop_range(&p, 2, PROP_BLOCKS);
+		unsigned int heads = 0;
+		struct rb_node *dn;
+
+		init_hash_tree(&tree);
+		for (unsigned int i = 0; i < nb; i++)
+			offs[i] = PROP_LEN * i;
+		prop_shuffle_u64(&p, offs, nb);
+
+		for (unsigned int i = 0; i < nb; i++) {
+			unsigned int f = (unsigned int)prop_below(&p, PROP_FILES);
+			unsigned int d = (unsigned int)prop_below(&p, 2);
+
+			if (insert_hashed_block(&tree, digests[d], files[f],
+						offs[i]))
+				abort();
+		}
+
+		sort_file_hash_heads(&tree);
+
+		for (dn = rb_first(&tree.root); dn; dn = rb_next(dn)) {
+			struct dupe_blocks_list *dl =
+				rb_entry(dn, struct dupe_blocks_list, dl_node);
+			struct rb_node *n;
+
+			for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
+				struct file_hash_head *h =
+					rb_entry(n, struct file_hash_head, h_node);
+				struct file_block *b;
+				uint64_t prev = 0;
+				bool first = true;
+
+				heads++;
+				list_for_each_entry(b, &h->h_blocks, b_head_list) {
+					prop_check(&p, b->b_file == h->h_file);
+					prop_check(&p, first || b->b_loff > prev);
+					prev = b->b_loff;
+					first = false;
+				}
+			}
+		}
+		/* Every list reached, not just the first. */
+		prop_check(&p, heads >= tree.num_hashes);
+
+		free_hash_tree(&tree);
+	}
+	free_all_filerecs();
+}
+
+/*
+ * A results tree's groups and their members stay consistent with what was
+ * inserted, across several digests *and* several lengths.
+ *
+ * A group is keyed on (digest, length) together, so drawing both is what makes
+ * the keying observable at all - with one digest at one length every case
+ * builds a one-node tree, num_dupes is never in question, and the comparator's
+ * second level never runs.
+ *
+ * dext_work() is the single definition of a group's work and four consumers
+ * depend on them agreeing: the largest-first sort key, the per-thread status
+ * total, the byte-progress settlement target and the upfront SQL total. It is
+ * restated here as arithmetic rather than called, so a change to the formula
+ * makes the two sides disagree instead of moving together.
+ */
+MU_TEST(test_prop_a_dup_group_counts_its_own_members) {
+	declare_prop(p, 150);
+#define PROP_LENS	3
+	struct filerec *files[PROP_FILES];
+	unsigned char digests[PROP_DIGESTS][DIGEST_LEN];
+	static const uint64_t lens[PROP_LENS] = {
+		PROP_LEN, PROP_LEN * 2, PROP_LEN * 3
+	};
+
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+	for (unsigned int i = 0; i < PROP_DIGESTS; i++)
+		digest_of(digests[i], i);
+
+	while (prop_next(&p)) {
+		struct results_tree res;
+		unsigned int n = (unsigned int)prop_range(&p, 1, 16);
+		unsigned int unique = 0, groups = 0;
+		/* Shadow model: which (digest, len) groups exist, and which
+		 * (digest, len, file, slot) extents are in them. */
+		bool has_group[PROP_DIGESTS][PROP_LENS] = {{false}};
+		bool seen[PROP_DIGESTS][PROP_LENS][PROP_FILES][4];
+		unsigned int members[PROP_DIGESTS][PROP_LENS] = {{0}};
+		struct rb_node *node;
+
+		init_results_tree(&res);
+		memset(seen, 0, sizeof(seen));
+
+		for (unsigned int i = 0; i < n; i++) {
+			unsigned int d = (unsigned int)prop_below(&p, PROP_DIGESTS);
+			unsigned int l = (unsigned int)prop_below(&p, PROP_LENS);
+			unsigned int f = (unsigned int)prop_below(&p, PROP_FILES);
+			unsigned int slot = (unsigned int)prop_below(&p, 4);
+
+			/*
+			 * Repeats on purpose: the same (file, offset) twice is
+			 * one extent, not two, and the second insert must free
+			 * its own allocation rather than counting it.
+			 */
+			if (insert_one_result(&res, digests[d], files[f],
+					      slot * PROP_LEN * 4, lens[l],
+					      0, false))
+				abort();
+			if (!has_group[d][l]) {
+				has_group[d][l] = true;
+				groups++;
+			}
+			if (!seen[d][l][f][slot]) {
+				seen[d][l][f][slot] = true;
+				members[d][l]++;
+				unique++;
+			}
+		}
+
+		prop_check(&p, res.num_extents == unique);
+		prop_check(&p, res.num_dupes == groups);
+
+		/* Each group is findable under its own key, and holds exactly
+		 * the members the model says. */
+		for (unsigned int d = 0; d < PROP_DIGESTS; d++) {
+			for (unsigned int l = 0; l < PROP_LENS; l++) {
+				struct dupe_extents *g =
+					find_dupe_extents(&res, digests[d], lens[l]);
+
+				if (!has_group[d][l]) {
+					prop_check(&p, g == NULL);
+					continue;
+				}
+				prop_check(&p, g != NULL);
+				prop_check(&p, g->de_num_dupes == members[d][l]);
+				prop_check(&p, g->de_len == lens[l]);
+			}
+		}
+
+		/* The list, the rbtree and the counter are three views of one
+		 * membership and must never disagree. */
+		for (node = rb_first(&res.root); node; node = rb_next(node)) {
+			struct dupe_extents *d =
+				rb_entry(node, struct dupe_extents, de_node);
+			struct extent *e;
+			unsigned int listed = 0, in_tree = 0;
+			struct rb_node *m;
+
+			list_for_each_entry(e, &d->de_extents, e_list) {
+				prop_check(&p, e->e_parent == d);
+				listed++;
+			}
+			for (m = rb_first(&d->de_extents_root); m; m = rb_next(m))
+				in_tree++;
+
+			prop_check(&p, listed == d->de_num_dupes);
+			prop_check(&p, in_tree == d->de_num_dupes);
+			prop_check(&p, dext_work(d) ==
+				   d->de_len * (d->de_num_dupes - 1));
+		}
+
+		free_results_tree(&res);
+	}
+	free_all_filerecs();
+}
+
+/*
+ * remove_extent's cascade, which is the part a fixture gets wrong.
+ *
+ * A group of one is meaningless - there is nothing left to dedupe against - so
+ * dropping to one member removes that member too and frees the group. Removing
+ * from a pair therefore takes *both* extents and answers 0, where a straight
+ * decrement would say 1. A test written against a three-member group alone
+ * never reaches the cascade.
+ */
+MU_TEST(test_removing_an_extent_collapses_a_group_of_one) {
+	struct results_tree res;
+	unsigned char digest[DIGEST_LEN];
+	struct dupe_extents *d;
+	struct extent *e;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(digest, 1);
+
+	for (unsigned int i = 0; i < 3; i++)
+		mu_check(insert_one_result(&res, digest, mkfilerec(i + 1), 0,
+					   PROP_LEN, 0, false) == 0);
+	mu_check(res.num_extents == 3 && res.num_dupes == 1);
+
+	/* Three members: one comes out, two remain, and it says so. */
+	d = find_dupe_extents(&res, digest, PROP_LEN);
+	mu_check(d && d->de_num_dupes == 3);
+	e = list_first_entry(&d->de_extents, struct extent, e_list);
+	mu_check(remove_extent(&res, e) == 2);
+	mu_check(res.num_extents == 2);
+	mu_check(res.num_dupes == 1);		/* the group survives */
+
+	/* Two members: removing one leaves a group of one, which goes too. */
+	d = find_dupe_extents(&res, digest, PROP_LEN);
+	mu_check(d != NULL);
+	e = list_first_entry(&d->de_extents, struct extent, e_list);
+	mu_check(remove_extent(&res, e) == 0);
+	mu_check(res.num_extents == 0);
+	mu_check(res.num_dupes == 0);
+	mu_check(RB_EMPTY_ROOT(&res.root));
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN) == NULL);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/*
+ * Groups are keyed on (digest, length) together, not on digest alone: two runs
+ * of identical bytes at different lengths are not duplicates of each other,
+ * and insert_one_result abort_on()s a length disagreeing with the group it
+ * landed in.
+ */
+MU_TEST(test_a_group_is_keyed_on_digest_and_length_together) {
+	struct results_tree res;
+	unsigned char digest[DIGEST_LEN], other[DIGEST_LEN];
+	struct filerec *a, *b;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	a = mkfilerec(1);
+	b = mkfilerec(2);
+	digest_of(digest, 1);
+	digest_of(other, 2);
+
+	mu_check(insert_one_result(&res, digest, a, 0, PROP_LEN, 0, false) == 0);
+	mu_check(insert_one_result(&res, digest, b, 0, PROP_LEN, 0, false) == 0);
+	mu_check(res.num_dupes == 1);
+
+	/* Same digest, different length: a second group, not an abort. */
+	mu_check(insert_one_result(&res, digest, a, PROP_LEN * 2, PROP_LEN * 2,
+				   0, false) == 0);
+	mu_check(res.num_dupes == 2);
+
+	/* Different digest, same length: a third. */
+	mu_check(insert_one_result(&res, other, a, PROP_LEN * 8, PROP_LEN, 0,
+				   false) == 0);
+	mu_check(res.num_dupes == 3);
+	mu_check(res.num_extents == 4);
+
+	/* Each is findable under its own key and not under the other's. */
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN) != NULL);
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN * 2) != NULL);
+	mu_check(find_dupe_extents(&res, other, PROP_LEN) != NULL);
+	mu_check(find_dupe_extents(&res, other, PROP_LEN * 2) == NULL);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/*
+ * The anchor flag latches: once a member claims it, later members that do not
+ * cannot clear it. That is what pins a group spanning several dedupe passes to
+ * one target instead of re-picking a least-fragmented one per pass.
+ *
+ * The order matters, and it is the whole test. Asserting it right after the
+ * anchored insert would pass just as well against `de_anchored = is_anchor`,
+ * because nothing follows to overwrite it - so "sticks" is only a claim if a
+ * non-anchored insert comes afterwards.
+ */
+MU_TEST(test_the_anchor_flag_latches_once_claimed) {
+	struct results_tree res;
+	unsigned char digest[DIGEST_LEN];
+	struct dupe_extents *d;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(digest, 1);
+
+	mu_check(insert_one_result(&res, digest, mkfilerec(1), 0, PROP_LEN, 0,
+				   false) == 0);
+	d = find_dupe_extents(&res, digest, PROP_LEN);
+	mu_check(d && !d->de_anchored);
+
+	mu_check(insert_one_result(&res, digest, mkfilerec(2), 0, PROP_LEN, 0,
+				   true) == 0);
+	mu_check(d->de_anchored);
+
+	/* The one that matters: a later plain member must not clear it. */
+	mu_check(insert_one_result(&res, digest, mkfilerec(3), 0, PROP_LEN, 0,
+				   false) == 0);
+	mu_check(d->de_anchored);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/*
+ * insert_result() is the pair-wise entry point find_dupes actually calls;
+ * insert_one_result() above is the single-extent variant. Testing the helper
+ * and not this one left 36 of results-tree.c's mutants untouched.
+ *
+ * Two things here that only this signature has. The group's length comes from
+ * `endoff[0] - startoff[0] + 1` - **inclusive**, and taken from the *first*
+ * pair alone - so an off-by-one silently files the pair under a neighbouring
+ * key, where it can never meet the extents it duplicates. And both extents go
+ * into one group, so a pair that is really the same extent twice must count
+ * once.
+ */
+MU_TEST(test_insert_result_files_a_pair_under_one_length) {
+	struct results_tree res;
+	unsigned char digest[DIGEST_LEN];
+	struct filerec *recs[2];
+	uint64_t startoff[2], endoff[2];
+	struct dupe_extents *d;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(digest, 1);
+	recs[0] = mkfilerec(1);
+	recs[1] = mkfilerec(2);
+
+	/* An inclusive range of exactly PROP_LEN bytes. */
+	startoff[0] = 0;
+	endoff[0] = PROP_LEN - 1;
+	startoff[1] = PROP_LEN * 4;
+	endoff[1] = PROP_LEN * 5 - 1;
+	mu_check(insert_result(&res, digest, recs, startoff, endoff) == 0);
+
+	mu_check(res.num_dupes == 1);
+	mu_check(res.num_extents == 2);
+	d = find_dupe_extents(&res, digest, PROP_LEN);
+	mu_check(d != NULL);			/* not PROP_LEN - 1, nor + 1 */
+	mu_check(d && d->de_num_dupes == 2);
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN - 1) == NULL);
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN + 1) == NULL);
+
+	/* The second file's offset is its own, not a copy of the first's. */
+	{
+		struct extent *e;
+		bool at_0 = false, at_4 = false;
+
+		list_for_each_entry(e, &d->de_extents, e_list) {
+			if (e->e_file == recs[0] && e->e_loff == 0)
+				at_0 = true;
+			if (e->e_file == recs[1] && e->e_loff == PROP_LEN * 4)
+				at_4 = true;
+		}
+		mu_check(at_0 && at_4);
+	}
+
+	/* The same extent named twice is one member, not two. */
+	recs[1] = recs[0];
+	startoff[1] = startoff[0];
+	endoff[1] = endoff[0];
+	mu_check(insert_result(&res, digest, recs, startoff, endoff) == 0);
+	mu_check(res.num_extents == 2);		/* unchanged */
+	mu_check(d->de_num_dupes == 2);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/* A real file to open. Any filesystem will do - this is fd bookkeeping, not
+ * dedupe - so it does not need the reflink scratch dir. */
+static struct filerec *mkrealfile(char *path, size_t sz)
+{
+	int fd;
+
+	snprintf(path, sz, "/tmp/oans-filerec-XXXXXX");
+	fd = mkstemp(path);
+	if (fd < 0 || write(fd, "hello", 5) != 5)
+		abort();
+	close(fd);
+	return filerec_new(path, 1, 5);
+}
+
+/*
+ * The file descriptor is reference counted, and that is the whole point: the
+ * dedupe phase opens the same file from several groups at once, so a nested
+ * open must hand back the descriptor already open rather than a second one.
+ * Opening twice and closing twice looks correct either way from the outside -
+ * what separates a real refcount from open-and-close-every-time is that the
+ * descriptor stays *usable* across the inner close, which is why this reads a
+ * byte through it rather than only inspecting the counter.
+ */
+MU_TEST(test_filerec_holds_one_descriptor_however_often_it_is_opened) {
+	char path[64];
+	struct filerec *f;
+	char buf[1];
+	int first_fd;
+
+	free_all_filerecs();
+	f = mkrealfile(path, sizeof(path));
+	mu_check(f->fd == -1 && f->fd_refs == 0);
+
+	mu_check(filerec_open(f, false) == 0);
+	mu_check(f->fd != -1 && f->fd_refs == 1);
+	first_fd = f->fd;
+
+	/* Nested open: the same descriptor, not a second one. */
+	mu_check(filerec_open(f, false) == 0);
+	mu_check(f->fd == first_fd);
+	mu_check(f->fd_refs == 2);
+
+	filerec_close(f);
+	mu_check(f->fd_refs == 1);
+	mu_check(f->fd == first_fd);
+	/* Still open, which a close-every-time implementation would fail. */
+	mu_check(pread(f->fd, buf, 1, 0) == 1 && buf[0] == 'h');
+
+	filerec_close(f);
+	mu_check(f->fd_refs == 0 && f->fd == -1);
+
+	/* A file that is not there reports the errno and leaves the filerec
+	 * closed rather than counting a descriptor it never got. */
+	unlink(path);
+	mu_check(filerec_open(f, true) == ENOENT);
+	mu_check(f->fd == -1 && f->fd_refs == 0);
+
+	free_all_filerecs();
+}
+
+/*
+ * filerec_open_once() is what the dedupe phase uses to open every member of a
+ * group without opening any of them twice. It remembers what it has opened in
+ * a token tree keyed on the filerec, so asking again is a no-op - and the test
+ * of that is the *refcount*, since a second real open would leave a
+ * descriptor no close in the batch will ever release.
+ */
+MU_TEST(test_filerec_open_once_opens_each_file_exactly_once) {
+	char path[64];
+	struct filerec *f;
+	OPEN_ONCE(open_files);
+
+	free_all_filerecs();
+	f = mkrealfile(path, sizeof(path));
+
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+
+	/* Asked twice, opened once. */
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+
+	filerec_close_open_list(&open_files);
+	mu_check(f->fd_refs == 0 && f->fd == -1);
+	mu_check(RB_EMPTY_ROOT(&open_files.root));
+
+	/* A missing file is reported, and leaves no token behind claiming it
+	 * was opened - otherwise a later pass would skip opening it. */
+	unlink(path);
+	mu_check(filerec_open_once(f, &open_files) == ENOENT);
+	mu_check(RB_EMPTY_ROOT(&open_files.root));
+	mu_check(f->fd_refs == 0);
+
+	free_all_filerecs();
+}
+
+/*
+ * The token tree is keyed on the filerec *pointer*, which is what makes the
+ * lookup above cheap. Worth its own case because pointer ordering is the one
+ * comparator here whose operands a test cannot choose: the property below
+ * inserts whatever addresses the allocator hands out, so it fails only if the
+ * comparator disagrees with itself.
+ */
+MU_TEST(test_prop_a_filerec_token_is_found_by_its_filerec) {
+	declare_prop(p, 120);
+	struct filerec *files[PROP_FILES];
+
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+
+	while (prop_next(&p)) {
+		struct rb_root root = RB_ROOT;
+		bool inserted[PROP_FILES] = {false};
+		uint64_t order[PROP_FILES];
+		unsigned int n = (unsigned int)prop_range(&p, 1, PROP_FILES);
+
+		for (unsigned int i = 0; i < PROP_FILES; i++)
+			order[i] = i;
+		prop_shuffle_u64(&p, order, PROP_FILES);
+
+		for (unsigned int i = 0; i < n; i++) {
+			struct filerec *f = files[order[i]];
+			struct filerec_token *t = filerec_token_new(f);
+
+			if (!t)
+				abort();
+			insert_filerec_token_rb(&root, t);
+			inserted[order[i]] = true;
+		}
+
+		for (unsigned int i = 0; i < PROP_FILES; i++) {
+			struct filerec_token *t =
+				find_filerec_token_rb(&root, files[i]);
+
+			if (!inserted[i]) {
+				prop_check(&p, t == NULL);
+				continue;
+			}
+			prop_check(&p, t != NULL);
+			prop_check(&p, t->t_file == files[i]);
+		}
+
+		while (!RB_EMPTY_ROOT(&root)) {
+			struct filerec_token *t =
+				rb_entry(rb_first(&root), struct filerec_token,
+					 t_node);
+
+			rb_erase(&t->t_node, &root);
+			filerec_token_free(t);
+		}
+	}
+	free_all_filerecs();
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -3653,6 +4532,20 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_prop_a_layout_matches_only_itself);
 	MU_RUN_TEST(test_prop_a_split_record_is_not_the_layout_it_covers);
 	MU_RUN_TEST(test_prop_stored_extents_come_back_where_they_were_put);
+	MU_RUN_TEST(test_filerec_the_registry_finds_what_was_put_in_it);
+	MU_RUN_TEST(test_filerec_is_unfindable_once_its_last_reference_goes);
+	MU_RUN_TEST(test_prop_every_filerec_is_findable_by_its_own_id);
+	MU_RUN_TEST(test_prop_the_hash_tree_counts_what_it_holds);
+	MU_RUN_TEST(test_prop_removing_every_block_empties_the_hash_tree);
+	MU_RUN_TEST(test_prop_sorting_puts_every_hash_head_in_offset_order);
+	MU_RUN_TEST(test_prop_a_dup_group_counts_its_own_members);
+	MU_RUN_TEST(test_removing_an_extent_collapses_a_group_of_one);
+	MU_RUN_TEST(test_a_group_is_keyed_on_digest_and_length_together);
+	MU_RUN_TEST(test_the_anchor_flag_latches_once_claimed);
+	MU_RUN_TEST(test_insert_result_files_a_pair_under_one_length);
+	MU_RUN_TEST(test_filerec_holds_one_descriptor_however_often_it_is_opened);
+	MU_RUN_TEST(test_filerec_open_once_opens_each_file_exactly_once);
+	MU_RUN_TEST(test_prop_a_filerec_token_is_found_by_its_filerec);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
