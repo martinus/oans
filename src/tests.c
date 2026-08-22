@@ -1035,6 +1035,281 @@ static void lp_check_helpers(const char *absdir, const char *base,
 	close(bfd);
 }
 
+/*
+ * --- the option parser and the human-readable formatters (util.c) ---
+ *
+ * These had no unit test at all, which the mutation sweep found rather than
+ * anyone noticing: 113 of src/util.c's 203 surviving mutants were in these four
+ * functions, against 5-9% survival in the escaping code next door. That is not
+ * a weak test, it is an absent one, and the shape of what it lets through is
+ * the worrying part - `parse_size` is a ladder of fallthroughs, so dropping one
+ * `mult *= 1024` makes `--max-filesize=10G` mean ten megabytes, silently, on a
+ * run that otherwise looks exactly right.
+ */
+
+/* parse_size takes a mutable string; the option parser hands it argv. */
+static uint64_t size_of(const char *s)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%s", s);
+	return parse_size(buf);
+}
+
+MU_TEST(test_parse_size) {
+	/* Bare numbers are bytes. */
+	mu_check(size_of("0") == 0);
+	mu_check(size_of("1") == 1);
+	mu_check(size_of("4096") == 4096);
+
+	/* The ladder, one rung at a time. Every one of these is a separate
+	 * fallthrough, and the compiler will not miss one for you. */
+	mu_check(size_of("1b") == 1);
+	mu_check(size_of("1k") == 1024ULL);
+	mu_check(size_of("1m") == 1024ULL * 1024);
+	mu_check(size_of("1g") == 1024ULL * 1024 * 1024);
+	mu_check(size_of("1t") == 1024ULL * 1024 * 1024 * 1024);
+	mu_check(size_of("1p") == 1024ULL * 1024 * 1024 * 1024 * 1024);
+	mu_check(size_of("1e") == 1024ULL * 1024 * 1024 * 1024 * 1024 * 1024);
+
+	/* Case is not significant. The switch spells some rungs twice and
+	 * leans on tolower() for the rest, so this is not free. */
+	mu_check(size_of("2K") == size_of("2k"));
+	mu_check(size_of("2M") == size_of("2m"));
+	mu_check(size_of("2G") == size_of("2g"));
+	mu_check(size_of("2T") == size_of("2t"));
+	mu_check(size_of("2P") == size_of("2p"));
+	mu_check(size_of("2E") == size_of("2e"));
+
+	/* The multiplier applies to the whole number, not the first digit. */
+	mu_check(size_of("123k") == 123ULL * 1024);
+	mu_check(size_of("1024k") == size_of("1m"));
+
+	/*
+	 * The error paths - an empty value, an unknown descriptor, a suffix
+	 * longer than one character - are not exercised here: parse_size()
+	 * calls exit() on each, which would take the whole suite with it.
+	 * They are covered end-to-end in tests/integration/test_min_filesize.py.
+	 */
+}
+
+/*
+ * Every rung of that ladder, against the arithmetic it stands for. The table
+ * above names the rungs; this says the multiplier is exactly 1024 per rung for
+ * any value, which is what a mutated `*= 1024` breaks in a way one example
+ * might happen to miss.
+ */
+MU_TEST(test_prop_parse_size_scales_by_the_suffix) {
+	declare_prop(p, 20000);
+	static const char rungs[] = "bkmgtpe";
+
+	while (prop_next(&p)) {
+		unsigned int level = (unsigned int)prop_below(&p, sizeof(rungs) - 1);
+		/* Bounded so that the largest rung cannot overflow: 1024^6 is
+		 * 2^60, leaving four bits of headroom. */
+		uint64_t n = prop_below(&p, 16);
+		uint64_t expect = n;
+		char buf[32];
+
+		for (unsigned int i = 0; i < level; i++)
+			expect *= 1024;
+
+		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n, rungs[level]);
+		prop_check(&p, parse_size(buf) == expect);
+
+		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n,
+			 (char)toupper(rungs[level]));
+		prop_check(&p, parse_size(buf) == expect);
+	}
+}
+
+MU_TEST(test_human_size) {
+	char buf[32];
+
+	/* Below a kibibyte the exact byte count is printed, with no decimal -
+	 * "0.0 B" for an empty file would be worse than useless. */
+	human_size_snprintf(0, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "0 B"));
+	human_size_snprintf(1023, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1023 B"));
+
+	/* The boundary in both directions. */
+	human_size_snprintf(1024, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 KiB"));
+	human_size_snprintf(1536, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.5 KiB"));
+
+	human_size_snprintf(1ULL << 20, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 MiB"));
+	human_size_snprintf(1ULL << 30, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 GiB"));
+	human_size_snprintf(1ULL << 40, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 TiB"));
+	human_size_snprintf(1ULL << 50, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 PiB"));
+
+	/* The top rung has to stop there: the loop is bounded by the size of
+	 * the units array, and one rung further reads past the end of it. */
+	human_size_snprintf(1ULL << 60, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 EiB"));
+	human_size_snprintf(UINT64_MAX, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "16.0 EiB"));
+
+	/*
+	 * One byte under a mebibyte reads as "1024.0 KiB" rather than
+	 * "1.0 MiB": the loop stops on the computed value, which is 1023.999,
+	 * and `%.1f` rounds it up afterwards. Cosmetic, and pinned here so
+	 * that it is a decision rather than a surprise - a property test
+	 * looking for a mantissa below 1024.0 finds this within a few thousand
+	 * cases.
+	 */
+	human_size_snprintf((1ULL << 20) - 1, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1024.0 KiB"));
+
+	/* A caller with no room gets nothing written and is told so. */
+	mu_check(human_size_snprintf(1024, buf, 0) == 0);
+}
+
+/*
+ * Whatever the size, the unit is one of the seven the array holds and the
+ * mantissa is in range for it. A mutated loop bound is an out-of-bounds read
+ * of `units` - which a plain build prints as whatever followed the array.
+ */
+MU_TEST(test_prop_human_size_picks_a_real_unit) {
+	declare_prop(p, 20000);
+	static const char * const units[] = { "B", "KiB", "MiB", "GiB",
+					      "TiB", "PiB", "EiB" };
+
+	while (prop_next(&p)) {
+		char buf[32], unit[8];
+		double v;
+		uint64_t size;
+		bool known = false;
+
+		/* Log-uniform, so every rung is reached about equally often;
+		 * a uniform draw over uint64 is a byte count above a
+		 * pebibyte essentially every time. */
+		size = prop_u64(&p) >> prop_below(&p, 64);
+
+		prop_check(&p, human_size_snprintf(size, buf, sizeof(buf)) > 0);
+		prop_check(&p, sscanf(buf, "%lf %7s", &v, unit) == 2);
+		for (unsigned int i = 0; i < ARRAY_SIZE(units); i++)
+			known = known || !strcmp(unit, units[i]);
+		prop_check(&p, known);
+		/* Bytes are printed whole and unscaled; anything else was
+		 * divided down until it was under a kibibyte.
+		 *
+		 * The upper bound is 1024.0 and not just below it, because the
+		 * division stops on the *computed* value and `%.1f` then
+		 * rounds: 1 MiB - 1 divides to 1023.999 and prints as
+		 * "1024.0 KiB". Pinned as a case in test_human_size rather
+		 * than tightened away - it is cosmetic, and where the unit
+		 * boundary sits is not a testing commit's to move. */
+		if (!strcmp(unit, "B"))
+			prop_check(&p, v == (double)size && size < 1024);
+		else
+			prop_check(&p, v >= 1.0 && v <= 1024.0);
+	}
+}
+
+MU_TEST(test_human_duration) {
+	char buf[32];
+
+	human_duration_snprintf(0, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "0s"));
+	human_duration_snprintf(59, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "59s"));
+
+	/* Seconds are zero-padded once minutes appear, so the field does not
+	 * jump width as a scan runs - the progress line is redrawn in place. */
+	human_duration_snprintf(60, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m00s"));
+	human_duration_snprintf(61, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m01s"));
+	human_duration_snprintf(3599, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "59m59s"));
+
+	/* Past an hour the seconds are dropped, not the minutes. */
+	human_duration_snprintf(3600, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1h00m"));
+	human_duration_snprintf(3660, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1h01m"));
+	human_duration_snprintf(86399, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "23h59m"));
+
+	/* Rounded to the nearest second rather than truncated, so an ETA of
+	 * 0.6s does not read as "0s" for the whole of its last second. */
+	human_duration_snprintf(0.6, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1s"));
+	human_duration_snprintf(59.5, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m00s"));
+
+	mu_check(human_duration_snprintf(1, buf, 0) == 0);
+}
+
+/*
+ * The rendering has to be readable *back*: whatever the duration, parsing the
+ * string returns the same number of seconds, to the resolution that form
+ * carries. That catches the swaps a table of examples reads straight past - a
+ * `/ 60` against a `% 60`, or minutes and seconds the wrong way round, both of
+ * which are right for some of the examples anyone would think to write.
+ */
+MU_TEST(test_prop_human_duration_reads_back) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char buf[32];
+		unsigned long s = (unsigned long)prop_below(&p, 100UL * 3600);
+		unsigned long h, m, sec;
+
+		human_duration_snprintf((double)s, buf, sizeof(buf));
+
+		if (s < 60) {
+			prop_check(&p, sscanf(buf, "%lus", &sec) == 1);
+			prop_check(&p, sec == s);
+		} else if (s < 3600) {
+			prop_check(&p, sscanf(buf, "%lum%lus", &m, &sec) == 2);
+			prop_check(&p, sec < 60);
+			prop_check(&p, m * 60 + sec == s);
+		} else {
+			prop_check(&p, sscanf(buf, "%luh%lum", &h, &m) == 2);
+			prop_check(&p, m < 60);
+			/* Seconds are dropped rather than rounded into the
+			 * minute, so what is printed accounts for everything
+			 * except them. */
+			prop_check(&p, h * 3600 + m * 60 == s - s % 60);
+		}
+	}
+}
+
+MU_TEST(test_num_digits) {
+	/* Zero has no digits by this definition, which is what its one caller
+	 * wants: a column width for a counter that has not started. */
+	mu_check(num_digits(0) == 0);
+	mu_check(num_digits(1) == 1);
+	mu_check(num_digits(9) == 1);
+	mu_check(num_digits(10) == 2);
+	mu_check(num_digits(99) == 2);
+	mu_check(num_digits(100) == 3);
+	mu_check(num_digits(ULLONG_MAX) == 20);
+}
+
+/* Against printf, which is the definition anyone actually means by it. */
+MU_TEST(test_prop_num_digits_matches_printf) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char buf[32];
+		/* Log-uniform: a uniform draw is a twenty-digit number
+		 * essentially every time, and every other width is the
+		 * interesting one. */
+		unsigned long long n = prop_u64(&p) >> prop_below(&p, 64);
+
+		snprintf(buf, sizeof(buf), "%llu", n);
+		prop_check(&p, num_digits(n) == (n ? (int)strlen(buf) : 0));
+	}
+}
+
 MU_TEST(test_longpath) {
 	const char *contents = "over-the-PATH_MAX limit\n";
 	char victim[LP_COMP_LEN + 1];
@@ -1127,6 +1402,68 @@ MU_TEST(test_glob_wildcards_respect_separators) {
 	mu_check(gs_hit("a?.txt", "/x/ab.txt", false));
 	mu_check(!gs_hit("a?.txt", "/x/abc.txt", false));
 	mu_check(!gs_hit("a?.txt", "/x/a/.txt", false));
+}
+
+/*
+ * `**` not followed by a separator, which is a different branch of
+ * glob_to_regex from the `**\/` above and had no test at all - the mutation
+ * sweep found nine survivors on those two lines.
+ *
+ * It is also where this implementation and gitignore disagree, so these cases
+ * are as much a record of the disagreement as a check on it. glob.h states two
+ * rules that collide - a pattern with no '/' is a basename rule, and `**`
+ * crosses directory boundaries - and here the second wins. git resolves it the
+ * other way: in gitignore `**` is only special as a whole path component, and
+ * inside one it means `*`. Nobody writes `node**` on purpose and the
+ * difference only ever excludes more than was asked for, so what is pinned
+ * here is what the code does, not what it arguably should.
+ */
+MU_TEST(test_glob_double_star_without_a_separator) {
+	/* Trailing: everything below the named directory, and the directory
+	 * itself only if something follows the stars. */
+	mu_check(gs_hit("/a/**", "/a/b", false));
+	mu_check(gs_hit("/a/**", "/a/b/c/d", false));
+
+	/* Interior, inside one component: the stars cross '/' where a single
+	 * '*' would not. This is the divergence from gitignore. */
+	mu_check(gs_hit("/a**z", "/ab/cd/z", false));
+	mu_check(!gs_hit("/a*z", "/ab/cd/z", false));
+
+	/* And so a bare pattern with '**' stops being purely a basename rule:
+	 * it matches through the separator on the left. */
+	mu_check(gs_hit("a**", "/a/bbc", false));
+	mu_check(!gs_hit("a**", "/bbc", false));
+
+	/* Three or more stars are the same as two - the run is counted, not
+	 * matched pairwise. */
+	mu_check(gs_hit("/a/***/t", "/a/b/c/t", false));
+}
+
+/*
+ * A backslash escapes the next character, so a pattern can name a file that
+ * has a metacharacter in it. One line of glob_to_regex, no test, and nine
+ * surviving mutants on it - including the `i + 1 < len` bound, whose failure
+ * is a read one past the end of the pattern.
+ */
+MU_TEST(test_glob_backslash_escapes) {
+	/* An escaped wildcard is a literal, and stops being a wildcard. */
+	mu_check(gs_hit("a\\*b", "/x/a*b", false));
+	mu_check(!gs_hit("a\\*b", "/x/axxb", false));
+
+	/* Same for the other metacharacters, so a real name gets named. */
+	mu_check(gs_hit("a\\?b", "/x/a?b", false));
+	mu_check(!gs_hit("a\\?b", "/x/azb", false));
+	mu_check(gs_hit("db\\[1].hash", "/var/db[1].hash", false));
+
+	/* The escape consumes exactly one character; what follows is ordinary
+	 * again. */
+	mu_check(gs_hit("a\\**b", "/x/a*zzb", false));
+
+	/* A trailing backslash has nothing to escape. It must be treated as a
+	 * literal rather than reaching past the end of the pattern for a
+	 * character that is not there. */
+	mu_check(gs_hit("a\\", "/x/a\\", false));
+	mu_check(!gs_hit("a\\", "/x/ab", false));
 }
 
 MU_TEST(test_glob_character_classes) {
@@ -2046,10 +2383,16 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_starved_worker_line_reads_idle);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
+	MU_RUN_TEST(test_parse_size);
+	MU_RUN_TEST(test_human_size);
+	MU_RUN_TEST(test_human_duration);
+	MU_RUN_TEST(test_num_digits);
 	MU_RUN_TEST(test_longpath);
 	MU_RUN_TEST(test_glob_basename);
 	MU_RUN_TEST(test_glob_anchored_vs_any_depth);
 	MU_RUN_TEST(test_glob_wildcards_respect_separators);
+	MU_RUN_TEST(test_glob_double_star_without_a_separator);
+	MU_RUN_TEST(test_glob_backslash_escapes);
 	MU_RUN_TEST(test_glob_character_classes);
 	MU_RUN_TEST(test_glob_directory_only);
 	MU_RUN_TEST(test_glob_literal_paths_are_not_globs);
@@ -2074,6 +2417,10 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_prop_adding_a_pattern_never_unexcludes_a_path);
 	MU_RUN_TEST(test_prop_a_directory_pattern_never_matches_a_file);
 	MU_RUN_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else);
+	MU_RUN_TEST(test_prop_parse_size_scales_by_the_suffix);
+	MU_RUN_TEST(test_prop_human_size_picks_a_real_unit);
+	MU_RUN_TEST(test_prop_human_duration_reads_back);
+	MU_RUN_TEST(test_prop_num_digits_matches_printf);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {
