@@ -2352,6 +2352,9 @@ static void squash_doublestars(char *s)
 MU_TEST(test_prop_a_bare_pattern_reads_only_the_basename) {
 	declare_prop(p, 3000);
 
+	if (prop_skip_jit(__func__))
+		return;
+
 	while (prop_next(&p)) {
 		char pat[6];
 		const char *pats[] = { pat };
@@ -2392,6 +2395,9 @@ MU_TEST(test_prop_a_bare_pattern_reads_only_the_basename) {
 MU_TEST(test_prop_adding_a_pattern_never_unexcludes_a_path) {
 	declare_prop(p, 3000);
 
+	if (prop_skip_jit(__func__))
+		return;
+
 	while (prop_next(&p)) {
 		char a[6], b[6];
 		const char *one[] = { a };
@@ -2428,6 +2434,9 @@ MU_TEST(test_prop_adding_a_pattern_never_unexcludes_a_path) {
  */
 MU_TEST(test_prop_a_directory_pattern_never_matches_a_file) {
 	declare_prop(p, 3000);
+
+	if (prop_skip_jit(__func__))
+		return;
 
 	while (prop_next(&p)) {
 		char seg[6], pat[sizeof(seg) + 2];

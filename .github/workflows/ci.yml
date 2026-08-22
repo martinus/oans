@@ -117,10 +117,19 @@ jobs:
       - name: Build
         run: make
 
+      # OANS_PROPTEST_NO_JIT skips the three properties that compile a GRegex.
+      # GLib compiles every pattern with G_REGEX_OPTIMIZE, PCRE2 emits machine
+      # code, and memcheck reports hundreds of "conditional jump depends on
+      # uninitialised value" from frames it cannot symbolise - verified to be
+      # the library, not oans, by a standalone program with no oans code in it.
+      # Suppressing instead would need `Memcheck:Cond` over `obj:*`, since the
+      # frames carry no object name, and that hides every uninitialised-value
+      # error in the process - the check that caught the missing memset in
+      # start_running_checksum(). The suite prints which properties it skipped.
       - name: Unit tests under valgrind
         run: |
           make test   # builds ./test (and runs it natively - fast)
-          valgrind -q --leak-check=full --error-exitcode=42 \
+          OANS_PROPTEST_NO_JIT=1 valgrind -q --leak-check=full --error-exitcode=42 \
             --suppressions=tests/valgrind.supp ./test
 
       - name: Set up a scratch btrfs

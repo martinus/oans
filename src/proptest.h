@@ -164,6 +164,38 @@ static inline uint64_t prop_seed(void)
 	return seed;
 }
 
+/*
+ * Whether to skip properties whose inputs drive PCRE2's JIT.
+ *
+ * Not a knob for making a failure go away: it exists because valgrind cannot
+ * see into JIT-generated code. GLib compiles every --exclude pattern with
+ * G_REGEX_OPTIMIZE, PCRE2 then emits machine code onto the heap, and memcheck
+ * reports a "conditional jump depends on uninitialised value" for each branch
+ * it cannot account for - hundreds of them, from frames with no symbol and a
+ * stack address where a return address should be.
+ *
+ * Verified to be the library and not oans: a standalone program containing no
+ * oans code, compiling 3000 generated patterns and matching 8 paths against
+ * each, is *clean* under memcheck with plain `g_regex_new` and produces the
+ * identical error signature the moment G_REGEX_OPTIMIZE is added. The suite's
+ * own glob properties compile thousands of patterns where the fixed tests
+ * compile a handful, which is why this only appeared with them.
+ *
+ * Suppressing it was the obvious alternative and is worse: the frames carry no
+ * object name, so valgrind's own generated suppression is `Memcheck:Cond` over
+ * `obj:*` - which would hide every uninitialised-value error in the process.
+ * That check is not decoration here; it is what caught the missing memset in
+ * start_running_checksum(). Losing three properties under one tool is the far
+ * smaller loss, and the suite says out loud when it has done so.
+ */
+static inline bool prop_skip_jit(const char *name)
+{
+	if (!getenv("OANS_PROPTEST_NO_JIT"))
+		return false;
+	printf("\n[proptest] skipping %s: PCRE2's JIT is opaque to valgrind\n", name);
+	return true;
+}
+
 /* Mix the property's name into its seed, so its stream is its own. */
 static inline uint64_t prop_stream(const char *name)
 {

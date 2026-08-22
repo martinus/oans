@@ -221,6 +221,19 @@ counterexample. No dependencies, one header, minunit-compatible.
   library is. The substitute is generators that only produce small inputs, so a
   counterexample is already readable. A property needing a large input to mean
   anything should be an ordinary test with a fixture.
+- **Three properties are skipped under valgrind** (`OANS_PROPTEST_NO_JIT=1`,
+  which the CI leg sets and which prints what it skipped). They compile a
+  `GRegex`, GLib compiles every pattern with `G_REGEX_OPTIMIZE`, and memcheck
+  cannot see into the machine code PCRE2 then emits — hundreds of "conditional
+  jump depends on uninitialised value" from frames with no symbol and a stack
+  address where a return address belongs. **Verified to be the library and not
+  oans**: a standalone program containing no oans code is clean under memcheck
+  with plain `g_regex_new` and reproduces the identical signature the moment
+  `G_REGEX_OPTIMIZE` is added. Don't reach for a suppression instead — the
+  frames have no object name, so valgrind's own generated entry is
+  `Memcheck:Cond` over `obj:*`, which would hide every uninitialised-value error
+  in the process, and that check is what caught the missing memset in
+  `start_running_checksum()`.
 - **Keep the suite fast, for a reason beyond taste.** The mutation tool derives
   a mutant's hang timeout from how long a green run takes, so a slow suite
   reclassifies slow mutants as `hang` instead of letting a test catch them —
