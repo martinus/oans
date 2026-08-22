@@ -6,6 +6,7 @@ underneath it. The file mutated by default is `src/csum.c`, the suite is the C
 unit binary `./test`, and make builds the lanes.
 
     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/fiemap.txt
+    make mutation-replay                                # every bug file, as CI does
     scripts/mutate/mutate.py --replace 'OLD CODE' 'NEW CODE'
     scripts/mutate/mutate.py --file src/glob.c --diff   # whatever is uncommitted
     scripts/mutate/mutate.py --file src/fiemap.c --lines 120-190
@@ -43,11 +44,27 @@ out of step with them:
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import mutate_core  # noqa: E402 - the path above is what makes it importable
+
+
+#: A bug file's first line names the source it mutates: `# file: src/util.c`.
+#: The alternative is deriving it from the file's *name*, which works until a
+#: bug file is named after a theme rather than a source - `escape.txt` was, and
+#: bought a special case in CI for it. A block that does not apply aborts the
+#: run, so a wrong target here is loud rather than a wall of `compiler`.
+BUG_FILE_TARGET = re.compile(r"^#\s*file:\s*(\S+)\s*$", re.M)
+
+
+def bug_file_target(path):
+    """The source a bug file mutates, or None if it does not say."""
+    with open(path, encoding="utf-8") as f:
+        m = BUG_FILE_TARGET.search(f.read())
+    return m.group(1) if m else None
 
 
 class Oans(mutate_core.Project):
@@ -159,6 +176,17 @@ class Oans(mutate_core.Project):
         if path.startswith("src" + os.sep) and path.endswith((".c", ".h")):
             return self.syntax_tu
         return None
+
+    def resolve_file(self, args):
+        """`--file` when given, else the target the bug file names.
+
+        So `mutate.py --bugs scripts/mutate/bugs/glob.txt` needs no second
+        argument that has to agree with the first, and nothing outside the bug
+        file has to know which source it is about.
+        """
+        if args.file != self.target or not args.bugs:
+            return args.file
+        return bug_file_target(args.bugs) or args.file
 
     def extra_facts(self, args):
         """Whether the reflink scratch directory the *other* suite needs exists.

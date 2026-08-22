@@ -134,6 +134,36 @@ MU_TEST(test_seen_inode) {
 	seen_inodes_free();
 }
 
+/*
+ * Every bounded writer here has the same contract, so it is stated once: the
+ * result is a NUL-terminated prefix of the untruncated form, complete whenever
+ * it fits, and nothing outside the caller's size is touched. The fences are the
+ * half a length assertion cannot make - `strlen(out) < sz` says nothing about
+ * the byte after it, and these are the only callers that can run out of room.
+ */
+struct fenced { char before[8]; char out[32]; char after[8]; };
+
+#define FENCE_BYTE '#'
+
+static bool fence_intact(const struct fenced *f)
+{
+	for (size_t i = 0; i < sizeof(f->before); i++)
+		if (f->before[i] != FENCE_BYTE || f->after[i] != FENCE_BYTE)
+			return false;
+	return true;
+}
+
+/* True if `f->out` is the prefix of `full` that `sz` bytes can hold. */
+static bool wrote_prefix_within(const struct fenced *f, size_t sz, const char *full)
+{
+	if (sz == 0)
+		return f->out[0] == FENCE_BYTE;	/* not even a NUL */
+	if (strlen(f->out) >= sz || strncmp(f->out, full, strlen(f->out)))
+		return false;
+	/* Truncated only when it had to be. */
+	return strlen(full) >= sz || !strcmp(f->out, full);
+}
+
 /* One fiemap record: {logical, physical, length, flags}. */
 struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
 
@@ -912,7 +942,7 @@ MU_TEST(test_prop_group_u64_truncates_to_a_prefix) {
 	declare_prop(p, 20000);
 
 	while (prop_next(&p)) {
-		struct { char before[8]; char out[30]; char after[8]; } fenced;
+		struct fenced fenced;
 		char full[32];
 		/* Log-uniform, so every digit width comes up. */
 		uint64_t n = prop_u64(&p) >> prop_below(&p, 64);
@@ -920,24 +950,14 @@ MU_TEST(test_prop_group_u64_truncates_to_a_prefix) {
 		int ret;
 
 		group_u64_snprintf(n, full, sizeof(full));
-		memset(&fenced, '#', sizeof(fenced));
+		memset(&fenced, FENCE_BYTE, sizeof(fenced));
 		ret = group_u64_snprintf(n, fenced.out, sz);
 
-		for (size_t i = 0; i < sizeof(fenced.before); i++)
-			prop_check(&p, fenced.before[i] == '#');
-		for (size_t i = 0; i < sizeof(fenced.after); i++)
-			prop_check(&p, fenced.after[i] == '#');
-		if (sz == 0) {
-			prop_check(&p, ret == 0);
-			prop_check(&p, fenced.out[0] == '#');	/* nothing written */
-			continue;
-		}
-		prop_check(&p, strlen(fenced.out) < sz);
-		prop_check(&p, (size_t)ret == strlen(fenced.out));
-		prop_check(&p, !strncmp(fenced.out, full, strlen(fenced.out)));
-		/* Truncated only when it had to be. */
-		if (strlen(full) < sz)
-			prop_check(&p, !strcmp(fenced.out, full));
+		prop_check(&p, fence_intact(&fenced));
+		prop_check(&p, wrote_prefix_within(&fenced, sz, full));
+		/* And the one part that is this function's own: it reports what it
+		 * wrote, not what it wanted to. */
+		prop_check(&p, (size_t)ret == (sz ? strlen(fenced.out) : 0));
 	}
 }
 
@@ -1831,22 +1851,13 @@ MU_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous) {
 			prop_check(&p, *q >= 0x20 && *q != 0x7f);
 			prop_check(&p, !(q[0] == 0xc2 && q[1] >= 0x80 && q[1] <= 0x9f));
 		}
-	}
-}
-
-/*
- * `path_for_display` sizes its buffer at SANITIZE_CTRL_MAX per input byte, so
- * that bound is load-bearing rather than decorative: an encoding that expanded
- * further would overflow a heap allocation on the first crafted name.
- */
-MU_TEST(test_prop_sanitize_ctrl_stays_inside_its_own_bound) {
-	declare_prop(p, 20000);
-
-	while (prop_next(&p)) {
-		char in[24], out[SANITIZE_CTRL_MAX * 24 + 1];
-
-		gen_hostile_name(&p, in, sizeof(in));
-		sanitize_ctrl(in, out, sizeof(out));
+		/*
+		 * And within the bound `path_for_display` sizes its allocation
+		 * by, which is load-bearing rather than decorative: an encoding
+		 * that expanded further would overflow a heap buffer on the
+		 * first crafted name. Asserted here rather than in a property
+		 * of its own, which would be this one's setup plus a line.
+		 */
 		prop_check(&p, strlen(out) <= SANITIZE_CTRL_MAX * strlen(in));
 	}
 }
@@ -1865,28 +1876,16 @@ MU_TEST(test_prop_sanitize_ctrl_truncates_on_whole_escapes) {
 
 	while (prop_next(&p)) {
 		char in[24], full[SANITIZE_CTRL_MAX * 24 + 1];
-		struct { char before[8]; char out[32]; char after[8]; } fenced;
+		struct fenced fenced;
 		size_t sz = (size_t)prop_below(&p, sizeof(fenced.out) + 1);
 
 		gen_hostile_name(&p, in, sizeof(in));
-		memset(&fenced, '#', sizeof(fenced));
+		memset(&fenced, FENCE_BYTE, sizeof(fenced));
 		sanitize_ctrl(in, fenced.out, sz);
 		sanitize_ctrl(in, full, sizeof(full));
 
-		for (size_t i = 0; i < sizeof(fenced.before); i++)
-			prop_check(&p, fenced.before[i] == '#');
-		for (size_t i = 0; i < sizeof(fenced.after); i++)
-			prop_check(&p, fenced.after[i] == '#');
-		if (sz == 0) {
-			/* Nothing may be written at all, not even a NUL. */
-			prop_check(&p, fenced.out[0] == '#');
-			continue;
-		}
-		prop_check(&p, strlen(fenced.out) < sz);
-		prop_check(&p, strncmp(fenced.out, full, strlen(fenced.out)) == 0);
-		/* Truncated only when it had to be. */
-		if (strlen(full) < sz)
-			prop_check(&p, strcmp(fenced.out, full) == 0);
+		prop_check(&p, fence_intact(&fenced));
+		prop_check(&p, wrote_prefix_within(&fenced, sz, full));
 	}
 }
 
@@ -1936,14 +1935,17 @@ MU_TEST(test_prop_checksum_resumes_at_any_split) {
 	size_t blob_len = running_checksum_state_size();
 	_cleanup_(freep) void *blob = malloc(blob_len);
 
+	/* Filled once: this property is about *where* a hash was interrupted,
+	 * not about content, and drawing 4 KiB per case cost ten times the
+	 * hashing it was there to exercise. */
+	prop_bytes(&p, data, sizeof(data));
+
 	while (prop_next(&p)) {
 		unsigned char whole[DIGEST_LEN], resumed[DIGEST_LEN];
 		size_t len = (size_t)prop_below(&p, sizeof(data) + 1);
 		unsigned int splits = (unsigned int)prop_below(&p, 4);
 		struct running_checksum *c;
 		size_t at = 0;
-
-		prop_bytes(&p, data, len);
 
 		c = start_running_checksum();
 		add_to_running_checksum(c, data, len);
@@ -2052,15 +2054,36 @@ static unsigned int gen_layout(struct prop *p, struct fm_rec *out)
 	return n;
 }
 
+/*
+ * fiemap.c's own definition, not a copy of it. This is a *gate* deciding which
+ * cases a property applies to rather than an oracle, so the usual "restate it
+ * independently so the test cannot agree with the bug" argument is inverted: a
+ * drifted copy here makes the property vacuous or spuriously red.
+ */
 static bool layout_has_phys(const struct fm_rec *r, unsigned int n)
 {
-	const uint32_t no_phys = FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC |
-				 FIEMAP_EXTENT_DATA_INLINE;
-
 	for (unsigned int i = 0; i < n; i++)
-		if (r[i].flags & no_phys)
+		if (r[i].flags & FIEMAP_NO_PHYS)
 			return false;
 	return true;
+}
+
+/*
+ * The shape #186 is about: one dedupe stopped on a block boundary, so the same
+ * stored extent is described as two records here and one there. Returns the new
+ * record count, or `n` unchanged where there is nothing to split.
+ */
+static unsigned int split_last_record(struct fm_rec *r, unsigned int n)
+{
+	if (n >= PROP_MAX_RECS || r[n - 1].len <= PROP_BLOCK)
+		return n;
+	r[n].log = r[n - 1].log + PROP_BLOCK;
+	r[n].phys = r[n - 1].phys;
+	r[n].len = r[n - 1].len - PROP_BLOCK;
+	r[n].flags = r[n - 1].flags;
+	r[n - 1].len = PROP_BLOCK;
+	r[n - 1].flags &= ~(uint32_t)FIEMAP_EXTENT_LAST;
+	return n + 1;
 }
 
 /*
@@ -2150,15 +2173,7 @@ MU_TEST(test_prop_shared_ranges_have_nothing_left_to_free) {
 			dst[prop_below(&p, nd)].phys += PROP_BLOCK;
 			break;
 		case 2:				/* a split tail */
-			if (dst[nd - 1].len > PROP_BLOCK && nd < PROP_MAX_RECS) {
-				dst[nd].log = dst[nd - 1].log + PROP_BLOCK;
-				dst[nd].phys = dst[nd - 1].phys;
-				dst[nd].len = dst[nd - 1].len - PROP_BLOCK;
-				dst[nd].flags = dst[nd - 1].flags;
-				dst[nd - 1].len = PROP_BLOCK;
-				dst[nd - 1].flags &= ~(uint32_t)FIEMAP_EXTENT_LAST;
-				nd++;
-			}
+			nd = split_last_record(dst, nd);
 			break;
 		default:			/* something else entirely */
 			nd = gen_layout(&p, dst);
@@ -2229,10 +2244,18 @@ static void gen_glob_segment(struct prop *p, char *buf, size_t sz)
 	size_t len = (size_t)prop_range(p, 1, sz - 1);
 
 	for (size_t i = 0; i < len; i++) {
-		switch (prop_below(p, 6)) {
+		switch (prop_below(p, 8)) {
 		case 0: buf[i] = '*'; break;
 		case 1: buf[i] = '?'; break;
 		case 2: buf[i] = '.'; break;
+		/* '[' and ']' reach append_class(), and an unmatched '[' is the
+		 * one way a pattern can fail to compile - which is what makes
+		 * gs_of()'s rejection path live. Without them it was dead:
+		 * measured 0 rejections in 12,000 compiles, so both the class
+		 * parser and the malformed-pattern branch were sampled zero
+		 * times while the comment claimed otherwise. */
+		case 3: buf[i] = '['; break;
+		case 4: buf[i] = ']'; break;
 		default: buf[i] = (char)prop_range(p, 'a', 'c'); break;
 		}
 	}
@@ -2253,6 +2276,21 @@ static void gen_glob_path(struct prop *p, char *buf, size_t sz)
 						     : (char)prop_range(p, 'a', 'c');
 	}
 	buf[o] = '\0';
+}
+
+/* A literal cannot be malformed, so a failure here is a bug in the test, not
+ * an input worth skipping - which is why this aborts where gs_of() returns. */
+static struct glob_set *gs_literal(const char *path)
+{
+	struct glob_set *gs = glob_set_new();
+	char *err = NULL;
+
+	glob_set_add_literal(gs, path);
+	if (glob_set_compile(gs, &err)) {
+		fprintf(stderr, "literal \"%s\" rejected: %s\n", path, err);
+		abort();
+	}
+	return gs;
 }
 
 /*
@@ -2421,30 +2459,22 @@ MU_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else) {
 
 	while (prop_next(&p)) {
 		char lit[24], other[24];
-		struct glob_set *gs = glob_set_new();
-		char *err = NULL;
+		struct glob_set *gs;
 		bool is_dir = prop_bool(&p);
+		size_t n;
 
 		gen_glob_path(&p, lit, sizeof(lit));
 		/* Metacharacters in the *literal*, which is the case it exists
 		 * for: as a pattern this would be a class or a wildcard. */
-		if (prop_bool(&p)) {
-			size_t n = strlen(lit);
-
-			if (n + 3 < sizeof(lit)) {
-				lit[n] = prop_bool(&p) ? '[' : '*';
-				lit[n + 1] = 'a';
-				lit[n + 2] = '\0';
-			}
+		n = strlen(lit);
+		if (n + 3 < sizeof(lit) && prop_bool(&p)) {
+			lit[n] = prop_bool(&p) ? '[' : '*';
+			lit[n + 1] = 'a';
+			lit[n + 2] = '\0';
 		}
 		gen_glob_path(&p, other, sizeof(other));
 
-		glob_set_add_literal(gs, lit);
-		if (glob_set_compile(gs, &err)) {
-			g_free(err);
-			glob_set_free(gs);
-			prop_check(&p, false);	/* a literal cannot be malformed */
-		}
+		gs = gs_literal(lit);
 		prop_check(&p, glob_set_match(gs, lit, is_dir, NULL));
 		if (strcmp(lit, other))
 			prop_check(&p, !glob_set_match(gs, other, is_dir, NULL));
@@ -2497,7 +2527,6 @@ MU_TEST_SUITE(test_suite) {
 	 * are a different question about the same code, and a failure here names
 	 * a seed to replay rather than a case to read. */
 	MU_RUN_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous);
-	MU_RUN_TEST(test_prop_sanitize_ctrl_stays_inside_its_own_bound);
 	MU_RUN_TEST(test_prop_sanitize_ctrl_truncates_on_whole_escapes);
 	MU_RUN_TEST(test_prop_sanitize_ctrl_is_identity_on_ordinary_names);
 	MU_RUN_TEST(test_prop_checksum_resumes_at_any_split);

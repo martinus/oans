@@ -34,6 +34,57 @@ REPO = Path(__file__).resolve().parent.parent
 CORE = REPO / "scripts" / "mutate" / "mutate_core.py"
 RECORDED = CORE.with_suffix(".sha256")
 ADAPTER = CORE.parent / "mutate.py"
+_ADAPTER = None
+
+
+def adapter_module():
+    """The adapter, imported once. Loading it is also the check that the core
+    beside it imports at all, which no hash can tell you."""
+    global _ADAPTER
+    if _ADAPTER is None:
+        spec = importlib.util.spec_from_file_location("mutate_adapter", ADAPTER)
+        _ADAPTER = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_ADAPTER)
+    return _ADAPTER
+
+
+def bug_file_problems(project):
+    """Every bugs/*.txt names a source that exists.
+
+    A bug file whose `# file:` line is missing or stale mutates whatever
+    `--file` defaults to, where its blocks do not appear - so every one of them
+    fails to apply, the run aborts, and the reason is two steps from the
+    message. One stat each, at the only moment anyone is looking.
+    """
+    found = []
+    for path in sorted((CORE.parent / "bugs").glob("*.txt")):
+        target = adapter_module().bug_file_target(str(path))
+        if target is None:
+            found.append("%s names no source: give it a `# file: src/....c` line"
+                         % path.relative_to(REPO))
+        elif not (REPO / target).exists():
+            found.append("%s names %s, which does not exist"
+                         % (path.relative_to(REPO), target))
+    return found
+
+
+def make_target_problems(project):
+    """Whether the target the lanes build exists, and builds without running."""
+    target = getattr(project.backend, "target", None)
+    if not target:
+        return []
+    r = subprocess.run(["make", "-C", str(REPO), "--dry-run", target],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return ["the backend builds `%s`, which make does not know: %s"
+                % (target, (r.stderr or r.stdout).strip().splitlines()[-1:])]
+    runs = "./" + project.test_binary
+    if any(line.strip().startswith(runs) for line in r.stdout.splitlines()):
+        return ["`%s` runs %s as well as building it, so a mutant the tests "
+                "caught would exit nonzero at the build step and be scored "
+                "`compiler` - crediting the compiler with protection the tests "
+                "provided" % (target, runs)]
+    return []
 
 
 def main():
@@ -63,9 +114,7 @@ def main():
     # The adapter against the core. `Project.problems()` is in the core rather
     # than written out here, so a newly required attribute reaches this
     # repository through the re-vendor that has to happen anyway.
-    spec = importlib.util.spec_from_file_location("mutate_adapter", ADAPTER)
-    adapter = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(adapter)
+    adapter = adapter_module()
     project = adapter.Oans()
     problems = list(project.problems())
     if Path(adapter.mutate_core.__file__).resolve() != CORE:
@@ -81,9 +130,16 @@ def main():
     # The one thing this repository can check that the others cannot: the make
     # target the lanes build must not also *run* the suite, or a mutant the
     # tests caught exits nonzero at the build step and is scored `compiler`.
-    target = getattr(project.backend, "target", None)
-    if target and target not in (REPO / "Makefile").read_text(encoding="utf-8"):
-        problems.append("the backend builds `%s`, which is not a target in the Makefile" % target)
+    #
+    # Asked of make rather than by searching the Makefile's text. A substring
+    # search cannot express the invariant and fails in the flattering
+    # direction: `MakeBackend("test")` - the exact regression the `test-build`
+    # split exists to prevent - passes it, because the word `test` appears all
+    # over the file. `make --dry-run` prints the recipe, so running the suite is
+    # visible where merely naming it is not, and a missing target is a nonzero
+    # exit rather than a guess. Costs ~0.1s, the same as either sibling lint.
+    problems += make_target_problems(project)
+    problems += bug_file_problems(project)
     if problems:
         print("%s does not fit the core it is vendored with:" % ADAPTER.relative_to(REPO))
         for problem in problems:

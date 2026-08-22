@@ -1,6 +1,8 @@
+# file: src/glob.c
+#
 # What --exclude promises (glob.h), broken on purpose.
 #
-#     scripts/mutate/mutate.py --file src/glob.c --bugs scripts/mutate/bugs/glob.txt
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/glob.txt
 #
 # The failure mode this file is about is silence. An exclude pattern that
 # matches nothing does not fail; the scan just takes longer and hashes things

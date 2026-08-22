@@ -113,7 +113,8 @@ and reports whether anything went red. Coverage says a line ran; this says
 something would have noticed it misbehaving.
 
 ```sh
-scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+scripts/mutate/mutate.py --bugs scripts/mutate/bugs/fiemap.txt
+make mutation-replay                                    # every bug file, as CI does
 scripts/mutate/mutate.py --file src/glob.c --diff       # only what you changed
 scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
 ```
@@ -122,10 +123,17 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   so there is no file that is obviously *the* code; the default (`src/csum.c`)
   is a starting point and a run without `--file` is usually the wrong question.
 - **`bugs/*.txt` are real oans bugs put back** — #147, #159, #186, #187, #191,
-  #202 — one block each, one file per source file. That is the everyday mode and
-  the one worth adding to: a fix without a block here has no answer to "does its
-  test earn its place". A block that stops applying means that part was
-  rewritten and the question wants re-deriving, not repairing.
+  #202 — one block each, and each file names the source it mutates on its own
+  first line (`# file: src/util.c`). That is the everyday mode and the one worth
+  adding to: a fix without a block here has no answer to "does its test earn its
+  place". A block that stops applying means that part was rewritten and the
+  question wants re-deriving, not repairing.
+  - **The target belongs in the file, not in its name.** Deriving it from the
+    filename works until a bug file is named after a theme rather than a source,
+    which `escape.txt` was — and it bought a special case in the CI loop for
+    exactly one file. `make mutation-replay` now runs the lot with nothing to
+    know, and `make lint` refuses a bug file whose `# file:` line is missing or
+    names something that is not there.
 - **A `survived` is a narrower claim than it reads.** The suite is `src/tests.c`
   alone: the end-to-end Python suite drives the *binary* and is not in the loop,
   so for the dedupe phase, the scan pipeline and the progress block a survivor

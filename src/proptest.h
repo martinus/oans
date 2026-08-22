@@ -70,12 +70,17 @@
 #include "minunit.h"
 
 struct prop {
-	const char	*name;		/* the test function, for the message */
-	uint64_t	seed;		/* what to set to replay this run */
 	uint64_t	state;		/* the generator, mixed per property */
 	unsigned int	iteration;	/* 1-based, and what a failure names */
 	unsigned int	iterations;
 };
+
+/*
+ * Deliberately not carrying the property's name or the run's seed: `prop_check`
+ * builds its message from `__func__` and `prop_seed()`, so a copy here would be
+ * a second spelling of both - and a field that reads as state without being any
+ * is what the next person adding to that message would reach for first.
+ */
 
 /*
  * splitmix64. Chosen for being eight lines rather than for its statistics: the
@@ -174,8 +179,6 @@ static inline uint64_t prop_stream(const char *name)
 static inline struct prop prop_init(const char *name, unsigned int iterations)
 {
 	struct prop p = {
-		.name = name,
-		.seed = prop_seed(),
 		.state = prop_stream(name),
 		.iteration = 0,
 		.iterations = iterations,
@@ -218,7 +221,7 @@ static inline bool prop_next(struct prop *p)
 			"\n\treplay: OANS_PROPTEST_SEED=%llu"		\
 			" (case %u of %u)",				\
 			__func__, __FILE__, __LINE__, #test,		\
-			(unsigned long long)(p)->seed,			\
+			(unsigned long long)prop_seed(),		\
 			(p)->iteration, (p)->iterations);		\
 		minunit_status = 1;					\
 		return;							\

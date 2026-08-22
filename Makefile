@@ -196,6 +196,19 @@ lint:
 	@python3 scripts/lint-escape.py
 	@python3 scripts/lint-mutate-core.py
 
+# Replay the known bugs in scripts/mutate/bugs/ and fail if any survives - the
+# check that says the tests would still notice #147, #159, #186, #187, #191 and
+# #202. Each bug file names the source it mutates on its own first line, so this
+# loop has nothing to know. Not in `check`: it is minutes rather than seconds,
+# and it is what the CI `mutation` job runs.
+.PHONY: mutation-replay
+mutation-replay:
+	@status=0; for bugs in scripts/mutate/bugs/*.txt; do \
+		echo "=== $$bugs ==="; \
+		python3 scripts/mutate/mutate.py --bugs "$$bugs" \
+			$(MUTATE_ARGS) || status=1; \
+	done; exit $$status
+
 .PHONY: check
 check: lint test integration
 

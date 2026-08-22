@@ -1,7 +1,9 @@
+# file: src/util.c
+#
 # The guarantee of #202: a file name is untrusted input, and nothing that
 # reaches the admin's terminal may still act on it.
 #
-#     scripts/mutate/mutate.py --file src/util.c --bugs scripts/mutate/bugs/escape.txt
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/util.txt
 #
 # Anyone who can create a file inside a scanned tree picks these bytes. A `\r`
 # in a name rewrites the line above it - the summary, a progress row - and

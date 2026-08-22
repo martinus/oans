@@ -53,7 +53,7 @@ jobs:
 
       # Guards the long-path invariant (#117): a syscall taking a scanned
       # file's path silently ENAMETOOLONGs and drops the file, exit 0.
-      - name: Lint (long-path invariant)
+      - name: Lint
         run: make lint
 
       - name: Build
@@ -222,19 +222,9 @@ jobs:
       - name: Lint
         run: make lint
 
-      # `--lanes 2` because the runner has two cores and each lane wants a
-      # compile to itself; the default would take one per hardware thread and
-      # spend the difference on contention. `--baseline-runs 1` because this
-      # suite is deterministic - a fixed property seed included - so the second
-      # green run the tool insists on by default buys nothing here.
+      # The same target a developer runs, so the gate is reproducible without
+      # retyping it out of this file. `--baseline-runs 1` because the suite is
+      # deterministic - a fixed property seed included - so the second green run
+      # the tool insists on by default buys nothing here.
       - name: Replay known bugs
-        run: |
-          status=0
-          for bugs in scripts/mutate/bugs/*.txt; do
-            src="src/$(basename "$bugs" .txt).c"
-            [ "$src" = src/escape.c ] && src=src/util.c
-            echo "=== $bugs -> $src ==="
-            python3 scripts/mutate/mutate.py --file "$src" --bugs "$bugs" \
-              --lanes 2 --baseline-runs 1 || status=1
-          done
-          exit $status
+        run: make mutation-replay MUTATE_ARGS="--baseline-runs 1"

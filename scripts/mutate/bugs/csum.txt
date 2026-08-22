@@ -1,6 +1,8 @@
+# file: src/csum.c
+#
 # What a checkpoint promises (#159), broken on purpose.
 #
-#     scripts/mutate/mutate.py --file src/csum.c --bugs scripts/mutate/bugs/csum.txt
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/csum.txt
 #
 # The failure mode this file guards against is the quietest one in oans: a
 # resumed hash that produces a digest of bytes that never existed. Nothing

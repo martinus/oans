@@ -1,6 +1,8 @@
+# file: src/fiemap.c
+#
 # Invariants of the fiemap arithmetic, each broken on purpose, and what notices.
 #
-#     scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/fiemap.txt
 #
 # A sweep asks "would anything notice this token changing". This asks the other
 # question: here is a mistake that was actually made in this file, does the

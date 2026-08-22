@@ -50,7 +50,8 @@ source file in a throwaway copy of the tree, rebuilds, runs the C unit suite and
 reports whether anything went red.
 
 ```sh
-scripts/mutate/mutate.py --file src/fiemap.c --bugs scripts/mutate/bugs/fiemap.txt
+scripts/mutate/mutate.py --bugs scripts/mutate/bugs/fiemap.txt
+make mutation-replay                                   # every bug file, as CI does
 scripts/mutate/mutate.py --file src/glob.c --diff        # only what you changed
 scripts/mutate/mutate.py --file src/util.c --dry-run     # how many, and how long
 ```
@@ -58,7 +59,10 @@ scripts/mutate/mutate.py --file src/util.c --dry-run     # how many, and how lon
 The everyday use is the first one: the bug files in `scripts/mutate/bugs/` are
 real oans bugs — #147, #159, #186, #187, #191, #202 — put back one at a time, so
 "does this test earn its place" has an answer. Add a block whenever you fix
-something, and check that the fix's own test is what catches it.
+something, and check that the fix's own test is what catches it. Each bug file
+names the source it mutates on its own first line, so `--file` is not needed
+alongside `--bugs`; `make mutation-replay` runs all of them, which is exactly
+what the CI job does.
 
 **Read the survivors by function, not as a total.** The first sweep of
 `src/util.c` reported 213 of 413 surviving, which sounds damning and says
