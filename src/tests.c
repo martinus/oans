@@ -3367,6 +3367,199 @@ MU_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else) {
  * skips a whole tree, a wrong YES brings back per-file dedupe errors -- so
  * anything that is not a clear statement about the filesystem stays UNKNOWN.
  */
+/*
+ * ---------------------------------------------------------------------------
+ * Properties of the hashfile
+ *
+ * The tables above name a layout and its answer. These name the two
+ * relationships that decide whether a snapshot-aware scan is safe at all, and
+ * go looking for a layout that breaks them - which is the right shape here,
+ * because what makes a layout interesting (a hole, two records that abut, a
+ * split at a block boundary) is a fact about extents rather than one anybody
+ * sits down and enumerates.
+ * ---------------------------------------------------------------------------
+ */
+
+/* One donor per case, since a file may hold only one set of extent rows. */
+static int64_t prop_donor(struct dbhandle *db, struct prop *p)
+{
+	char name[64];
+
+	snprintf(name, sizeof(name), "/snap/%u", p->iteration);
+	return put_file(db, name, 100000 + p->iteration, 1);
+}
+
+/* The fiemap records, as the rows a scan would have stored for them. */
+static void rows_of(const struct fm_rec *recs, unsigned int n,
+		    struct extent_csum *out)
+{
+	for (unsigned int i = 0; i < n; i++) {
+		out[i].loff = recs[i].log;
+		out[i].poff = recs[i].phys;
+		out[i].len = recs[i].len;
+		memset(out[i].digest, (int)i + 1, DIGEST_LEN);
+	}
+}
+
+/*
+ * The re-check accepts exactly the layout it was given and nothing else.
+ *
+ * Misses are free and false hits are catastrophic: a wrong match copies one
+ * file's digest onto another, and nothing downstream can tell that from a file
+ * with no duplicate. So both halves are asserted for every generated layout -
+ * that the records it stored match, and that no single-field change to any one
+ * record still does.
+ *
+ * Not a tautology: one side is a `struct fiemap`, the other is the rows
+ * dbfile_store_extent_hashes() wrote, and only the loop under test relates
+ * them. A mutation inside it makes the two sides disagree rather than agreeing
+ * with each other.
+ */
+MU_TEST(test_prop_a_layout_matches_only_itself) {
+	declare_prop(p, 300);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+	while (prop_next(&p)) {
+		struct fm_rec recs[PROP_MAX_RECS], probe[PROP_MAX_RECS];
+		struct extent_csum rows[PROP_MAX_RECS];
+		unsigned int n = gen_layout(&p, recs);
+		int64_t donor = prop_donor(db, &p);
+		unsigned int k, field;
+
+		rows_of(recs, n, rows);
+		if (dbfile_store_extent_hashes(db, donor, n, rows))
+			abort();
+
+		memcpy(probe, recs, n * sizeof(*probe));
+		prop_check(&p, layout_matches(db, donor, probe, n) == 1);
+
+		/* One field of one record, moved by one block. */
+		k = (unsigned int)prop_below(&p, n);
+		field = (unsigned int)prop_below(&p, 3);
+		if (field == 0)
+			probe[k].log += PROP_BLOCK;
+		else if (field == 1)
+			probe[k].phys += PROP_BLOCK;
+		else
+			probe[k].len += PROP_BLOCK;
+		prop_check(&p, layout_matches(db, donor, probe, n) == 0);
+
+		/* A prefix of the donor is still a miss, both directions. */
+		memcpy(probe, recs, n * sizeof(*probe));
+		if (n > 1)
+			prop_check(&p, layout_matches(db, donor, probe, n - 1) == 0);
+	}
+}
+
+/*
+ * The same *storage* described with different record boundaries reads as a
+ * miss. Splitting one record in two covers byte for byte what the donor
+ * covers, at the same addresses - so a check that reasoned about coverage
+ * would say yes, and it must say no (#186 is the same confusion from the other
+ * side, where treating two descriptions as different cost convergence).
+ *
+ * Its own property rather than a branch of the one above, because it is the
+ * one case where "obviously the same bytes" and "the same records" part
+ * company, and a generator has to be told to produce it.
+ */
+MU_TEST(test_prop_a_split_record_is_not_the_layout_it_covers) {
+	declare_prop(p, 300);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+	while (prop_next(&p)) {
+		struct fm_rec recs[PROP_MAX_RECS], probe[PROP_MAX_RECS + 1];
+		struct extent_csum rows[PROP_MAX_RECS];
+		unsigned int n = gen_layout(&p, recs);
+		int64_t donor;
+		unsigned int k = (unsigned int)prop_below(&p, n);
+		unsigned int i, j;
+		uint64_t half;
+
+		if (recs[k].len < 2 * PROP_BLOCK)
+			continue;		/* nothing to split */
+		half = recs[k].len / 2;
+
+		donor = prop_donor(db, &p);
+		rows_of(recs, n, rows);
+		if (dbfile_store_extent_hashes(db, donor, n, rows))
+			abort();
+
+		for (i = 0, j = 0; i < n; i++) {
+			probe[j++] = recs[i];
+			if (i != k)
+				continue;
+			probe[j - 1].len = half;
+			probe[j] = recs[i];
+			probe[j].log += half;
+			probe[j].len -= half;
+			/* The address is left alone: fe_physical addresses a
+			 * whole extent, so an offset into it means nothing on
+			 * a compressed one. Same trap as fiemap_maps_share. */
+			j++;
+		}
+		prop_check(&p, layout_matches(db, donor, probe, j) == 0);
+	}
+}
+
+/*
+ * Everything handed to dbfile_store_extent_hashes() comes back at the offsets
+ * it was given, and nothing else does.
+ *
+ * The second clause is what makes the zero-length skip a property rather than
+ * a case: an extent naming no bytes must not be stored at any count, at any
+ * position in the array, including as the only element. The table above can
+ * only ask that at the two shapes it writes down.
+ *
+ * Read back with SQL rather than through a loader, so a bind index shifted
+ * consistently in both directions cannot round-trip.
+ */
+MU_TEST(test_prop_stored_extents_come_back_where_they_were_put) {
+	declare_prop(p, 300);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+	while (prop_next(&p)) {
+		struct extent_csum ext[6];
+		unsigned int n = (unsigned int)prop_range(&p, 0, ARRAY_SIZE(ext));
+		uint64_t loff = 0, expect = 0;
+		int64_t id = prop_donor(db, &p);
+		char sql[256];
+
+		for (unsigned int i = 0; i < n; i++) {
+			ext[i].loff = loff;
+			ext[i].poff = PROP_BLOCK * prop_range(&p, 100, 108);
+			/* Empty about one record in five, so the skip is
+			 * reached first, last and alone across the run. */
+			ext[i].len = prop_chance(&p, 5)
+				   ? 0 : PROP_BLOCK * prop_range(&p, 1, 3);
+			memset(ext[i].digest, (int)prop_u64(&p), DIGEST_LEN);
+			loff += PROP_BLOCK * prop_range(&p, 1, 4);
+			if (ext[i].len)
+				expect++;
+		}
+
+		if (dbfile_store_extent_hashes(db, id, n, ext))
+			abort();
+
+		for (unsigned int i = 0; i < n; i++) {
+			if (!ext[i].len)
+				continue;
+			snprintf(sql, sizeof(sql),
+				 "select count(*) from extents where "
+				 "fileid = %lld and loff = %llu and "
+				 "poff = %llu and len = %llu",
+				 (long long)id, (unsigned long long)ext[i].loff,
+				 (unsigned long long)ext[i].poff,
+				 (unsigned long long)ext[i].len);
+			prop_check(&p, dbfile_query_u64(db->db, sql) == 1);
+		}
+
+		snprintf(sql, sizeof(sql),
+			 "select count(*) from extents where fileid = %lld",
+			 (long long)id);
+		prop_check(&p, dbfile_query_u64(db->db, sql) == expect);
+	}
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -3457,6 +3650,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_glob_reports_matching_pattern_and_counts);
 	MU_RUN_TEST(test_glob_rejects_malformed);
 	MU_RUN_TEST(test_glob_empty_set_matches_nothing);
+	MU_RUN_TEST(test_prop_a_layout_matches_only_itself);
+	MU_RUN_TEST(test_prop_a_split_record_is_not_the_layout_it_covers);
+	MU_RUN_TEST(test_prop_stored_extents_come_back_where_they_were_put);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
