@@ -4439,6 +4439,434 @@ MU_TEST(test_prop_a_filerec_token_is_found_by_its_filerec) {
 	free_all_filerecs();
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The dedupe-phase loaders
+ *
+ * Where the hashfile meets the in-memory model: five functions turning rows
+ * into filerecs, hash trees and results trees. They were 155 mutants with a 0%
+ * kill rate, and they need both fixtures at once - memdb() from the hashfile
+ * tests, mkfilerec()/free_all_filerecs() from the model ones - which is why
+ * they waited until both existed.
+ *
+ * What they get wrong fails silently in the usual way: a target elected
+ * differently in two overlapping windows deduplicates into a file the other
+ * window is still relocating, and the summary looks exactly the same.
+ * ---------------------------------------------------------------------------
+ */
+
+/* A scanned row with every column the whole-file loader ranks on. */
+static int64_t put_dupe(struct dbhandle *db, const char *name, uint64_t ino,
+			unsigned int dg, uint64_t size, unsigned int seq,
+			unsigned int flags, unsigned int nr_extents)
+{
+	_cleanup_(file_cleanup) struct file f = {0};
+	unsigned char digest[DIGEST_LEN];
+	int64_t id;
+
+	if (file_set_filename(&f, name))
+		abort();
+	f.ino = ino;
+	f.subvol = 1;
+	f.size = size;
+	f.mtime = 1000;
+	f.dedupe_seq = seq;
+	id = dbfile_store_file_info(db, &f);
+	if (id <= 0)
+		abort();
+	digest_of(digest, dg);
+	if (dbfile_update_scanned_file(db, id, digest, flags, nr_extents))
+		abort();
+	return id;
+}
+
+/* The group's dedupe target: the loader orders it first, and
+ * dedupe_extent_list() always dedupes against list_first_entry(). */
+static struct filerec *target_of(struct dupe_extents *d)
+{
+	return list_first_entry(&d->de_extents, struct extent, e_list)->e_file;
+}
+
+static struct dupe_extents *only_group(struct results_tree *res)
+{
+	if (RB_EMPTY_ROOT(&res->root))
+		return NULL;
+	return rb_entry(rb_first(&res->root), struct dupe_extents, de_node);
+}
+
+/*
+ * A whole-file duplicate group loads every member of the window with its
+ * target first, and every member at poff 0.
+ *
+ * That zero is not incidental. GET_DUPLICATE_FILES has no fiemap to draw on,
+ * so whole-file members carry no physical offset - which is exactly why they
+ * skip clean_deduped() and why `--dedupe-options=only_whole_files` converged
+ * while the extent path did not (#186). A loader that invented a poff here
+ * would put them back on the path that failed to converge.
+ */
+MU_TEST(test_whole_file_dupes_load_with_their_target_first) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct results_tree res;
+	struct dupe_extents *d;
+	struct extent *e;
+	unsigned int n = 0;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+
+	/* Three copies of one 8 KiB file, all scanned in this window. */
+	put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 1);
+	put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 1);
+	put_dupe(db, "/tree/c", 3, 7, 8192, 1, 0, 1);
+	/* A file of the same size but a different digest is not a duplicate. */
+	put_dupe(db, "/tree/d", 4, 8, 8192, 1, 0, 1);
+	/* ...and neither is one of the same digest at a different size. */
+	put_dupe(db, "/tree/e", 5, 7, 4096, 1, 0, 1);
+
+	mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+
+	mu_check(res.num_dupes == 1);
+	d = only_group(&res);
+	mu_check(d && d->de_num_dupes == 3);
+	mu_check(d->de_len == 8192);
+
+	list_for_each_entry(e, &d->de_extents, e_list) {
+		mu_check(e->e_loff == 0);
+		mu_check(e->e_poff == 0);	/* no fiemap here, and #186 */
+		n++;
+	}
+	mu_check(n == 3);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/*
+ * Which member becomes the target, and the ranking is the whole point.
+ *
+ * A read-only member wins outright: the kernel will not write into one, so it
+ * has to be the source rather than a destination (#172). Below that, the
+ * least-fragmented member wins, because every copy inherits the target's
+ * fragmentation. Both are read from columns fixed at scan time rather than
+ * probed live, so that every generation window reaches the same answer (#197).
+ */
+MU_TEST(test_the_whole_file_target_prefers_readonly_then_fewest_extents) {
+	struct results_tree res;
+	struct filerec *tgt;
+
+	/* Fewest extents wins, even against a lower id. */
+	{
+		_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+		free_all_filerecs();
+		init_results_tree(&res);
+		put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 9);	/* id 1, ragged */
+		put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 2);	/* id 2, tidiest */
+		put_dupe(db, "/tree/c", 3, 7, 8192, 1, 0, 5);
+		mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+		tgt = target_of(only_group(&res));
+		mu_check(tgt && !strcmp(tgt->filename, "/tree/b"));
+		free_results_tree(&res);
+		free_all_filerecs();
+	}
+
+	/* A read-only member wins even when it is both later and worse. */
+	{
+		_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+		free_all_filerecs();
+		init_results_tree(&res);
+		put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 1);	/* id 1, tidiest */
+		put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 3);
+		put_dupe(db, "/tree/c", 3, 7, 8192, 1,
+			 FILE_RO_SUBVOL, 9);			/* worst, wins */
+		mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+		tgt = target_of(only_group(&res));
+		mu_check(tgt && !strcmp(tgt->filename, "/tree/c"));
+		free_results_tree(&res);
+		free_all_filerecs();
+	}
+
+	/* Everything else equal, the lowest id breaks the tie. */
+	{
+		_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+		free_all_filerecs();
+		init_results_tree(&res);
+		put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 4);
+		put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 4);
+		put_dupe(db, "/tree/c", 3, 7, 8192, 1, 0, 4);
+		mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+		tgt = target_of(only_group(&res));
+		mu_check(tgt && !strcmp(tgt->filename, "/tree/a"));
+		free_results_tree(&res);
+		free_all_filerecs();
+	}
+}
+
+/*
+ * #197 itself: two overlapping generation windows must elect the *same*
+ * target.
+ *
+ * The bug was a window free to choose someone else, so a group spanning passes
+ * converged on one cluster per pass instead of a single extent - and each pass
+ * deduplicated into a file an earlier pass was still relocating. The election
+ * is over every member of the group, not just the window's, which is what makes
+ * the answer window-invariant; a loader that ranked only the rows it loaded
+ * would pass every single-window test and fail this one.
+ */
+MU_TEST(test_every_window_elects_the_same_whole_file_target) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct results_tree first = {0}, second = {0};
+	struct filerec *t1, *t2;
+
+	free_all_filerecs();
+
+	/* The tidiest copy is old; the later windows never see it as new. */
+	put_dupe(db, "/tree/old", 1, 7, 8192, 1, 0, 1);
+	put_dupe(db, "/tree/mid", 2, 7, 8192, 2, 0, 6);
+	put_dupe(db, "/tree/new", 3, 7, 8192, 3, 0, 4);
+
+	init_results_tree(&first);
+	mu_check(dbfile_load_same_files(db, &first, 1, 2) == 0);
+	t1 = target_of(only_group(&first));
+	mu_check(t1 != NULL);
+
+	init_results_tree(&second);
+	mu_check(dbfile_load_same_files(db, &second, 2, 3) == 0);
+	t2 = target_of(only_group(&second));
+	mu_check(t2 != NULL);
+
+	/* Same file, in both - and it is the one outside either window. */
+	mu_check(t1 == t2);
+	mu_check(t1 && !strcmp(t1->filename, "/tree/old"));
+
+	/* Each window loads its own new member plus that target, and nothing
+	 * else: two members, not three. */
+	mu_check(only_group(&first)->de_num_dupes == 2);
+	mu_check(only_group(&second)->de_num_dupes == 2);
+
+	free_results_tree(&first);
+	free_results_tree(&second);
+	free_all_filerecs();
+}
+
+/*
+ * An inlined file is not a group member, not a target, and cannot make a group
+ * exist at all. oans stores no extents for one and the kernel will not
+ * deduplicate it, so a group formed around one is work that can only fail.
+ */
+MU_TEST(test_an_inlined_file_is_never_loaded_as_a_duplicate) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct results_tree res;
+	struct dupe_extents *d;
+	struct extent *e;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+
+	/* Two real copies and one inlined: the inlined one must not appear. */
+	put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 1);
+	put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 1);
+	put_dupe(db, "/tree/inline", 3, 7, 8192, 1, FILE_INLINED, 0);
+	mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+
+	d = only_group(&res);
+	mu_check(d && d->de_num_dupes == 2);
+	list_for_each_entry(e, &d->de_extents, e_list)
+		mu_check(strcmp(e->e_file->filename, "/tree/inline") != 0);
+	free_results_tree(&res);
+
+	/*
+	 * And a pair that is only a pair *because* of the inlined file is no
+	 * group at all: the one real copy has nothing left to be deduplicated
+	 * against, so the group must not exist rather than exist with one
+	 * member.
+	 */
+	{
+		_cleanup_(sqlite3_close_cleanup) struct dbhandle *db2 = memdb();
+
+		free_all_filerecs();
+		init_results_tree(&res);
+		put_dupe(db2, "/t/real", 1, 9, 4096, 1, 0, 1);
+		put_dupe(db2, "/t/inl", 2, 9, 4096, 1, FILE_INLINED, 0);
+		mu_check(dbfile_load_same_files(db2, &res, 0, 1) == 0);
+		mu_check(res.num_dupes == 0);
+		free_results_tree(&res);
+	}
+
+	free_all_filerecs();
+}
+
+/*
+ * dbfile_load_one_filerec() answers "no such file" with success and a NULL
+ * out-parameter, not an error. The dedupe phase calls it for ids it read from
+ * rows that may since have been pruned, so a missing file is ordinary; a
+ * loader returning an error there would abort a whole batch over a file
+ * somebody deleted mid-run.
+ */
+MU_TEST(test_loading_one_filerec_treats_a_missing_id_as_success) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct filerec *f = NULL;
+	int64_t id;
+
+	free_all_filerecs();
+	id = put_dupe(db, "/tree/only", 1, 7, 12288, 1, 0, 1);
+
+	mu_check(dbfile_load_one_filerec(db, id, &f) == 0);
+	mu_check(f != NULL);
+	mu_check(f && !strcmp(f->filename, "/tree/only"));
+	mu_check(f && f->fileid == id);
+	mu_check(f && f->size == 12288);	/* the row's size, not a default */
+
+	/* Absent: success, and the caller's pointer cleared rather than left
+	 * holding whatever it had. */
+	f = (struct filerec *)(uintptr_t)0x1;
+	mu_check(dbfile_load_one_filerec(db, id + 999, &f) == 0);
+	mu_check(f == NULL);
+
+	free_all_filerecs();
+}
+
+/*
+ * Block hashes load into a hash tree, and come out of it sorted.
+ *
+ * The loader ends with sort_file_hash_heads() because find_dupes walks each
+ * file's blocks under a hash expecting increasing offsets. Rows arrive in
+ * whatever order the query yields, so this is the one place that ordering is
+ * established for the dedupe phase - and a fixture whose rows happen to be
+ * stored in ascending order cannot tell the sort from its absence, which is
+ * why these go in deliberately jumbled.
+ */
+MU_TEST(test_block_hashes_load_into_the_tree_in_offset_order) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct hash_tree tree;
+	unsigned char dg[DIGEST_LEN];
+	struct block_csum blocks[3];
+	struct dupe_blocks_list *dl;
+	struct rb_node *n;
+	int64_t a, b;
+
+	free_all_filerecs();
+	init_hash_tree(&tree);
+	digest_of(dg, 3);
+
+	a = put_dupe(db, "/tree/a", 1, 7, 12288, 1, 0, 1);
+	b = put_dupe(db, "/tree/b", 2, 8, 12288, 1, 0, 1);
+
+	/* Deliberately not ascending. */
+	blocks[0].loff = 8192;
+	blocks[1].loff = 0;
+	blocks[2].loff = 4096;
+	for (unsigned int i = 0; i < 3; i++)
+		memcpy(blocks[i].digest, dg, DIGEST_LEN);
+	mu_check(dbfile_store_block_hashes(db, a, 3, blocks) == 0);
+	mu_check(dbfile_store_block_hashes(db, b, 3, blocks) == 0);
+
+	mu_check(dbfile_load_block_hashes(db, &tree, 0, 1) == 0);
+
+	mu_check(tree.num_blocks == 6);
+	mu_check(tree.num_hashes == 1);
+	dl = find_block_list(&tree, dg);
+	mu_check(dl != NULL);
+	mu_check(dl && dl->dl_num_elem == 6);
+
+	/* Both files present, each with its blocks in increasing offset. */
+	{
+		unsigned int heads = 0;
+
+		for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
+			struct file_hash_head *h =
+				rb_entry(n, struct file_hash_head, h_node);
+			struct file_block *blk;
+			uint64_t prev = 0;
+			bool first = true;
+
+			heads++;
+			list_for_each_entry(blk, &h->h_blocks, b_head_list) {
+				mu_check(first || blk->b_loff > prev);
+				prev = blk->b_loff;
+				first = false;
+			}
+			mu_check(prev == 8192);	/* reached the last one */
+		}
+		mu_check(heads == 2);
+	}
+
+	free_hash_tree(&tree);
+	free_all_filerecs();
+}
+
+/*
+ * Extent hashes load as a group per (digest, length), carrying the physical
+ * offset the scan recorded - which is what the extent path needs and the
+ * whole-file path deliberately lacks.
+ *
+ * A group needs two members: one extent with a digest nothing else shares is
+ * not a duplicate of anything, and loading it would put a group into the tree
+ * that the worker can only throw away.
+ */
+MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct results_tree res;
+	struct dupe_extents *d;
+	struct extent *e;
+	unsigned char shared[DIGEST_LEN], lonely[DIGEST_LEN];
+	struct extent_csum ea[2], eb[1];
+	int64_t a, b;
+	unsigned int seen = 0;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(shared, 4);
+	digest_of(lonely, 5);
+
+	a = put_dupe(db, "/tree/a", 1, 7, 65536, 1, 0, 2);
+	b = put_dupe(db, "/tree/b", 2, 8, 65536, 1, 0, 2);
+
+	/* One extent shared between the files, one only file a has. */
+	ea[0].loff = 0;
+	ea[0].poff = 4096;
+	ea[0].len = 4096;
+	memcpy(ea[0].digest, shared, DIGEST_LEN);
+	ea[1].loff = 4096;
+	ea[1].poff = 8192;
+	ea[1].len = 4096;
+	memcpy(ea[1].digest, lonely, DIGEST_LEN);
+	eb[0].loff = 16384;
+	eb[0].poff = 65536;
+	eb[0].len = 4096;
+	memcpy(eb[0].digest, shared, DIGEST_LEN);
+
+	mu_check(dbfile_store_extent_hashes(db, a, 2, ea) == 0);
+	mu_check(dbfile_store_extent_hashes(db, b, 1, eb) == 0);
+
+	mu_check(dbfile_load_extent_hashes(db, &res, 0, 1) == 0);
+
+	/* Only the shared digest makes a group. */
+	mu_check(res.num_dupes == 1);
+	mu_check(res.num_extents == 2);
+	d = only_group(&res);
+	mu_check(d && d->de_len == 4096);
+	mu_check(d && !memcmp(d->de_hash, shared, DIGEST_LEN));
+
+	/* Each member keeps the physical offset its row recorded - the extent
+	 * path reads it to decide what is already shared. */
+	list_for_each_entry(e, &d->de_extents, e_list) {
+		if (e->e_loff == 0)
+			mu_check(e->e_poff == 4096);
+		else if (e->e_loff == 16384)
+			mu_check(e->e_poff == 65536);
+		else
+			mu_check(false);	/* an offset nobody stored */
+		seen++;
+	}
+	mu_check(seen == 2);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -4546,6 +4974,13 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_filerec_holds_one_descriptor_however_often_it_is_opened);
 	MU_RUN_TEST(test_filerec_open_once_opens_each_file_exactly_once);
 	MU_RUN_TEST(test_prop_a_filerec_token_is_found_by_its_filerec);
+	MU_RUN_TEST(test_whole_file_dupes_load_with_their_target_first);
+	MU_RUN_TEST(test_the_whole_file_target_prefers_readonly_then_fewest_extents);
+	MU_RUN_TEST(test_every_window_elects_the_same_whole_file_target);
+	MU_RUN_TEST(test_an_inlined_file_is_never_loaded_as_a_duplicate);
+	MU_RUN_TEST(test_loading_one_filerec_treats_a_missing_id_as_success);
+	MU_RUN_TEST(test_block_hashes_load_into_the_tree_in_offset_order);
+	MU_RUN_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
