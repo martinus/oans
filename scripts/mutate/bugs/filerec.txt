@@ -1,0 +1,52 @@
+# file: src/filerec.c
+#
+# Invariants of the in-memory dedupe model, each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/filerec.txt
+#
+# Like the hashfile's, every one of these fails *silently*. The trees decide
+# what oans compares and what it opens; nothing downstream validates them, so a
+# count that drifts or a group that collapses early just means a run that
+# deduplicates less than it should and says nothing at all.
+#
+# Pure memory, no filesystem - except the two file-descriptor blocks, which use
+# a temp file the test makes for itself.
+
+# the descriptor is closed on every filerec_close
+# The dedupe phase opens one file from several groups at once, so an inner
+# close must not pull the descriptor out from under the outer holder. The
+# counter still reaches zero either way; what breaks is that reads through the
+# fd start failing in the middle of a batch.
+<<<
+	file->fd_refs--;
+
+	if (file->fd_refs == 0) {
+		close(file->fd);
+		file->fd = -1;
+	}
+===
+	file->fd_refs--;
+	close(file->fd);
+	file->fd = -1;
+>>>
+
+# open_once forgets what it has already opened
+# Every member of a group is then opened once per group it appears in, while
+# the close list only ever releases one reference each - so a long dedupe run
+# leaks descriptors until it hits the process limit, having deduplicated
+# correctly right up to that point.
+<<<
+	if (find_filerec_token_rb(&open_files->root, file))
+		return 0;
+
+===
+>>>
+
+# a filerec keeps its place in the lookup tree after it is freed
+# filerec_find() then returns a pointer into freed memory. Nothing here
+# crashes: the node's contents survive long enough to look plausible.
+<<<
+		if (!RB_EMPTY_NODE(&file->fileid_node))
+			rb_erase(&file->fileid_node, &filerec_by_fileid);
+===
+>>>

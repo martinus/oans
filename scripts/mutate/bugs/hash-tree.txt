@@ -1,0 +1,50 @@
+# file: src/hash-tree.c
+#
+# Invariants of the in-memory dedupe model, each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/hash-tree.txt
+#
+# Like the hashfile's, every one of these fails *silently*. The trees decide
+# what oans compares and what it opens; nothing downstream validates them, so a
+# count that drifts or a group that collapses early just means a run that
+# deduplicates less than it should and says nothing at all.
+#
+# Pure memory, no filesystem - except the two file-descriptor blocks, which use
+# a temp file the test makes for itself.
+
+# removing the last block of a digest no longer says so
+# The return value is how find_dupes learns the list is gone. Answer 0 and the
+# caller keeps walking a list that has just been freed - which is a
+# use-after-free that the counters, being correct, do nothing to reveal.
+<<<
+		free_dupe_blocks_list(blocklist);
+		ret = 1;
+===
+		free_dupe_blocks_list(blocklist);
+>>>
+
+# a drained file's hash head is left behind
+# The head is freed when that file's sublist empties, which with one file in
+# the group coincides with the whole list being freed - so this leaks only when
+# several files share a digest, and only a multi-file fixture can see it.
+<<<
+	head = find_file_hash_head(blocklist, file);
+	if (head && list_empty(&head->h_blocks))
+		free_one_hash_head(blocklist, head);
+===
+>>>
+
+# only the first block list gets its heads sorted
+# find_dupes requires increasing offsets per file, and the blocks arrive that
+# way only because the scan happens to produce them so. Sorting one list looks
+# right in any fixture that uses a single digest.
+<<<
+	for (dups_node = rb_first(&tree->root); dups_node;
+	     dups_node = rb_next(dups_node)) {
+===
+	for (dups_node = rb_first(&tree->root); dups_node;
+	     dups_node = NULL) {
+>>>
+
+# ---------------------------------------------------------------- filerecs
+

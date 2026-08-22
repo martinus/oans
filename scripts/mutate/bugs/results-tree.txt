@@ -1,0 +1,70 @@
+# file: src/results-tree.c
+#
+# Invariants of the in-memory dedupe model, each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/results-tree.txt
+#
+# Like the hashfile's, every one of these fails *silently*. The trees decide
+# what oans compares and what it opens; nothing downstream validates them, so a
+# count that drifts or a group that collapses early just means a run that
+# deduplicates less than it should and says nothing at all.
+#
+# Pure memory, no filesystem - except the two file-descriptor blocks, which use
+# a temp file the test makes for itself.
+#
+# Invariants of the in-memory dedupe model, each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/dedupe-model.txt
+#
+# Like the hashfile's, every one of these fails *silently*. The trees decide
+# what oans compares and what it opens; nothing downstream validates them, so a
+# count that drifts or a group that collapses early just means a run that
+# deduplicates less than it should and says nothing at all.
+#
+# These need no filesystem: the model is pure memory, and the two file-
+# descriptor blocks use a temp file the test makes for itself.
+
+# ---------------------------------------------------------------- grouping
+
+# the pair-wise insert reads its length as exclusive
+# endoff is inclusive, and the length keys the group - so one byte short files
+# every pair under a length no other extent will ever be filed under. The pair
+# still becomes a group, so nothing is empty and nothing errors; those two
+# extents simply never meet the rest of their duplicates.
+<<<
+	uint64_t len = endoff[0] - startoff[0] + 1;
+===
+	uint64_t len = endoff[0] - startoff[0];
+>>>
+
+# a group of one is left in the tree instead of collapsing
+# There is nothing for a lone extent to be deduplicated against, so dropping to
+# one member has to take that member too. Leaving it behind strands an extent
+# in a group that can never be acted on, and the counters still add up.
+<<<
+	if (p->de_num_dupes == 1) {
+		/* It doesn't make sense to have one extent in a dup
+		 * list. */
+		abort_on(RB_EMPTY_ROOT(&p->de_extents_root));/* logic error */
+
+		n = rb_first(&p->de_extents_root);
+		extent = rb_entry(n, struct extent, e_node);
+		goto again;
+	}
+===
+>>>
+
+# the anchor flag is assigned rather than latched
+# A group spanning several dedupe passes must keep the target the first pass
+# chose, or each pass converges the copies onto a different physical extent and
+# the run never settles. The mutation only shows if a *later* member arrives
+# without the flag, which is the shape a test has to be written for.
+<<<
+	if (is_anchor)
+		dext->de_anchored = true;
+===
+	dext->de_anchored = is_anchor;
+>>>
+
+# ---------------------------------------------------------------- hash tree
+
