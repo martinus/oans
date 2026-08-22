@@ -198,6 +198,13 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     line, and the caller's comes after). A `--make-arg SANITIZE=...` run is
     unaffected either way — the makefile appends its own `-O1 -fsanitize=...`
     through `override CFLAGS +=`, which lands last and wins.
+  - **Validated over a whole file, not a sample.** `src/dbfile.c` swept at both
+    settings: 908 survivors at `-O2`, 901 at `-O0`, and **17 of 1,879 mutants
+    (0.9%) differ**. Every one of the 17 is a *statement deletion* — a removed
+    `return ret;` or assignment, which leaves a function falling off the end or
+    a value uninitialised. That is undefined behaviour, so its observable
+    result depends on codegen and the verdict is not a stable property of the
+    tests under any build. Nothing else moved, in either direction.
 - **Read a survivor count by function, never as a total.** The first sweep of
   `src/util.c` came back 213 survivors of 413 and that number says nothing:
   grouped by function it was 5-9% survival everywhere a test existed
