@@ -11,6 +11,10 @@ unit binary `./test`, and make builds the lanes.
     scripts/mutate/mutate.py --file src/glob.c --diff   # whatever is uncommitted
     scripts/mutate/mutate.py --file src/fiemap.c --lines 120-190
 
+**Lanes build at `-O0`** (see MUTANT_CFLAGS), which is 3.7x faster per mutant
+than the makefile's shipping flags and scores the same verdicts. Pass
+`--make-arg CFLAGS=...` to override it.
+
 **The target is any C file, and `--file` is how you say which.** oans is not a
 single-header library, so unlike the other two projects that vendor this core
 there is no one file that is obviously *the* code. The default is only a default;
@@ -67,6 +71,41 @@ def bug_file_target(path):
     return m.group(1) if m else None
 
 
+#: What a lane compiles with, unless the caller says otherwise.
+#:
+#: A mutant is one compile of `src/tests.c`, which `#include`s 24 sources - some
+#: 20,000 lines in a single translation unit, with no incremental build to be had
+#: and nothing for ccache to hit, since every mutant is a preprocessed source
+#: nothing has ever seen. That compile *is* the run. Measured on this tree,
+#: interleaved: `-O2 -ggdb` plus release hardening is 5.6 s and `-O0` without
+#: debug info is 1.3 s, while the suite itself goes only 0.24 s -> 0.30 s. So a
+#: mutant costs 5.84 s by default and 1.60 s here - 3.7x, or a whole-file sweep
+#: in 13 minutes instead of 49.
+#:
+#: The warning flags stay. They cost nothing and dropping them would move
+#: mutants between `compiler` and the verdicts that are about the tests, which
+#: is the one comparison this tool exists to make.
+MUTANT_CFLAGS = ("-Wall -Wextra -Wno-unused-parameter -std=gnu11 "
+                 "-Werror=strict-prototypes -MMD -O0")
+
+
+class OansMake(mutate_core.MakeBackend):
+    """make, told to compile for speed rather than for shipping.
+
+    Only the default changes: `--make-arg CFLAGS=...` still wins, because make
+    takes the last assignment on the command line and the caller's arguments
+    come after this one. A `--make-arg SANITIZE=...` run is unaffected too - the
+    makefile appends its own `-O1 -fsanitize=...` through `override CFLAGS +=`,
+    which lands after this and therefore wins.
+    """
+
+    def setup_args(self, args):
+        supplied = super().setup_args(args)
+        if any(a.startswith("CFLAGS=") for a in supplied):
+            return supplied
+        return ["CFLAGS=" + MUTANT_CFLAGS] + supplied
+
+
 class Oans(mutate_core.Project):
     slug = "oans"
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -89,7 +128,7 @@ class Oans(mutate_core.Project):
     # `test-build` and not `test`: the latter builds *and runs* the binary, so a
     # mutant the suite caught would exit nonzero at the build step and be scored
     # `compiler` - the compiler credited with protection the tests provided.
-    backend = mutate_core.MakeBackend("test-build")
+    backend = OansMake("test-build")
     harness = mutate_core.MinunitHarness()
 
     compiler_env = "CC"
@@ -107,12 +146,13 @@ class Oans(mutate_core.Project):
     # Measured: ~4 MB of sources, ~13 MB once built (one binary with -ggdb).
     lane_bytes = 24 * mutate_core.MIB
 
-    # Measured on this tree, gcc 13 at -O2: one mutant is 4.4 s of compiling
-    # `src/tests.c`, 0.5 s to link and 0.004 s to run the suite. Nearly all of
-    # it is one serial compile inside one lane, so the lanes divide it and the
+    # Measured on this tree with MUTANT_CFLAGS: one mutant is ~1.3 s of
+    # compiling and linking `src/tests.c` and 0.3 s to run the suite. Nearly all
+    # of it is one serial compile inside one lane, so the lanes divide it and the
     # machine does not - the same shape as nanobench and the opposite of
-    # unordered_dense's ~90 translation units.
-    lane_seconds_per_mutant = 5.0
+    # unordered_dense's ~90 translation units. At the makefile's own -O2 this
+    # figure is 5.8; pass `--make-arg CFLAGS=...` and --dry-run will read low.
+    lane_seconds_per_mutant = 1.6
     overhead_seconds_per_mutant = 0.3
     setup_seconds = 8.0
     setup_seconds_per_lane = 0.2

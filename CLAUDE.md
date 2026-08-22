@@ -180,10 +180,31 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   edit it here — change it there, run that suite, re-copy into all three and
   update each `mutate_core.sha256`. `make lint` fails if this copy has drifted.
   Only `scripts/mutate/mutate.py` (the ~130-line adapter) is oans's.
-- A mutant costs one compile of `src/tests.c` (~4.5 s) — every source is
-  `#include`d into it, so there is no incremental build and ccache cannot help.
-  The `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of
-  that.
+- **A mutant costs one compile of `src/tests.c`** — every source is `#include`d
+  into it, so ~20,000 lines in one translation unit, no incremental build, and
+  nothing for ccache to hit since each mutant is a preprocessed source nothing
+  has ever seen. That compile *is* the run: the suite itself is 0.3 s. The
+  `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of a
+  build.
+  - **The lanes therefore build at `-O0`** (`MUTANT_CFLAGS` in the adapter),
+    which is the single biggest lever there is. Measured, interleaved: the
+    makefile's shipping flags (`-O2 -ggdb` plus hardening) compile in 5.6 s
+    against 1.3 s, while the suite goes only 0.24 s → 0.30 s — so a mutant is
+    **5.84 s → 1.60 s, 3.7×**, and a whole-file sweep of `src/dbfile.c` is 22
+    minutes instead of 49. The warning flags stay: dropping them would move
+    mutants between `compiler` and the verdicts that are about the tests, which
+    is the one comparison this tool exists to make.
+  - `--make-arg CFLAGS=...` overrides it (make takes the last assignment on the
+    line, and the caller's comes after). A `--make-arg SANITIZE=...` run is
+    unaffected either way — the makefile appends its own `-O1 -fsanitize=...`
+    through `override CFLAGS +=`, which lands last and wins.
+  - **Validated over a whole file, not a sample.** `src/dbfile.c` swept at both
+    settings: 908 survivors at `-O2`, 901 at `-O0`, and **17 of 1,879 mutants
+    (0.9%) differ**. Every one of the 17 is a *statement deletion* — a removed
+    `return ret;` or assignment, which leaves a function falling off the end or
+    a value uninitialised. That is undefined behaviour, so its observable
+    result depends on codegen and the verdict is not a stable property of the
+    tests under any build. Nothing else moved, in either direction.
 - **Read a survivor count by function, never as a total.** The first sweep of
   `src/util.c` came back 213 survivors of 413 and that number says nothing:
   grouped by function it was 5-9% survival everywhere a test existed
@@ -205,6 +226,52 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   from `<=` because `v >= 1024.0` fails first, UINT64_MAX being 16 EiB. Check
   the equivalents rather than assuming them: three that looked equivalent were
   not, and one of those wrote a byte past a buffer.
+
+### The hashfile is unit-testable, in memory
+
+`dbfile_open_handle(NULL)` opens a shared-cache in-memory SQLite - the same path
+a run without `--hashfile` takes - so `dbfile.c` needs no filesystem, no btrfs
+and no scan to test. That is not a test-only seam; it is the in-memory mode
+oans already ships. Coverage went 0% → 47% on eight tests, and a whole-file
+sweep from **901 survivors to 785**.
+
+- **`memdb()` handles all share one database.** Shared-cache in-memory means a
+  second `dbfile_open_handle(NULL)` is the *same* database, not an empty one -
+  so "what does this answer against a fresh hashfile" has to be asked before
+  the test stores anything, and a test that opens a second handle expecting a
+  clean slate silently asserts against the first one's rows.
+- **Read the survivors by function here too, and twice it changed the fix.**
+  `dbfile_get_run_summary` barely moved on the second sweep, 22 → 21, and the
+  grouping said why: its five error buckets are adjacent columns read by
+  index, and the fixture had three of them at 0 - indistinguishable from each
+  other *and* from a read that was dropped. Distinct values fixed it.
+  `dbfile_load_scan_config` still let `mfs = 0` be deleted, because the
+  fixture deleted *both* size-limit keys; the two limits are read through one
+  scratch variable, so only deleting the additive one exposes `max` silently
+  becoming `min`. In both cases the test looked thorough and the number said
+  otherwise.
+- **A `perror_sqlite` + `goto out` pair is residue, not a hole.** After the
+  strengthening, all ten of `dbfile_describe_file`'s remaining survivors are
+  that shape - a bind or step failure no unit test can provoke. Triage to
+  that point and stop; the next honest move is a fault-injection seam, not a
+  bigger fixture.
+
+- **What is worth testing there is what fails silently.** A hashfile is a cache,
+  so nothing downstream validates it: a row that vanished, a digest copied from
+  the wrong donor and a replay that adopted a dead default all produce a run
+  that exits 0 and looks exactly like a correct one. `bugs/dbfile.txt` puts
+  eight of those back.
+- **Three API shapes that a test gets wrong first.** `dbfile_store_file_info()`
+  writes no digest - `dbfile_update_scanned_file()` does, and the digest is
+  precisely what tells a finished file from one an interrupted run left partway,
+  so a helper that skips it builds rows the startup prune deletes.
+  `dbfile_load_scan_config()` returns **1** for "a config was stored" and 0 for
+  "none", so `== 0` reads success as failure. And `dbfile_load_checkpoint()`
+  *copies into buffers the caller owns* - a zeroed `struct scan_checkpoint` is a
+  write through NULL, which is now said in the header.
+- **`mu_check()` cannot be used in a helper that returns a value.** It expands
+  to a bare `return;`; gcc warns, clang refuses. Conditions that mean "the test
+  itself is broken" `abort()` instead, the way `gs_hit()` already did.
 
 ### `src/proptest.h` — properties, not tables
 
@@ -261,6 +328,21 @@ counterexample. No dependencies, one header, minunit-compatible.
   the named-bug files they earn their place differently again — leaving the
   fiemap address set unsorted is caught by nothing else. Expect that
   unevenness rather than a uniform number.
+  - The three **hashfile** properties are the same story a third time:
+    `src/dbfile.c` swept with and without them is **786 survivors → 785**,
+    one mutant. That one is worth the three, though - `i > 0` → `i > 1` in
+    `dbfile_layout_matches`, i.e. *a donor with exactly one stored extent
+    stops matching*. Every fixture in the table has two records, so nothing
+    there could see it, and a single-extent file is the common case: btrfs
+    reports a contiguously allocated file as one fiemap record however large
+    it is. A snapshot-aware scan would have silently stopped copying
+    anything on the most ordinary layout there is.
+  - **And the sweep cannot score one of them at all.** "Normalize adjacent
+    records before comparing" - the #186 confusion, and what
+    `test_prop_a_split_record_is_not_the_layout_it_covers` exists to refuse -
+    is a design change, not a single-token edit or a statement deletion, so
+    no operator generates it. Read a property's `caught` count as a lower
+    bound on what it guards, never as the measure.
 
 ## Profiling & measurement — read before optimizing
 
