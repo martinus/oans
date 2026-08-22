@@ -4689,17 +4689,33 @@ MU_TEST(test_an_inlined_file_is_never_loaded_as_a_duplicate) {
 	struct results_tree res;
 	struct dupe_extents *d;
 	struct extent *e;
+	unsigned char solo[DIGEST_LEN];
 	int64_t inlined;
 
 	free_all_filerecs();
 	init_results_tree(&res);
+	digest_of(solo, 9);
 
 	/* Two real copies and one inlined, all the same digest and size. */
 	put_dupe(db, "/tree/a", 1, 7, 8192, 1, 0, 1);
 	put_dupe(db, "/tree/b", 2, 7, 8192, 1, 0, 1);
 	inlined = put_dupe(db, "/tree/inline", 3, 7, 8192, 1, FILE_INLINED, 0);
 
+	/*
+	 * And a pair that is a pair *only* because of the inlined file. The
+	 * group must not exist at all: excluding the inlined file from the
+	 * membership but not from the count leaves a group of one real copy,
+	 * which has nothing to be deduplicated against and whose work figure
+	 * is zero. A fixture with two real copies cannot see that, because the
+	 * group qualifies on them alone.
+	 */
+	put_dupe(db, "/tree/solo", 4, 9, 4096, 1, 0, 1);
+	put_dupe(db, "/tree/solo-inl", 5, 9, 4096, 1, FILE_INLINED, 0);
+
 	mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+
+	mu_check(res.num_dupes == 1);		/* the digest-7 group, only */
+	mu_check(find_dupe_extents(&res, solo, 4096) == NULL);
 
 	d = only_group(&res);
 	mu_check(d->de_num_dupes == 2);
@@ -4885,6 +4901,143 @@ MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
 	free_all_filerecs();
 }
 
+/*
+ * The extents of one file that nothing else in the hashfile shares.
+ *
+ * `--dedupe-options=partial` asks this for each file, then searches those
+ * extents block by block for matches the extent-level pass could not see. So
+ * an extent wrongly included is work the search can only waste, and one
+ * wrongly excluded is a duplicate nobody ever finds - and neither shows up
+ * anywhere, since both produce a run that exits 0 having deduplicated slightly
+ * less than it could.
+ *
+ * The uniqueness test is over the *whole* extents table, not the file: an
+ * extent shared with any other file, including one outside this run's windows,
+ * is not a candidate.
+ */
+MU_TEST(test_nondupe_extents_are_the_ones_nothing_else_shares) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	_cleanup_(freep) struct file_extent *got = NULL;
+	struct filerec *f;
+	unsigned char uniq[DIGEST_LEN], shared[DIGEST_LEN];
+	struct extent_csum mine[3], theirs[1];
+	unsigned int n = 99;
+	int64_t a, b;
+
+	free_all_filerecs();
+	a = put_dupe(db, "/tree/a", 1, 7, 65536, 1, 0, 3);
+	b = put_dupe(db, "/tree/b", 2, 8, 65536, 1, 0, 1);
+	f = filerec_new("/tree/a", a, 65536);
+	if (!f)
+		abort();
+	digest_of(uniq, 11);
+	digest_of(shared, 12);
+
+	/* Two of a's extents are unique; the middle one is also in b. */
+	mine[0].loff = 0;      mine[0].poff = 4096;  mine[0].len = 4096;
+	memcpy(mine[0].digest, uniq, DIGEST_LEN);
+	mine[1].loff = 4096;   mine[1].poff = 8192;  mine[1].len = 4096;
+	memcpy(mine[1].digest, shared, DIGEST_LEN);
+	mine[2].loff = 8192;   mine[2].poff = 16384; mine[2].len = 8192;
+	digest_of(mine[2].digest, 13);
+	theirs[0].loff = 0;    theirs[0].poff = 32768; theirs[0].len = 4096;
+	memcpy(theirs[0].digest, shared, DIGEST_LEN);
+
+	mu_check(dbfile_store_extent_hashes(db, a, 3, mine) == 0);
+	mu_check(dbfile_store_extent_hashes(db, b, 1, theirs) == 0);
+
+	mu_check(dbfile_load_nondupe_file_extents(db, f, &got, &n) == 0);
+	mu_check(n == 2);		/* the shared one is not a candidate */
+	mu_check(got != NULL);
+
+	/* All three columns, paired - a loader reading len where poff is
+	 * returns the right number of extents describing the wrong bytes. */
+	mu_check(got[0].loff == 0 && got[0].poff == 4096 && got[0].len == 4096);
+	mu_check(got[1].loff == 8192 && got[1].poff == 16384 && got[1].len == 8192);
+
+	free_all_filerecs();
+}
+
+/*
+ * More extents than the array starts with, so the geometric growth runs.
+ *
+ * It begins at 16 and doubles, and the count is the only thing that says how
+ * much of the buffer is live - so a growth that loses the tail, or an index
+ * that runs past it, is invisible below 17 extents. Deliberately just over two
+ * doublings.
+ */
+MU_TEST(test_nondupe_extents_grow_past_the_initial_capacity) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	_cleanup_(freep) struct file_extent *got = NULL;
+	struct filerec *f;
+	struct extent_csum ext[40];
+	unsigned int n = 0;
+	int64_t a;
+
+	free_all_filerecs();
+	a = put_dupe(db, "/tree/a", 1, 7, 1u << 20, 1, 0, 40);
+	f = filerec_new("/tree/a", a, 1u << 20);
+	if (!f)
+		abort();
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(ext); i++) {
+		ext[i].loff = i * 4096;
+		ext[i].poff = (i + 100) * 4096;
+		ext[i].len = 4096;
+		digest_of(ext[i].digest, 100 + i);	/* all distinct */
+	}
+	mu_check(dbfile_store_extent_hashes(db, a, ARRAY_SIZE(ext), ext) == 0);
+
+	mu_check(dbfile_load_nondupe_file_extents(db, f, &got, &n) == 0);
+	mu_check(n == ARRAY_SIZE(ext));
+
+	/* Every one of them, at its own offsets: a lost tail would still leave
+	 * a plausible array of a plausible length. */
+	for (unsigned int i = 0; i < n; i++) {
+		mu_check(got[i].loff == i * 4096);
+		mu_check(got[i].poff == (i + 100) * 4096);
+		mu_check(got[i].len == 4096);
+	}
+
+	free_all_filerecs();
+}
+
+/*
+ * A file whose every extent is shared has no candidates, and says so with a
+ * count of zero rather than by leaving the caller's count untouched -
+ * find_dupes tests `!num_extents` before it looks at the array.
+ */
+MU_TEST(test_a_file_with_nothing_unique_yields_no_nondupe_extents) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	_cleanup_(freep) struct file_extent *got = NULL;
+	struct filerec *f;
+	unsigned char dg[DIGEST_LEN];
+	struct extent_csum mine[1], theirs[1];
+	unsigned int n = 99;			/* must be overwritten */
+	int64_t a, b;
+
+	free_all_filerecs();
+	a = put_dupe(db, "/tree/a", 1, 7, 4096, 1, 0, 1);
+	b = put_dupe(db, "/tree/b", 2, 8, 4096, 1, 0, 1);
+	f = filerec_new("/tree/a", a, 4096);
+	if (!f)
+		abort();
+	digest_of(dg, 21);
+
+	mine[0].loff = 0;   mine[0].poff = 4096;  mine[0].len = 4096;
+	memcpy(mine[0].digest, dg, DIGEST_LEN);
+	theirs[0].loff = 0; theirs[0].poff = 8192; theirs[0].len = 4096;
+	memcpy(theirs[0].digest, dg, DIGEST_LEN);
+	mu_check(dbfile_store_extent_hashes(db, a, 1, mine) == 0);
+	mu_check(dbfile_store_extent_hashes(db, b, 1, theirs) == 0);
+
+	mu_check(dbfile_load_nondupe_file_extents(db, f, &got, &n) == 0);
+	mu_check(n == 0);
+	mu_check(got == NULL);		/* nothing allocated, nothing to free */
+
+	free_all_filerecs();
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -4999,6 +5152,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_loading_one_filerec_treats_a_missing_id_as_success);
 	MU_RUN_TEST(test_block_hashes_load_into_the_tree_in_offset_order);
 	MU_RUN_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets);
+	MU_RUN_TEST(test_nondupe_extents_are_the_ones_nothing_else_shares);
+	MU_RUN_TEST(test_nondupe_extents_grow_past_the_initial_capacity);
+	MU_RUN_TEST(test_a_file_with_nothing_unique_yields_no_nondupe_extents);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run

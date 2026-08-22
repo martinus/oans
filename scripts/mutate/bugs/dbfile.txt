@@ -235,3 +235,83 @@
 	cp->size = sqlite3_column_int64(stmt, 2);
 	cp->mtime = sqlite3_column_int64(stmt, 1);
 >>>
+
+# ---------------------------------------------------------------- loaders
+
+# a read-only member stops being preferred as the target
+# The kernel will not write into a read-only subvolume, so such a member has to
+# be the source rather than a destination. Rank it like any other and the
+# dedupe simply fails on every group that has one - having read every byte
+# first.
+<<<
+"			order by (flags & 2) desc, nr_extents, id) rn "	\
+===
+"			order by nr_extents, id) rn "			\
+>>>
+
+# the target is elected by lowest id rather than least fragmented
+# Every copy inherits the target's fragmentation, so deduping a group against
+# its most shredded member leaves all of them shredded - measured roughly
+# linear in the target's extent count. Nothing reports it; the run succeeds and
+# the tree is quietly worse laid out than before.
+<<<
+"			order by (flags & 2) desc, nr_extents, id) rn "	\
+===
+"			order by (flags & 2) desc, id) rn "		\
+>>>
+
+# an inlined file is loaded as a duplicate member
+# oans stores no extents for an inlined file and the kernel declines to
+# deduplicate it, so every group formed around one is work that can only fail.
+<<<
+"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
+===
+"	where dedupe_seq <= ?2 and (digest, size) in ( "			\
+>>>
+
+# the anchor flag never reaches the group
+# The one C statement in the loader that exists for #197. Nothing reads the
+# flag today (#237), so this survives everything except a test that asserts it
+# - which is the point: it is how the disconnection would be noticed.
+<<<
+		ret = insert_one_result(res, digest, file, 0, size, 0, is_anchor);
+===
+		ret = insert_one_result(res, digest, file, 0, size, 0, false);
+>>>
+
+# block hashes reach find_dupes in whatever order the query yielded
+# GET_DUPLICATE_BLOCKS orders by fileid, not by offset, and the hash heads are
+# appended in arrival order - so this is the only place the ordering find_dupes
+# requires is established.
+<<<
+	sort_file_hash_heads(hash_tree);
+
+===
+>>>
+
+# a missing fileid is reported as an error rather than as no file
+# The dedupe phase asks about ids from rows that may have been pruned since,
+# so a missing file is ordinary. Returning an error there aborts a whole batch
+# over one file somebody deleted mid-run.
+<<<
+	if (ret == SQLITE_DONE) {
+		dprintf("dbfile_load_one_filerec: no file found in hashdb: fileid = %lu\n", fileid);
+		return 0;
+	}
+===
+	if (ret == SQLITE_DONE)
+		return ENOENT;
+>>>
+
+# the nondupe scan keeps extents another file also has
+# --dedupe-options=partial searches these block by block for matches the
+# extent pass missed. Include the shared ones and every one of them is
+# rediscovered as a duplicate of something already handled: pure wasted search,
+# reported as nothing at all.
+<<<
+"(SELECT 1 FROM extents as e where e.digest = extents.digest "		\
+"and e.rowid <> extents.rowid);"
+===
+"(SELECT 1 FROM extents as e where e.digest = extents.digest "		\
+"and e.rowid = extents.rowid);"
+>>>
