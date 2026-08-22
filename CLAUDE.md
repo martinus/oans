@@ -169,10 +169,17 @@ counterexample. No dependencies, one header, minunit-compatible.
   The glob properties compile a `GRegex` per pattern, which is nearly all of
   what they cost, so they try `PROP_GLOB_PATHS` paths per compile. The whole
   suite is ~0.3 s for ~1M assertions; keep it there.
-- **They are not a replacement for the tables and did not behave like one.**
-  Written for #202's escaping they found nothing the fixed tests had missed;
-  written for `fiemap_phys_set` they were the *only* thing that caught leaving
-  the address set unsorted. Expect that unevenness rather than a uniform lift.
+- **They are not a replacement for the tables, and the lift is uneven.**
+  Measured, same 413-mutant sweep of `src/util.c` with the properties removed
+  and restored: **213 survivors → 203**, and every one of the ten is a
+  `survived → caught` in `sanitize_ctrl`'s buffer arithmetic — the truncation
+  boundary, which needs a buffer that runs out at each possible offset and so
+  is exactly what a hand-written table does not cover. The same A/B over
+  `src/glob.c` (305 mutants) gained **nothing**: two mutants moved, both from
+  `caught`/`survived` to `hang`, purely because the suite had got slower. On
+  the named-bug files they earn their place differently again — leaving the
+  fiemap address set unsorted is caught by nothing else. Expect that
+  unevenness rather than a uniform number.
 
 ## Profiling & measurement — read before optimizing
 

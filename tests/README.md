@@ -124,9 +124,13 @@ goes looking and prints the seed it chose, and a failure names the seed and case
 number to replay. `src/proptest.h`'s header comment has the rest, including why
 there is no shrinking and what that costs.
 
-Neither kind replaces the other. Writing the properties for #202's escaping
-found nothing the fixed tests had missed; writing them for `fiemap_phys_set`
-found that leaving the address set unsorted was caught by nothing at all.
+Neither kind replaces the other, and the properties do not lift everything
+equally. Measured with `scripts/mutate/mutate.py` over `src/util.c`, the same
+413 mutants with the properties removed and restored: 213 survivors → 203, all
+ten of them in `sanitize_ctrl`'s truncation arithmetic, which needs a buffer
+that runs out at each possible offset. Over `src/glob.c` they gained nothing at
+all. And writing them for `fiemap_phys_set` found that leaving the address set
+unsorted was caught by nothing whatsoever.
 
 ## Notes
 
