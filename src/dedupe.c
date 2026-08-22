@@ -556,18 +556,51 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
  * another filesystem gains the ioctl, so filesystems it does not name are now
  * asked directly rather than assumed hopeless.
  *
- * The question is asked with a zero-length dedupe request, which changes
- * nothing: a filesystem with no remap_file_range is refused with EOPNOTSUPP
- * before the kernel touches anything, and elsewhere zero bytes is a no-op.
- * Unlike FICLONERANGE, a zero src_length does *not* mean "to end of file" for
- * FIDEDUPERANGE, so this cannot accidentally share data. Measured on ext4: a
- * zero-length request and a real one both return EOPNOTSUPP, and the file is
- * untouched.
+ * The question is a real, block-sized request rather than a zero-length one,
+ * and the answer is read from BOTH the ioctl return and the per-destination
+ * status. Measured, on a container's overlayfs over ext4:
+ *
+ *	zero-length	rc=0			(overlayfs answers for itself)
+ *	4K request	rc=0, status=-EINVAL	(the lower fs refuses)
+ *
+ * against plain ext4, where every shape returns rc=-1/EOPNOTSUPP. A stacking
+ * filesystem implements remap_file_range as a pass-through, so a zero-length
+ * request never reaches the storage underneath and it answers yes for a
+ * filesystem that cannot dedupe a single byte. Reading only errno therefore
+ * accepts every containerised run on an overlay root, which then hashes the
+ * whole tree and fails at dedupe time -- exactly the behaviour refusing
+ * unsupported filesystems upfront exists to prevent.
+ *
+ * The cost of a real request is that on a filesystem that *does* support
+ * dedupe, the two ranges may turn out identical and get shared. That is a
+ * genuine dedupe of one block within one file, byte-verified by the kernel
+ * like any other: it cannot change the file's contents, size or mtime, and it
+ * only ever happens when the answer is yes -- that is, when oans is about to
+ * deduplicate this tree anyway. test_fs_probe.py pins the file being left
+ * alone.
  */
-enum dedupe_support dedupe_classify_probe(int rc, int err)
+
+/* Probe with a block-sized range, and never more than this. Large enough to
+ * survive a filesystem rounding the length down to its block size (64K blocks
+ * exist), small enough that any ordinary file can host two of them. */
+#define DEDUPE_PROBE_LEN_MAX	(64 * 1024)
+#define DEDUPE_PROBE_LEN_MIN	4096
+
+enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status)
 {
-	if (rc == 0)
-		return DEDUPE_SUPPORT_YES;
+	if (rc == 0) {
+		/*
+		 * The ioctl was dispatched; the verdict for this destination is
+		 * in status. Zero is FILE_DEDUPE_RANGE_SAME and 1 is
+		 * FILE_DEDUPE_RANGE_DIFFERS -- both mean the filesystem did the
+		 * work and compared the bytes, which is all we are asking.
+		 */
+		if (status >= 0)
+			return DEDUPE_SUPPORT_YES;
+		if (status == -EOPNOTSUPP || status == -ENOTTY)
+			return DEDUPE_SUPPORT_NO;
+		return DEDUPE_SUPPORT_UNKNOWN;
+	}
 
 	/*
 	 * An answer about the filesystem: it has no remap_file_range at all
@@ -585,27 +618,40 @@ enum dedupe_support dedupe_classify_probe(int rc, int err)
 	 *
 	 * Refusing to guess is what keeps this safe in both directions: a wrong
 	 * "no" would silently skip someone's whole tree, and a wrong "yes"
-	 * brings back the per-file FIEMAP/dedupe errors the upfront rejection
-	 * exists to avoid. The caller tries the next file instead.
+	 * brings back the per-file dedupe errors the upfront rejection exists
+	 * to avoid. The caller tries the next file instead.
 	 */
 	return DEDUPE_SUPPORT_UNKNOWN;
 }
 
-enum dedupe_support dedupe_probe_fd(int fd)
+enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
 {
 	char buf[sizeof(struct file_dedupe_range) +
 		 sizeof(struct file_dedupe_range_info)] = {0,};
 	struct file_dedupe_range *same = (struct file_dedupe_range *)buf;
+	uint64_t len = size / 2;
 	int rc;
 
+	/*
+	 * Two disjoint ranges of one file: [0, len) against [len, 2 * len).
+	 * One file is all the caller has - the probe runs on whatever the walk
+	 * produced first - and a file too small to hold both simply cannot
+	 * answer.
+	 */
+	if (len > DEDUPE_PROBE_LEN_MAX)
+		len = DEDUPE_PROBE_LEN_MAX;
+	len &= ~((uint64_t)DEDUPE_PROBE_LEN_MIN - 1);	/* whole blocks only */
+	if (len < DEDUPE_PROBE_LEN_MIN)
+		return DEDUPE_SUPPORT_UNKNOWN;
+
 	same->src_offset = 0;
-	same->src_length = 0;
+	same->src_length = len;
 	same->dest_count = 1;
 	same->info[0].dest_fd = fd;
-	same->info[0].dest_offset = 0;
+	same->info[0].dest_offset = len;
 
 	errno = 0;
 	rc = ioctl(fd, FIDEDUPERANGE, same);
 
-	return dedupe_classify_probe(rc, errno);
+	return dedupe_classify_probe(rc, errno, same->info[0].status);
 }

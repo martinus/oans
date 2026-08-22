@@ -2,7 +2,9 @@
 
 btrfs and XFS stay on an allowlist fast path, so their behaviour is exactly
 what it always was. Everything else is asked directly for FIDEDUPERANGE with a
-zero-length request, which changes nothing.
+real block-sized request, reading the per-destination status as well as errno
+(a zero-length request cannot tell a pass-through filesystem like overlayfs
+from one that can really dedupe).
 
 That leaves the accept branch untestable by ordinary means: the only
 filesystems known to answer "yes" are the two that never reach the probe.
@@ -62,12 +64,13 @@ class FsProbeTest(DuperemoveTest):
                          "a forced probe changed what the scan stored")
 
     def test_the_probe_leaves_the_file_alone(self):
-        """A zero-length dedupe must not touch the file it is asked about.
+        """The probe must not change the file it is asked about.
 
-        This is the property that makes probing safe to do on a stranger's
-        data: unlike FICLONERANGE, a zero src_length is not "to end of file"
-        for FIDEDUPERANGE. A regression here would silently share or truncate
-        the first file of every scan on an unrecognised filesystem.
+        It issues a real dedupe request, so on a filesystem that supports the
+        ioctl its two ranges may genuinely be shared -- that is the trade for
+        seeing through a pass-through filesystem. What must never change is
+        what anyone can observe: contents, size, mtime. A regression here would
+        corrupt the first file of every scan on an unrecognised filesystem.
         """
         p = self.mkrand("tree/only.bin", 1 * MiB)
         with open(p, "rb") as f:

@@ -1240,25 +1240,43 @@ MU_TEST(test_running_checksum_rejects_foreign_state) {
 
 
 /*
- * The FIDEDUPERANGE probe's error taxonomy (#224). Worth testing directly and
- * exhaustively: the probe's whole job is turning one errno into a verdict, and
- * which errno a filesystem returns is exactly what a test host cannot vary.
- * Both wrong answers are bad in different ways -- a wrong NO silently skips a
- * whole tree, a wrong YES brings back per-file dedupe errors -- so anything
- * that is not a clear statement about the filesystem must stay UNKNOWN.
+ * The FIDEDUPERANGE probe's answer taxonomy (#224). Worth testing directly and
+ * exhaustively: the probe's whole job is turning one ioctl result into a
+ * verdict, and what a filesystem returns is exactly what a test host cannot
+ * vary. Both wrong answers are bad in different ways -- a wrong NO silently
+ * skips a whole tree, a wrong YES brings back per-file dedupe errors -- so
+ * anything that is not a clear statement about the filesystem stays UNKNOWN.
  */
 MU_TEST(test_dedupe_classify_probe)
 {
-	/* The ioctl went through: the filesystem implements it. */
-	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0));
+	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0, 1));
 	/* errno is meaningless on success and must not be consulted. */
-	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, EINVAL));
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES,
+			 dedupe_classify_probe(0, EINVAL, 0));
 
-	/* Answers about the filesystem. EOPNOTSUPP is what ext4 returns
-	 * (measured); ENOTTY is a kernel that does not know the ioctl. */
+	/*
+	 * A stacking filesystem (overlayfs) answers the ioctl itself and puts
+	 * the lower filesystem's refusal in status, leaving rc and errno clean.
+	 * Measured on overlayfs over ext4: rc=0, status=-EINVAL. Reading only
+	 * errno would accept every containerised run on an overlay root.
+	 */
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(0, 0, -EINVAL));
+	/* A status that does name the filesystem is still an answer. */
 	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
-			 dedupe_classify_probe(-1, EOPNOTSUPP));
-	mu_assert_int_eq(DEDUPE_SUPPORT_NO, dedupe_classify_probe(-1, ENOTTY));
+			 dedupe_classify_probe(0, 0, -EOPNOTSUPP));
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(0, 0, -ENOTTY));
+
+	/* Answers about the filesystem from the ioctl itself. EOPNOTSUPP is
+	 * what ext4 returns (measured); ENOTTY is a kernel that does not know
+	 * the ioctl. status is not filled in when the ioctl fails. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(-1, EOPNOTSUPP, 0));
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(-1, ENOTTY, 0));
 
 	/*
 	 * Answers about this file or this caller. EINVAL is the important one:
@@ -1268,19 +1286,19 @@ MU_TEST(test_dedupe_classify_probe)
 	 * evidence of one awkward file.
 	 */
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EINVAL));
+			 dedupe_classify_probe(-1, EINVAL, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EACCES));
+			 dedupe_classify_probe(-1, EACCES, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EROFS));
+			 dedupe_classify_probe(-1, EROFS, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EPERM));
+			 dedupe_classify_probe(-1, EPERM, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EISDIR));
+			 dedupe_classify_probe(-1, EISDIR, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, EBADF));
+			 dedupe_classify_probe(-1, EBADF, 0));
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
-			 dedupe_classify_probe(-1, ETXTBSY));
+			 dedupe_classify_probe(-1, ETXTBSY, 0));
 }
 
 MU_TEST_SUITE(test_suite) {

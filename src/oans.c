@@ -1679,16 +1679,32 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	}
 
 	/*
-	 * The filesystem was never asked whether it supports FIDEDUPERANGE,
-	 * because no file reached the scanner. Nothing was proved, so say so
-	 * rather than exiting 0 on a filesystem that may well be unusable.
+	 * The walk ended without establishing that this filesystem supports
+	 * FIDEDUPERANGE. Nothing was proved, so say so rather than exiting 0 on
+	 * a filesystem that may well be unusable.
 	 */
-	if (!ret && filescan_fs_probe_unsettled()) {
-		eprintf("Error: no file was available to test whether this "
-			"filesystem supports FIDEDUPERANGE, so oans cannot tell "
-			"whether it can deduplicate here. Deduplication is "
-			"known to work on btrfs and XFS.\n");
-		ret = 1;
+	if (!ret) {
+		unsigned int asked = 0;
+
+		if (filescan_fs_probe_unsettled(&asked)) {
+			if (asked)
+				eprintf("Error: could not determine whether this "
+					"filesystem supports FIDEDUPERANGE - %u "
+					"file(s) were asked and none could "
+					"answer. A stacking filesystem such as "
+					"overlayfs reports its lower "
+					"filesystem's refusal this way. "
+					"Deduplication is known to work on "
+					"btrfs and XFS.\n", asked);
+			else
+				eprintf("Error: no file was available to test "
+					"whether this filesystem supports "
+					"FIDEDUPERANGE, so oans cannot tell "
+					"whether it can deduplicate here. "
+					"Deduplication is known to work on "
+					"btrfs and XFS.\n");
+			ret = 1;
+		}
 	}
 
 	/* Only once the walk actually ran: after a failure every pattern would

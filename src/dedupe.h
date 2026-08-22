@@ -114,17 +114,23 @@ enum dedupe_support {
 };
 
 /*
- * Classify one probe result. Pure, so the taxonomy can be unit-tested against
- * every errno that matters instead of against whichever filesystem the test
- * host happens to have.
+ * Classify one probe result from the ioctl's return and the per-destination
+ * status it fills in. Pure, so the taxonomy can be unit-tested against every
+ * errno that matters instead of against whichever filesystem the test host
+ * happens to have.
+ *
+ * Reading `status` is not optional: a stacking filesystem answers the ioctl
+ * itself and reports the lower filesystem's refusal there, leaving rc and
+ * errno clean (see dedupe_probe_fd).
  */
-enum dedupe_support dedupe_classify_probe(int rc, int err);
+enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status);
 
 /*
- * Ask the filesystem behind `fd` whether it implements FIDEDUPERANGE, without
- * changing anything. `fd` must be open for writing (the ioctl's destination
- * must be writable) and refer to a regular file.
+ * Ask the filesystem behind `fd` whether it implements FIDEDUPERANGE. `fd`
+ * must be open for writing (the ioctl's destination must be writable) and
+ * refer to a regular file of `size` bytes; a file too small to hold two
+ * disjoint ranges cannot answer.
  */
-enum dedupe_support dedupe_probe_fd(int fd);
+enum dedupe_support dedupe_probe_fd(int fd, uint64_t size);
 
 #endif	/* __DEDUPE_H__ */

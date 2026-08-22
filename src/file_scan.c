@@ -1283,14 +1283,17 @@ bool filescan_seed_failed(void)
 }
 
 /*
- * True when a root was locked onto a filesystem oans does not recognise and no
- * file ever reached __scan_file() to settle whether it supports FIDEDUPERANGE
- * -- an empty tree, or one whose every file was excluded or filtered out by
- * size. The walk then ends having proved nothing, and exiting 0 would be the
- * silent no-op the upfront rejection was introduced to prevent.
+ * True when a root was locked onto a filesystem oans does not recognise and the
+ * walk ended without settling whether it supports FIDEDUPERANGE. Either no file
+ * ever reached __scan_file() (an empty tree, or one filtered out by --exclude
+ * or by size), or every file that did declined to answer -- `asked` tells the
+ * two apart, and they need different advice. Exiting 0 having proved nothing
+ * would be the silent no-op the upfront rejection was introduced to prevent.
  */
-bool filescan_fs_probe_unsettled(void)
+bool filescan_fs_probe_unsettled(unsigned int *asked)
 {
+	if (asked)
+		*asked = locked_fs.dedupe_probe_tries;
 	return locked_fs.dedupe_probe_pending;
 }
 
@@ -1927,7 +1930,8 @@ static void seed_checkpointed_files(struct dbhandle *db)
  * A file can fail to answer for reasons of its own, so an inconclusive result
  * moves on to the next file rather than condemning the tree.
  */
-static bool fs_dedupe_probe_settled(const char *path)
+static bool fs_dedupe_probe_settled(const char *path,
+				    const struct statx *st)
 {
 	enum dedupe_support support;
 	_cleanup_(closefd) int fd = -1;
@@ -1936,14 +1940,13 @@ static bool fs_dedupe_probe_settled(const char *path)
 	 * The ioctl's destination must be writable, so this opens O_RDWR -- it
 	 * never writes, and a zero-length request changes nothing. A file we
 	 * cannot open that way (a read-only file, a read-only mount) simply
-	 * cannot answer; that is one of the inconclusive cases below. Empty
-	 * files are asked too: a zero-length request does not care about the
-	 * size, and skipping them would spend the try budget on a tree of
-	 * marker files and then condemn a filesystem that was never asked.
+	 * cannot answer; that is one of the inconclusive cases below, as is a
+	 * file too small to hold the two ranges the probe compares.
 	 */
 	fd = longpath_open(path, O_RDWR);
 
-	support = fd == -1 ? DEDUPE_SUPPORT_UNKNOWN : dedupe_probe_fd(fd);
+	support = fd == -1 ? DEDUPE_SUPPORT_UNKNOWN
+			   : dedupe_probe_fd(fd, st->stx_size);
 
 	if (support == DEDUPE_SUPPORT_YES) {
 		locked_fs.dedupe_probe_pending = false;
@@ -2005,7 +2008,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	 * paths..." line would only bury it.
 	 */
 	if (locked_fs.dedupe_probe_pending &&
-	    !fs_dedupe_probe_settled(path))
+	    !fs_dedupe_probe_settled(path, st))
 		return 1;
 
 	pscan_examined();	/* count every file the listing walk visits */
