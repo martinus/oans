@@ -180,10 +180,24 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   edit it here — change it there, run that suite, re-copy into all three and
   update each `mutate_core.sha256`. `make lint` fails if this copy has drifted.
   Only `scripts/mutate/mutate.py` (the ~130-line adapter) is oans's.
-- A mutant costs one compile of `src/tests.c` (~4.5 s) — every source is
-  `#include`d into it, so there is no incremental build and ccache cannot help.
-  The `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of
-  that.
+- **A mutant costs one compile of `src/tests.c`** — every source is `#include`d
+  into it, so ~20,000 lines in one translation unit, no incremental build, and
+  nothing for ccache to hit since each mutant is a preprocessed source nothing
+  has ever seen. That compile *is* the run: the suite itself is 0.3 s. The
+  `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of a
+  build.
+  - **The lanes therefore build at `-O0`** (`MUTANT_CFLAGS` in the adapter),
+    which is the single biggest lever there is. Measured, interleaved: the
+    makefile's shipping flags (`-O2 -ggdb` plus hardening) compile in 5.6 s
+    against 1.3 s, while the suite goes only 0.24 s → 0.30 s — so a mutant is
+    **5.84 s → 1.60 s, 3.7×**, and a whole-file sweep of `src/dbfile.c` is 22
+    minutes instead of 49. The warning flags stay: dropping them would move
+    mutants between `compiler` and the verdicts that are about the tests, which
+    is the one comparison this tool exists to make.
+  - `--make-arg CFLAGS=...` overrides it (make takes the last assignment on the
+    line, and the caller's comes after). A `--make-arg SANITIZE=...` run is
+    unaffected either way — the makefile appends its own `-O1 -fsanitize=...`
+    through `override CFLAGS +=`, which lands last and wins.
 - **Read a survivor count by function, never as a total.** The first sweep of
   `src/util.c` came back 213 survivors of 413 and that number says nothing:
   grouped by function it was 5-9% survival everywhere a test existed
