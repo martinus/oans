@@ -101,6 +101,167 @@ in `tests/`; no shell tests.
   before trusting any before/after. (The `~/git` tree, ~174k files on btrfs, is
   the usual benchmark target.)
 
+## Mutation & property testing (the C unit suite)
+
+Two additions to `src/tests.c`'s side of the house. Neither touches the
+integration suite, and the distinction matters for reading either of them.
+
+### `scripts/mutate/mutate.py` — does anything notice when this breaks
+
+Breaks a source file in a throwaway copy of the tree, rebuilds, runs `./test`,
+and reports whether anything went red. Coverage says a line ran; this says
+something would have noticed it misbehaving.
+
+```sh
+scripts/mutate/mutate.py --bugs scripts/mutate/bugs/fiemap.txt
+make mutation-replay                                    # every bug file, as CI does
+scripts/mutate/mutate.py --file src/glob.c --diff       # only what you changed
+scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
+```
+
+- **`--file` is not optional in practice.** oans is not a single-header library,
+  so there is no file that is obviously *the* code; the default (`src/csum.c`)
+  is a starting point and a run without `--file` is usually the wrong question.
+- **`bugs/*.txt` are real oans bugs put back** — #147, #159, #186, #187, #191,
+  #202 — one block each, and each file names the source it mutates on its own
+  first line (`# file: src/util.c`). That is the everyday mode and the one worth
+  adding to: a fix without a block here has no answer to "does its test earn its
+  place". A block that stops applying means that part was rewritten and the
+  question wants re-deriving, not repairing.
+  - **The target belongs in the file, not in its name.** Deriving it from the
+    filename works until a bug file is named after a theme rather than a source,
+    which `escape.txt` was — and it bought a special case in the CI loop for
+    exactly one file. `make mutation-replay` now runs the lot with nothing to
+    know, and `make lint` refuses a bug file whose `# file:` line is missing or
+    names something that is not there.
+- **A `survived` is a narrower claim than it reads.** The suite is `src/tests.c`
+  alone: the end-to-end Python suite drives the *binary* and is not in the loop,
+  so for the dedupe phase, the scan pipeline and the progress block a survivor
+  means nothing at all. The tool says so in its own fingerprint.
+- **No sanitizer by default**, so a mutant that reads one slot too far only
+  shows up if it corrupts something a test checks. Re-run a surprising survivor
+  with `--make-arg SANITIZE=address,undefined --make-arg CC=clang`.
+  - **`tests/lsan.supp` was hiding oans's own leaks, and this is how that was
+    found.** Its `leak:libglib-2.0` line matches any leak whose stack passes
+    through GLib, and oans keeps nearly everything in GLib containers
+    (`GPtrArray`, `GHashTable`, `GRegex`, `GString`) — so it suppressed most of
+    oans's heap along with the cached-thread residue it was written for.
+    Measured: deleting one `g_free()` from `glob_set_free()` leaks 769,200
+    bytes in 32,050 allocations, LSan names `glob_set_new()` as the site, and
+    the run still exits **0**. Measured over a whole `src/glob.c` sweep, all
+    three on one tree: **plain 64 survivors, ASAN with this file 50, ASAN with
+    the module-wide pattern 64** — so under the broad file the sanitizer leg was
+    worth *nothing at all* over a plain build on this file, and narrowing
+    recovers 14, every one a deleted `g_free`/`g_string_free`/`g_regex_unref` or
+    an early `return` that skips one. `tests/lsan.supp` now names three
+    GLib functions and nothing wider, for **both** legs. A handful of
+    deallocation mutants still survive it, on error paths the suite never
+    reaches — untested code, not an untested leak.
+  - **Narrowing it for the end-to-end leg was measured, not assumed**, which
+    took getting around the missing btrfs: force `dedupe_probe_fd()` to answer
+    `DEDUPE_SUPPORT_YES` in a throwaway tree (before #232 the same trick was
+    stubbing `is_fs_supported()`) and the binary runs its whole scan and dedupe
+    pipeline on ext4 — the ioctl fails, but the walkers, the csum pool, the
+    dedupe pool, sqlite and the progress block all run. Scan, all three dedupe modes,
+    `--io-threads=16`, `--exclude`, `--progress=json`, in-memory, replay,
+    `--stats`, `--json`: **zero leaks with no suppressions at all**, and under
+    `print_suppressions=1` the three entries never fire. They stay as insurance
+    against a GLib that caches more eagerly (measured on 2.80), so one of them
+    starting to match is worth looking at rather than assuming.
+  - What that could not reach is a *successful* `FIDEDUPERANGE`, which ext4
+    refuses — so allocations on the accepted-destination path are unverified,
+    and are one CI run on btrfs from being answered.
+- **`make test-build` exists for this** and only this: `make test` builds *and
+  runs*, so a mutant the tests caught would exit nonzero at the build step and
+  be scored `compiler` — the compiler credited with protection the tests
+  provided. Don't merge the two targets back together.
+- **`mutate_core.py` is vendored** from unordered_dense, where its own hermetic
+  suite (`scripts/test_mutate.py`) lives; nanobench holds the same copy. Never
+  edit it here — change it there, run that suite, re-copy into all three and
+  update each `mutate_core.sha256`. `make lint` fails if this copy has drifted.
+  Only `scripts/mutate/mutate.py` (the ~130-line adapter) is oans's.
+- A mutant costs one compile of `src/tests.c` (~4.5 s) — every source is
+  `#include`d into it, so there is no incremental build and ccache cannot help.
+  The `-fsyntax-only` pre-filter rejects the invalid ones at about a tenth of
+  that.
+- **Read a survivor count by function, never as a total.** The first sweep of
+  `src/util.c` came back 213 survivors of 413 and that number says nothing:
+  grouped by function it was 5-9% survival everywhere a test existed
+  (`ctrl_seq_len` 2/37, `sanitize_ctrl` 4/58) and 85-94% in four pure functions
+  that had *no test at all* — `parse_size`, `human_size_snprintf`,
+  `human_duration_snprintf`, `num_digits`, together 113 of the 213. Writing
+  those took it to 94. So the tool measures absent tests and weak tests with
+  the same number, and only the grouping tells them apart.
+  - `parse_size` is why it mattered: a ladder of `switch` fallthroughs, so one
+    missing `mult *= 1024` makes `--max-filesize=10G` mean ten megabytes on a
+    run that otherwise looks right. The integration suite passes `1K` and `1M`,
+    which left `g`/`t`/`p`/`e` unexercised anywhere.
+- **Triage the residue rather than reporting it.** What was left at 94 is
+  ~61 mutants in `setrlimit`/`sysconf`/`clock_gettime`/`backtrace` code no unit
+  test can reach, 14 on `parse_size`'s `exit()` paths (a test that reaches them
+  takes the suite with it), and a handful that are provably equivalent —
+  `memcpy(buf, "\\t", 3)` copies the literal's own NUL into a scratch buffer
+  whose third byte is never read; `u < ARRAY_SIZE(units) - 1` cannot differ
+  from `<=` because `v >= 1024.0` fails first, UINT64_MAX being 16 EiB. Check
+  the equivalents rather than assuming them: three that looked equivalent were
+  not, and one of those wrote a byte past a buffer.
+
+### `src/proptest.h` — properties, not tables
+
+An ordinary test names an input and its answer; a property names a relationship
+that must hold for *every* input and generates inputs looking for a
+counterexample. No dependencies, one header, minunit-compatible.
+
+- **The seed is fixed on purpose** (`make test` is reproducible, CI can trust
+  it); `OANS_PROPTEST_SEED=random ./test` goes looking and prints what it chose,
+  and every failure names the seed and case number to replay. Each property
+  draws from its own stream, mixed from the seed and the test's name, so adding
+  one does not renumber the cases in all the others.
+- **There is no shrinking**, which is most of what a real property-testing
+  library is. The substitute is generators that only produce small inputs, so a
+  counterexample is already readable. A property needing a large input to mean
+  anything should be an ordinary test with a fixture.
+- **Three properties are skipped under valgrind** (`OANS_PROPTEST_NO_JIT=1`,
+  which the CI leg sets and which prints what it skipped). They compile a
+  `GRegex`, GLib compiles every pattern with `G_REGEX_OPTIMIZE`, and memcheck
+  cannot see into the machine code PCRE2 then emits — hundreds of "conditional
+  jump depends on uninitialised value" from frames with no symbol and a stack
+  address where a return address belongs. **Verified to be the library and not
+  oans**: a standalone program containing no oans code is clean under memcheck
+  with plain `g_regex_new` and reproduces the identical signature the moment
+  `G_REGEX_OPTIMIZE` is added. Don't reach for a suppression instead — the
+  frames have no object name, so valgrind's own generated entry is
+  `Memcheck:Cond` over `obj:*`, which would hide every uninitialised-value error
+  in the process, and that check is what caught the missing memset in
+  `start_running_checksum()`.
+- **Keep the suite fast, for a reason beyond taste.** The mutation tool derives
+  a mutant's hang timeout from how long a green run takes, so a slow suite
+  reclassifies slow mutants as `hang` instead of letting a test catch them —
+  measured: at 1.2 s two glob mutants moved from `caught`/`survived` to `hang`.
+  The glob properties compile a `GRegex` per pattern, which is nearly all of
+  what they cost, so they try `PROP_GLOB_PATHS` paths per compile. The whole
+  suite is ~0.3 s for ~1M assertions; keep it there.
+- **A property phrased in terms of the function under test cannot see that
+  function being wrong**, only being inconsistent. The escaping property asserts
+  `!has_ctrl(out)` — and `has_ctrl` *is* `ctrl_seq_len`, which is also what the
+  escaper calls, so a mutation inside the classifier leaves both sides agreeing.
+  Measured: narrowing the C1 test from `>= 0x80` to `> 0x80` was caught by
+  nothing there, while U+0080 reached the terminal unescaped. The property now
+  also checks the raw bytes, spelled out rather than delegated. Reach for a
+  second, independent phrasing wherever the obvious property is a tautology
+  waiting to happen.
+- **They are not a replacement for the tables, and the lift is uneven.**
+  Measured, same 413-mutant sweep of `src/util.c` with the properties removed
+  and restored: **213 survivors → 203**, and every one of the ten is a
+  `survived → caught` in `sanitize_ctrl`'s buffer arithmetic — the truncation
+  boundary, which needs a buffer that runs out at each possible offset and so
+  is exactly what a hand-written table does not cover. The same A/B over
+  `src/glob.c` (305 mutants) gained **nothing**: two mutants moved, both from
+  `caught`/`survived` to `hang`, purely because the suite had got slower. On
+  the named-bug files they earn their place differently again — leaving the
+  fiemap address set unsorted is caught by nothing else. Expect that
+  unevenness rather than a uniform number.
+
 ## Profiling & measurement — read before optimizing
 
 - **`scripts/perf-profile.sh`** runs an oans command under `perf` and prints the

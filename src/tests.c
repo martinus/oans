@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 
 #include "minunit.h"
+#include "proptest.h"
 #include "rbtree.c"
 
 #include "opt.c"
@@ -134,6 +135,36 @@ MU_TEST(test_seen_inode) {
 	seen_inodes_free();
 }
 
+/*
+ * Every bounded writer here has the same contract, so it is stated once: the
+ * result is a NUL-terminated prefix of the untruncated form, complete whenever
+ * it fits, and nothing outside the caller's size is touched. The fences are the
+ * half a length assertion cannot make - `strlen(out) < sz` says nothing about
+ * the byte after it, and these are the only callers that can run out of room.
+ */
+struct fenced { char before[8]; char out[32]; char after[8]; };
+
+#define FENCE_BYTE '#'
+
+static bool fence_intact(const struct fenced *f)
+{
+	for (size_t i = 0; i < sizeof(f->before); i++)
+		if (f->before[i] != FENCE_BYTE || f->after[i] != FENCE_BYTE)
+			return false;
+	return true;
+}
+
+/* True if `f->out` is the prefix of `full` that `sz` bytes can hold. */
+static bool wrote_prefix_within(const struct fenced *f, size_t sz, const char *full)
+{
+	if (sz == 0)
+		return f->out[0] == FENCE_BYTE;	/* not even a NUL */
+	if (strlen(f->out) >= sz || strncmp(f->out, full, strlen(f->out)))
+		return false;
+	/* Truncated only when it had to be. */
+	return strlen(full) >= sz || !strcmp(f->out, full);
+}
+
 /* One fiemap record: {logical, physical, length, flags}. */
 struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
 
@@ -258,6 +289,23 @@ MU_TEST(test_fiemap_layout_key) {
 	/* A prefix of the same records must not collide with the whole. */
 	mu_check(key_of(two, 1, 12288, b));
 	mu_check(memcmp(a, b, DIGEST_LEN) != 0);
+
+	/*
+	 * Both sides have to sit the same distance into their record, and that
+	 * has to be checked *separately* from the address rather than folded
+	 * into `phys + offset` arithmetic. On a compressed extent fe_physical
+	 * names the extent as a whole, so an offset into it means nothing - and
+	 * the two spellings differ exactly here, where the sums coincide and
+	 * the addresses do not. Believing this skips a dedupe that was real.
+	 *
+	 * The target record starts at the range, the destination's starts 4 KiB
+	 * before it; 8192+0 and 4096+4096 are the same number and the stored
+	 * extents are not the same extent.
+	 */
+	struct fm_rec at_start[] = {{4096, 8192, 8192, SH}};
+	struct fm_rec offset_in[] = {{0, 4096, 8192, SH}};
+
+	mu_check(!share(at_start, 1, 4096, offset_in, 1, 4096, 4096));
 
 	/* Compressed extents are fine: the address is only ever compared. */
 	struct fm_rec enc[] = {{0, 4096, 8192, ENC}};
@@ -472,6 +520,20 @@ MU_TEST(test_fiemap_unshared_bytes_accumulates) {
 	/* The target's own storage was never creditable. */
 	mu_check(fiemap_unshared_bytes(&seen, t, 0, 8192) == 0);
 
+	/*
+	 * A record with no usable address must be credited *every* time, not
+	 * remembered after the first. fe_physical is zero-or-meaningless there,
+	 * so remembering it would make one unwritten extent stand in for every
+	 * later one - and the figure this feeds is a saving, where guessing high
+	 * is the way to be wrong that a user cannot check.
+	 */
+	struct fm_rec pending[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
+	struct fiemap *d = mkmap(pending, 1);
+
+	mu_check(fiemap_unshared_bytes(&seen, d, 0, 8192) == 8192);
+	mu_check(fiemap_unshared_bytes(&seen, d, 0, 8192) == 8192);
+	free(d);
+
 	fiemap_phys_set_free(&seen);
 	free(t);
 	free(b);
@@ -542,10 +604,30 @@ MU_TEST(test_sanitize_ctrl) {
 	mu_check(ctrl_seq_len((const unsigned char *)"a", &cp) == 0);
 	mu_check(ctrl_seq_len((const unsigned char *)"\x1b", &cp) == 1 && cp == 0x1b);
 	mu_check(ctrl_seq_len((const unsigned char *)"\x7f", &cp) == 1 && cp == 0x7f);
-	/* A C1 costs two input bytes and is named by its code point. */
+	/*
+	 * A C1 costs two input bytes and is named by its code point - at *both*
+	 * ends of the range and not just the top. Only U+009F was checked here
+	 * before, which left `>= 0x80` and `<= 0x9f` each satisfied by one
+	 * example: a sweep turned `>= 0x80` into `> 0x80` and `<= 0x9f` into
+	 * `== 0x9f` and nothing went red, so U+0080 was reaching the terminal.
+	 */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x80", &cp) == 2 && cp == 0x80);
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x8f", &cp) == 2 && cp == 0x8f);
 	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x9f", &cp) == 2 && cp == 0x9f);
+	/* One below and one above the range, which are ordinary UTF-8. */
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\x7f", &cp) == 0);
+	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\xa0", &cp) == 0);
 	/* 0xc2 not followed by a continuation byte is ordinary UTF-8 lead. */
 	mu_check(ctrl_seq_len((const unsigned char *)"\xc2\xa9", &cp) == 0);
+	/* And the whole range survives the escaper, not only its endpoints. */
+	for (unsigned int c1 = 0x80; c1 <= 0x9f; c1++) {
+		char name[8], want[8];
+
+		snprintf(name, sizeof(name), "x\xc2%c", (char)c1);
+		snprintf(want, sizeof(want), "x\\x%02x", c1);
+		sanitize_ctrl(name, out, sizeof(out));
+		mu_check(!strcmp(out, want));
+	}
 
 	mu_check(!has_ctrl("plain.txt"));
 	mu_check(!has_ctrl("café-Β.txt"));
@@ -562,6 +644,17 @@ MU_TEST(test_sanitize_ctrl) {
 	free(dup);
 	dup = path_for_display("café-Β.txt");	/* the fast path: unchanged */
 	mu_check(dup && strcmp(dup, "café-Β.txt") == 0);
+	free(dup);
+
+	/*
+	 * A name that is *entirely* control bytes, where the allocation is
+	 * exactly SANITIZE_CTRL_MAX per byte plus the NUL and there is no slack
+	 * to absorb an arithmetic slip. A mixed name has room to spare, so the
+	 * cases above pass with the `+ 1` removed - and what ships then is a
+	 * path silently one character short, which names a different file.
+	 */
+	dup = path_for_display("\x1b\x1b\x1b");
+	mu_check(dup && strcmp(dup, "\\x1b\\x1b\\x1b") == 0);
 	free(dup);
 }
 
@@ -820,10 +913,53 @@ MU_TEST(test_group_u64) {
 	group_u64_snprintf(18446744073709551615ull, b, sizeof(b));
 	mu_check(strcmp(b, "18,446,744,073,709,551,615") == 0);
 
-	/* Truncation stays NUL-terminated and within bounds. */
+	/*
+	 * Truncation, asserted on the bytes rather than on the length. `strlen
+	 * <= 3` is satisfied by almost any arithmetic slip in the three
+	 * `str_bytes - 1` bounds, which is why sixteen mutants across those
+	 * three lines survived it.
+	 */
 	char small[4];
 	group_u64_snprintf(2505166, small, sizeof(small));
-	mu_check(small[3] == '\0' && strlen(small) <= 3);
+	mu_check(!strcmp(small, "2,5"));		/* "2,505,166" cut to fit */
+	char one[2];
+	group_u64_snprintf(2505166, one, sizeof(one));
+	mu_check(!strcmp(one, "2"));
+	char just_a_nul[1];
+	group_u64_snprintf(2505166, just_a_nul, sizeof(just_a_nul));
+	mu_check(just_a_nul[0] == '\0');
+	/* The return value is what was written, not what was wanted. */
+	mu_check(group_u64_snprintf(2505166, small, sizeof(small)) == 3);
+	mu_check(group_u64_snprintf(999, b, sizeof(b)) == 3);
+}
+
+/*
+ * Whatever the number and whatever the room, the result is a NUL-terminated
+ * prefix of the full grouping, the return value is its length, and nothing is
+ * written past the buffer. The three `str_bytes - 1` bounds are the whole of
+ * this function's difficulty and a table cannot walk every cut point.
+ */
+MU_TEST(test_prop_group_u64_truncates_to_a_prefix) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct fenced fenced;
+		char full[32];
+		/* Log-uniform, so every digit width comes up. */
+		uint64_t n = prop_u64(&p) >> prop_below(&p, 64);
+		size_t sz = (size_t)prop_below(&p, sizeof(fenced.out) + 1);
+		int ret;
+
+		group_u64_snprintf(n, full, sizeof(full));
+		memset(&fenced, FENCE_BYTE, sizeof(fenced));
+		ret = group_u64_snprintf(n, fenced.out, sz);
+
+		prop_check(&p, fence_intact(&fenced));
+		prop_check(&p, wrote_prefix_within(&fenced, sz, full));
+		/* And the one part that is this function's own: it reports what it
+		 * wrote, not what it wanted to. */
+		prop_check(&p, (size_t)ret == (sz ? strlen(fenced.out) : 0));
+	}
 }
 
 /*
@@ -1004,6 +1140,281 @@ static void lp_check_helpers(const char *absdir, const char *base,
 	close(bfd);
 }
 
+/*
+ * --- the option parser and the human-readable formatters (util.c) ---
+ *
+ * These had no unit test at all, which the mutation sweep found rather than
+ * anyone noticing: 113 of src/util.c's 203 surviving mutants were in these four
+ * functions, against 5-9% survival in the escaping code next door. That is not
+ * a weak test, it is an absent one, and the shape of what it lets through is
+ * the worrying part - `parse_size` is a ladder of fallthroughs, so dropping one
+ * `mult *= 1024` makes `--max-filesize=10G` mean ten megabytes, silently, on a
+ * run that otherwise looks exactly right.
+ */
+
+/* parse_size takes a mutable string; the option parser hands it argv. */
+static uint64_t size_of(const char *s)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%s", s);
+	return parse_size(buf);
+}
+
+MU_TEST(test_parse_size) {
+	/* Bare numbers are bytes. */
+	mu_check(size_of("0") == 0);
+	mu_check(size_of("1") == 1);
+	mu_check(size_of("4096") == 4096);
+
+	/* The ladder, one rung at a time. Every one of these is a separate
+	 * fallthrough, and the compiler will not miss one for you. */
+	mu_check(size_of("1b") == 1);
+	mu_check(size_of("1k") == 1024ULL);
+	mu_check(size_of("1m") == 1024ULL * 1024);
+	mu_check(size_of("1g") == 1024ULL * 1024 * 1024);
+	mu_check(size_of("1t") == 1024ULL * 1024 * 1024 * 1024);
+	mu_check(size_of("1p") == 1024ULL * 1024 * 1024 * 1024 * 1024);
+	mu_check(size_of("1e") == 1024ULL * 1024 * 1024 * 1024 * 1024 * 1024);
+
+	/* Case is not significant. The switch spells some rungs twice and
+	 * leans on tolower() for the rest, so this is not free. */
+	mu_check(size_of("2K") == size_of("2k"));
+	mu_check(size_of("2M") == size_of("2m"));
+	mu_check(size_of("2G") == size_of("2g"));
+	mu_check(size_of("2T") == size_of("2t"));
+	mu_check(size_of("2P") == size_of("2p"));
+	mu_check(size_of("2E") == size_of("2e"));
+
+	/* The multiplier applies to the whole number, not the first digit. */
+	mu_check(size_of("123k") == 123ULL * 1024);
+	mu_check(size_of("1024k") == size_of("1m"));
+
+	/*
+	 * The error paths - an empty value, an unknown descriptor, a suffix
+	 * longer than one character - are not exercised here: parse_size()
+	 * calls exit() on each, which would take the whole suite with it.
+	 * They are covered end-to-end in tests/integration/test_min_filesize.py.
+	 */
+}
+
+/*
+ * Every rung of that ladder, against the arithmetic it stands for. The table
+ * above names the rungs; this says the multiplier is exactly 1024 per rung for
+ * any value, which is what a mutated `*= 1024` breaks in a way one example
+ * might happen to miss.
+ */
+MU_TEST(test_prop_parse_size_scales_by_the_suffix) {
+	declare_prop(p, 20000);
+	static const char rungs[] = "bkmgtpe";
+
+	while (prop_next(&p)) {
+		unsigned int level = (unsigned int)prop_below(&p, sizeof(rungs) - 1);
+		/* Bounded so that the largest rung cannot overflow: 1024^6 is
+		 * 2^60, leaving four bits of headroom. */
+		uint64_t n = prop_below(&p, 16);
+		uint64_t expect = n;
+		char buf[32];
+
+		for (unsigned int i = 0; i < level; i++)
+			expect *= 1024;
+
+		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n, rungs[level]);
+		prop_check(&p, parse_size(buf) == expect);
+
+		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n,
+			 (char)toupper(rungs[level]));
+		prop_check(&p, parse_size(buf) == expect);
+	}
+}
+
+MU_TEST(test_human_size) {
+	char buf[32];
+
+	/* Below a kibibyte the exact byte count is printed, with no decimal -
+	 * "0.0 B" for an empty file would be worse than useless. */
+	human_size_snprintf(0, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "0 B"));
+	human_size_snprintf(1023, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1023 B"));
+
+	/* The boundary in both directions. */
+	human_size_snprintf(1024, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 KiB"));
+	human_size_snprintf(1536, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.5 KiB"));
+
+	human_size_snprintf(1ULL << 20, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 MiB"));
+	human_size_snprintf(1ULL << 30, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 GiB"));
+	human_size_snprintf(1ULL << 40, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 TiB"));
+	human_size_snprintf(1ULL << 50, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 PiB"));
+
+	/* The top rung has to stop there: the loop is bounded by the size of
+	 * the units array, and one rung further reads past the end of it. */
+	human_size_snprintf(1ULL << 60, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1.0 EiB"));
+	human_size_snprintf(UINT64_MAX, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "16.0 EiB"));
+
+	/*
+	 * One byte under a mebibyte reads as "1024.0 KiB" rather than
+	 * "1.0 MiB": the loop stops on the computed value, which is 1023.999,
+	 * and `%.1f` rounds it up afterwards. Cosmetic, and pinned here so
+	 * that it is a decision rather than a surprise - a property test
+	 * looking for a mantissa below 1024.0 finds this within a few thousand
+	 * cases.
+	 */
+	human_size_snprintf((1ULL << 20) - 1, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1024.0 KiB"));
+
+	/* A caller with no room gets nothing written and is told so. */
+	mu_check(human_size_snprintf(1024, buf, 0) == 0);
+}
+
+/*
+ * Whatever the size, the unit is one of the seven the array holds and the
+ * mantissa is in range for it. A mutated loop bound is an out-of-bounds read
+ * of `units` - which a plain build prints as whatever followed the array.
+ */
+MU_TEST(test_prop_human_size_picks_a_real_unit) {
+	declare_prop(p, 20000);
+	static const char * const units[] = { "B", "KiB", "MiB", "GiB",
+					      "TiB", "PiB", "EiB" };
+
+	while (prop_next(&p)) {
+		char buf[32], unit[8];
+		double v;
+		uint64_t size;
+		bool known = false;
+
+		/* Log-uniform, so every rung is reached about equally often;
+		 * a uniform draw over uint64 is a byte count above a
+		 * pebibyte essentially every time. */
+		size = prop_u64(&p) >> prop_below(&p, 64);
+
+		prop_check(&p, human_size_snprintf(size, buf, sizeof(buf)) > 0);
+		prop_check(&p, sscanf(buf, "%lf %7s", &v, unit) == 2);
+		for (unsigned int i = 0; i < ARRAY_SIZE(units); i++)
+			known = known || !strcmp(unit, units[i]);
+		prop_check(&p, known);
+		/* Bytes are printed whole and unscaled; anything else was
+		 * divided down until it was under a kibibyte.
+		 *
+		 * The upper bound is 1024.0 and not just below it, because the
+		 * division stops on the *computed* value and `%.1f` then
+		 * rounds: 1 MiB - 1 divides to 1023.999 and prints as
+		 * "1024.0 KiB". Pinned as a case in test_human_size rather
+		 * than tightened away - it is cosmetic, and where the unit
+		 * boundary sits is not a testing commit's to move. */
+		if (!strcmp(unit, "B"))
+			prop_check(&p, v == (double)size && size < 1024);
+		else
+			prop_check(&p, v >= 1.0 && v <= 1024.0);
+	}
+}
+
+MU_TEST(test_human_duration) {
+	char buf[32];
+
+	human_duration_snprintf(0, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "0s"));
+	human_duration_snprintf(59, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "59s"));
+
+	/* Seconds are zero-padded once minutes appear, so the field does not
+	 * jump width as a scan runs - the progress line is redrawn in place. */
+	human_duration_snprintf(60, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m00s"));
+	human_duration_snprintf(61, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m01s"));
+	human_duration_snprintf(3599, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "59m59s"));
+
+	/* Past an hour the seconds are dropped, not the minutes. */
+	human_duration_snprintf(3600, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1h00m"));
+	human_duration_snprintf(3660, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1h01m"));
+	human_duration_snprintf(86399, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "23h59m"));
+
+	/* Rounded to the nearest second rather than truncated, so an ETA of
+	 * 0.6s does not read as "0s" for the whole of its last second. */
+	human_duration_snprintf(0.6, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1s"));
+	human_duration_snprintf(59.5, buf, sizeof(buf));
+	mu_check(!strcmp(buf, "1m00s"));
+
+	mu_check(human_duration_snprintf(1, buf, 0) == 0);
+}
+
+/*
+ * The rendering has to be readable *back*: whatever the duration, parsing the
+ * string returns the same number of seconds, to the resolution that form
+ * carries. That catches the swaps a table of examples reads straight past - a
+ * `/ 60` against a `% 60`, or minutes and seconds the wrong way round, both of
+ * which are right for some of the examples anyone would think to write.
+ */
+MU_TEST(test_prop_human_duration_reads_back) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char buf[32];
+		unsigned long s = (unsigned long)prop_below(&p, 100UL * 3600);
+		unsigned long h, m, sec;
+
+		human_duration_snprintf((double)s, buf, sizeof(buf));
+
+		if (s < 60) {
+			prop_check(&p, sscanf(buf, "%lus", &sec) == 1);
+			prop_check(&p, sec == s);
+		} else if (s < 3600) {
+			prop_check(&p, sscanf(buf, "%lum%lus", &m, &sec) == 2);
+			prop_check(&p, sec < 60);
+			prop_check(&p, m * 60 + sec == s);
+		} else {
+			prop_check(&p, sscanf(buf, "%luh%lum", &h, &m) == 2);
+			prop_check(&p, m < 60);
+			/* Seconds are dropped rather than rounded into the
+			 * minute, so what is printed accounts for everything
+			 * except them. */
+			prop_check(&p, h * 3600 + m * 60 == s - s % 60);
+		}
+	}
+}
+
+MU_TEST(test_num_digits) {
+	/* Zero has no digits by this definition, which is what its one caller
+	 * wants: a column width for a counter that has not started. */
+	mu_check(num_digits(0) == 0);
+	mu_check(num_digits(1) == 1);
+	mu_check(num_digits(9) == 1);
+	mu_check(num_digits(10) == 2);
+	mu_check(num_digits(99) == 2);
+	mu_check(num_digits(100) == 3);
+	mu_check(num_digits(ULLONG_MAX) == 20);
+}
+
+/* Against printf, which is the definition anyone actually means by it. */
+MU_TEST(test_prop_num_digits_matches_printf) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char buf[32];
+		/* Log-uniform: a uniform draw is a twenty-digit number
+		 * essentially every time, and every other width is the
+		 * interesting one. */
+		unsigned long long n = prop_u64(&p) >> prop_below(&p, 64);
+
+		snprintf(buf, sizeof(buf), "%llu", n);
+		prop_check(&p, num_digits(n) == (n ? (int)strlen(buf) : 0));
+	}
+}
+
 MU_TEST(test_longpath) {
 	const char *contents = "over-the-PATH_MAX limit\n";
 	char victim[LP_COMP_LEN + 1];
@@ -1096,6 +1507,68 @@ MU_TEST(test_glob_wildcards_respect_separators) {
 	mu_check(gs_hit("a?.txt", "/x/ab.txt", false));
 	mu_check(!gs_hit("a?.txt", "/x/abc.txt", false));
 	mu_check(!gs_hit("a?.txt", "/x/a/.txt", false));
+}
+
+/*
+ * `**` not followed by a separator, which is a different branch of
+ * glob_to_regex from the `**\/` above and had no test at all - the mutation
+ * sweep found nine survivors on those two lines.
+ *
+ * It is also where this implementation and gitignore disagree, so these cases
+ * are as much a record of the disagreement as a check on it. glob.h states two
+ * rules that collide - a pattern with no '/' is a basename rule, and `**`
+ * crosses directory boundaries - and here the second wins. git resolves it the
+ * other way: in gitignore `**` is only special as a whole path component, and
+ * inside one it means `*`. Nobody writes `node**` on purpose and the
+ * difference only ever excludes more than was asked for, so what is pinned
+ * here is what the code does, not what it arguably should.
+ */
+MU_TEST(test_glob_double_star_without_a_separator) {
+	/* Trailing: everything below the named directory, and the directory
+	 * itself only if something follows the stars. */
+	mu_check(gs_hit("/a/**", "/a/b", false));
+	mu_check(gs_hit("/a/**", "/a/b/c/d", false));
+
+	/* Interior, inside one component: the stars cross '/' where a single
+	 * '*' would not. This is the divergence from gitignore. */
+	mu_check(gs_hit("/a**z", "/ab/cd/z", false));
+	mu_check(!gs_hit("/a*z", "/ab/cd/z", false));
+
+	/* And so a bare pattern with '**' stops being purely a basename rule:
+	 * it matches through the separator on the left. */
+	mu_check(gs_hit("a**", "/a/bbc", false));
+	mu_check(!gs_hit("a**", "/bbc", false));
+
+	/* Three or more stars are the same as two - the run is counted, not
+	 * matched pairwise. */
+	mu_check(gs_hit("/a/***/t", "/a/b/c/t", false));
+}
+
+/*
+ * A backslash escapes the next character, so a pattern can name a file that
+ * has a metacharacter in it. One line of glob_to_regex, no test, and nine
+ * surviving mutants on it - including the `i + 1 < len` bound, whose failure
+ * is a read one past the end of the pattern.
+ */
+MU_TEST(test_glob_backslash_escapes) {
+	/* An escaped wildcard is a literal, and stops being a wildcard. */
+	mu_check(gs_hit("a\\*b", "/x/a*b", false));
+	mu_check(!gs_hit("a\\*b", "/x/axxb", false));
+
+	/* Same for the other metacharacters, so a real name gets named. */
+	mu_check(gs_hit("a\\?b", "/x/a?b", false));
+	mu_check(!gs_hit("a\\?b", "/x/azb", false));
+	mu_check(gs_hit("db\\[1].hash", "/var/db[1].hash", false));
+
+	/* The escape consumes exactly one character; what follows is ordinary
+	 * again. */
+	mu_check(gs_hit("a\\**b", "/x/a*zzb", false));
+
+	/* A trailing backslash has nothing to escape. It must be treated as a
+	 * literal rather than reaching past the end of the pattern for a
+	 * character that is not there. */
+	mu_check(gs_hit("a\\", "/x/a\\", false));
+	mu_check(!gs_hit("a\\", "/x/ab", false));
 }
 
 MU_TEST(test_glob_character_classes) {
@@ -1211,6 +1684,66 @@ MU_TEST(test_running_checksum_survives_save_restore) {
 	mu_check(memcmp(whole, resumed, DIGEST_LEN) == 0);
 }
 
+/*
+ * A restored state must not follow the pointer it was saved with.
+ * XXH3_state_t holds one to the library's static secret, whose address is
+ * whatever this process's loader chose - so the saved copy is meaningless in
+ * the process that reads it back, and every checkpoint is read back by a
+ * different process than wrote it. Nothing in-process can notice: the two
+ * addresses are the same one until the blob crosses a process boundary, which
+ * is why the saved pointer is scribbled on here rather than trusted to differ.
+ */
+MU_TEST(test_running_checksum_repoints_the_secret_on_restore) {
+	unsigned char data[512];
+	unsigned char whole[DIGEST_LEN], resumed[DIGEST_LEN];
+	size_t len = running_checksum_state_size();
+	_cleanup_(freep) unsigned char *blob = malloc(len);
+	struct running_checksum *c;
+
+	for (unsigned int i = 0; i < sizeof(data); i++)
+		data[i] = (unsigned char)(i * 7);
+
+	c = start_running_checksum();
+	add_to_running_checksum(c, data, sizeof(data));
+	finish_running_checksum(c, whole);
+
+	c = start_running_checksum();
+	add_to_running_checksum(c, data, 300);
+	mu_check(running_checksum_save(c, blob, len) == 0);
+	finish_running_checksum(c, NULL);
+
+	/* What another process's copy of the same state looks like from here. */
+	memset(blob + sizeof(struct csum_state_hdr) +
+	       offsetof(XXH3_state_t, extSecret), 0xa5, sizeof(void *));
+
+	c = running_checksum_restore(blob, len);
+	mu_check(c != NULL);
+	add_to_running_checksum(c, data + 300, sizeof(data) - 300);
+	finish_running_checksum(c, resumed);
+	mu_check(memcmp(whole, resumed, DIGEST_LEN) == 0);
+}
+
+/*
+ * A buffer that cannot hold the state is refused and left alone. The caller is
+ * the checkpoint writer, and a short buffer there would otherwise be a write
+ * past whatever it had allocated.
+ */
+MU_TEST(test_running_checksum_save_refuses_a_short_buffer) {
+	size_t len = running_checksum_state_size();
+	_cleanup_(freep) unsigned char *buf = malloc(len);
+	struct running_checksum *c = start_running_checksum();
+
+	memset(buf, 0x5a, len);
+	mu_check(running_checksum_save(c, buf, len - 1) != 0);
+	for (size_t i = 0; i < len; i++)
+		mu_check(buf[i] == 0x5a);	/* nothing was written */
+
+	/* The control: one byte more and it is written in full. */
+	mu_check(running_checksum_save(c, buf, len) == 0);
+	mu_check(buf[0] != 0x5a || buf[1] != 0x5a);
+	finish_running_checksum(c, NULL);
+}
+
 /* A blob this binary cannot vouch for must be refused, not reinterpreted. */
 MU_TEST(test_running_checksum_rejects_foreign_state) {
 	size_t len = running_checksum_state_size();
@@ -1238,6 +1771,726 @@ MU_TEST(test_running_checksum_rejects_foreign_state) {
 	mu_check(running_checksum_restore(blob, len) == NULL);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Property-based tests. See src/proptest.h for the harness and for why the
+ * seed is fixed; `OANS_PROPTEST_SEED=random ./test` goes looking for more.
+ *
+ * Everything below states a relationship that has to hold for *every* input,
+ * rather than an input and its answer. The tests above are not redundant with
+ * these and are not replaced by them: a table of cases says what a function is
+ * for and reads as documentation, while a property says what must never
+ * happen and reaches inputs nobody sits down and writes.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * A name as hostile as anything a scanned tree can contain: mostly ordinary
+ * bytes, with C0 controls, DEL and the two-byte UTF-8 C1 encodings salted in
+ * at a rate no uniform draw would reach. The 0xc2 lead byte is emitted on its
+ * own often enough to land immediately before the terminator, which is the
+ * case ctrl_seq_len() has to read one byte past to decide.
+ */
+static void gen_hostile_name(struct prop *p, char *buf, size_t sz)
+{
+	size_t len = (size_t)prop_below(p, sz - 1);
+
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c;
+
+		switch (prop_below(p, 8)) {
+		case 0:				/* a C0 control or DEL */
+			c = prop_chance(p, 4) ? 0x7f
+					      : (unsigned char)prop_below(p, 0x20);
+			break;
+		case 1:				/* the lead byte of a C1 */
+			c = 0xc2;
+			break;
+		case 2:				/* a C1 trail, or a stray one */
+			c = (unsigned char)prop_range(p, 0x80, 0x9f);
+			break;
+		case 3:				/* any byte at all */
+			c = (unsigned char)prop_u64(p);
+			break;
+		default:			/* something a name is made of */
+			c = (unsigned char)prop_range(p, 'a', 'z');
+			break;
+		}
+		/* A NUL would end the string early and silently shrink every
+		 * case that drew one; the interesting truncation is the
+		 * buffer's, and that is generated on purpose below. */
+		buf[i] = c ? (char)c : 'x';
+	}
+	buf[len] = '\0';
+}
+
+/*
+ * The guarantee #202 rests on: whatever bytes are in a file's name, nothing
+ * that reaches the terminal can still act on it. Stated over the classifier
+ * rather than over a list of characters, so the two cannot drift - adding an
+ * encoding to ctrl_seq_len() tightens this test in the same commit.
+ */
+MU_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char in[24], out[SANITIZE_CTRL_MAX * 24 + 1];
+
+		gen_hostile_name(&p, in, sizeof(in));
+		sanitize_ctrl(in, out, sizeof(out));
+		prop_check(&p, !has_ctrl(out));
+		/*
+		 * And again in raw bytes, which is not the redundancy it looks
+		 * like. `has_ctrl` is `ctrl_seq_len` and so is the escaper, so
+		 * a mutation *inside the classifier* leaves the two agreeing
+		 * and this property blind to it - measured: narrowing the C1
+		 * test to `> 0x80` was caught by nothing here. A property
+		 * phrased in terms of the function under test cannot see the
+		 * function being wrong, only inconsistent.
+		 */
+		for (const unsigned char *q = (const unsigned char *)out; *q; q++) {
+			prop_check(&p, *q >= 0x20 && *q != 0x7f);
+			prop_check(&p, !(q[0] == 0xc2 && q[1] >= 0x80 && q[1] <= 0x9f));
+		}
+		/*
+		 * And within the bound `path_for_display` sizes its allocation
+		 * by, which is load-bearing rather than decorative: an encoding
+		 * that expanded further would overflow a heap buffer on the
+		 * first crafted name. Asserted here rather than in a property
+		 * of its own, which would be this one's setup plus a line.
+		 */
+		prop_check(&p, strlen(out) <= SANITIZE_CTRL_MAX * strlen(in));
+	}
+}
+
+/*
+ * A short buffer must truncate and never split an escape - half of `\xNN` is
+ * two characters of something else. Stated as "the short answer is a prefix of
+ * the long one", which says that and also that nothing else changes with the
+ * buffer size; a rule about the last four bytes would not.
+ *
+ * The canaries are the other half: this is the only caller that can run out of
+ * room, so a fencepost here writes past a heap allocation in production.
+ */
+MU_TEST(test_prop_sanitize_ctrl_truncates_on_whole_escapes) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char in[24], full[SANITIZE_CTRL_MAX * 24 + 1];
+		struct fenced fenced;
+		size_t sz = (size_t)prop_below(&p, sizeof(fenced.out) + 1);
+
+		gen_hostile_name(&p, in, sizeof(in));
+		memset(&fenced, FENCE_BYTE, sizeof(fenced));
+		sanitize_ctrl(in, fenced.out, sz);
+		sanitize_ctrl(in, full, sizeof(full));
+
+		prop_check(&p, fence_intact(&fenced));
+		prop_check(&p, wrote_prefix_within(&fenced, sz, full));
+	}
+}
+
+/*
+ * Every real name takes the fast path, and it has to be exactly that - a fast
+ * path that also *changed* the name would rewrite most of what oans prints.
+ */
+MU_TEST(test_prop_sanitize_ctrl_is_identity_on_ordinary_names) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char in[24], out[sizeof(in)];
+		size_t len = (size_t)prop_below(&p, sizeof(in) - 1);
+
+		for (size_t i = 0; i < len; i++) {
+			unsigned char c;
+
+			/* Anything ctrl_seq_len() does not flag, which
+			 * includes the high bytes of ordinary UTF-8. */
+			do {
+				c = (unsigned char)prop_u64(&p);
+			} while (!c || c < 0x20 || c == 0x7f || c == 0xc2);
+			in[i] = (char)c;
+		}
+		in[len] = '\0';
+
+		prop_check(&p, !has_ctrl(in));
+		sanitize_ctrl(in, out, sizeof(out));
+		prop_check(&p, strcmp(out, in) == 0);
+
+		_cleanup_(freep) char *disp = path_for_display(in);
+
+		prop_check(&p, disp && !strcmp(disp, in));
+	}
+}
+
+/*
+ * #159's whole design constraint: the digest a resumed hash produces is the
+ * digest of the same bytes, whatever offsets it was interrupted at. The one
+ * fixed case above splits at 1000 bytes because that is not a multiple of
+ * XXH3's internal buffer; this asks the same question at every offset, and at
+ * several of them in a row, which is what a 1 TiB file actually does.
+ */
+MU_TEST(test_prop_checksum_resumes_at_any_split) {
+	declare_prop(p, 2000);
+	unsigned char data[4096];
+	size_t blob_len = running_checksum_state_size();
+	_cleanup_(freep) void *blob = malloc(blob_len);
+
+	/* Filled once: this property is about *where* a hash was interrupted,
+	 * not about content, and drawing 4 KiB per case cost ten times the
+	 * hashing it was there to exercise. */
+	prop_bytes(&p, data, sizeof(data));
+
+	while (prop_next(&p)) {
+		unsigned char whole[DIGEST_LEN], resumed[DIGEST_LEN];
+		size_t len = (size_t)prop_below(&p, sizeof(data) + 1);
+		unsigned int splits = (unsigned int)prop_below(&p, 4);
+		struct running_checksum *c;
+		size_t at = 0;
+
+		c = start_running_checksum();
+		add_to_running_checksum(c, data, len);
+		finish_running_checksum(c, whole);
+
+		c = start_running_checksum();
+		for (unsigned int s = 0; s < splits; s++) {
+			/* Biased to the offsets that are awkward for a
+			 * buffered hash: nothing yet, one byte, and either
+			 * side of XXH3's 256-byte block. */
+			size_t next;
+
+			switch (prop_below(&p, 4)) {
+			case 0: next = at; break;
+			case 1: next = at + 1; break;
+			case 2: next = (at + 256) & ~(size_t)255; break;
+			default: next = (size_t)prop_range(&p, at, len); break;
+			}
+			if (next > len)
+				next = len;
+			add_to_running_checksum(c, data + at, next - at);
+			at = next;
+
+			prop_check(&p, running_checksum_save(c, blob, blob_len) == 0);
+			finish_running_checksum(c, NULL);
+			c = running_checksum_restore(blob, blob_len);
+			prop_check(&p, c != NULL);
+		}
+		add_to_running_checksum(c, data + at, len - at);
+		finish_running_checksum(c, resumed);
+
+		prop_check(&p, memcmp(whole, resumed, DIGEST_LEN) == 0);
+	}
+}
+
+/*
+ * A checkpoint this binary cannot vouch for has to be refused rather than
+ * reinterpreted: restoring a state a different xxhash wrote yields a digest of
+ * bytes that never existed, and nothing downstream could tell that from a file
+ * with no duplicate. Every bit of the header is part of that promise, so every
+ * bit is flipped.
+ */
+MU_TEST(test_prop_checksum_refuses_any_damaged_header) {
+	declare_prop(p, 4000);
+	size_t blob_len = running_checksum_state_size();
+	size_t hdr_len = sizeof(struct csum_state_hdr);
+	_cleanup_(freep) unsigned char *blob = malloc(blob_len);
+
+	while (prop_next(&p)) {
+		struct running_checksum *c = start_running_checksum();
+		size_t byte = (size_t)prop_below(&p, hdr_len);
+		unsigned char bit = (unsigned char)(1u << prop_below(&p, 8));
+		unsigned char fed[] = "some bytes";
+
+		add_to_running_checksum(c, fed, sizeof(fed));
+		prop_check(&p, running_checksum_save(c, blob, blob_len) == 0);
+		finish_running_checksum(c, NULL);
+
+		/* The control: untouched, this one has to be accepted, or the
+		 * assertion below would hold for a blob that was never valid. */
+		c = running_checksum_restore(blob, blob_len);
+		prop_check(&p, c != NULL);
+		finish_running_checksum(c, NULL);
+
+		blob[byte] ^= bit;
+		prop_check(&p, running_checksum_restore(blob, blob_len) == NULL);
+		blob[byte] ^= bit;
+
+		/* A length that is not exactly right is refused too - a short
+		 * read of a checkpoint row must not be reinterpreted. */
+		prop_check(&p, running_checksum_restore(blob, blob_len - 1) == NULL);
+		prop_check(&p, running_checksum_restore(blob, blob_len + 1) == NULL);
+	}
+}
+
+/* Somewhere between "one extent" and "a shredded file", in whole blocks. */
+#define PROP_MAX_RECS	5
+#define PROP_BLOCK	4096
+
+/*
+ * A plausible extent layout: ascending, block-aligned, sometimes with a hole
+ * before a record, addresses drawn from a small pool so that two layouts
+ * genuinely collide rather than never doing so. NO_PHYS records appear about
+ * one map in eight, because "cannot prove it" is a case with its own rules and
+ * a generator that never produced one would leave them to the fixed tests.
+ */
+static unsigned int gen_layout(struct prop *p, struct fm_rec *out)
+{
+	unsigned int n = (unsigned int)prop_range(p, 1, PROP_MAX_RECS);
+	uint64_t log = 0;
+
+	for (unsigned int i = 0; i < n; i++) {
+		if (prop_chance(p, 3))			/* a hole before it */
+			log += PROP_BLOCK * prop_range(p, 1, 2);
+		out[i].log = log;
+		out[i].len = PROP_BLOCK * prop_range(p, 1, 3);
+		/* A small pool of addresses, offset so that 0 - which fiemap
+		 * uses for "nowhere" - is never one of them. */
+		out[i].phys = PROP_BLOCK * prop_range(p, 100, 108);
+		out[i].flags = prop_bool(p) ? FIEMAP_EXTENT_SHARED : 0;
+		if (prop_chance(p, 40))
+			out[i].flags |= FIEMAP_EXTENT_DELALLOC;
+		log += out[i].len;
+	}
+	out[n - 1].flags |= FIEMAP_EXTENT_LAST;
+	return n;
+}
+
+/*
+ * fiemap.c's own definition, not a copy of it. This is a *gate* deciding which
+ * cases a property applies to rather than an oracle, so the usual "restate it
+ * independently so the test cannot agree with the bug" argument is inverted: a
+ * drifted copy here makes the property vacuous or spuriously red.
+ */
+static bool layout_has_phys(const struct fm_rec *r, unsigned int n)
+{
+	for (unsigned int i = 0; i < n; i++)
+		if (r[i].flags & FIEMAP_NO_PHYS)
+			return false;
+	return true;
+}
+
+/*
+ * The shape #186 is about: one dedupe stopped on a block boundary, so the same
+ * stored extent is described as two records here and one there. Returns the new
+ * record count, or `n` unchanged where there is nothing to split.
+ */
+static unsigned int split_last_record(struct fm_rec *r, unsigned int n)
+{
+	if (n >= PROP_MAX_RECS || r[n - 1].len <= PROP_BLOCK)
+		return n;
+	r[n].log = r[n - 1].log + PROP_BLOCK;
+	r[n].phys = r[n - 1].phys;
+	r[n].len = r[n - 1].len - PROP_BLOCK;
+	r[n].flags = r[n - 1].flags;
+	r[n - 1].len = PROP_BLOCK;
+	r[n - 1].flags &= ~(uint32_t)FIEMAP_EXTENT_LAST;
+	return n + 1;
+}
+
+/*
+ * The convergence property, from the other end than test_dedupe_idempotent.py
+ * reaches it: a range always already shares storage with *itself*, so a second
+ * dedupe run over an unchanged tree submits nothing. #186 was three separate
+ * ways for this to be false, and what made it survive so long is that the
+ * summary reports bytes compared rather than bytes freed - the run says it
+ * reclaimed gigabytes either way.
+ *
+ * Excludes only the records whose address means nothing, which the function
+ * refuses by design.
+ */
+MU_TEST(test_prop_maps_share_with_themselves) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct fm_rec recs[PROP_MAX_RECS];
+		unsigned int n = gen_layout(&p, recs);
+		uint64_t end = recs[n - 1].log + recs[n - 1].len;
+		uint64_t off = PROP_BLOCK * prop_below(&p, 3);
+		uint64_t len = PROP_BLOCK * prop_range(&p, 1, end / PROP_BLOCK + 2);
+
+		if (!layout_has_phys(recs, n))
+			continue;
+		prop_check(&p, share(recs, n, off, recs, n, off, len));
+	}
+}
+
+/*
+ * A record the kernel cannot pin down poisons the whole comparison, wherever
+ * it sits. Deduping past one would be submitted against an address that names
+ * nothing - and unlike a miss, which costs one redundant ioctl, believing it
+ * skips a dedupe that was real.
+ */
+MU_TEST(test_prop_maps_never_share_without_a_real_address) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct fm_rec recs[PROP_MAX_RECS];
+		unsigned int n = gen_layout(&p, recs);
+		unsigned int bad = (unsigned int)prop_below(&p, n);
+		uint64_t len;
+
+		switch (prop_below(&p, 3)) {
+		case 0: recs[bad].flags |= FIEMAP_EXTENT_UNKNOWN; break;
+		case 1: recs[bad].flags |= FIEMAP_EXTENT_DELALLOC; break;
+		default: recs[bad].flags |= FIEMAP_EXTENT_DATA_INLINE; break;
+		}
+		/* Long enough to reach the poisoned record, so the walk has to
+		 * meet it rather than stopping short of it. */
+		len = recs[bad].log + recs[bad].len;
+		prop_check(&p, !share(recs, n, 0, recs, n, 0, len));
+	}
+}
+
+/*
+ * The two measures gate different things - one a skip, one a reported number -
+ * and the fixed tests already pin them together at a handful of points. This
+ * is the same statement over whatever the generator produces: anything
+ * fiemap_maps_share() calls fully shared has, by definition, nothing left to
+ * free, and a figure claiming otherwise is #187 again.
+ *
+ * Only one direction is asserted. The converse - nothing left to free implies
+ * fully shared - is not a promise either function makes: fiemap_unshared_bytes
+ * matches addresses in any order while fiemap_maps_share walks the two maps in
+ * step and refuses what it cannot line up, so a destination holding the
+ * target's extents in a different order is 0 bytes and not shared.
+ */
+MU_TEST(test_prop_shared_ranges_have_nothing_left_to_free) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct fm_rec tgt[PROP_MAX_RECS], dst[PROP_MAX_RECS];
+		unsigned int nt = gen_layout(&p, tgt), nd;
+		uint64_t len;
+
+		/* The destination is mostly a variation on the target, because
+		 * two independently drawn layouts almost never share anything
+		 * and the interesting half of this property would never run. */
+		nd = nt;
+		memcpy(dst, tgt, nt * sizeof(*tgt));
+		switch (prop_below(&p, 4)) {
+		case 0:				/* identical */
+			break;
+		case 1:				/* one address moved */
+			dst[prop_below(&p, nd)].phys += PROP_BLOCK;
+			break;
+		case 2:				/* a split tail */
+			nd = split_last_record(dst, nd);
+			break;
+		default:			/* something else entirely */
+			nd = gen_layout(&p, dst);
+			break;
+		}
+
+		len = PROP_BLOCK * prop_range(&p, 1, 8);
+		if (share(tgt, nt, 0, dst, nd, 0, len))
+			prop_check(&p, unshared(tgt, nt, dst, nd, 0, len) == 0);
+	}
+}
+
+/*
+ * What a destination can be credited with is bounded by the range submitted,
+ * and a second destination on storage already accounted for adds nothing.
+ * Both are #191: crediting two destinations in full for one extent claimed
+ * twice what releasing it frees.
+ *
+ * The second statement holds only where every record has a real address, and
+ * the generator produces plenty that do not. A DELALLOC or inline record has
+ * no stable address to remember, so it is never merged into the set and every
+ * pass credits it again - which is the conservative direction (the figure it
+ * feeds is a saving, and over-claiming one is #187) but it does mean the
+ * unrestricted form of this property is false by design. What is true
+ * unconditionally is that a second pass can never credit *more* than the
+ * first, since it is measured against a superset of what has been seen.
+ */
+MU_TEST(test_prop_unshared_bytes_are_bounded_and_credited_once) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		struct fm_rec tgt[PROP_MAX_RECS], dst[PROP_MAX_RECS];
+		unsigned int nt = gen_layout(&p, tgt);
+		unsigned int nd = gen_layout(&p, dst);
+		uint64_t len = PROP_BLOCK * prop_range(&p, 1, 8);
+		struct fiemap *t = mkmap(tgt, nt), *d = mkmap(dst, nd);
+		struct fiemap_phys_set seen;
+		uint64_t first, again;
+
+		fiemap_phys_set_init(&seen, t);
+		first = fiemap_unshared_bytes(&seen, d, 0, len);
+		again = fiemap_unshared_bytes(&seen, d, 0, len);
+		fiemap_phys_set_free(&seen);
+		free(t);
+		free(d);
+
+		prop_check(&p, first <= len);
+		prop_check(&p, again <= first);
+		if (layout_has_phys(dst, nd))
+			prop_check(&p, again == 0);
+	}
+}
+
+/*
+ * A tiny alphabet on purpose: with three letters and three metacharacters,
+ * patterns and paths collide constantly, where a wide alphabet would generate
+ * thousands of cases that match nothing and prove nothing.
+ */
+/* Paths tried against each compiled pattern. Compiling the automaton is nearly
+ * the whole cost of a glob case, so this buys path coverage at no extra
+ * regexes - and the suite's own speed matters here beyond the usual reason:
+ * the mutation tool derives a mutant's hang timeout from how long a green run
+ * takes, so a slow suite reclassifies slow mutants as hangs rather than
+ * letting a test catch them. */
+#define PROP_GLOB_PATHS 8
+static void gen_glob_segment(struct prop *p, char *buf, size_t sz)
+{
+	size_t len = (size_t)prop_range(p, 1, sz - 1);
+
+	for (size_t i = 0; i < len; i++) {
+		switch (prop_below(p, 8)) {
+		case 0: buf[i] = '*'; break;
+		case 1: buf[i] = '?'; break;
+		case 2: buf[i] = '.'; break;
+		/* '[' and ']' reach append_class(), and an unmatched '[' is the
+		 * one way a pattern can fail to compile - which is what makes
+		 * gs_of()'s rejection path live. Without them it was dead:
+		 * measured 0 rejections in 12,000 compiles, so both the class
+		 * parser and the malformed-pattern branch were sampled zero
+		 * times while the comment claimed otherwise. */
+		case 3: buf[i] = '['; break;
+		case 4: buf[i] = ']'; break;
+		default: buf[i] = (char)prop_range(p, 'a', 'c'); break;
+		}
+	}
+	buf[len] = '\0';
+}
+
+static void gen_glob_path(struct prop *p, char *buf, size_t sz)
+{
+	unsigned int segs = (unsigned int)prop_range(p, 1, 3);
+	size_t o = 0;
+
+	for (unsigned int s = 0; s < segs && o + 6 < sz; s++) {
+		size_t len = (size_t)prop_range(p, 1, 3);
+
+		buf[o++] = '/';
+		for (size_t i = 0; i < len; i++)
+			buf[o++] = prop_chance(p, 6) ? '.'
+						     : (char)prop_range(p, 'a', 'c');
+	}
+	buf[o] = '\0';
+}
+
+/* A literal cannot be malformed, so a failure here is a bug in the test, not
+ * an input worth skipping - which is why this aborts where gs_of() returns. */
+static struct glob_set *gs_literal(const char *path)
+{
+	struct glob_set *gs = glob_set_new();
+	char *err = NULL;
+
+	glob_set_add_literal(gs, path);
+	if (glob_set_compile(gs, &err)) {
+		fprintf(stderr, "literal \"%s\" rejected: %s\n", path, err);
+		abort();
+	}
+	return gs;
+}
+
+/*
+ * Build a set from `n` patterns, or NULL if any of them is malformed - which
+ * the generator does produce, since '[' comes out of the same draw as the rest.
+ * A rejected pattern must not be laundered into "matches nothing": that would
+ * make every property below pass vacuously on exactly the inputs where the
+ * compiler had something to say.
+ */
+static struct glob_set *gs_of(const char *const *pats, unsigned int n)
+{
+	struct glob_set *gs = glob_set_new();
+	char *err = NULL;
+
+	for (unsigned int i = 0; i < n; i++) {
+		if (glob_set_add(gs, pats[i], &err)) {
+			g_free(err);
+			glob_set_free(gs);
+			return NULL;
+		}
+	}
+	if (glob_set_compile(gs, &err)) {
+		g_free(err);
+		glob_set_free(gs);
+		return NULL;
+	}
+	return gs;
+}
+
+/*
+ * The rule the 1.6.0 break was made for (#147): a pattern with no '/' is about
+ * the basename and nothing else. Stated without reimplementing the matcher -
+ * the path and its own last component have to give the same answer, whatever
+ * that answer is - so this cannot pass by agreeing with a second copy of the
+ * same bug.
+ *
+ * `**` is excluded from the pattern, and finding out why is what this property
+ * was worth writing for. glob.h states two rules that collide: a pattern with
+ * no '/' is a basename rule, and `**` crosses directory boundaries. Here the
+ * second wins, so `a**` matches `/a/bbc` - crossing the slash, against a
+ * basename that is `bbc` - while `/bbc` alone does not match. git resolves the
+ * same collision the other way: in gitignore `**` is only special as a whole
+ * path component, and inside one it means `*`. Nobody writes `node**` on
+ * purpose and the divergence only ever excludes more than was asked for, so it
+ * is left alone here rather than fixed in a test commit; excluded by name so
+ * that the property states what is actually promised.
+ */
+static void squash_doublestars(char *s)
+{
+	char *w = s;
+
+	for (const char *r = s; *r; r++)
+		if (*r != '*' || w == s || w[-1] != '*')
+			*w++ = *r;
+	*w = '\0';
+}
+
+MU_TEST(test_prop_a_bare_pattern_reads_only_the_basename) {
+	declare_prop(p, 3000);
+
+	if (prop_skip_jit(__func__))
+		return;
+
+	while (prop_next(&p)) {
+		char pat[6];
+		const char *pats[] = { pat };
+		struct glob_set *gs;
+
+		gen_glob_segment(&p, pat, sizeof(pat));
+		squash_doublestars(pat);
+		gs = gs_of(pats, 1);
+		if (!gs)
+			continue;
+
+		/* Several paths per compile: building the automaton is nearly
+		 * all of what a case costs here - a GRegex compile against a
+		 * matcher call - and paths are the axis worth sampling. */
+		for (unsigned int k = 0; k < PROP_GLOB_PATHS; k++) {
+			char path[24], base[sizeof(path) + 1];
+			bool is_dir = prop_bool(&p);
+			const char *slash;
+
+			gen_glob_path(&p, path, sizeof(path));
+			slash = strrchr(path, '/');
+			snprintf(base, sizeof(base), "/%s",
+				 slash ? slash + 1 : path);
+			prop_check(&p, glob_set_match(gs, path, is_dir, NULL) ==
+				       glob_set_match(gs, base, is_dir, NULL));
+		}
+		glob_set_free(gs);
+	}
+}
+
+/*
+ * --exclude is a union, so adding a pattern can only ever exclude more. The
+ * failure this rules out is a shared automaton in which one pattern's
+ * compilation changes another's - the patterns are joined into a single
+ * regex, and a fragment that leaks a group or an alternation past its own
+ * boundary would do exactly that.
+ */
+MU_TEST(test_prop_adding_a_pattern_never_unexcludes_a_path) {
+	declare_prop(p, 3000);
+
+	if (prop_skip_jit(__func__))
+		return;
+
+	while (prop_next(&p)) {
+		char a[6], b[6];
+		const char *one[] = { a };
+		const char *both[] = { a, b };
+		struct glob_set *gs1, *gs2;
+
+		gen_glob_segment(&p, a, sizeof(a));
+		gen_glob_segment(&p, b, sizeof(b));
+		gs1 = gs_of(one, 1);
+		gs2 = gs_of(both, 2);
+		if (!gs1 || !gs2) {
+			glob_set_free(gs1);
+			glob_set_free(gs2);
+			continue;
+		}
+		for (unsigned int k = 0; k < PROP_GLOB_PATHS; k++) {
+			char path[24];
+			bool is_dir = prop_bool(&p);
+
+			gen_glob_path(&p, path, sizeof(path));
+			if (glob_set_match(gs1, path, is_dir, NULL))
+				prop_check(&p, glob_set_match(gs2, path, is_dir, NULL));
+		}
+		glob_set_free(gs1);
+		glob_set_free(gs2);
+	}
+}
+
+/*
+ * A trailing '/' restricts a pattern to directories, and the walk hands
+ * `is_dir` straight from the stat. Getting this backwards would exclude every
+ * *file* a `cache/` pattern named and none of the directories - and the run
+ * would look like it worked, since something was excluded.
+ */
+MU_TEST(test_prop_a_directory_pattern_never_matches_a_file) {
+	declare_prop(p, 3000);
+
+	if (prop_skip_jit(__func__))
+		return;
+
+	while (prop_next(&p)) {
+		char seg[6], pat[sizeof(seg) + 2];
+		const char *pats[] = { pat };
+		struct glob_set *gs;
+
+		gen_glob_segment(&p, seg, sizeof(seg));
+		snprintf(pat, sizeof(pat), "%s/", seg);
+		gs = gs_of(pats, 1);
+		if (!gs)
+			continue;
+		for (unsigned int k = 0; k < PROP_GLOB_PATHS; k++) {
+			char path[24];
+
+			gen_glob_path(&p, path, sizeof(path));
+			prop_check(&p, !glob_set_match(gs, path, false, NULL));
+		}
+		glob_set_free(gs);
+	}
+}
+
+/*
+ * A literal is exempt from metacharacter interpretation, which is what keeps a
+ * hashfile called `db[1].hash` from being read as a character class - oans adds
+ * its own hashfile and the two WAL sidecars this way. So it must match that one
+ * path and, being an absolute path rather than a basename rule, nothing else.
+ */
+MU_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char lit[24], other[24];
+		struct glob_set *gs;
+		bool is_dir = prop_bool(&p);
+		size_t n;
+
+		gen_glob_path(&p, lit, sizeof(lit));
+		/* Metacharacters in the *literal*, which is the case it exists
+		 * for: as a pattern this would be a class or a wildcard. */
+		n = strlen(lit);
+		if (n + 3 < sizeof(lit) && prop_bool(&p)) {
+			lit[n] = prop_bool(&p) ? '[' : '*';
+			lit[n + 1] = 'a';
+			lit[n + 2] = '\0';
+		}
+		gen_glob_path(&p, other, sizeof(other));
+
+		gs = gs_literal(lit);
+		prop_check(&p, glob_set_match(gs, lit, is_dir, NULL));
+		if (strcmp(lit, other))
+			prop_check(&p, !glob_set_match(gs, other, is_dir, NULL));
+		glob_set_free(gs);
+	}
+}
 
 /*
  * The FIDEDUPERANGE probe's answer taxonomy (#224). Worth testing directly and
@@ -1299,6 +2552,8 @@ MU_TEST(test_dedupe_classify_probe)
 
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_running_checksum_survives_save_restore);
+	MU_RUN_TEST(test_running_checksum_repoints_the_secret_on_restore);
+	MU_RUN_TEST(test_running_checksum_save_refuses_a_short_buffer);
 	MU_RUN_TEST(test_running_checksum_rejects_foreign_state);
 	MU_RUN_TEST(test_is_block_zeroed);
 	MU_RUN_TEST(test_block_len);
@@ -1319,10 +2574,16 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_starved_worker_line_reads_idle);
 	MU_RUN_TEST(test_scan_eta);
 	MU_RUN_TEST(test_group_u64);
+	MU_RUN_TEST(test_parse_size);
+	MU_RUN_TEST(test_human_size);
+	MU_RUN_TEST(test_human_duration);
+	MU_RUN_TEST(test_num_digits);
 	MU_RUN_TEST(test_longpath);
 	MU_RUN_TEST(test_glob_basename);
 	MU_RUN_TEST(test_glob_anchored_vs_any_depth);
 	MU_RUN_TEST(test_glob_wildcards_respect_separators);
+	MU_RUN_TEST(test_glob_double_star_without_a_separator);
+	MU_RUN_TEST(test_glob_backslash_escapes);
 	MU_RUN_TEST(test_glob_character_classes);
 	MU_RUN_TEST(test_glob_directory_only);
 	MU_RUN_TEST(test_glob_literal_paths_are_not_globs);
@@ -1330,6 +2591,28 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_glob_rejects_malformed);
 	MU_RUN_TEST(test_glob_empty_set_matches_nothing);
 	MU_RUN_TEST(test_dedupe_classify_probe);
+
+	/* Property-based (src/proptest.h). Grouped rather than interleaved: they
+	 * are a different question about the same code, and a failure here names
+	 * a seed to replay rather than a case to read. */
+	MU_RUN_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous);
+	MU_RUN_TEST(test_prop_sanitize_ctrl_truncates_on_whole_escapes);
+	MU_RUN_TEST(test_prop_sanitize_ctrl_is_identity_on_ordinary_names);
+	MU_RUN_TEST(test_prop_checksum_resumes_at_any_split);
+	MU_RUN_TEST(test_prop_checksum_refuses_any_damaged_header);
+	MU_RUN_TEST(test_prop_maps_share_with_themselves);
+	MU_RUN_TEST(test_prop_maps_never_share_without_a_real_address);
+	MU_RUN_TEST(test_prop_shared_ranges_have_nothing_left_to_free);
+	MU_RUN_TEST(test_prop_unshared_bytes_are_bounded_and_credited_once);
+	MU_RUN_TEST(test_prop_a_bare_pattern_reads_only_the_basename);
+	MU_RUN_TEST(test_prop_adding_a_pattern_never_unexcludes_a_path);
+	MU_RUN_TEST(test_prop_a_directory_pattern_never_matches_a_file);
+	MU_RUN_TEST(test_prop_a_literal_path_matches_itself_and_nothing_else);
+	MU_RUN_TEST(test_prop_parse_size_scales_by_the_suffix);
+	MU_RUN_TEST(test_prop_human_size_picks_a_real_unit);
+	MU_RUN_TEST(test_prop_human_duration_reads_back);
+	MU_RUN_TEST(test_prop_num_digits_matches_printf);
+	MU_RUN_TEST(test_prop_group_u64_truncates_to_a_prefix);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

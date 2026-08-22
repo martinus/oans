@@ -93,6 +93,45 @@ Key helpers on `DuperemoveTest` (see `harness.py` for the full set):
 | `mkrand` / `mkdup` / `make_sparse` / `write` / `hardlink` | build test data (copies are plain writes, so the pre-dedupe state is genuinely unshared) |
 | `requires_reflink` (class decorator) | skip tests that need dedupe when the fs can't |
 
+## The C unit suite
+
+`src/tests.c` is a separate thing from everything above: one translation unit
+that `#include`s the other sources, so it can reach their static functions, run
+by `make test` in a few hundred milliseconds. Two kinds of test live in it.
+
+**Tables of cases**, in minunit's `MU_TEST`, are the majority. They say what a
+function is for, and read as documentation of it.
+
+**Properties**, via `src/proptest.h`, state a relationship that must hold for
+every input and then generate inputs looking for one where it does not:
+
+```c
+MU_TEST(test_prop_sanitize_ctrl_leaves_nothing_dangerous) {
+	declare_prop(p, 20000);
+
+	while (prop_next(&p)) {
+		char in[24], out[SANITIZE_CTRL_MAX * 24 + 1];
+
+		gen_hostile_name(&p, in, sizeof(in));
+		sanitize_ctrl(in, out, sizeof(out));
+		prop_check(&p, !has_ctrl(out));
+	}
+}
+```
+
+The seed is fixed so `make test` is reproducible; `OANS_PROPTEST_SEED=random`
+goes looking and prints the seed it chose, and a failure names the seed and case
+number to replay. `src/proptest.h`'s header comment has the rest, including why
+there is no shrinking and what that costs.
+
+Neither kind replaces the other, and the properties do not lift everything
+equally. Measured with `scripts/mutate/mutate.py` over `src/util.c`, the same
+413 mutants with the properties removed and restored: 213 survivors → 203, all
+ten of them in `sanitize_ctrl`'s truncation arithmetic, which needs a buffer
+that runs out at each possible offset. Over `src/glob.c` they gained nothing at
+all. And writing them for `fiemap_phys_set` found that leaving the address set
+unsorted was caught by nothing whatsoever.
+
 ## Notes
 
 - The suite is self-validating: running it against a binary with a known bug

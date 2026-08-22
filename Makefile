@@ -133,9 +133,20 @@ oans: $(OBJECTS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBRARY_FLAGS)
 
 # C unit tests: tests.c pulls in the other .c files, so build it standalone.
+#
+# Building and running are separate targets because a harness that reads the
+# exit status has to tell the two apart. scripts/mutate/mutate.py builds a
+# mutated tree and then runs the suite; with one command doing both, a mutant
+# the tests caught would exit nonzero at the *build* step and be reported as
+# one the compiler refused - crediting the compiler with protection the tests
+# provided, which is the direction that tool must never be wrong in.
+# `make test` is unchanged for everyone else.
+.PHONY: test-build
+test-build:
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o test $(LIBRARY_FLAGS)
+
 .PHONY: test
-test:
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o $@ $(LIBRARY_FLAGS)
+test: test-build
 	$(SANITIZE_RUN) ./test
 
 # End-to-end suite (Python stdlib unittest). Dedupe cases need a reflink fs;
@@ -175,10 +186,28 @@ integration-valgrind: oans
 #     argument, or it silently ENAMETOOLONGs and the file is dropped;
 #   escape (#202) - no scanned file's name may be printed unescaped, or a
 #     crafted name rewrites the terminal.
+#
+# Plus one invariant about the tree rather than the sources: mutate_core.py is
+# vendored from unordered_dense, where its test suite lives, so a local edit
+# here would leave this repository running something nothing tests.
 .PHONY: lint
 lint:
 	@python3 scripts/lint-longpath.py
 	@python3 scripts/lint-escape.py
+	@python3 scripts/lint-mutate-core.py
+
+# Replay the known bugs in scripts/mutate/bugs/ and fail if any survives - the
+# check that says the tests would still notice #147, #159, #186, #187, #191 and
+# #202. Each bug file names the source it mutates on its own first line, so this
+# loop has nothing to know. Not in `check`: it is minutes rather than seconds,
+# and it is what the CI `mutation` job runs.
+.PHONY: mutation-replay
+mutation-replay:
+	@status=0; for bugs in scripts/mutate/bugs/*.txt; do \
+		echo "=== $$bugs ==="; \
+		python3 scripts/mutate/mutate.py --bugs "$$bugs" \
+			$(MUTATE_ARGS) || status=1; \
+	done; exit $$status
 
 .PHONY: check
 check: lint test integration
