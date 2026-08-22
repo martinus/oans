@@ -747,11 +747,26 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
   (`dext_work()` etc.) **before** the push. Reading after once fed
   `len * (0 - 1)` from a freed dext into the pushed-work total (frozen bar,
   multi-thousand-year ETA); `push_results` now asserts sane per-group work.
-- **Partial mode drains.** `find_additional_dedupe()` walks the **global**
-  filerec list, so with `--dedupe-options=partial` the producer calls
-  `dedupe_drain()` before the block-hash search — earlier batches are reaped
-  (filerecs freed) first, at the cost of cross-batch pipelining in that mode.
-  Default mode keeps the full overlap; don't add other drain points.
+- **Partial mode drains — *before* `dedupe_begin_batch()`, not mid-load (#227).**
+  `find_additional_dedupe()` walks the **global** filerec list, so with
+  `--dedupe-options=partial` the producer calls `dedupe_drain()` — earlier
+  batches reaped, filerecs freed — at the cost of cross-batch pipelining in that
+  mode. Default mode keeps the full overlap; don't add other drain points.
+  - **A reap may never land while a batch is open.** A batch takes its filerec
+    refs in `push_results()`, so between a load and its push the open batch's
+    groups point at filerecs kept alive only by the refs the reap drops — and a
+    group spanning two windows is exactly that shape, since the anchor member
+    (min id) is reloaded by every later window. The drain used to sit between
+    the extent load and the push, which freed that anchor and made
+    `push_results()` walk into it: a heap UAF that only showed up under
+    `--dedupe-options=partial`, and only when the previous batch was still in
+    flight. `free_batch()` now asserts `open_batch == NULL`, so putting a reap
+    back in the middle of a load aborts at the violation instead of corrupting
+    the heap.
+  - `DUPEREMOVE_DEDUPE_DELAY_MS` holds each dedupe worker back so a batch is
+    still in flight while the next one loads; on a test-sized tree the window
+    never opens without it (`test_partial_cross_window.py`). Sibling of
+    `DUPEREMOVE_SEARCH_DELAY_MS` below.
 - **The search must outlive nothing.** `find_additional_dedupe()` waits for
   every worker it pushed (its own counter/cond in `find_dupes.c`) before
   returning, because the caller reaps batches — freeing filerecs — right after.

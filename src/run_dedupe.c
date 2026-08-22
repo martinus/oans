@@ -105,6 +105,23 @@ static GMutex		producer_mutex;	/* guards the in-flight list + counts */
 static GCond		producer_cond;	/* producer waits; workers/seal signal */
 static struct list_head	inflight_batches = LIST_HEAD_INIT(inflight_batches);
 static unsigned int	inflight_count;
+/*
+ * The batch the producer is loading into, between dedupe_begin_batch() and
+ * dedupe_seal_batch(); NULL the rest of the time. Producer thread only, and
+ * only ever read by the assert in free_batch().
+ */
+static struct dedupe_batch *open_batch;
+
+/*
+ * Test hook (DUPEREMOVE_DEDUPE_DELAY_MS): hold each dedupe worker back so a
+ * batch is still in flight while the producer loads the next one. That is the
+ * ordering #227 needs - a reap has to land in the middle of a load - and on a
+ * test-sized tree a batch otherwise finishes long before the next load starts,
+ * so the window never opens. Read once on the producer thread in
+ * dedupe_phase_begin(); unset in normal use, so this costs one
+ * predictable-branch load per group.
+ */
+static useconds_t dedupe_delay_us;
 /* Called on the producer thread when a batch (and all earlier ones) complete,
  * to advance the durable dedupe_seq. Provided by the caller of the phase. */
 static void		(*batch_complete_cb)(unsigned int seq_hi);
@@ -853,6 +870,9 @@ static void dedupe_worker_body(void *priv)
 
 	free(item);	/* the item is consumed; dext/batch captured above */
 
+	if (dedupe_delay_us)
+		usleep(dedupe_delay_us);	/* test hook, see above */
+
 	/*
 	 * Seed the display line from the group before any work: first member
 	 * as the (provisional) target path, and the data the kernel has to
@@ -1028,6 +1048,7 @@ struct dedupe_batch *dedupe_begin_batch(unsigned int seq_hi)
 	b->held = g_ptr_array_new();
 	b->seq_hi = seq_hi;
 	INIT_LIST_HEAD(&b->list);
+	open_batch = b;
 	return b;
 }
 
@@ -1067,6 +1088,18 @@ static void free_batch(struct dedupe_batch *b)
 	 * than an abort.
 	 */
 	abort_on(!extents_search_idle());
+
+	/*
+	 * Nor may a batch be reaped while another one is being loaded. A batch
+	 * takes its filerec refs in push_results(), so between a load and its
+	 * push the open batch's groups point at filerecs kept alive only by the
+	 * refs of the batches reaped here - and a group spanning two windows
+	 * (the anchor member) is exactly that shape. Dropping those refs here
+	 * frees the filerec out from under the open batch, which then walks
+	 * into it: issue #227, where dedupe_drain() for the block-hash search
+	 * sat in the middle of the load. Reaps belong before dedupe_begin_batch.
+	 */
+	abort_on(open_batch != NULL);
 
 	if (batch_complete_cb)
 		batch_complete_cb(b->seq_hi);
@@ -1120,6 +1153,7 @@ void dedupe_await_slot(void)
  * reap it (and any earlier ready batch) if it is already complete. */
 void dedupe_seal_batch(struct dedupe_batch *b)
 {
+	open_batch = NULL;
 	g_mutex_lock(&producer_mutex);
 	b->fully_pushed = true;
 	list_add_tail(&b->list, &inflight_batches);
@@ -1136,6 +1170,7 @@ void dedupe_seal_batch(struct dedupe_batch *b)
 void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 {
 	GError *err = NULL;
+	const char *delay = getenv("DUPEREMOVE_DEDUPE_DELAY_MS");
 
 	batch_complete_cb = on_complete;
 	/* Kept in step with the print condition in dedupe_phase_end(): this
@@ -1144,8 +1179,11 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	report_net_shared = !isatty(STDOUT_FILENO);
 	curr_dedupe_pass = 0;
 	total_dedupe_passes = 0;
+	open_batch = NULL;
 	inflight_count = 0;
 	INIT_LIST_HEAD(&inflight_batches);
+	if (delay)
+		dedupe_delay_us = (useconds_t)strtoul(delay, NULL, 10) * 1000;
 
 	vprintf("Using %u threads for dedupe phase\n", options.io_threads);
 

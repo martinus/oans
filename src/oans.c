@@ -1279,14 +1279,10 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 		struct hash_tree dups_tree;
 
 		/*
-		 * The block-hash search walks the GLOBAL filerec list, so the
-		 * previous window's batches must be reaped (their filerecs
-		 * freed) first or it would rescan those files. This gives up
-		 * cross-batch pipelining in partial mode; the default mode
-		 * keeps the full overlap.
+		 * The previous window's batches were already reaped before this
+		 * one was begun (see stream_duplicates), so the global filerec
+		 * list holds only this window's files.
 		 */
-		dedupe_drain();
-
 		init_hash_tree(&dups_tree);
 		load_lock(inmem);
 		ret = dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
@@ -1341,6 +1337,25 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 		}
 
 		dedupe_await_slot();		/* bound to 2 batches in flight */
+
+		/*
+		 * The block-hash search (--dedupe-options=partial) walks the
+		 * GLOBAL filerec list, so the previous window's batches must be
+		 * reaped (their filerecs freed) before this one runs, or it
+		 * would rescan those files. It has to happen here, before the
+		 * batch is begun: reaping drops the refs that keep filerecs
+		 * alive, and a batch takes its own refs only once its loaded
+		 * groups are pushed. Draining between this batch's load and its
+		 * push - where this used to sit - freed a filerec that the
+		 * groups just loaded still pointed at (a cross-window anchor is
+		 * the same filerec in both windows), and push_results() then
+		 * dereferenced it: issue #227. This gives up cross-batch
+		 * pipelining in partial mode; the default mode keeps the full
+		 * overlap.
+		 */
+		if (options.do_block_hash)
+			dedupe_drain();
+
 		pdedupe_set_batch(++pass);
 		batch = dedupe_begin_batch(hi);
 		stream_load_batch(pdb, inmem, batch, i, hi);
