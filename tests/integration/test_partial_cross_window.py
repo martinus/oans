@@ -53,15 +53,16 @@ class PartialCrossWindowTest(DuperemoveTest):
             self._mkfile(f"f{i:02d}.bin", os.urandom(2 * MiB), tail)
         self.sync()
 
-        self.dedupe(self.work, "--dedupe-options=partial",
-                    "-B", BATCH_SIZE, "--io-threads=2",
-                    env={"DUPEREMOVE_FILES_PER_PASS": FILES_PER_PASS,
-                         "DUPEREMOVE_DEDUPE_DELAY_MS": "200"})
+        self.dm("-rd", self.work, "--dedupe-options=partial",
+                "-B", BATCH_SIZE, "--io-threads=2",
+                env={"DUPEREMOVE_FILES_PER_PASS": FILES_PER_PASS,
+                     "DUPEREMOVE_DEDUPE_DELAY_MS": "200"})
         # A use-after-free shows up as a signal (SIGABRT from the invariant
         # assert, or SIGSEGV / an ASAN abort in a sanitizer build), which
         # assertDmOk reports as a failure rather than reading the partial
         # output as a clean run.
         self.assertDmOk("partial-mode dedupe across generation windows failed")
+        self.sync()
 
         # The run has to have actually deduped, or it proves nothing: an empty
         # extent pass never loads a cross-window anchor in the first place.
