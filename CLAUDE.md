@@ -133,6 +133,22 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
 - **No sanitizer by default**, so a mutant that reads one slot too far only
   shows up if it corrupts something a test checks. Re-run a surprising survivor
   with `--make-arg SANITIZE=address,undefined --make-arg CC=clang`.
+  - **`tests/lsan.supp` was hiding oans's own leaks, and this is how that was
+    found.** Its `leak:libglib-2.0` line matches any leak whose stack passes
+    through GLib, and oans keeps nearly everything in GLib containers
+    (`GPtrArray`, `GHashTable`, `GRegex`, `GString`) — so it suppressed most of
+    oans's heap along with the cached-thread residue it was written for.
+    Measured: deleting one `g_free()` from `glob_set_free()` leaks 769,200
+    bytes in 32,050 allocations, LSan names `glob_set_new()` as the site, and
+    the run still exits **0**. Fourteen deletions of a free or an unref in
+    `src/glob.c` survived a `SANITIZE=address` sweep for that reason alone.
+    The unit leg now takes `tests/lsan-unit.supp` (the three thread-cache
+    entries by function), which catches all of them; the suite is in fact
+    leak-clean with no suppressions at all. **The end-to-end leg still takes
+    the broad file** — it drives the binary, whose GLib thread pools are what
+    the suppression was written for, and that leg cannot be run without a
+    btrfs or XFS scratch dir. Narrowing it too is one CI run away from being
+    answerable, and worth doing.
 - **`make test-build` exists for this** and only this: `make test` builds *and
   runs*, so a mutant the tests caught would exit nonzero at the build step and
   be scored `compiler` — the compiler credited with protection the tests

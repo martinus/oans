@@ -1,0 +1,25 @@
+# LeakSanitizer suppressions for the C unit suite (`make test SANITIZE=address`).
+#
+# Deliberately *narrower* than tests/lsan.supp next door, and the difference is
+# load-bearing. That file carries a module-wide `leak:libglib-2.0`, which
+# matches any leak whose stack passes through GLib - and oans holds nearly
+# everything in GLib containers (GPtrArray, GHashTable, GRegex, GString), so
+# the pattern suppresses most of oans's own heap along with GLib's.
+#
+# Measured, on this suite: removing one `g_free()` from glob_set_free() leaks
+# 769,200 bytes in 32,050 allocations, LeakSanitizer names glob_set_new() as
+# the allocation site - and `leak:libglib-2.0` suppresses every one of them, so
+# the run exits 0. A mutation sweep found fourteen deletions of a free() or an
+# unref() surviving an ASAN build for exactly this reason.
+#
+# What is left here is what the suppression was written for: GLib caches idle
+# worker threads from its thread pools rather than joining them at exit, so the
+# per-thread bookkeeping and TLS can still be live when LSAN scans. Those three
+# are named by function, so they cannot swallow anything else.
+#
+# The unit suite currently needs none of this - it is leak-clean with no
+# suppressions at all - so these are insurance against a GLib version that
+# caches more eagerly, not a known requirement.
+leak:g_thread_proxy
+leak:g_private_get
+leak:g_thread_self
