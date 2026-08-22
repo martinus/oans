@@ -119,9 +119,8 @@ enum dedupe_support {
  * errno that matters instead of against whichever filesystem the test host
  * happens to have.
  *
- * Reading `status` is not optional: a stacking filesystem answers the ioctl
- * itself and reports the lower filesystem's refusal there, leaving rc and
- * errno clean (see dedupe_probe_fd).
+ * Reading `status` is not optional; see dedupe_probe_fd for why, and for the
+ * measurements behind it.
  */
 enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status);
 

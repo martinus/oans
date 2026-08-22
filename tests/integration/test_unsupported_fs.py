@@ -19,15 +19,21 @@ from harness import DuperemoveTest, scratch_fstype
 
 
 class UnsupportedFsTest(DuperemoveTest):
-    def test_unsupported_fs_fails_loudly(self):
-        # Need a directory that is NOT on btrfs/XFS. The system temp dir is
-        # ext4 (CI) or tmpfs (most dev boxes); skip if it happens to be a
-        # reflink fs so we don't misjudge a supported setup.
+    def unsupported_dir(self):
+        """A scratch directory that is NOT on btrfs/XFS, or skip the test.
+
+        The system temp dir is ext4 (CI) or tmpfs (most dev boxes); skip if it
+        happens to be a reflink fs so we don't misjudge a supported setup.
+        """
         outside = tempfile.mkdtemp(prefix="oans-unsupported.")
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
         fstype = scratch_fstype(outside)
         if fstype in ("btrfs", "xfs"):
             self.skipTest(f"system temp dir is {fstype}, a supported fs")
+        return outside
+
+    def test_unsupported_fs_fails_loudly(self):
+        outside = self.unsupported_dir()
 
         with open(os.path.join(outside, "a.bin"), "wb") as f:
             f.write(os.urandom(1 << 20))
@@ -54,11 +60,7 @@ class UnsupportedFsTest(DuperemoveTest):
         the user pointed oans at a filesystem it may not be able to use at all
         and would have been told nothing.
         """
-        outside = tempfile.mkdtemp(prefix="oans-unsupported-empty.")
-        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
-        fstype = scratch_fstype(outside)
-        if fstype in ("btrfs", "xfs"):
-            self.skipTest(f"system temp dir is {fstype}, a supported fs")
+        outside = self.unsupported_dir()
 
         # Empty files: below --min-filesize, so none of them reaches the
         # scanner and nothing can answer the probe.

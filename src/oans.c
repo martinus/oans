@@ -1665,10 +1665,8 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	/*
 	 * Nothing could be locked onto a usable filesystem, so the walk saw no
 	 * files. Fail loudly rather than printing a misleading "Nothing to
-	 * deduplicate" and exiting 0. Two common causes: XFS on a kernel older
-	 * than 6.4 scanned without root (its UUID needs libblkid), and a
-	 * filesystem that turned out not to implement FIDEDUPERANGE -- which
-	 * has already said so, in the probe's own words (#224).
+	 * deduplicate" and exiting 0. The most common cause is XFS on a kernel
+	 * older than 6.4 scanned without root (its UUID needs libblkid).
 	 */
 	if (!ret && filescan_seed_failed()) {
 		eprintf("Error: none of the given paths are on a filesystem oans "
@@ -1683,29 +1681,8 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	 * FIDEDUPERANGE. Nothing was proved, so say so rather than exiting 0 on
 	 * a filesystem that may well be unusable.
 	 */
-	if (!ret) {
-		unsigned int asked = 0;
-
-		if (filescan_fs_probe_unsettled(&asked)) {
-			if (asked)
-				eprintf("Error: could not determine whether this "
-					"filesystem supports FIDEDUPERANGE - %u "
-					"file(s) were asked and none could "
-					"answer. A stacking filesystem such as "
-					"overlayfs reports its lower "
-					"filesystem's refusal this way. "
-					"Deduplication is known to work on "
-					"btrfs and XFS.\n", asked);
-			else
-				eprintf("Error: no file was available to test "
-					"whether this filesystem supports "
-					"FIDEDUPERANGE, so oans cannot tell "
-					"whether it can deduplicate here. "
-					"Deduplication is known to work on "
-					"btrfs and XFS.\n");
-			ret = 1;
-		}
-	}
+	if (!ret && filescan_report_fs_unusable())
+		ret = 1;
 
 	/* Only once the walk actually ran: after a failure every pattern would
 	 * trivially have "matched nothing" and would bury the real error. */

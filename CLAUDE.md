@@ -574,6 +574,11 @@ names the two; `dedupe_probe_fd()` asks everything else.
   what refusing unsupported filesystems upfront exists to prevent. Pinned by
   the `dedupe_classify_probe` unit test; reproduce with an `overlay` mount over
   ext4 and `./oans -rq`.
+  The length comes from `dedupe_shareable_len()`/`cached_blocksize()`, the
+  helpers the dedupe path already uses: `dest_offset` must be block-aligned or
+  a filesystem that *does* support the ioctl answers `EINVAL`, which reads as
+  UNKNOWN and quietly defeats the probe. Don't hardcode 4096 — 64K blocks exist
+  and the codebase can query the real value.
 - **The trade the real request buys that with:** on a filesystem that *does*
   support dedupe, the probe's two ranges may turn out identical and get shared.
   That is a genuine, byte-verified dedupe of one block within one file — it
@@ -595,8 +600,11 @@ names the two; `dedupe_probe_fd()` asks everything else.
   by default since #182). So `check_file()` locks the root provisionally and
   `__scan_file()` — the single consumer, hence no locking — settles it before
   anything is hashed. A definite no returns nonzero, which stops the consume
-  loop. An UNKNOWN file is hashed normally, so an unrecognised filesystem costs
-  at most `FS_PROBE_MAX_TRIES` files before it is refused.
+  loop — **and sets the walk-abort flag the walker threads poll**, mirroring
+  `interrupted()`. Without that the walkers readdir/statx the whole tree after
+  the error is already on screen: measured on a 20k-file tree, 402 `getdents64`
+  became 16. An UNKNOWN file is hashed normally, so an unrecognised filesystem
+  costs at most `FS_PROBE_MAX_TRIES` files before it is refused.
 - **Three ways to end up refusing, and they say different things.** A definite
   no; `FS_PROBE_MAX_TRIES` files that all declined; and a walk that ended with
   the question never asked (`filescan_fs_probe_unsettled()` — an empty tree, or
@@ -605,6 +613,10 @@ names the two; `dedupe_probe_fd()` asks everything else.
 - **Not routed through `seed_fs_lock_failed`.** That reports roots which could
   never be locked at all and only fires when *none* was seeded; here a root was
   seeded and the probe has already said precisely what is wrong.
+- **One place words the refusal** (`report_fs_unusable()`), because which of the
+  three cases it is decides the advice, and `file_scan` owns the state — the
+  same shape as `filescan_report_excludes()`. It also skips the report on an
+  interrupted run, whose exit status belongs to the signal.
 - **`DUPEREMOVE_FORCE_FS_PROBE=1` drops the fast path.** Without it the accept
   branch is unreachable in tests: the only filesystems known to answer *yes*
   are the two that never reach the probe. `test_fs_probe.py` uses it to run the

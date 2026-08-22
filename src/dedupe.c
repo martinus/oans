@@ -580,11 +580,10 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
  * alone.
  */
 
-/* Probe with a block-sized range, and never more than this. Large enough to
- * survive a filesystem rounding the length down to its block size (64K blocks
- * exist), small enough that any ordinary file can host two of them. */
+/* Never probe with more than this, however large the file: one block answers
+ * the question, and a longer range only means more bytes the kernel might end
+ * up sharing. Raised to the block size where that is bigger. */
 #define DEDUPE_PROBE_LEN_MAX	(64 * 1024)
-#define DEDUPE_PROBE_LEN_MIN	4096
 
 enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status)
 {
@@ -629,19 +628,27 @@ enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
 	char buf[sizeof(struct file_dedupe_range) +
 		 sizeof(struct file_dedupe_range_info)] = {0,};
 	struct file_dedupe_range *same = (struct file_dedupe_range *)buf;
+	unsigned int bs = cached_blocksize(fd);
+	uint64_t cap = bs > DEDUPE_PROBE_LEN_MAX ? bs : DEDUPE_PROBE_LEN_MAX;
 	uint64_t len = size / 2;
 	int rc;
 
 	/*
 	 * Two disjoint ranges of one file: [0, len) against [len, 2 * len).
 	 * One file is all the caller has - the probe runs on whatever the walk
-	 * produced first - and a file too small to hold both simply cannot
-	 * answer.
+	 * produced first.
+	 *
+	 * Whole blocks only, and at least one: dest_offset has to be block
+	 * aligned, or a filesystem that does implement the ioctl answers
+	 * EINVAL, which reads as UNKNOWN and quietly defeats the probe.
+	 * dedupe_shareable_len() owns that rounding rule and queries the real
+	 * block size, so this does not have to guess it. A file too small to
+	 * hold both ranges cannot answer.
 	 */
-	if (len > DEDUPE_PROBE_LEN_MAX)
-		len = DEDUPE_PROBE_LEN_MAX;
-	len &= ~((uint64_t)DEDUPE_PROBE_LEN_MIN - 1);	/* whole blocks only */
-	if (len < DEDUPE_PROBE_LEN_MIN)
+	if (len > cap)
+		len = cap;
+	len = dedupe_shareable_len(fd, len);
+	if (len < bs)
 		return DEDUPE_SUPPORT_UNKNOWN;
 
 	same->src_offset = 0;
@@ -650,7 +657,7 @@ enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
 	same->info[0].dest_fd = fd;
 	same->info[0].dest_offset = len;
 
-	errno = 0;
+	/* errno matters only when the ioctl fails, and then it sets it. */
 	rc = ioctl(fd, FIDEDUPERANGE, same);
 
 	return dedupe_classify_probe(rc, errno, same->info[0].status);

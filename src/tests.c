@@ -1256,12 +1256,8 @@ MU_TEST(test_dedupe_classify_probe)
 	mu_assert_int_eq(DEDUPE_SUPPORT_YES,
 			 dedupe_classify_probe(0, EINVAL, 0));
 
-	/*
-	 * A stacking filesystem (overlayfs) answers the ioctl itself and puts
-	 * the lower filesystem's refusal in status, leaving rc and errno clean.
-	 * Measured on overlayfs over ext4: rc=0, status=-EINVAL. Reading only
-	 * errno would accept every containerised run on an overlay root.
-	 */
+	/* A stacking filesystem puts the lower filesystem's refusal in status
+	 * and leaves rc/errno clean - the case dedupe_probe_fd documents. */
 	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
 			 dedupe_classify_probe(0, 0, -EINVAL));
 	/* A status that does name the filesystem is still an answer. */

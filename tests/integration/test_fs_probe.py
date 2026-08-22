@@ -38,12 +38,13 @@ class FsProbeTest(DuperemoveTest):
         self.assertShared(a, b, "the files were not deduped under a forced probe")
 
     def test_a_forced_probe_changes_nothing(self):
-        """Byte-for-byte the same hashfile as a run that took the fast path.
+        """The same hashfile as a run that took the fast path.
 
         The probe is meant to be invisible on a filesystem that supports the
-        ioctl: same files, same digests. Asserting on the stored hashes rather
-        than on a log line is the only check that would catch the probe
-        perturbing what gets scanned.
+        ioctl. fingerprints() is the comparison for that (files, extents and
+        blocks) - the probe issues a real dedupe request, so a weaker check on
+        file digests alone would miss it perturbing the extent rows, which is
+        exactly where it could show.
         """
         self.mkdup("tree/a.bin", "tree/b.bin", 1 * MiB)
         self.mkrand("tree/c.bin", 512 * 1024)
@@ -51,16 +52,13 @@ class FsProbeTest(DuperemoveTest):
 
         self.scan(self.path("tree"))
         self.assertDmOk()
-        baseline = self.hf_query(
-            "select filename, digest from files order by filename")
+        baseline = self.fingerprints()
 
-        os.unlink(self.hf)
+        self.drop_hashfile()
         self.dm("-r", self.path("tree"), env=FORCED)
         self.assertDmOk()
-        forced = self.hf_query(
-            "select filename, digest from files order by filename")
 
-        self.assertEqual(baseline, forced,
+        self.assertEqual(baseline, self.fingerprints(),
                          "a forced probe changed what the scan stored")
 
     def test_the_probe_leaves_the_file_alone(self):
@@ -73,17 +71,15 @@ class FsProbeTest(DuperemoveTest):
         corrupt the first file of every scan on an unrecognised filesystem.
         """
         p = self.mkrand("tree/only.bin", 1 * MiB)
-        with open(p, "rb") as f:
-            before = f.read()
+        before = self.tree_digest(self.path("tree"))
         st_before = os.stat(p)
         self.sync()
 
         self.dm("-r", self.path("tree"), env=FORCED)
         self.assertDmOk()
 
-        with open(p, "rb") as f:
-            self.assertEqual(before, f.read(),
-                             "the probe altered the file's contents")
+        self.assertEqual(before, self.tree_digest(self.path("tree")),
+                         "the probe altered the file's contents")
         st_after = os.stat(p)
         self.assertEqual(st_before.st_size, st_after.st_size,
                          "the probe altered the file's size")
