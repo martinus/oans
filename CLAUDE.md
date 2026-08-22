@@ -232,7 +232,29 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
 `dbfile_open_handle(NULL)` opens a shared-cache in-memory SQLite - the same path
 a run without `--hashfile` takes - so `dbfile.c` needs no filesystem, no btrfs
 and no scan to test. That is not a test-only seam; it is the in-memory mode
-oans already ships. Coverage went 0% → 47% on eight tests.
+oans already ships. Coverage went 0% → 47% on eight tests, and a whole-file
+sweep from **901 survivors to 785**.
+
+- **`memdb()` handles all share one database.** Shared-cache in-memory means a
+  second `dbfile_open_handle(NULL)` is the *same* database, not an empty one -
+  so "what does this answer against a fresh hashfile" has to be asked before
+  the test stores anything, and a test that opens a second handle expecting a
+  clean slate silently asserts against the first one's rows.
+- **Read the survivors by function here too, and twice it changed the fix.**
+  `dbfile_get_run_summary` barely moved on the second sweep, 22 → 21, and the
+  grouping said why: its five error buckets are adjacent columns read by
+  index, and the fixture had three of them at 0 - indistinguishable from each
+  other *and* from a read that was dropped. Distinct values fixed it.
+  `dbfile_load_scan_config` still let `mfs = 0` be deleted, because the
+  fixture deleted *both* size-limit keys; the two limits are read through one
+  scratch variable, so only deleting the additive one exposes `max` silently
+  becoming `min`. In both cases the test looked thorough and the number said
+  otherwise.
+- **A `perror_sqlite` + `goto out` pair is residue, not a hole.** After the
+  strengthening, all ten of `dbfile_describe_file`'s remaining survivors are
+  that shape - a bind or step failure no unit test can provoke. Triage to
+  that point and stop; the next honest move is a fault-injection seam, not a
+  bigger fixture.
 
 - **What is worth testing there is what fails silently.** A hashfile is a cache,
   so nothing downstream validates it: a row that vanished, a digest copied from
@@ -306,6 +328,21 @@ counterexample. No dependencies, one header, minunit-compatible.
   the named-bug files they earn their place differently again — leaving the
   fiemap address set unsorted is caught by nothing else. Expect that
   unevenness rather than a uniform number.
+  - The three **hashfile** properties are the same story a third time:
+    `src/dbfile.c` swept with and without them is **786 survivors → 785**,
+    one mutant. That one is worth the three, though - `i > 0` → `i > 1` in
+    `dbfile_layout_matches`, i.e. *a donor with exactly one stored extent
+    stops matching*. Every fixture in the table has two records, so nothing
+    there could see it, and a single-extent file is the common case: btrfs
+    reports a contiguously allocated file as one fiemap record however large
+    it is. A snapshot-aware scan would have silently stopped copying
+    anything on the most ordinary layout there is.
+  - **And the sweep cannot score one of them at all.** "Normalize adjacent
+    records before comparing" - the #186 confusion, and what
+    `test_prop_a_split_record_is_not_the_layout_it_covers` exists to refuse -
+    is a design change, not a single-token edit or a statement deletion, so
+    no operator generates it. Read a property's `caught` count as a lower
+    bound on what it guards, never as the measure.
 
 ## Profiling & measurement — read before optimizing
 
