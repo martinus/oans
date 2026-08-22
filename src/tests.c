@@ -4216,6 +4216,229 @@ MU_TEST(test_the_anchor_flag_latches_once_claimed) {
 	free_all_filerecs();
 }
 
+/*
+ * insert_result() is the pair-wise entry point find_dupes actually calls;
+ * insert_one_result() above is the single-extent variant. Testing the helper
+ * and not this one left 36 of results-tree.c's mutants untouched.
+ *
+ * Two things here that only this signature has. The group's length comes from
+ * `endoff[0] - startoff[0] + 1` - **inclusive**, and taken from the *first*
+ * pair alone - so an off-by-one silently files the pair under a neighbouring
+ * key, where it can never meet the extents it duplicates. And both extents go
+ * into one group, so a pair that is really the same extent twice must count
+ * once.
+ */
+MU_TEST(test_insert_result_files_a_pair_under_one_length) {
+	struct results_tree res;
+	unsigned char digest[DIGEST_LEN];
+	struct filerec *recs[2];
+	uint64_t startoff[2], endoff[2];
+	struct dupe_extents *d;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(digest, 1);
+	recs[0] = mkfilerec(1);
+	recs[1] = mkfilerec(2);
+
+	/* An inclusive range of exactly PROP_LEN bytes. */
+	startoff[0] = 0;
+	endoff[0] = PROP_LEN - 1;
+	startoff[1] = PROP_LEN * 4;
+	endoff[1] = PROP_LEN * 5 - 1;
+	mu_check(insert_result(&res, digest, recs, startoff, endoff) == 0);
+
+	mu_check(res.num_dupes == 1);
+	mu_check(res.num_extents == 2);
+	d = find_dupe_extents(&res, digest, PROP_LEN);
+	mu_check(d != NULL);			/* not PROP_LEN - 1, nor + 1 */
+	mu_check(d && d->de_num_dupes == 2);
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN - 1) == NULL);
+	mu_check(find_dupe_extents(&res, digest, PROP_LEN + 1) == NULL);
+
+	/* The second file's offset is its own, not a copy of the first's. */
+	{
+		struct extent *e;
+		bool at_0 = false, at_4 = false;
+
+		list_for_each_entry(e, &d->de_extents, e_list) {
+			if (e->e_file == recs[0] && e->e_loff == 0)
+				at_0 = true;
+			if (e->e_file == recs[1] && e->e_loff == PROP_LEN * 4)
+				at_4 = true;
+		}
+		mu_check(at_0 && at_4);
+	}
+
+	/* The same extent named twice is one member, not two. */
+	recs[1] = recs[0];
+	startoff[1] = startoff[0];
+	endoff[1] = endoff[0];
+	mu_check(insert_result(&res, digest, recs, startoff, endoff) == 0);
+	mu_check(res.num_extents == 2);		/* unchanged */
+	mu_check(d->de_num_dupes == 2);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+}
+
+/* A real file to open. Any filesystem will do - this is fd bookkeeping, not
+ * dedupe - so it does not need the reflink scratch dir. */
+static struct filerec *mkrealfile(char *path, size_t sz)
+{
+	int fd;
+
+	snprintf(path, sz, "/tmp/oans-filerec-XXXXXX");
+	fd = mkstemp(path);
+	if (fd < 0 || write(fd, "hello", 5) != 5)
+		abort();
+	close(fd);
+	return filerec_new(path, 1, 5);
+}
+
+/*
+ * The file descriptor is reference counted, and that is the whole point: the
+ * dedupe phase opens the same file from several groups at once, so a nested
+ * open must hand back the descriptor already open rather than a second one.
+ * Opening twice and closing twice looks correct either way from the outside -
+ * what separates a real refcount from open-and-close-every-time is that the
+ * descriptor stays *usable* across the inner close, which is why this reads a
+ * byte through it rather than only inspecting the counter.
+ */
+MU_TEST(test_filerec_holds_one_descriptor_however_often_it_is_opened) {
+	char path[64];
+	struct filerec *f;
+	char buf[1];
+	int first_fd;
+
+	free_all_filerecs();
+	f = mkrealfile(path, sizeof(path));
+	mu_check(f->fd == -1 && f->fd_refs == 0);
+
+	mu_check(filerec_open(f, false) == 0);
+	mu_check(f->fd != -1 && f->fd_refs == 1);
+	first_fd = f->fd;
+
+	/* Nested open: the same descriptor, not a second one. */
+	mu_check(filerec_open(f, false) == 0);
+	mu_check(f->fd == first_fd);
+	mu_check(f->fd_refs == 2);
+
+	filerec_close(f);
+	mu_check(f->fd_refs == 1);
+	mu_check(f->fd == first_fd);
+	/* Still open, which a close-every-time implementation would fail. */
+	mu_check(pread(f->fd, buf, 1, 0) == 1 && buf[0] == 'h');
+
+	filerec_close(f);
+	mu_check(f->fd_refs == 0 && f->fd == -1);
+
+	/* A file that is not there reports the errno and leaves the filerec
+	 * closed rather than counting a descriptor it never got. */
+	unlink(path);
+	mu_check(filerec_open(f, true) == ENOENT);
+	mu_check(f->fd == -1 && f->fd_refs == 0);
+
+	free_all_filerecs();
+}
+
+/*
+ * filerec_open_once() is what the dedupe phase uses to open every member of a
+ * group without opening any of them twice. It remembers what it has opened in
+ * a token tree keyed on the filerec, so asking again is a no-op - and the test
+ * of that is the *refcount*, since a second real open would leave a
+ * descriptor no close in the batch will ever release.
+ */
+MU_TEST(test_filerec_open_once_opens_each_file_exactly_once) {
+	char path[64];
+	struct filerec *f;
+	OPEN_ONCE(open_files);
+
+	free_all_filerecs();
+	f = mkrealfile(path, sizeof(path));
+
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+
+	/* Asked twice, opened once. */
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+	mu_check(filerec_open_once(f, &open_files) == 0);
+	mu_check(f->fd_refs == 1);
+
+	filerec_close_open_list(&open_files);
+	mu_check(f->fd_refs == 0 && f->fd == -1);
+	mu_check(RB_EMPTY_ROOT(&open_files.root));
+
+	/* A missing file is reported, and leaves no token behind claiming it
+	 * was opened - otherwise a later pass would skip opening it. */
+	unlink(path);
+	mu_check(filerec_open_once(f, &open_files) == ENOENT);
+	mu_check(RB_EMPTY_ROOT(&open_files.root));
+	mu_check(f->fd_refs == 0);
+
+	free_all_filerecs();
+}
+
+/*
+ * The token tree is keyed on the filerec *pointer*, which is what makes the
+ * lookup above cheap. Worth its own case because pointer ordering is the one
+ * comparator here whose operands a test cannot choose: the property below
+ * inserts whatever addresses the allocator hands out, so it fails only if the
+ * comparator disagrees with itself.
+ */
+MU_TEST(test_prop_a_filerec_token_is_found_by_its_filerec) {
+	declare_prop(p, 120);
+	struct filerec *files[PROP_FILES];
+
+	free_all_filerecs();
+	for (unsigned int i = 0; i < PROP_FILES; i++)
+		files[i] = mkfilerec((int64_t)i + 1);
+
+	while (prop_next(&p)) {
+		struct rb_root root = RB_ROOT;
+		bool inserted[PROP_FILES] = {false};
+		uint64_t order[PROP_FILES];
+		unsigned int n = (unsigned int)prop_range(&p, 1, PROP_FILES);
+
+		for (unsigned int i = 0; i < PROP_FILES; i++)
+			order[i] = i;
+		prop_shuffle_u64(&p, order, PROP_FILES);
+
+		for (unsigned int i = 0; i < n; i++) {
+			struct filerec *f = files[order[i]];
+			struct filerec_token *t = filerec_token_new(f);
+
+			if (!t)
+				abort();
+			insert_filerec_token_rb(&root, t);
+			inserted[order[i]] = true;
+		}
+
+		for (unsigned int i = 0; i < PROP_FILES; i++) {
+			struct filerec_token *t =
+				find_filerec_token_rb(&root, files[i]);
+
+			if (!inserted[i]) {
+				prop_check(&p, t == NULL);
+				continue;
+			}
+			prop_check(&p, t != NULL);
+			prop_check(&p, t->t_file == files[i]);
+		}
+
+		while (!RB_EMPTY_ROOT(&root)) {
+			struct filerec_token *t =
+				rb_entry(rb_first(&root), struct filerec_token,
+					 t_node);
+
+			rb_erase(&t->t_node, &root);
+			filerec_token_free(t);
+		}
+	}
+	free_all_filerecs();
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -4319,6 +4542,10 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_removing_an_extent_collapses_a_group_of_one);
 	MU_RUN_TEST(test_a_group_is_keyed_on_digest_and_length_together);
 	MU_RUN_TEST(test_the_anchor_flag_latches_once_claimed);
+	MU_RUN_TEST(test_insert_result_files_a_pair_under_one_length);
+	MU_RUN_TEST(test_filerec_holds_one_descriptor_however_often_it_is_opened);
+	MU_RUN_TEST(test_filerec_open_once_opens_each_file_exactly_once);
+	MU_RUN_TEST(test_prop_a_filerec_token_is_found_by_its_filerec);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
