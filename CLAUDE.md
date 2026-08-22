@@ -175,6 +175,13 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   runs*, so a mutant the tests caught would exit nonzero at the build step and
   be scored `compiler` — the compiler credited with protection the tests
   provided. Don't merge the two targets back together.
+- **A file `src/tests.c` does not `#include` is refused, not swept.** `oans.c`
+  and `run_dedupe.c` belong to the shipped binary alone, and `make test-build`
+  compiles only `tests.c` - so every mutant in them came back `survived` and
+  the report read "whatever covers them is decoration" over 1,394 mutants that
+  were never under test. The tool now appends an `#error` to the target and
+  builds: if that succeeds, nothing the test binary is made of included the
+  file. To sweep either one, put it in the test translation unit first.
 - **`mutate_core.py` is vendored** from unordered_dense, where its own hermetic
   suite (`scripts/test_mutate.py`) lives; nanobench holds the same copy. Never
   edit it here — change it there, run that suite, re-copy into all three and
