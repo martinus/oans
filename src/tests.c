@@ -24,6 +24,7 @@
 #include "storage.c"
 #include "longpath.c"
 #include "glob.c"
+#include "dedupe.c"
 
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
@@ -1237,6 +1238,51 @@ MU_TEST(test_running_checksum_rejects_foreign_state) {
 	mu_check(running_checksum_restore(blob, len) == NULL);
 }
 
+
+/*
+ * The FIDEDUPERANGE probe's error taxonomy (#224). Worth testing directly and
+ * exhaustively: the probe's whole job is turning one errno into a verdict, and
+ * which errno a filesystem returns is exactly what a test host cannot vary.
+ * Both wrong answers are bad in different ways -- a wrong NO silently skips a
+ * whole tree, a wrong YES brings back per-file dedupe errors -- so anything
+ * that is not a clear statement about the filesystem must stay UNKNOWN.
+ */
+MU_TEST(test_dedupe_classify_probe)
+{
+	/* The ioctl went through: the filesystem implements it. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, 0));
+	/* errno is meaningless on success and must not be consulted. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_YES, dedupe_classify_probe(0, EINVAL));
+
+	/* Answers about the filesystem. EOPNOTSUPP is what ext4 returns
+	 * (measured); ENOTTY is a kernel that does not know the ioctl. */
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO,
+			 dedupe_classify_probe(-1, EOPNOTSUPP));
+	mu_assert_int_eq(DEDUPE_SUPPORT_NO, dedupe_classify_probe(-1, ENOTTY));
+
+	/*
+	 * Answers about this file or this caller. EINVAL is the important one:
+	 * it is documented for "the filesystem does not support deduplicating
+	 * the ranges of the given files" *and* for ordinary per-file
+	 * conditions, so reading it as NO would condemn a filesystem on the
+	 * evidence of one awkward file.
+	 */
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EINVAL));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EACCES));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EROFS));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EPERM));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EISDIR));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, EBADF));
+	mu_assert_int_eq(DEDUPE_SUPPORT_UNKNOWN,
+			 dedupe_classify_probe(-1, ETXTBSY));
+}
+
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_running_checksum_survives_save_restore);
 	MU_RUN_TEST(test_running_checksum_rejects_foreign_state);
@@ -1269,6 +1315,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_glob_reports_matching_pattern_and_counts);
 	MU_RUN_TEST(test_glob_rejects_malformed);
 	MU_RUN_TEST(test_glob_empty_set_matches_nothing);
+	MU_RUN_TEST(test_dedupe_classify_probe);
 }
 
 int main(int argc [[maybe_unused]], char *argv[]) {

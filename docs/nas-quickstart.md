@@ -19,9 +19,9 @@ findmnt -no FSTYPE /srv/media      # or: stat -f -c %T /srv/media
 - **btrfs / xfs** → you're good. (Most Synology volumes are btrfs.)
 - **zfs** → stop. oans cannot dedupe ZFS; use ZFS's own deduplication instead.
   (This rules out a stock TrueNAS SCALE pool.)
-- **ext4 / anything else** → stop. oans refuses an unsupported filesystem before
-  it walks it, so there is no scan-only mode either: it needs FIEMAP to find
-  extents and `FIDEDUPERANGE` to share them.
+- **ext4 / anything else** → stop. oans asks the filesystem for
+  `FIDEDUPERANGE` and refuses it if the answer is no, before hashing anything —
+  so there is no scan-only mode either. (It also needs FIEMAP, to find extents.)
 
 ## Step 1 — Build and install
 

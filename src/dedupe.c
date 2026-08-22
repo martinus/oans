@@ -547,3 +547,65 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 
 	return !!list_empty(&ctxt->completed);
 }
+
+/*
+ * Probing a filesystem for FIDEDUPERANGE (#224)
+ *
+ * oans used to decide what it could deduplicate by matching the statfs magic
+ * against btrfs and XFS. That allowlist needs editing and releasing every time
+ * another filesystem gains the ioctl, so filesystems it does not name are now
+ * asked directly rather than assumed hopeless.
+ *
+ * The question is asked with a zero-length dedupe request, which changes
+ * nothing: a filesystem with no remap_file_range is refused with EOPNOTSUPP
+ * before the kernel touches anything, and elsewhere zero bytes is a no-op.
+ * Unlike FICLONERANGE, a zero src_length does *not* mean "to end of file" for
+ * FIDEDUPERANGE, so this cannot accidentally share data. Measured on ext4: a
+ * zero-length request and a real one both return EOPNOTSUPP, and the file is
+ * untouched.
+ */
+enum dedupe_support dedupe_classify_probe(int rc, int err)
+{
+	if (rc == 0)
+		return DEDUPE_SUPPORT_YES;
+
+	/*
+	 * An answer about the filesystem: it has no remap_file_range at all
+	 * (EOPNOTSUPP), or the kernel does not know the ioctl (ENOTTY).
+	 */
+	if (err == EOPNOTSUPP || err == ENOTTY)
+		return DEDUPE_SUPPORT_NO;
+
+	/*
+	 * Anything else is about this file or this caller, not the filesystem.
+	 * EINVAL in particular is documented both for "the filesystem does not
+	 * support deduplicating the ranges of the given files" and for a dozen
+	 * ordinary per-file conditions, so it cannot be read either way;
+	 * EACCES/EROFS/EPERM are permission, EISDIR the wrong kind of file.
+	 *
+	 * Refusing to guess is what keeps this safe in both directions: a wrong
+	 * "no" would silently skip someone's whole tree, and a wrong "yes"
+	 * brings back the per-file FIEMAP/dedupe errors the upfront rejection
+	 * exists to avoid. The caller tries the next file instead.
+	 */
+	return DEDUPE_SUPPORT_UNKNOWN;
+}
+
+enum dedupe_support dedupe_probe_fd(int fd)
+{
+	char buf[sizeof(struct file_dedupe_range) +
+		 sizeof(struct file_dedupe_range_info)] = {0,};
+	struct file_dedupe_range *same = (struct file_dedupe_range *)buf;
+	int rc;
+
+	same->src_offset = 0;
+	same->src_length = 0;
+	same->dest_count = 1;
+	same->info[0].dest_fd = fd;
+	same->info[0].dest_offset = 0;
+
+	errno = 0;
+	rc = ioctl(fd, FIDEDUPERANGE, same);
+
+	return dedupe_classify_probe(rc, errno);
+}

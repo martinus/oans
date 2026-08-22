@@ -556,6 +556,46 @@ is the false premise this took two PRs to unwind:
   means "the user never asked", so `dbfile_load_scan_config` coerces `< 0` to 0 —
   a replay adopts the new default; only an explicit `1` survives.
 
+## What oans will scan: allowlist, then probe (#224)
+
+btrfs and XFS are an **allowlist fast path**, not the definition of supported.
+Anything else is asked directly whether it implements `FIDEDUPERANGE`, so a
+filesystem that gains the ioctl needs no code change. `is_fs_allowlisted()`
+names the two; `dedupe_probe_fd()` asks everything else.
+
+- **The question is a zero-length dedupe, which changes nothing.** A filesystem
+  with no `remap_file_range` is refused `EOPNOTSUPP` before the kernel touches
+  anything, and zero bytes is a no-op elsewhere. Crucially, **a zero
+  `src_length` does *not* mean "to end of file" for `FIDEDUPERANGE`** the way it
+  does for `FICLONERANGE` — so this cannot accidentally share data. Measured on
+  ext4: zero-length and real requests both return `EOPNOTSUPP`, file untouched.
+  `test_fs_probe.py::…_leaves_the_file_alone` pins it.
+- **The taxonomy is the whole feature, so it is a pure function**
+  (`dedupe_classify_probe`, unit-tested against every errno that matters). Only
+  `EOPNOTSUPP`/`ENOTTY` mean *no*; everything else — `EINVAL` above all, which
+  the man page documents both for "the filesystem does not support
+  deduplicating the ranges" and for a dozen per-file conditions — is
+  **UNKNOWN**, and the next file is asked instead (up to `FS_PROBE_MAX_TRIES`).
+  Never widen *no*: a wrong *no* silently skips someone's whole tree.
+- **Probed lazily, at the first regular file, not at seed time.** The ioctl
+  needs a writable regular file and a root is normally a directory — measured,
+  a directory fd gives `EISDIR`, not `EOPNOTSUPP`. Creating a scratch file
+  instead is a non-starter (read-only mounts; read-only subvolumes are scanned
+  by default since #182). So `check_file()` locks the root provisionally and
+  `__scan_file()` — the single consumer, hence no locking — settles it before
+  anything is hashed. A definite no returns nonzero, which stops the consume
+  loop.
+- **Not routed through `seed_fs_lock_failed`.** That reports roots which could
+  never be locked at all and only fires when *none* was seeded; here a root was
+  seeded and the probe has already said precisely what is wrong.
+- **`DUPEREMOVE_FORCE_FS_PROBE=1` drops the fast path.** Without it the accept
+  branch is unreachable in tests: the only filesystems known to answer *yes*
+  are the two that never reach the probe. `test_fs_probe.py` uses it to run the
+  probe against the real scratch btrfs/XFS, which is the only way this ships
+  having been seen to say *yes* and not just *no*.
+- The refusal path is testable anywhere (`test_unsupported_fs.py`), since any
+  non-reflink filesystem — ext4, tmpfs — answers `EOPNOTSUPP`.
+
 ## Snapshot-aware scan: copy hashes for an identical layout (#206)
 
 Hashing N snapshots of a subvolume read N× the data. Two files whose fiemaps

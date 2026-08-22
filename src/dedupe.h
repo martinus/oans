@@ -106,4 +106,25 @@ int dedupe_extents(struct dedupe_ctxt *ctxt);
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 			  uint64_t *bytes_freed, struct filerec **file);
 
+/* What a FIDEDUPERANGE probe learned about a filesystem (#224). */
+enum dedupe_support {
+	DEDUPE_SUPPORT_NO,	/* the filesystem does not implement the ioctl */
+	DEDUPE_SUPPORT_YES,	/* it does */
+	DEDUPE_SUPPORT_UNKNOWN,	/* this file could not answer the question */
+};
+
+/*
+ * Classify one probe result. Pure, so the taxonomy can be unit-tested against
+ * every errno that matters instead of against whichever filesystem the test
+ * host happens to have.
+ */
+enum dedupe_support dedupe_classify_probe(int rc, int err);
+
+/*
+ * Ask the filesystem behind `fd` whether it implements FIDEDUPERANGE, without
+ * changing anything. `fd` must be open for writing (the ioctl's destination
+ * must be writable) and refer to a regular file.
+ */
+enum dedupe_support dedupe_probe_fd(int fd);
+
 #endif	/* __DEDUPE_H__ */

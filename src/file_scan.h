@@ -45,6 +45,7 @@ void fs_get_locked_uuid(uuid_t *uuid);
  * of reporting a silent, successful no-op.
  */
 bool filescan_seed_failed(void);
+bool filescan_fs_probe_unsettled(void);
 
 /*
  * How many scan roots named on the command line (or in a "-" stdin list) could
