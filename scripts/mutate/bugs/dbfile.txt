@@ -39,23 +39,18 @@
 "delete from files where digest is NULL;"
 >>>
 
-# a resumed file is put through the ordinary upsert instead of a targeted UPDATE
-# INSERT OR REPLACE deletes the row and cascades its checkpoint and every stored
-# hash away. The file keeps its name and its size, so nothing looks wrong.
+# a resumed file's generation is written with the ordinary upsert
+# The mistake is reaching for the statement that already writes a files row.
+# INSERT OR REPLACE deletes the row and cascades its checkpoint *and* every
+# stored hash away, so the file restarts at byte zero - and it keeps its name
+# and its size, so nothing looks wrong.
 <<<
-int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
-{
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
-	return run_by_fileid_arg(stmt, fileid, seq);
-}
+#define UPDATE_DEDUPE_SEQ "update files set dedupe_seq = ?2 where id = ?1;"
 ===
-int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
-{
-	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.update_dedupe_seq;
-
-	sqlite3_exec(db->db, "delete from scan_checkpoints", NULL, NULL, NULL);
-	return run_by_fileid_arg(stmt, fileid, seq);
-}
+#define UPDATE_DEDUPE_SEQ						\
+"insert or replace into files (id, filename, path_hash, ino, subvol, "	\
+"size, mtime, dedupe_seq) select id, filename, path_hash, ino, subvol, "\
+"size, mtime, ?2 from files where id = ?1;"
 >>>
 
 # ---------------------------------------------------------------- #206
@@ -93,14 +88,27 @@ int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
 
 # ---------------------------------------------------------------- schema
 
-# the hash tables stop cascading when their file is dropped
-# The stat-based prune then leaves orphan hashes behind on every deleted file:
-# they match nothing, are never collected, and the hashfile grows forever.
+# the block hashes stop cascading when their file is dropped
+# `blocks` only - `extents` spells its UNIQUE differently, so one edit cannot
+# reach both. The stat-based prune then leaves orphan block hashes behind on
+# every deleted file: they match nothing, are never collected, and the hashfile
+# grows forever.
 <<<
 "UNIQUE(fileid, loff) "							\
 "FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
 ===
 "UNIQUE(fileid, loff));"
+>>>
+
+# the files table is unique on the inode alone rather than the pair
+# A subvolume id and an inode number are each 64 bits, and two files in
+# different subvolumes routinely share an inode number - so this quietly
+# collapses them into one row, and one of the two files stops being scanned at
+# all. The same trap seen_inode() has on the other side of the fence.
+<<<
+"flags INTEGER, UNIQUE(ino, subvol), UNIQUE(path_hash));"
+===
+"flags INTEGER, UNIQUE(ino), UNIQUE(path_hash));"
 >>>
 
 # ---------------------------------------------------------------- history

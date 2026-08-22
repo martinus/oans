@@ -211,7 +211,7 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
 `dbfile_open_handle(NULL)` opens a shared-cache in-memory SQLite - the same path
 a run without `--hashfile` takes - so `dbfile.c` needs no filesystem, no btrfs
 and no scan to test. That is not a test-only seam; it is the in-memory mode
-oans already ships. Coverage went 0% → 47% on nine tests.
+oans already ships. Coverage went 0% → 47% on eight tests.
 
 - **What is worth testing there is what fails silently.** A hashfile is a cache,
   so nothing downstream validates it: a row that vanished, a digest copied from

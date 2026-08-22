@@ -1784,22 +1784,38 @@ MU_TEST(test_running_checksum_rejects_foreign_state) {
  * file whose stored hashes vanish, a replay that adopts the wrong default.
  */
 
-/* A fresh in-memory hashfile. The shared-cache URI means every handle in this
- * process sees the same database, so each test drops what it made. */
+/*
+ * A fresh in-memory hashfile.
+ *
+ * Nothing is cleared, because there is nothing to clear: a shared-cache
+ * in-memory database exists only while a connection is open, so the moment the
+ * last handle closes SQLite frees it, tables and all. Every caller below takes
+ * its handle with `_cleanup_(sqlite3_close_cleanup)`, which is what makes that
+ * true even when an assertion fails partway - `mu_check()` expands to a bare
+ * `return`, so a hand-written close is skipped exactly when a test goes red.
+ * Isolation by construction rather than by a hand-maintained `delete from`
+ * list, which goes stale silently the first time the schema grows a table.
+ *
+ * Costs one schema build and 30 prepared statements per test, measured at
+ * 1.6 ms. That is 5% of the suite and 0.07% of the mutation tool's hang
+ * timeout, which is the budget that actually binds - a shared handle would buy
+ * the 13 ms back and put isolation on the stale list instead.
+ */
 static struct dbhandle *memdb(void)
 {
 	struct dbhandle *db = dbfile_open_handle(NULL);
 
 	if (!db)
 		abort();	/* the test cannot run at all, not a finding */
-	sqlite3_exec(db->db, "delete from scan_checkpoints; delete from blocks;"
-			     "delete from extents; delete from files;"
-			     "delete from config; delete from scan_roots;"
-			     "delete from scan_excludes; delete from run_history;",
-		     NULL, NULL, NULL);
 	return db;
 }
 
+/*
+ * Row count for the tables no shipped API reports. `files`, `blocks` and
+ * `extents` deliberately go through dbfile_get_stats() instead - that is what
+ * `--stats` and `--json` print, so asserting through it covers the production
+ * counters as well as the tables.
+ */
 static uint64_t rows(struct dbhandle *db, const char *table)
 {
 	char sql[64];
@@ -1808,33 +1824,61 @@ static uint64_t rows(struct dbhandle *db, const char *table)
 	return dbfile_query_u64(db->db, sql);
 }
 
-/*
- * A checkpoint carries a real running-checksum state - `file_state` is bound as
- * a blob of running_checksum_state_size() bytes, so a NULL there is a
- * constraint failure rather than an empty column. Caller frees `*state`.
- */
-static struct scan_checkpoint mkcheckpoint(void **state, uint64_t loff)
+/* The three counts oans itself reports. */
+static struct dbfile_stats stats_of(struct dbhandle *db)
 {
+	struct dbfile_stats st = {0};
+
+	if (dbfile_get_stats(db, &st))
+		abort();
+	return st;
+}
+
+/*
+ * A checkpoint carries a real running-checksum state: `file_state` is bound as
+ * a blob of running_checksum_state_size() bytes, so a NULL there is a
+ * constraint failure rather than an empty column. The caller owns the buffers,
+ * which is also how dbfile_load_checkpoint() reads one back - one convention,
+ * not two.
+ *
+ * `ext_state` is the half that matters most (#159): a checkpoint at an extent
+ * boundary needs none, but btrfs reports a contiguously allocated file as a
+ * single fiemap extent however large it is, so the boundary-only first cut
+ * never fired. Pass NULL for the boundary case and a buffer for the in-flight
+ * one.
+ */
+static struct scan_checkpoint mkcheckpoint(void *file_state, void *ext_state,
+					   uint64_t loff)
+{
+	size_t len = running_checksum_state_size();
 	struct running_checksum *c = start_running_checksum();
 	struct scan_checkpoint cp = {
 		.loff = loff, .size = loff * 2, .mtime = 1000,
-		.ext_loff = 0, .ext_len = 4096, .has_ext_state = false,
+		.ext_loff = 0, .ext_len = 4096,
+		.file_state = file_state,
+		.ext_state = ext_state,
+		.has_ext_state = ext_state != NULL,
 	};
 
-	*state = malloc(running_checksum_state_size());
-	if (!*state)
-		abort();
 	add_to_running_checksum(c, (unsigned char *)"some bytes", 10);
-	if (running_checksum_save(c, *state, running_checksum_state_size()))
+	if (running_checksum_save(c, file_state, len))
 		abort();
 	finish_running_checksum(c, NULL);
-	cp.file_state = *state;
+	if (ext_state)
+		memcpy(ext_state, file_state, len);
 	return cp;
 }
 
 /* Store one file row; returns its id. */
-static int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
-			uint64_t subvol, unsigned int seq)
+/*
+ * A row for a file that has been *seen* but not finished - which is what
+ * `dbfile_store_file_info` alone produces, because it deliberately writes no
+ * digest. The digest is precisely what tells a scanned file from one an
+ * interrupted run left partway, so this is the shape the startup prune is
+ * about, and the two helpers are split so a test can ask for either.
+ */
+static int64_t put_unscanned_file(struct dbhandle *db, const char *name,
+				  uint64_t ino, uint64_t subvol)
 {
 	_cleanup_(file_cleanup) struct file f = {0};
 	int64_t id;
@@ -1846,17 +1890,18 @@ static int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
 	f.size = 4096;
 	f.blocks = 1;
 	f.mtime = 1000;
-	f.dedupe_seq = seq;
+	f.dedupe_seq = 1;
 	id = dbfile_store_file_info(db, &f);
 	if (id <= 0)
 		abort();
-	/*
-	 * A digest is written separately, and only once the file has been
-	 * hashed all the way through - `dbfile_store_file_info` deliberately
-	 * writes none. That is what tells a scanned row from one an interrupted
-	 * run left partway, so a helper that skipped this would produce rows
-	 * the startup prune deletes.
-	 */
+	return id;
+}
+
+/* ... and the same row finished, the way a completed hash leaves it. */
+static int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
+			uint64_t subvol)
+{
+	int64_t id = put_unscanned_file(db, name, ino, subvol);
 	unsigned char digest[DIGEST_LEN];
 
 	memset(digest, (int)ino, DIGEST_LEN);
@@ -1865,63 +1910,76 @@ static int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
 	return id;
 }
 
+/* Build the map, ask, free - the shape share() and key_of() above have. */
+static int layout_matches(struct dbhandle *db, int64_t fileid,
+			  const struct fm_rec *recs, unsigned int n)
+{
+	struct fiemap *fm = mkmap(recs, n);
+	int ret = dbfile_layout_matches(db, fileid, fm);
+
+	free(fm);
+	return ret;
+}
+
 /*
- * The hardlink hazard, from CLAUDE.md: `files` has UNIQUE(ino, subvol), and
- * storing a second link to the same inode is an INSERT OR REPLACE - which
- * *deletes* the first row and cascades its hashes away. The scan guards this
- * with an in-memory seen_inodes set rather than in SQL, so what this pins is
- * the shape of the hazard: two names, one inode, one surviving row. A batch
- * that hit this could empty a hashfile while exiting 0.
+ * `files` is unique on the *pair* (ino, subvol), and both halves matter: a
+ * subvolume id and an inode number are each 64 bits and two different files can
+ * share either one alone. Conflating them is the same trap seen_inode() has, so
+ * it is pinned here as a property of the schema.
+ *
+ * What this deliberately does *not* assert is that a second link destroys the
+ * first row. That is true today - storing one is an INSERT OR REPLACE - but it
+ * is the hazard, not the contract: the protection is an in-memory seen_inodes
+ * set in file_scan.c, pinned end-to-end by tests/integration/test_hardlinks.py.
+ * A test demanding the destructive behaviour would go red on the day someone
+ * makes the write safe, and read as a regression while the tests that actually
+ * guard it stayed green. If that day comes, delete this comment rather than
+ * repairing anything.
  */
-MU_TEST(test_dbfile_hardlink_replaces_rather_than_adds) {
-	struct dbhandle *db = memdb();
+MU_TEST(test_dbfile_files_are_unique_on_the_inode_pair) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
 
-	int64_t first = put_file(db, "/tree/a", 42, 1, 1);
+	put_file(db, "/tree/a", 42, 1);
+	mu_check(stats_of(db).num_files == 1);
 
-	mu_check(rows(db, "files") == 1);
+	/* A different inode in the same subvolume is a different file... */
+	put_file(db, "/tree/c", 43, 1);
+	mu_check(stats_of(db).num_files == 2);
 
-	/* A second link to the same inode: same (ino, subvol), different name. */
-	int64_t second = put_file(db, "/tree/b", 42, 1, 1);
+	/* ...and so is the same inode number in a different subvolume. */
+	put_file(db, "/other/a", 42, 2);
+	mu_check(stats_of(db).num_files == 3);
 
-	mu_check(rows(db, "files") == 1);	/* replaced, not added */
-	mu_check(second != first);		/* and it is a *new* row */
-
-	/* A different inode is a different row, so the uniqueness is on the
-	 * inode pair and not on something coarser. */
-	put_file(db, "/tree/c", 43, 1, 1);
-	mu_check(rows(db, "files") == 2);
-
-	/* Different subvol, same inode number: also distinct - the two 64-bit
-	 * fields must not be conflated (the same trap seen_inode() has). */
-	put_file(db, "/other/a", 42, 2, 1);
-	mu_check(rows(db, "files") == 3);
-
-	dbfile_close_handle(db);
 }
 
 /*
  * A file's hashes belong to it: dropping the row takes them with it, via the
- * ON DELETE CASCADE the prune relies on. If that FK is ever lost, pruning a
- * deleted file leaves orphan hashes that later match nothing and are never
- * collected.
+ * ON DELETE CASCADE. If that FK is ever lost, pruning a deleted file leaves
+ * orphan hashes that match nothing and are never collected.
+ *
+ * Driven through dbfile_prune_missing_files() rather than dbfile_remove_file(),
+ * so it exercises the caller the comment is about. That needs no filesystem:
+ * the rule is stat-based, and "/tree/a" genuinely does not exist, which is
+ * exactly the ENOENT the prune looks for. It is stat-based rather than
+ * "delete what this run did not walk" precisely so that scanning a subdirectory
+ * cannot wipe rows that are merely out of scope.
  */
-MU_TEST(test_dbfile_dropping_a_file_takes_its_hashes) {
-	struct dbhandle *db = memdb();
-	int64_t id = put_file(db, "/tree/a", 1, 1, 1);
+MU_TEST(test_dbfile_pruning_a_deleted_file_takes_its_hashes) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t id = put_file(db, "/tree/a", 1, 1);
 	struct block_csum blocks[2] = { { .loff = 0 }, { .loff = 4096 } };
 	struct extent_csum extents[1] = { { .loff = 0, .poff = 8192, .len = 8192 } };
 
 	mu_check(dbfile_store_block_hashes(db, id, 2, blocks) == 0);
 	mu_check(dbfile_store_extent_hashes(db, id, 1, extents) == 0);
-	mu_check(rows(db, "blocks") == 2);
-	mu_check(rows(db, "extents") == 1);
+	mu_check(stats_of(db).num_b_hashes == 2);
+	mu_check(stats_of(db).num_e_hashes == 1);
 
-	mu_check(dbfile_remove_file(db, "/tree/a") == 0);
-	mu_check(rows(db, "files") == 0);
-	mu_check(rows(db, "blocks") == 0);	/* cascaded */
-	mu_check(rows(db, "extents") == 0);
+	mu_check(dbfile_prune_missing_files(db, NULL) == 1);
+	mu_check(stats_of(db).num_files == 0);
+	mu_check(stats_of(db).num_b_hashes == 0);	/* cascaded */
+	mu_check(stats_of(db).num_e_hashes == 0);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -1933,15 +1991,20 @@ MU_TEST(test_dbfile_dropping_a_file_takes_its_hashes) {
  * the 1 TiB file this feature exists for is hours.
  */
 MU_TEST(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint) {
-	struct dbhandle *db = memdb();
-	int64_t id = put_file(db, "/tree/big", 1, 1, 1);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t id = put_file(db, "/tree/big", 1, 1);
 	struct block_csum blocks[1] = { { .loff = 0 } };
-	_cleanup_(freep) void *state = NULL;
-	struct scan_checkpoint cp = mkcheckpoint(&state, 1u << 30);
+	size_t len = running_checksum_state_size();
+	_cleanup_(freep) void *file_state = malloc(len);
+	_cleanup_(freep) void *ext_state = malloc(len);
+	/* Interrupted mid-extent, which is the case that fires in practice:
+	 * btrfs reports a contiguously allocated file as one fiemap extent
+	 * however large it is, so a boundary-only checkpoint never happens. */
+	struct scan_checkpoint cp = mkcheckpoint(file_state, ext_state, 1u << 30);
 	/* load_checkpoint copies into buffers the caller owns; a zeroed struct
 	 * would be a write through NULL. */
-	_cleanup_(freep) void *got_file = malloc(running_checksum_state_size());
-	_cleanup_(freep) void *got_ext = malloc(running_checksum_state_size());
+	_cleanup_(freep) void *got_file = malloc(len);
+	_cleanup_(freep) void *got_ext = malloc(len);
 	struct scan_checkpoint got = { .file_state = got_file, .ext_state = got_ext };
 
 	mu_check(dbfile_store_block_hashes(db, id, 1, blocks) == 0);
@@ -1959,9 +2022,12 @@ MU_TEST(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint) {
 	mu_check(rows(db, "blocks") == 1);
 	mu_check(dbfile_load_checkpoint(db, id, &got));
 	mu_check(got.loff == cp.loff && got.ext_len == cp.ext_len);
-	mu_check(!memcmp(got.file_state, state, running_checksum_state_size()));
+	mu_check(!memcmp(got.file_state, file_state, len));
+	/* The in-flight extent digest rides along, or a resume that lands inside
+	 * an extent has to discard the checkpoint and start the file over. */
+	mu_check(got.has_ext_state);
+	mu_check(!memcmp(got.ext_state, ext_state, len));
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -1971,38 +2037,34 @@ MU_TEST(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint) {
  * exactly what kept a resumable file from surviving to be resumed.
  */
 MU_TEST(test_dbfile_pruning_unscanned_files_spares_checkpointed_ones) {
-	struct dbhandle *db = memdb();
-	_cleanup_(file_cleanup) struct file partway = {0};
-	_cleanup_(file_cleanup) struct file abandoned = {0};
-	_cleanup_(freep) void *state = NULL;
-	struct scan_checkpoint cp = mkcheckpoint(&state, 4096);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	_cleanup_(freep) void *state = malloc(running_checksum_state_size());
+	/* No ext_state: a checkpoint that happened to land on an extent
+	 * boundary, which is the other half of what dbfile_load_checkpoint
+	 * validates. */
+	struct scan_checkpoint cp = mkcheckpoint(state, NULL, 4096);
 
 	/* A finished file: has a digest. */
-	put_file(db, "/tree/done", 1, 1, 1);
+	put_file(db, "/tree/done", 1, 1);
 
 	/* One interrupted with a checkpoint, one simply never hashed. Neither
 	 * has a digest, which is the only thing the prune looks at. */
-	mu_check(file_set_filename(&partway, "/tree/partway") == 0);
-	partway.ino = 2; partway.subvol = 1; partway.size = 8192;
-	int64_t pid = dbfile_store_file_info(db, &partway);
+	int64_t pid = put_unscanned_file(db, "/tree/partway", 2, 1);
 
-	mu_check(file_set_filename(&abandoned, "/tree/abandoned") == 0);
-	abandoned.ino = 3; abandoned.subvol = 1; abandoned.size = 8192;
-	dbfile_store_file_info(db, &abandoned);
+	put_unscanned_file(db, "/tree/abandoned", 3, 1);
 
 	mu_check(dbfile_store_checkpoint(db, pid, &cp) == 0);
-	mu_check(rows(db, "files") == 3);
+	mu_check(stats_of(db).num_files == 3);
 
 	mu_check(dbfile_prune_unscanned_files(db) == 0);
 
 	/* The finished one and the checkpointed one survive; the third goes. */
-	mu_check(rows(db, "files") == 2);
+	mu_check(stats_of(db).num_files == 2);
 	mu_check(dbfile_query_u64(db->db,
 		 "select count(*) from files where filename = '/tree/partway'") == 1);
 	mu_check(dbfile_query_u64(db->db,
 		 "select count(*) from files where filename = '/tree/abandoned'") == 0);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -2013,7 +2075,7 @@ MU_TEST(test_dbfile_pruning_unscanned_files_spares_checkpointed_ones) {
  * silently skips every snapshot on a scheduled run.
  */
 MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
-	struct dbhandle *db = memdb();
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
 	char *roots[] = { (char *)"/data", (char *)"/srv" };
 	char *excludes[] = { (char *)"*.iso" };
 	struct scan_config out = {
@@ -2051,7 +2113,6 @@ MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
 	mu_check(in.skip_readonly_subvols == 0);	/* coerced to the new default */
 	scan_config_free(&in);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -2062,7 +2123,7 @@ MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
  * forever.
  */
 MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
-	struct dbhandle *db = memdb();
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
 	struct run_record first = {
 		.ts = 1000, .duration_ms = 500, .files_scanned = 10,
 		.reclaimed = 4096, .groups = 2, .deduped = 1,
@@ -2093,7 +2154,6 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
 	/* ...while the lifetime figure still remembers them. */
 	mu_check(s.total_skip_errors == 4);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -2104,8 +2164,8 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
  * downstream could tell that from a file with no duplicate.
  */
 MU_TEST(test_dbfile_layout_matches_compares_every_record) {
-	struct dbhandle *db = memdb();
-	int64_t donor = put_file(db, "/snap/a", 1, 1, 1);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t donor = put_file(db, "/snap/a", 1, 1);
 	struct extent_csum stored[2] = {
 		{ .loff = 0,    .poff = 4096,  .len = 8192 },
 		{ .loff = 8192, .poff = 65536, .len = 4096 },
@@ -2115,39 +2175,25 @@ MU_TEST(test_dbfile_layout_matches_compares_every_record) {
 	struct fm_rec shortr[] = { {0, 4096, 8192, 0} };
 	struct fm_rec longer[] = { {0, 4096, 8192, 0}, {8192, 65536, 4096, 0},
 				   {12288, 73728, 4096, 0} };
-	struct fiemap *fm;
 
 	mu_check(dbfile_store_extent_hashes(db, donor, 2, stored) == 0);
 
-	fm = mkmap(same, 2);
-	mu_check(dbfile_layout_matches(db, donor, fm) == 1);
-	free(fm);
-
+	mu_check(layout_matches(db, donor, same, ARRAY_SIZE(same)) == 1);
 	/* One address moved: not the same storage. */
-	fm = mkmap(moved, 2);
-	mu_check(dbfile_layout_matches(db, donor, fm) == 0);
-	free(fm);
-
-	/* The candidate has fewer records than the donor... */
-	fm = mkmap(shortr, 1);
-	mu_check(dbfile_layout_matches(db, donor, fm) == 0);
-	free(fm);
-
-	/* ...and more. Both directions, because a prefix match is still a miss. */
-	fm = mkmap(longer, 3);
-	mu_check(dbfile_layout_matches(db, donor, fm) == 0);
-	free(fm);
+	mu_check(layout_matches(db, donor, moved, ARRAY_SIZE(moved)) == 0);
+	/* The candidate has fewer records than the donor, and more. Both
+	 * directions, because a prefix match is still a miss. */
+	mu_check(layout_matches(db, donor, shortr, ARRAY_SIZE(shortr)) == 0);
+	mu_check(layout_matches(db, donor, longer, ARRAY_SIZE(longer)) == 0);
 
 	/*
 	 * A donor whose rows are gone - an aborted batch, a hardlink cascade -
 	 * verifies as a miss by construction rather than needing a guard, which
 	 * is why the in-memory map can hold only a key and a file id.
 	 */
-	int64_t empty = put_file(db, "/snap/b", 2, 1, 1);
+	int64_t empty = put_file(db, "/snap/b", 2, 1);
 
-	fm = mkmap(same, 2);
-	mu_check(dbfile_layout_matches(db, empty, fm) == 0);
-	free(fm);
+	mu_check(layout_matches(db, empty, same, ARRAY_SIZE(same)) == 0);
 
 	/*
 	 * And the case that needs saying separately: *both* sides empty. The
@@ -2156,11 +2202,8 @@ MU_TEST(test_dbfile_layout_matches_compares_every_record) {
 	 * onto the other. "No records" is not evidence of identical storage,
 	 * it is the absence of evidence.
 	 */
-	fm = mkmap(same, 0);
-	mu_check(dbfile_layout_matches(db, empty, fm) == 0);
-	free(fm);
+	mu_check(layout_matches(db, empty, same, 0) == 0);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -2170,32 +2213,27 @@ MU_TEST(test_dbfile_layout_matches_compares_every_record) {
  * against nothing.
  */
 MU_TEST(test_dbfile_copying_a_donor_brings_all_three) {
-	struct dbhandle *db = memdb();
-	int64_t donor = put_file(db, "/snap/a", 1, 1, 1);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t donor = put_file(db, "/snap/a", 1, 1);
 	int64_t dst;
 	struct block_csum blocks[2] = { { .loff = 0 }, { .loff = 4096 } };
 	struct extent_csum extents[1] = { { .loff = 0, .poff = 4096, .len = 8192 } };
-	_cleanup_(file_cleanup) struct file f = {0};
 
 	mu_check(dbfile_store_block_hashes(db, donor, 2, blocks) == 0);
 	mu_check(dbfile_store_extent_hashes(db, donor, 1, extents) == 0);
 
 	/* The destination starts with no digest, the way a file does before it
 	 * has been hashed. */
-	mu_check(file_set_filename(&f, "/snap/b") == 0);
-	f.ino = 2; f.subvol = 1; f.size = 8192; f.mtime = 1000;
-	dst = dbfile_store_file_info(db, &f);
-	mu_check(dst > 0);
+	dst = put_unscanned_file(db, "/snap/b", 2, 1);
 
 	mu_check(dbfile_copy_scanned_file(db, dst, donor, 0) == 0);
 
-	mu_check(rows(db, "blocks") == 4);	/* two each */
-	mu_check(rows(db, "extents") == 2);
+	mu_check(stats_of(db).num_b_hashes == 4);	/* two each */
+	mu_check(stats_of(db).num_e_hashes == 2);
 	/* And the destination now has a digest, so it reads as scanned. */
 	mu_check(dbfile_query_u64(db->db,
 		 "select count(*) from files where digest is not null") == 2);
 
-	dbfile_close_handle(db);
 }
 
 /*
@@ -3021,8 +3059,8 @@ MU_TEST_SUITE(test_suite) {
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
 	 * without --hashfile takes, so none of this is a test-only seam. */
-	MU_RUN_TEST(test_dbfile_hardlink_replaces_rather_than_adds);
-	MU_RUN_TEST(test_dbfile_dropping_a_file_takes_its_hashes);
+	MU_RUN_TEST(test_dbfile_files_are_unique_on_the_inode_pair);
+	MU_RUN_TEST(test_dbfile_pruning_a_deleted_file_takes_its_hashes);
 	MU_RUN_TEST(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint);
 	MU_RUN_TEST(test_dbfile_pruning_unscanned_files_spares_checkpointed_ones);
 	MU_RUN_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto);
