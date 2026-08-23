@@ -1,10 +1,8 @@
 /*
  * The extent search that --dedupe-options=partial runs.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_scan.c, which is where the sources these tests reach
+ * into are #included.
  */
 MU_TEST(test_block_len) {
 	struct file_block block;
@@ -454,27 +452,6 @@ static void search_file(struct search_fixture *s, struct dbhandle *db,
 	if (!fd_file(&s->fd, id, blocks, n, 0))
 		abort();
 }
-
-/*
- * ---------------------------------------------------------------------------
- * The interrupt flag (#201)
- *
- * SIGINT and SIGTERM set a flag; every loop that owns state notices it and
- * unwinds through its ordinary exit, so the batched writer commits on the way
- * out. What fails silently here is the whole of it: a flag that is never set
- * makes a Ctrl-C look ignored for minutes, and a second one that kills before
- * the flush throws away exactly the work the feature exists to keep.
- *
- * One test with ordered scenarios, because the state is global *and* one-shot:
- * SA_RESETHAND puts the default action back on delivery, so a raise with no
- * handler installed would kill the suite rather than fail it. Every scenario
- * below re-installs before it raises, and puts the flag back afterwards.
- * tests.c #includes interrupt.c, so the statics are reachable to do that -
- * without it none of this would be testable at all.
- * ---------------------------------------------------------------------------
- */
-
-/* What the kernel currently has installed for a signal. */
 
 MU_TEST(test_the_extent_search_driven_by_its_pool) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();

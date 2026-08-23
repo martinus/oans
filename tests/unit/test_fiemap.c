@@ -1,10 +1,8 @@
 /*
  * Extent maps: the layout key, the sharing walk, and the ioctl wrapper.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_fiemap.c, which is where the sources these tests reach
+ * into are #included.
  */
 MU_TEST(test_get_extent) {
 	/* Three data extents with holes between them:

@@ -1,10 +1,8 @@
 /*
  * --exclude matching, in .gitignore syntax.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_glob.c, which is where the sources these tests reach
+ * into are #included.
  */
 static bool gs_hit(const char *pattern, const char *path, bool is_dir)
 {

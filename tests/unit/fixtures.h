@@ -5,26 +5,20 @@
  * anything a single subject uses lives beside that subject instead. The order
  * is the order they were written in, which is what keeps each one declared
  * before whatever uses it.
+ *
+ * `[[maybe_unused]] static` because each translation unit that includes this
+ * gets its own copy of the ones it calls: without it a TU using half of them
+ * reports the other half under -Wunused-function, which -Werror then turns
+ * into a broken build. Same spelling src/memstats.h uses for the same reason.
  */
 
 #ifndef OANS_TEST_FIXTURES_H
 #define OANS_TEST_FIXTURES_H
 
-/*
- * Every fixture is `static` and marked unused: each translation unit that
- * includes this gets its own copy of the ones it calls, and the linker drops
- * the rest. Without the attribute a TU using half of them reports the other
- * half under -Wunused-function, which -Werror then turns into a broken build.
- */
-#if defined(__GNUC__) || defined(__clang__)
-#  define FIXTURE __attribute__((unused)) static
-#else
-#  define FIXTURE static
-#endif
 
 struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
 
-FIXTURE struct fiemap *mkmap(const struct fm_rec *recs, unsigned int n)
+[[maybe_unused]] static struct fiemap *mkmap(const struct fm_rec *recs, unsigned int n)
 {
 	struct fiemap *fm = calloc(1, sizeof(*fm) +
 				   n * sizeof(struct fiemap_extent));
@@ -39,7 +33,7 @@ FIXTURE struct fiemap *mkmap(const struct fm_rec *recs, unsigned int n)
 	return fm;
 }
 
-FIXTURE bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
+[[maybe_unused]] static bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
 		  const struct fm_rec *rb, unsigned int nb, uint64_t off_b,
 		  uint64_t len)
 {
@@ -58,7 +52,7 @@ FIXTURE bool share(const struct fm_rec *ra, unsigned int na, uint64_t off_a,
  * to the kernel on every run (#186) - and "no" whenever it cannot prove it.
  */
 /* Same records, same size -> same key; anything that changes the bytes doesn't. */
-FIXTURE bool key_of(const struct fm_rec *recs, unsigned int n, uint64_t size,
+[[maybe_unused]] static bool key_of(const struct fm_rec *recs, unsigned int n, uint64_t size,
 		   unsigned char *out)
 {
 	struct fiemap *fm = mkmap(recs, n);
@@ -68,13 +62,13 @@ FIXTURE bool key_of(const struct fm_rec *recs, unsigned int n, uint64_t size,
 	return ok;
 }
 
-FIXTURE bool near(double got, double want, double eps)
+[[maybe_unused]] static bool near(double got, double want, double eps)
 {
 	double e = got - want;
 	return e < eps && e > -eps;
 }
 
-FIXTURE struct dbhandle *memdb(void)
+[[maybe_unused]] static struct dbhandle *memdb(void)
 {
 	struct dbhandle *db = dbfile_open_handle(NULL);
 
@@ -96,7 +90,7 @@ FIXTURE struct dbhandle *memdb(void)
  * which is how the wrong-length-blob case below first passed against a column
  * that does not exist.
  */
-FIXTURE void exec(struct dbhandle *db, const char *sql)
+[[maybe_unused]] static void exec(struct dbhandle *db, const char *sql)
 {
 	char *err = NULL;
 
@@ -104,7 +98,7 @@ FIXTURE void exec(struct dbhandle *db, const char *sql)
 		abort();
 	sqlite3_free(err);
 }
-FIXTURE uint64_t rows(struct dbhandle *db, const char *table)
+[[maybe_unused]] static uint64_t rows(struct dbhandle *db, const char *table)
 {
 	char sql[64];
 
@@ -113,7 +107,7 @@ FIXTURE uint64_t rows(struct dbhandle *db, const char *table)
 }
 
 /* The three counts oans itself reports. */
-FIXTURE void digest_of(unsigned char *out, unsigned int n)
+[[maybe_unused]] static void digest_of(unsigned char *out, unsigned int n)
 {
 	for (unsigned int i = 0; i < DIGEST_LEN; i++)
 		out[i] = (unsigned char)(n * 7 + i * 31);
@@ -121,7 +115,7 @@ FIXTURE void digest_of(unsigned char *out, unsigned int n)
 /* The one row builder. Everything below adds columns to it rather than
  * repeating the build - two near-identical copies differing by an inert line
  * is what this replaced. */
-FIXTURE int64_t put_row(struct dbhandle *db, const char *name, uint64_t ino,
+[[maybe_unused]] static int64_t put_row(struct dbhandle *db, const char *name, uint64_t ino,
 		       uint64_t subvol, uint64_t size, unsigned int seq)
 {
 	_cleanup_(file_cleanup) struct file f = {0};
@@ -139,14 +133,14 @@ FIXTURE int64_t put_row(struct dbhandle *db, const char *name, uint64_t ino,
 		abort();
 	return id;
 }
-FIXTURE int64_t put_unscanned_file(struct dbhandle *db, const char *name,
+[[maybe_unused]] static int64_t put_unscanned_file(struct dbhandle *db, const char *name,
 				  uint64_t ino, uint64_t subvol)
 {
 	return put_row(db, name, ino, subvol, 4096, 1);
 }
 
 /* ... and the same row finished, the way a completed hash leaves it. */
-FIXTURE int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
+[[maybe_unused]] static int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
 			uint64_t subvol)
 {
 	int64_t id = put_unscanned_file(db, name, ino, subvol);
@@ -159,7 +153,7 @@ FIXTURE int64_t put_file(struct dbhandle *db, const char *name, uint64_t ino,
 }
 
 /* Build the map, ask, free - the shape share() and key_of() above have. */
-FIXTURE int layout_matches(struct dbhandle *db, int64_t fileid,
+[[maybe_unused]] static int layout_matches(struct dbhandle *db, int64_t fileid,
 			  const struct fm_rec *recs, unsigned int n)
 {
 	struct fiemap *fm = mkmap(recs, n);
@@ -193,7 +187,7 @@ FIXTURE int layout_matches(struct dbhandle *db, int64_t fileid,
  * one map in eight, because "cannot prove it" is a case with its own rules and
  * a generator that never produced one would leave them to the fixed tests.
  */
-FIXTURE int64_t prop_donor(struct dbhandle *db, struct prop *p)
+[[maybe_unused]] static int64_t prop_donor(struct dbhandle *db, struct prop *p)
 {
 	char name[64];
 
@@ -215,7 +209,7 @@ FIXTURE int64_t prop_donor(struct dbhandle *db, struct prop *p)
 /* Takes the fileid it will actually have: the tests look filerecs up by id,
  * so a helper that invented its own numbering had to be bypassed by the one
  * property that chooses ids. */
-FIXTURE struct filerec *mkfilerec(int64_t fileid)
+[[maybe_unused]] static struct filerec *mkfilerec(int64_t fileid)
 {
 	char name[64];
 	struct filerec *f;
@@ -227,7 +221,7 @@ FIXTURE struct filerec *mkfilerec(int64_t fileid)
 	return f;
 }
 
-FIXTURE void prop_shuffle_u64(struct prop *p, uint64_t *a, unsigned int n)
+[[maybe_unused]] static void prop_shuffle_u64(struct prop *p, uint64_t *a, unsigned int n)
 {
 	for (unsigned int i = n; i > 1; i--) {
 		unsigned int j = (unsigned int)prop_below(p, i);
@@ -238,7 +232,7 @@ FIXTURE void prop_shuffle_u64(struct prop *p, uint64_t *a, unsigned int n)
 	}
 }
 
-FIXTURE int64_t put_dupe(struct dbhandle *db, const char *name, uint64_t ino,
+[[maybe_unused]] static int64_t put_dupe(struct dbhandle *db, const char *name, uint64_t ino,
 			unsigned int dg, uint64_t size, unsigned int seq,
 			unsigned int flags, unsigned int nr_extents)
 {
@@ -256,7 +250,7 @@ FIXTURE int64_t put_dupe(struct dbhandle *db, const char *name, uint64_t ino,
  * there is not exactly one: that means the fixture is broken, and a test that
  * quietly took the first of two groups would pass while the loader split them.
  */
-FIXTURE struct dupe_extents *only_group(struct results_tree *res)
+[[maybe_unused]] static struct dupe_extents *only_group(struct results_tree *res)
 {
 	if (res->num_dupes != 1 || RB_EMPTY_ROOT(&res->root))
 		abort();
@@ -281,7 +275,7 @@ struct fm_file {
 	uint64_t size;
 };
 
-FIXTURE struct fm_file fm_open(const char *name, unsigned int chunks, bool sparse)
+[[maybe_unused]] static struct fm_file fm_open(const char *name, unsigned int chunks, bool sparse)
 {
 	struct fm_file f = { .fd = -1 };
 	_cleanup_(freep) char *buf = malloc(FM_CHUNK);

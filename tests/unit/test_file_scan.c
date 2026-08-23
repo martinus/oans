@@ -1,10 +1,8 @@
 /*
  * The walk: zero blocks, rename detection, the inode set and the queue.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_scan.c, which is where the sources these tests reach
+ * into are #included.
  */
 MU_TEST(test_is_block_zeroed) {
 	blocksize = 100;

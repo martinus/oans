@@ -47,6 +47,7 @@ out of step with them:
     scripts/mutate/mutate.py --file src/fiemap.c --make-arg=SANITIZE=address,undefined --make-arg=CC=clang
 """
 
+import glob
 import os
 import re
 import sys
@@ -206,18 +207,34 @@ class Oans(mutate_core.Project):
         return "none"
 
     def default_syntax_tu(self, path):
-        """Every source here is compiled through `tests/unit/main.c`, so that is
-        the pre-filter's TU whichever one is mutated - unlike the core's default,
-        which would check a `.c` file on its own and miss anything that only
-        breaks where the includes meet.
+        """The `tests/unit/tu_*.c` that actually compiles this source.
 
-        Anything outside `src/` is not in that translation unit at all, and a
-        check that compiles something the mutation cannot reach passes every
-        time and quietly stops filtering.
+        The suite is one translation unit per subject, so there is no single TU
+        any more: `main.c` is the runner and `#include`s no source at all.
+        Returning it regardless - which this did while the suite was one TU -
+        makes the pre-filter compile something the mutation cannot reach, so it
+        passes every time and quietly stops filtering. That is the failure the
+        core documents at its own `default_syntax_tu`, and it costs the whole
+        point of the check: an invalid mutant then falls through to a full
+        build to be told what a tenth of one would have said.
+
+        A header is asked for by name because several TUs include it and any of
+        them would do; a source is matched against the `#include` lines, which
+        is the same truth the makefile spells out by hand as TEST_INLINED (drift
+        there is a duplicate-symbol link error, so it is loud). Nothing else
+        is in a test TU, so nothing else gets a pre-filter.
         """
-        if path.startswith("src" + os.sep) and path.endswith((".c", ".h")):
+        if not path.endswith((".c", ".h")):
+            return None
+        if path.endswith(".h"):
             return self.syntax_tu
-        return None
+        want = '#include "%s"' % os.path.basename(path)
+        for tu in sorted(glob.glob(os.path.join("tests", "unit", "tu_*.c"))):
+            with open(tu, encoding="utf-8") as f:
+                if want in f.read():
+                    return tu
+        # Compiled as an ordinary object and linked, so it is a TU of its own.
+        return path if path.startswith("src" + os.sep) else None
 
     def resolve_file(self, args):
         """`--file` when given, else the target the bug file names.

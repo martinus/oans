@@ -1,10 +1,8 @@
 /*
  * The in-memory block tree and results tree.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_dbfile.c, which is where the sources these tests reach
+ * into are #included.
  */
 #define PROP_DIGESTS	5
 MU_TEST(test_prop_the_hash_tree_counts_what_it_holds) {

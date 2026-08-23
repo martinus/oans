@@ -1,8 +1,8 @@
 /*
  * The filerec registry and its descriptor refcount.
  *
- * Its own translation unit. Nothing here needs a static function, so this
- * links against the sources rather than including them.
+ * Compiled as part of tu_plain.c, which #includes no source at all: nothing
+ * here reaches a static, so it links against them like any consumer.
  */
 
 MU_TEST(test_filerec_the_registry_finds_what_was_put_in_it) {

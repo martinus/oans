@@ -1,8 +1,8 @@
 /*
  * Paths past PATH_MAX (#117).
  *
- * Its own translation unit. Nothing here needs a static function, so this
- * links against the sources rather than including them.
+ * Compiled as part of tu_plain.c, which #includes no source at all: nothing
+ * here reaches a static, so it links against them like any consumer.
  */
 
 #define LP_COMP_LEN 255

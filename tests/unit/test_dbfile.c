@@ -1,10 +1,8 @@
 /*
  * The hashfile: storage, change detection, and the dedupe-phase loaders.
  *
- * Its own translation unit. The sources below are #included rather than
- * linked, because tests here call their static functions; every other source
- * the suite needs is compiled once and linked, which is what makes a mutant
- * rebuild one subject instead of all of them.
+ * Compiled as part of tu_dbfile.c, which is where the sources these tests reach
+ * into are #included.
  */
 static struct dbfile_stats stats_of(struct dbhandle *db)
 {

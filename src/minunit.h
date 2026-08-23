@@ -65,54 +65,28 @@
 #include <stdio.h>
 #include <math.h>
 
-/*  oans: a TU that defines no test uses neither timer. */
-#if defined(__GNUC__) || defined(__clang__)
-#  define MINUNIT_MAYBE_UNUSED __attribute__((unused))
-#else
-#  define MINUNIT_MAYBE_UNUSED
-#endif
-
 /*  Maximum length of last message */
 #define MINUNIT_MESSAGE_LEN 1024
 /*  Accuracy with which floats are compared */
 #define MINUNIT_EPSILON 1E-12
 
 /*
- * oans fork of upstream minunit, and the only change to this file.
+ * oans fork of upstream minunit. Two changes, both about the suite being
+ * several translation units rather than one: this block, and the two
+ * mu_timer_* helpers below made `static inline` so a TU that runs no test does
+ * not report them unused.
  *
- * Upstream assumes the whole suite is one translation unit, where `static` on
- * this state is exactly right. oans's suite is one TU per subject, so `static`
- * would give each of them its own counters: every test would run, every
- * assertion would pass, and MU_REPORT() in the runner would print *its* copy -
- * "0 tests, 0 assertions" - and exit 0. A suite that reports nothing while
- * looking green is the one failure this repository's tooling exists to catch,
- * so it must not be possible to build it by accident.
+ * Upstream declares this state `static`, which is exactly right for one TU and
+ * silently wrong for eight: each would count its own, and MU_REPORT() in the
+ * runner would print "0 tests, 0 assertions" and exit 0. A suite that reports
+ * nothing while looking green is the one failure this repository's tooling
+ * exists to catch, so it must not be buildable by accident.
  *
- * MINUNIT_MAIN is defined by tests/unit/main.c and nowhere else. A second
- * definer is a duplicate-symbol link error, and no definer leaves the counters
- * undefined at link time - both loud.
+ * Plain `extern`, defined once in tests/unit/main.c beside `blocksize` - the
+ * same shape src/memstats.h and every other shared global here already use.
+ * Two definers is a duplicate symbol, none is an undefined reference: both
+ * loud, with no per-TU switch to get wrong.
  */
-#ifdef MINUNIT_MAIN
-
-/*  Misc. counters */
-int minunit_run = 0;
-int minunit_assert = 0;
-int minunit_fail = 0;
-int minunit_status = 0;
-
-/*  Timers */
-double minunit_real_timer = 0;
-double minunit_proc_timer = 0;
-
-/*  Last message */
-char minunit_last_message[MINUNIT_MESSAGE_LEN];
-
-/*  Test setup and teardown function pointers */
-void (*minunit_setup)(void) = NULL;
-void (*minunit_teardown)(void) = NULL;
-
-#else
-
 extern int minunit_run;
 extern int minunit_assert;
 extern int minunit_fail;
@@ -122,8 +96,6 @@ extern double minunit_proc_timer;
 extern char minunit_last_message[MINUNIT_MESSAGE_LEN];
 extern void (*minunit_setup)(void);
 extern void (*minunit_teardown)(void);
-
-#endif
 
 /*  Definitions */
 #define MU_TEST(method_name) static void method_name(void)
@@ -271,8 +243,7 @@ extern void (*minunit_teardown)(void);
  * The returned real time is only useful for computing an elapsed time
  * between two calls to this function.
  */
-static double mu_timer_real(void) MINUNIT_MAYBE_UNUSED;
-static double mu_timer_real(void)
+static inline double mu_timer_real(void)
 {
 #if defined(_WIN32)
 	/* Windows 2000 and later. ---------------------------------- */
@@ -347,8 +318,7 @@ static double mu_timer_real(void)
  * Returns the amount of CPU time used by the current process,
  * in seconds, or -1.0 if an error occurred.
  */
-static double mu_timer_cpu(void) MINUNIT_MAYBE_UNUSED;
-static double mu_timer_cpu(void)
+static inline double mu_timer_cpu(void)
 {
 #if defined(_WIN32)
 	/* Windows -------------------------------------------------- */

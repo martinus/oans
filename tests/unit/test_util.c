@@ -1,8 +1,8 @@
 /*
  * Escaping, sizes, durations and digit grouping.
  *
- * Its own translation unit. Nothing here needs a static function, so this
- * links against the sources rather than including them.
+ * Compiled as part of tu_plain.c, which #includes no source at all: nothing
+ * here reaches a static, so it links against them like any consumer.
  */
 
 struct fenced { char before[8]; char out[32]; char after[8]; };

@@ -1,9 +1,8 @@
 /*
  * Running-checksum save and restore (#159).
  *
- * Its own translation unit. csum.c is #included rather than linked: the
- * checkpoint header and the xxhash state are defined in it, not in csum.h,
- * so a test that asserts on their size cannot see them otherwise.
+ * Compiled as part of tu_csum.c, which is where the sources these tests reach
+ * into are #included.
  */
 
 MU_TEST(test_running_checksum_survives_save_restore) {

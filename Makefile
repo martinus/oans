@@ -165,8 +165,7 @@ tests/unit/%.o: tests/unit/%.c
 # provided, which is the direction that tool must never be wrong in.
 # `make test` is unchanged for everyone else.
 .PHONY: test-build
-test-build:
-	$(MAKE) $(TEST_OBJECTS) $(TEST_LINKED)
+test-build: $(TEST_OBJECTS) $(TEST_LINKED)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(TEST_OBJECTS) $(TEST_LINKED) \
 		-o test $(LIBRARY_FLAGS)
 
@@ -219,6 +218,7 @@ integration-valgrind: oans
 lint:
 	@python3 scripts/lint-longpath.py
 	@python3 scripts/lint-escape.py
+	@python3 scripts/lint-test-registry.py
 	@python3 scripts/lint-mutate-core.py
 	@python3 scripts/mutate/test_report.py
 

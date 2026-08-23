@@ -5,12 +5,8 @@
  * other's statics - a progress test drives file_scan's work queue, and the
  * search test asserts on progress.c's counters - and a source can be
  * #included into exactly one TU.
- *
- * A translation unit of the oans unit suite. Rebuilding this rebuilds only
- * these subjects, which is what makes a mutation sweep affordable.
  */
 #include "suite.h"
-
 
 #include "file_scan.c"
 #include "progress.c"

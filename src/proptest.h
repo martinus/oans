@@ -141,27 +141,22 @@ static inline void prop_bytes(struct prop *p, void *buf, size_t len)
  * a run has one seed or it has none that can be replayed.
  */
 /*
- * The cache is file scope and defined once, not function-local.
+ * The cache is file scope and defined once (in tests/unit/main.c), not
+ * function-local.
  *
  * The suite is one translation unit per subject, and a `static` inside a
  * `static inline` is a separate object in each of them - so every TU would
  * resolve the seed on its own. Under a fixed seed that is merely wasteful;
  * under `OANS_PROPTEST_SEED=random` each TU would pick a *different* seed and
  * print its own notice, which is the thing the comment above says must not
- * happen. PROPTEST_MAIN is defined by tests/unit/main.c and nowhere else.
+ * happen.
  */
-#ifdef PROPTEST_MAIN
-uint64_t prop_seed_value;
-bool prop_seed_resolved;
-#else
 extern uint64_t prop_seed_value;
 extern bool prop_seed_resolved;
-#endif
 
 static inline uint64_t prop_seed(void)
 {
 	const char *env;
-	char here;
 
 	if (prop_seed_resolved)
 		return prop_seed_value;
@@ -172,7 +167,7 @@ static inline uint64_t prop_seed(void)
 		/* Only the address of a stack object and the time, because
 		 * this is a test knob and not a source of randomness anyone
 		 * relies on. Printed, so whatever it lands on can be replayed. */
-		prop_seed_value = (uint64_t)(uintptr_t)&here
+		prop_seed_value = (uint64_t)(uintptr_t)&env
 				  ^ ((uint64_t)time(NULL) << 20);
 		printf("\n[proptest] OANS_PROPTEST_SEED=%llu\n",
 		       (unsigned long long)prop_seed_value);

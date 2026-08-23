@@ -58,9 +58,6 @@
 #include "interrupt.h"
 #include "find_dupes.h"
 #include "progress.h"
-#include "threads.h"
-#include "btrfs-util.h"
-#include "list_sort.h"
 
 #include "minunit.h"
 #include "proptest.h"
@@ -68,7 +65,18 @@
 #undef MU_TEST
 #define MU_TEST(method_name) void method_name(void)
 
-/* Set by main() from argv[0]; a few tests re-exec the binary. */
+/*
+ * Run a test that lives in another translation unit.
+ *
+ * A block-scope `extern` is legal C, so the declaration goes where the name is
+ * already written and there is no second list to keep. A hand-written header of
+ * 111 declarations was tried first and was worse than it looked: leaving a test
+ * out of it is only an implicit-declaration *warning*, so a default build still
+ * succeeded and the suite still reported green.
+ */
+#define MU_RUN(test) do { void test(void); MU_RUN_TEST(test); } while (0)
+
+/* Set by main() from argv[0]; one test hands it to is_file_renamed(). */
 extern char *exec_path;
 
 #include "fixtures.h"
