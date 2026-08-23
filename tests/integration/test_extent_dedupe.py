@@ -8,51 +8,60 @@ only a hint for the "already deduped" check, and the kernel byte-verifies every
 dedupe, so a wrong hint changes neither data nor sharing. This guards the path
 against crashes/errors and against sharing/data regressions.)
 
-Requires btrfs: the setup relies on an fsync-forced extent boundary between the
-head and the shared tail so the tail is its own extent the extent pass can
-match. That boundary only forms under copy-on-write; XFS overwrites in place and
-keeps the file as one extent, so it cannot reproduce the partially-shared layout
-(genuine whole-file and naturally-aligned dedupe still works on XFS).
+A punched hole separates the unique head from the shared tail, which is what
+puts the tail in an extent of its own for the extent pass to match. A hole is a
+property of the extent map rather than of how one filesystem allocates, so
+test_shared_tail_is_deduped runs anywhere reflink does.
+
+It used to force that boundary with an fsync, and this file used to explain that
+only copy-on-write can produce one - "XFS overwrites in place and keeps the file
+as one extent, so it cannot reproduce the partially-shared layout". That was
+wrong twice: a hole owes nothing to copy-on-write, and XFS does fragment a file
+written around unmapped regions (#242, with filefrag and xfs_bmap output).
+test_einval.py has been building this very layout and passing on the XFS leg all
+along, which is the evidence the claim was never checked.
+
+The second case stays btrfs-only for a reason the first no longer shares: it
+reflinks a file and rewrites the head in place, and it is copy-on-write that
+makes such a rewrite replace the head while leaving the tail extents untouched.
+XFS reflink is expected to do the same, but that is unverified here.
 """
 
 import os
-from harness import DuperemoveTest, requires_btrfs
+from harness import DuperemoveTest, requires_btrfs, requires_reflink
 
 MiB = 1 << 20
 
+# Between the unique head and the shared tail: what puts the tail in an extent
+# of its own. Block-aligned, and generous, which costs nothing - it is a hole.
+HOLE = MiB
 
-@requires_btrfs
-class ExtentDedupeTest(DuperemoveTest):
-    # Extent-layout sensitive: see DuperemoveTest.serial.
-    serial = True
+
+class _ExtentFixtures:
+    """Setup shared by both cases below.
+
+    A plain mixin rather than a shared TestCase base: unittest collects every
+    TestCase subclass, so a base holding tests as well as helpers would run
+    those tests again for each case that inherits from it.
+    """
 
     def _mkfile(self, rel, head, tail):
-        """head, an fsync to force an extent boundary, then the shared tail."""
-        p = self.path(rel)
-        with open(p, "wb") as f:
-            f.write(head)
-            f.flush()
-            os.fsync(f.fileno())
-            f.write(tail)
-        return p
-
-    def _reflink_new_head(self, src_rel, dst_rel, head_len):
-        """Reflink src, then rewrite its head in place.
-
-        Copy-on-write replaces only the head blocks, so the copy keeps the
-        seed's tail extents byte for byte - a physical class of two that does
-        not depend on how writeback laid anything out.
-        """
-        p = self.reflink(src_rel, dst_rel)
-        with open(p, "r+b") as f:
-            f.write(os.urandom(head_len))
-        return p
+        """head, a punched hole, then the shared tail."""
+        return self.make_sparse(rel, head, HOLE, tail)
 
     def _layout(self, **files):
         """Physical extents per file, for a failure message worth reading."""
         from harness import phys_extents
         return "\n  " + "\n  ".join(
             f"{name}: {sorted(phys_extents(p))}" for name, p in files.items())
+
+
+@requires_reflink
+class ExtentDedupeTest(_ExtentFixtures, DuperemoveTest):
+    # Extent-layout sensitive: see DuperemoveTest.serial. The hole makes the
+    # boundary itself deterministic, but the assertions still read a map that
+    # concurrent writeback moves around, so this stays held back.
+    serial = True
 
     def test_shared_tail_is_deduped(self):
         # Distinct heads, identical tail -> not whole-file dupes, so only the
@@ -78,6 +87,24 @@ class ExtentDedupeTest(DuperemoveTest):
         self.assertDmOk()
         self.assertNoNewSharing()
 
+
+@requires_btrfs
+class ExtentDedupeCowTest(_ExtentFixtures, DuperemoveTest):
+    # Extent-layout sensitive: see DuperemoveTest.serial.
+    serial = True
+
+    def _reflink_new_head(self, src_rel, dst_rel, head_len):
+        """Reflink src, then rewrite its head in place.
+
+        Copy-on-write replaces only the head blocks, so the copy keeps the
+        seed's tail extents byte for byte - a physical class of two that does
+        not depend on how writeback laid anything out.
+        """
+        p = self.reflink(src_rel, dst_rel)
+        with open(p, "r+b") as f:
+            f.write(os.urandom(head_len))
+        return p
+
     def test_group_on_two_physical_extents_converges_in_one_run(self):
         """Every member lands on the target, not just one per physical extent.
 
@@ -97,8 +124,8 @@ class ExtentDedupeTest(DuperemoveTest):
         hoping writeback splits all four tails the same way does not survive a
         different allocator (it failed on CI's fresh 2 GiB image while passing
         on a large aged filesystem). Only a1-vs-b1 still relies on two
-        head+fsync+tail writes matching, which test_shared_tail_is_deduped
-        above already depends on.
+        head+hole+tail writes matching, and a punched hole puts that boundary
+        in the extent map by construction rather than leaving it to writeback.
         """
         head = 64 * 1024        # block-aligned, so rewriting it spares the tail
         tail = os.urandom(4 * MiB)

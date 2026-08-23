@@ -209,9 +209,12 @@ def scratch_fstype(directory=TEST_ROOT):
 
 
 # btrfs is copy-on-write, so an in-place overwrite of alternate blocks splits a
-# file into many physical extents. xfs (even with reflink) overwrites in place
-# and stays one extent, so tests that need to *build* a fragmented file can only
-# run on btrfs. (btrfs is reflink-capable, so this implies @requires_reflink.)
+# file into many physical extents; xfs overwrites in place instead. So this is
+# for a test that fragments a file *by rewriting part of it*, and for nothing
+# else. It is not what a test needs merely to get more than one extent: writing
+# around a hole does that anywhere (#242, and see make_sparse), and this comment
+# claimed the opposite for long enough to keep an extent-pass test off xfs.
+# (btrfs is reflink-capable, so this implies @requires_reflink.)
 BTRFS = scratch_fstype() == "btrfs"
 requires_btrfs = unittest.skipUnless(
     BTRFS, "test needs btrfs (copy-on-write fragmentation)")
@@ -228,6 +231,29 @@ def btrfs_ok(*args):
 # --------------------------------------------------------------------------
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+# fallocate(2) mode bits - the os module exposes posix_fallocate() only.
+_FALLOC_FL_KEEP_SIZE = 0x01
+_FALLOC_FL_PUNCH_HOLE = 0x02
+
+# off_t is 64-bit; without this ctypes passes the offsets as int and a hole
+# past 2 GiB lands somewhere else entirely.
+_libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int,
+                            ctypes.c_longlong, ctypes.c_longlong]
+
+
+def punch_hole(fd, offset, length):
+    """Punch a real hole into fd, keeping the file size.
+
+    Raises rather than returning a status: a fixture that silently failed to
+    punch would leave a file with no hole in it, and every assertion about
+    holes would then pass by not being about anything.
+    """
+    if _libc.fallocate(fd, _FALLOC_FL_PUNCH_HOLE | _FALLOC_FL_KEEP_SIZE,
+                       offset, length):
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err),
+                      f"punch_hole(offset={offset}, length={length})")
 
 
 def _settle_scratch():
@@ -255,8 +281,8 @@ class DuperemoveTest(unittest.TestCase):
     """Base class: a fresh scratch dir + hashfile per test, plus helpers."""
 
     # Set True on a class whose assertions depend on the *physical* extent
-    # layout the kernel happens to produce - the fsync-forced extent boundary
-    # trick, or fiemap counts. Concurrent I/O perturbs btrfs writeback enough
+    # layout the kernel happens to produce - which extents a file ended up in,
+    # or fiemap counts. Concurrent I/O perturbs btrfs writeback enough
     # that the layout the setup intends is not the one it gets, so tests/run.py
     # holds these back and runs them one at a time after the pool drains.
     # Per-test scratch isolation is *not* what this is for; that already works.
@@ -517,6 +543,21 @@ class DuperemoveTest(unittest.TestCase):
     def make_sparse(self, relpath, head, hole, tail):
         """Write head bytes, a real hole of `hole` bytes, then tail bytes.
 
+        The hole is punched rather than merely seeked over. XFS reserves blocks
+        past the end of a buffered extending write - for these sizes, about the
+        size of the gap - and reports the reservation as one DELALLOC record,
+        so a seeked-over gap can come back mapped and the file has no hole at
+        all on half the CI matrix. Punching says what is meant; the truncate
+        drops whatever the last write reserved past EOF. Same recipe, and the
+        same reason, as mkfile_fiemap() in tests/unit/fixtures.h.
+
+        A punched hole is also what puts head and tail in *separate extents* on
+        a filesystem that does not fragment a file by itself, which is what
+        lets an extent-pass test run somewhere other than btrfs (#242).
+
+        `hole` and len(head) should be block multiples; an unaligned edge is
+        zeroed rather than punched, which costs sparseness but not content.
+
         head/tail are bytes objects; pass the same ones to two calls to build
         identical, independently-stored sparse twins.
         """
@@ -525,6 +566,9 @@ class DuperemoveTest(unittest.TestCase):
             f.write(head)
             f.seek(len(head) + hole)
             f.write(tail)
+            f.flush()               # punch after the writes, not before
+            punch_hole(f.fileno(), len(head), hole)
+            f.truncate(len(head) + hole + len(tail))
         return p
 
     def make_trailing_hole(self, relpath, data, size):

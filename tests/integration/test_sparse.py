@@ -1,10 +1,53 @@
 """Sparse files, holes, unaligned tails, and empty/zero files."""
 
+import errno
 import os
 from harness import DuperemoveTest, requires_reflink
 
 
 class SparseTest(DuperemoveTest):
+    def test_make_sparse_really_punches_a_hole(self):
+        """The gap is in the extent map, not merely skipped by the writer.
+
+        Seeking over a gap leaves a hole on btrfs and ext4, but XFS reserves
+        blocks past the end of a buffered extending write - for these sizes,
+        about the size of the gap - so the gap can come back mapped and the
+        file has no hole at all on half the CI matrix. Every other assertion in
+        this file would then pass by not being about anything (#242).
+
+        SEEK_HOLE/SEEK_DATA ask the kernel what the map really is, which is the
+        only way to tell a punched hole from a gap the filesystem filled in.
+        """
+        head, hole, tail = 65536, 131072, 40000
+        p = self.make_sparse("tree/sp", os.urandom(head), hole, os.urandom(tail))
+        self.sync()
+        with open(p, "rb") as f:
+            fd = f.fileno()
+            self.assertEqual(head, os.lseek(fd, 0, os.SEEK_HOLE),
+                             "the hole begins where the head ends")
+            self.assertEqual(head + hole, os.lseek(fd, head, os.SEEK_DATA),
+                             "and ends where the tail begins")
+        self.assertEqual(head + hole + tail, os.stat(p).st_size,
+                         "punching kept the file size")
+
+    def test_a_punch_that_fails_is_raised_not_swallowed(self):
+        """The test above can only fail on XFS - btrfs and ext4 leave a hole
+        whether or not anything punched - so this pins the other half of the
+        guarantee, which every filesystem can show: a punch that did not happen
+        must not pass for one. tests/unit/fixtures.h can ignore the return
+        value because it aborts on the following ftruncate anyway; here the
+        file would simply come back without its hole and nothing would say so.
+        """
+        from harness import punch_hole
+        p = self.write("tree/ro", os.urandom(65536))
+        fd = os.open(p, os.O_RDONLY)           # fallocate needs it writable
+        try:
+            with self.assertRaises(OSError) as caught:
+                punch_hole(fd, 0, 4096)
+        finally:
+            os.close(fd)
+        self.assertEqual(errno.EBADF, caught.exception.errno)
+
     def test_sparse_file_scans(self):
         self.make_sparse("tree/sp", os.urandom(65536), 131072, os.urandom(40000))
         self.scan(self.path("tree"))

@@ -28,8 +28,8 @@ class EinvalTest(DuperemoveTest):
         # tail is the shared extent whose block-rounded length overshoots EOF.
         head_a, head_b = os.urandom(262144), os.urandom(262144)
         tail = os.urandom(12345)
-        a = self.make_sparse_headtail("tree/a", head_a, 327680, tail)
-        b = self.make_sparse_headtail("tree/b", head_b, 327680, tail)
+        a = self.make_sparse("tree/a", head_a, 65536, tail)
+        b = self.make_sparse("tree/b", head_b, 65536, tail)
         self.sync()
 
         before = self.tree_digest(self.path("tree"))
@@ -53,10 +53,3 @@ class EinvalTest(DuperemoveTest):
         self.assertEqual(before, self.tree_digest(self.path("tree")), "data preserved")
 
     # A sparse file with a *unique* head and a shared tail placed after a hole.
-    def make_sparse_headtail(self, relpath, head, tail_offset, tail):
-        p = self.path(relpath)
-        with open(p, "wb") as f:
-            f.write(head)
-            f.seek(tail_offset)
-            f.write(tail)
-        return p
