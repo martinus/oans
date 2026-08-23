@@ -106,6 +106,49 @@ in `tests/`; no shell tests.
 Two additions to `src/tests.c`'s side of the house. Neither touches the
 integration suite, and the distinction matters for reading either of them.
 
+### What eight iterations of this actually taught
+
+The per-file sections below are the findings. This is the method they converged
+on, and it is worth reading before starting a ninth.
+
+- **The loop is: write the tests, review them, sweep, then open the PR — in
+  that order.** A review that lands after the sweep invalidates every number in
+  it, because a review of tests always edits tests. Sweeping first and
+  reviewing second means re-running a sweep that costs minutes to an hour.
+- **In seven of seven iterations, the review found a test that could not
+  fail.** Not a weak test — a test whose assertion held no matter what the code
+  did. The list, because the shapes repeat: a fixture whose winner led on every
+  column (so a `min(id)` election passed the #197 test); an `is_anchor`
+  assertion that passed against its own mutation; two symmetric file layouts,
+  which made "which side of the pair was written" unobservable and cost 47 of
+  72 mutants; a helper wrapping `list_first_entry()` on a possibly-empty list,
+  which never returns NULL, so every `mu_check(t != NULL)` around it held
+  whatever the loader did; an idleness check a deleted wait still satisfied; a
+  vacuous empty-file scenario; and "a fresh file shares nothing", equally
+  satisfied by fiemap mapping nothing at all.
+  That rate did not fall as the work got better, which is the argument for the
+  review step being mandatory rather than a finishing touch. **Suspect the
+  fixture before you suspect the code**, and ask of every new assertion: what
+  would have to be true for this to fail?
+- **Read every survivor count by function** (`report.py`, below). The number the
+  tool prints answers a question nobody asked. `src/util.c` at 213 of 413 was
+  5-9% survival wherever a test existed and 85-94% in four untested pure
+  functions; the total says one thing and the grouping says two.
+- **Check the equivalents rather than counting them.** `storage.c` ended at
+  nine survivors in a pure function of which eight are provably equivalent, and
+  the discipline is what found the two that were not. Three that *looked*
+  equivalent in `src/util.c` were not, and one of those wrote a byte past a
+  buffer — so prove it, one at a time, rather than waving at the group.
+- **Then stop.** Residue that is an ioctl, a `perror_sqlite` + `goto out` pair,
+  or an `exit()` path is triaged, not fixed: the next honest move there is a
+  fault-injection seam, and saying so is a better answer than a bigger fixture.
+- **A `caught` count is a lower bound on what a test guards, never the
+  measure.** Measured four times now: the `src/glob.c` properties gained
+  nothing on a sweep, the three hashfile ones moved exactly one mutant (and it
+  was worth all three), and the storage property moved *zero* while catching
+  its own bug block. No operator generates a design change, so anything a
+  bug file guards against is invisible to a sweep by construction.
+
 ### `scripts/mutate/mutate.py` — does anything notice when this breaks
 
 Breaks a source file in a throwaway copy of the tree, rebuilds, runs `./test`,
@@ -134,6 +177,16 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     exactly one file. `make mutation-replay` now runs the lot with nothing to
     know, and `make lint` refuses a bug file whose `# file:` line is missing or
     names something that is not there.
+  - **One source per bug file, and the lint now enforces that too.** A *second*
+    `# file:` line is worse than a missing one, because it does not abort: the
+    adapter takes the first match and ignores the rest, so the blocks under the
+    later heading are applied to the earlier heading's source. Measured — a
+    block written for `src/util.c` (`if (base < 1)`) applied cleanly to
+    `src/storage.c`, where the same text exists and the mutant is equivalent,
+    and came back **`survived`**, under the report's "nothing noticed these —
+    whatever covers them is decoration". A test called decoration when it was
+    never run, which is the direction every bug in this tool has erred. This is
+    how nine blocks in one file once became three that ran.
 - **A `survived` is a narrower claim than it reads.** The suite is `src/tests.c`
   alone: the end-to-end Python suite drives the *binary* and is not in the loop,
   so for the dedupe phase, the scan pipeline and the progress block a survivor
@@ -233,6 +286,50 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   from `<=` because `v >= 1024.0` fails first, UINT64_MAX being 16 EiB. Check
   the equivalents rather than assuming them: three that looked equivalent were
   not, and one of those wrote a byte past a buffer.
+
+### `scripts/mutate/report.py` — the grouping, and the diff
+
+`mutate.py --json` writes a report; this reads it. Two modes, and both exist
+because they were hand-rolled in throwaway python four times over eight
+iterations before earning a file.
+
+```sh
+scripts/mutate/report.py sweep.json                 # survivors by function
+scripts/mutate/report.py before.json after.json     # what a change moved
+```
+
+- **The grouping is the rule above, made cheap.** Kill rate per function is
+  computed over the *scored* mutants (total minus `compiler`), since a function
+  whose mutants the build all rejected says nothing about the tests.
+- **The diff is the claim worth making.** "Survivors went down by four" is the
+  same number for a change that killed four and one that killed six and lost
+  two, so it names the mutants that went and calls out any that **arrived** —
+  a test that stopped covering something is the finding a total cannot show.
+  Used to confirm that `storage.c`'s six kills were exactly the six argued to
+  be real, and that nothing regressed.
+- **It refuses a per-mutant diff across a changed source, and this is the whole
+  reason it is careful.** Line numbers move, so mapping one run's lines through
+  the other's function map attributes survivors to whatever now sits at that
+  number — done by hand once here, it produced a confident report of a
+  regression in `extents_search_init`, a function the change had not touched.
+  The guard is the mutant population: identical `(line, name)` multisets mean
+  the same source, and anything else falls back to per-function counts and says
+  so.
+- **`scripts/mutate/test_report.py` is hermetic and runs in `make lint`** — no
+  compiler, no build, no lanes. It is there because this tool is only ever read
+  as the explanation of a number, so a wrong grouping does not fail, it
+  persuades: the first parser walked back over a signature into the doc comment
+  above it and filed all 36 of `read_rotational`'s mutants under `parent`, a
+  word from prose about partitions. A plausible name with a plausible count.
+  - The makefile runs the script directly rather than piping it to `tail`.
+    `sh` reports a pipeline's *last* command, so a `| tail -1` would return 0
+    however the tests went — the check could never fail, which is the exact
+    shape of thing this directory exists to catch.
+- **Not in `mutate_core.py`, deliberately.** The core is vendored byte-identical
+  into unordered_dense and nanobench and tested over there, so a change to it is
+  a three-repo errand; this reads only the JSON those runs already emit, and
+  nothing about it is oans-specific except the C function parser. Promote it if
+  the other two want it, rather than paying that cost up front.
 
 ### The dedupe model is unit-testable too, and needs no fixture at all
 

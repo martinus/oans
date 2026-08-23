@@ -49,15 +49,33 @@ def adapter_module():
 
 
 def bug_file_problems(project):
-    """Every bugs/*.txt names a source that exists.
+    """Every bugs/*.txt names exactly one source, and that source exists.
 
     A bug file whose `# file:` line is missing or stale mutates whatever
     `--file` defaults to, where its blocks do not appear - so every one of them
     fails to apply, the run aborts, and the reason is two steps from the
     message. One stat each, at the only moment anyone is looking.
+
+    A *second* `# file:` line is worse than either, because it does not abort.
+    The adapter takes the first match and ignores the rest, so the blocks under
+    the second heading are applied to the first heading's source - and a short
+    block often exists in both files. Measured: `if (base < 1)` written for
+    src/util.c applied cleanly to src/storage.c, where it is an equivalent
+    mutant, and came back `survived` under "nothing noticed these - whatever
+    covers them is decoration". That is a test being called decoration when it
+    was never run, and it is the direction every bug in this tool has erred.
+    One file per source; split the blocks.
     """
     found = []
     for path in sorted((CORE.parent / "bugs").glob("*.txt")):
+        headings = adapter_module().BUG_FILE_TARGET.findall(path.read_text())
+        if len(headings) > 1:
+            found.append("%s names %d sources (%s): a bug file mutates one, "
+                         "and the blocks under the later ones would be applied "
+                         "to the first - split it"
+                         % (path.relative_to(REPO), len(headings),
+                            ", ".join(headings)))
+            continue
         target = adapter_module().bug_file_target(str(path))
         if target is None:
             found.append("%s names no source: give it a `# file: src/....c` line"
