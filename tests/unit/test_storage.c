@@ -148,3 +148,104 @@ MU_TEST(test_storage_describe) {
 	mu_assert_string_eq("btrfs pool ", buf);	/* 11 chars + NUL */
 	mu_check(buf[12] == 'x');	/* nothing written past the length */
 }
+
+/*
+ * read_rotational, against a sysfs tree the test builds.
+ *
+ * The seam is read_rotational_at()'s root parameter, and it is the only one
+ * the residue actually needed: everything else that looked unreachable takes
+ * an fd or a database handle a test already controls. This builds an absolute
+ * path and opens it, so without the parameter there is no way in at all - 29
+ * of its 36 mutants survived on that.
+ *
+ * What is exercised here is real: a real open() of a real file, returning the
+ * real errno when it is missing. Nothing is stubbed.
+ */
+static void rm_rf(const char *path)
+{
+	char cmd[PATH_MAX + 16];
+
+	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+	if (system(cmd) < 0)
+		abort();
+}
+
+/* Writes `content` to <root>/dev/block/<maj>:<min>/queue/rotational. */
+static void fake_rotational(const char *root, unsigned maj, unsigned min,
+			    const char *content)
+{
+	char dir[PATH_MAX], file[PATH_MAX], cmd[PATH_MAX + 16];
+	FILE *f;
+
+	snprintf(dir, sizeof(dir), "%s/dev/block/%u:%u/queue", root, maj, min);
+	snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir);
+	if (system(cmd) < 0)
+		abort();
+	snprintf(file, sizeof(file), "%s/rotational", dir);
+	f = fopen(file, "w");
+	if (!f)
+		abort();
+	fputs(content, f);
+	fclose(f);
+}
+
+MU_TEST(test_read_rotational_reads_what_sysfs_says) {
+	char root[] = "/tmp/oans-sysfs-XXXXXX";
+	bool rot = true;
+
+	if (!mkdtemp(root))
+		abort();
+
+	/* Absent: neither path form exists, so it must say so rather than
+	 * leave `rot` at whatever the caller had. */
+	rot = true;
+	mu_assert(read_rotational_at(root, makedev(7, 0), &rot) == -ENOENT,
+		  "a missing sysfs entry was not reported");
+
+	/* '0' is an SSD, and anything else is a spinner - the test is on the
+	 * byte, not on truthiness, which is what `c != '0'` means. */
+	fake_rotational(root, 8, 0, "0\n");
+	mu_check(read_rotational_at(root, makedev(8, 0), &rot) == 0);
+	mu_assert(!rot, "'0' was read as rotational");
+
+	fake_rotational(root, 8, 16, "1\n");
+	mu_check(read_rotational_at(root, makedev(8, 16), &rot) == 0);
+	mu_assert(rot, "'1' was not read as rotational");
+
+	/*
+	 * A partition, which is the whole reason there are two forms.
+	 *
+	 * In sysfs /sys/dev/block/8:1 is a *symlink* to the partition's real
+	 * directory, which has no queue/ of its own - so `..` resolves against
+	 * the symlink target and lands on the parent disk, which does. The
+	 * fixture has to be that shape or the first form finds the file and
+	 * the second is never reached: built the obvious way, with a real
+	 * directory holding queue/rotational, deleting the second form outright
+	 * left this test green.
+	 */
+	{
+		char cmd[PATH_MAX * 2];
+
+		snprintf(cmd, sizeof(cmd),
+			 "mkdir -p '%s/devices/sda/queue' '%s/devices/sda/sda1' && "
+			 "printf 1 > '%s/devices/sda/queue/rotational' && "
+			 "ln -sfn '%s/devices/sda/sda1' '%s/dev/block/8:1'",
+			 root, root, root, root, root);
+		if (system(cmd) < 0)
+			abort();
+
+		rot = false;
+		mu_check(read_rotational_at(root, makedev(8, 1), &rot) == 0);
+		mu_assert(rot,
+			  "the parent disk's queue/ was not reached, so the\n"
+			  "  second path form is doing nothing");
+	}
+
+	/* An empty file: the read returns 0 bytes, which is not an answer. */
+	fake_rotational(root, 9, 0, "");
+	rot = true;
+	mu_assert(read_rotational_at(root, makedev(9, 0), &rot) == -ENOENT,
+		  "an empty rotational file was treated as an answer");
+
+	rm_rf(root);
+}

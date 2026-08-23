@@ -1379,3 +1379,90 @@ MU_TEST(test_a_file_with_nothing_unique_yields_no_nondupe_extents) {
  * at the time.
  * ---------------------------------------------------------------------------
  */
+
+/*
+ * What every `perror_sqlite` + `goto out` pair is for.
+ *
+ * dbfile.c has 82 of them and until now no unit test reached one: they guard a
+ * bind or a step failing, which a healthy in-memory database never does. The
+ * residue was triaged as needing a fault-injection seam - and the seam is
+ * sqlite's own `query_only`, which needs no change to the product.
+ *
+ * The invariant is the one that matters for a cache nothing downstream
+ * validates. A hashfile is not checked by anything that reads it, so a write
+ * that failed and *said so* costs one re-hash, while a write that failed and
+ * returned success produces a run that exits 0, looks correct, and has a hole
+ * in it. Every one of these asserts the first and would fail on the second.
+ */
+MU_TEST(test_a_refused_write_is_reported_rather_than_swallowed) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t fileid;
+	struct file f;
+	unsigned char digest[DIGEST_LEN];
+	struct block_csum block;
+	struct scan_checkpoint cp;
+	struct run_record run;
+
+	/* A real row first, on a healthy connection, so the ids below are not
+	 * themselves the reason a write fails. */
+	fileid = put_file(db, "/refused", 4001, 1);
+	mu_check(fileid > 0);
+
+	db_refuse_writes(db);
+
+	/* Each of these binds and steps a write. Under query_only the step
+	 * answers SQLITE_READONLY, which is precisely the branch the pairs
+	 * guard - and the answer must not be "fine". */
+	memset(&f, 0, sizeof(f));
+	f.filename = "/also-refused";
+	f.ino = 4002;
+	f.subvol = 1;
+	f.size = 4096;
+	f.mtime = 222;
+	mu_assert(dbfile_store_file_info(db, &f) <= 0,
+		  "a refused insert reported a rowid");
+
+	memset(digest, 0xcd, sizeof(digest));
+	mu_assert(dbfile_update_scanned_file(db, fileid, digest, 0, 1) != 0,
+		  "a refused digest update reported success");
+
+	memset(&block, 0, sizeof(block));
+	block.loff = 0;
+	memcpy(block.digest, digest, DIGEST_LEN);
+	mu_assert(dbfile_store_block_hashes(db, fileid, 1, &block) != 0,
+		  "a refused block-hash write reported success");
+
+	memset(&cp, 0, sizeof(cp));
+	cp.loff = 4096;
+	cp.mtime = 222;
+	cp.size = 4096;
+	mu_assert(dbfile_store_checkpoint(db, fileid, &cp) != 0,
+		  "a refused checkpoint reported success - the one write whose\n"
+		  "  whole purpose is that a later run can trust it");
+
+	memset(&run, 0, sizeof(run));
+	run.files_scanned = 1;
+	mu_assert(dbfile_record_run(db, &run) != 0,
+		  "a refused run-history append reported success");
+}
+
+/*
+ * The read side still works while writes are refused.
+ *
+ * Without this the test above is satisfied by a connection that is simply
+ * broken - every call failing for any reason would pass it. This is what makes
+ * "the write was refused" a different statement from "nothing works".
+ */
+MU_TEST(test_reads_still_answer_while_writes_are_refused) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	int64_t fileid = put_file(db, "/still-readable", 4010, 1);
+	struct file out;
+
+	mu_check(fileid > 0);
+	db_refuse_writes(db);
+
+	memset(&out, 0, sizeof(out));
+	mu_check(dbfile_describe_file(db, 4010, 1, &out) == 0);
+	mu_assert(out.id == fileid,
+		  "the read path stopped answering, so the test above proves nothing");
+}

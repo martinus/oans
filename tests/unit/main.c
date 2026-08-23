@@ -55,6 +55,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_progress_path_two_stage_render);
 	MU_RUN(test_storage_recommend_io_threads);
 	MU_RUN(test_storage_describe);
+	MU_RUN(test_read_rotational_reads_what_sysfs_says);
 	MU_RUN(test_prop_a_recommendation_is_never_zero_and_never_over_the_cap);
 	MU_RUN(test_scan_bucket);
 	MU_RUN(test_scan_workq_priority);
@@ -117,6 +118,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_fiemap_maps_a_real_file);
 	MU_RUN(test_fiemap_range_answers_for_the_range_asked_for);
 	MU_RUN(test_fiemap_counts_nothing_shared_in_a_fresh_file);
+	MU_RUN(test_a_refused_ioctl_is_an_error_not_a_zero_answer);
+	MU_RUN(test_a_closed_descriptor_is_refused_too);
 	MU_RUN(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
@@ -130,6 +133,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_dbfile_layout_matches_compares_every_record);
 	MU_RUN(test_dbfile_copying_a_donor_brings_all_three);
 	MU_RUN(test_dbfile_a_stored_file_round_trips_every_field);
+	MU_RUN(test_a_refused_write_is_reported_rather_than_swallowed);
+	MU_RUN(test_reads_still_answer_while_writes_are_refused);
 	MU_RUN(test_dbfile_hashes_round_trip_their_offsets);
 	MU_RUN(test_dbfile_load_checkpoint_declines_what_it_cannot_vouch_for);
 	MU_RUN(test_dbfile_pruning_keeps_what_still_exists);

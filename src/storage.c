@@ -35,20 +35,33 @@
  * partitions have no queue/ of their own, so we retry via the parent ("..",
  * which resolves against the symlink target's real directory).
  */
-static int read_rotational(dev_t dev, bool *rot)
+/*
+ * The sysfs root, so a test can point this at a tree it built.
+ *
+ * This is the one place in the residue that genuinely needed a seam rather
+ * than a hostile fixture: the ioctl wrappers take an fd and the sqlite paths
+ * have query_only, but this builds an absolute path and reads it, so nothing a
+ * caller controls decides what it opens. 29 of its 36 mutants survived because
+ * of that - the two path forms, the open-fails-so-try-the-next branch, the
+ * short-read branch and the `!= '0'` are all real behaviour with no way in.
+ *
+ * A parameter, not an environment variable: the product must not grow a knob
+ * that changes where it reads hardware facts from.
+ */
+static int read_rotational_at(const char *sysfs, dev_t dev, bool *rot)
 {
-	static const char *const forms[] = {
-		"/sys/dev/block/%u:%u/queue/rotational",
-		"/sys/dev/block/%u:%u/../queue/rotational",
+	const char *forms[] = {
+		"%s/dev/block/%u:%u/queue/rotational",
+		"%s/dev/block/%u:%u/../queue/rotational",
 	};
-	char path[64];
+	char path[PATH_MAX];
 	unsigned maj = major(dev), min = minor(dev);
 
 	for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
 		char c;
 		int fd, n;
 
-		snprintf(path, sizeof(path), forms[i], maj, min);
+		snprintf(path, sizeof(path), forms[i], sysfs, maj, min);
 		/* longpath-ok: a generated /sys path, never a scanned file. */
 		fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd < 0)
@@ -62,6 +75,11 @@ static int read_rotational(dev_t dev, bool *rot)
 		}
 	}
 	return -ENOENT;
+}
+
+static int read_rotational(dev_t dev, bool *rot)
+{
+	return read_rotational_at("/sys", dev, rot);
 }
 
 /* Merge one device's rotational reading into the aggregate profile. */

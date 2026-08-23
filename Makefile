@@ -52,7 +52,7 @@ DEPENDS := $(CFILES:.c=.d)
 # or every symbol in them is defined twice. Everything else the suite needs is
 # an ordinary object it shares with the binary.
 TEST_INLINED := file_scan.c progress.c find_dupes.c dbfile.c hash-tree.c \
-		results-tree.c fiemap.c glob.c csum.c interrupt.c longpath.c
+		results-tree.c fiemap.c glob.c csum.c interrupt.c longpath.c storage.c
 TEST_SKIP    := $(addprefix src/,$(TEST_INLINED:.c=.o)) src/oans.o src/run_dedupe.o
 TEST_LINKED  := $(filter-out $(TEST_SKIP),$(OBJECTS))
 TEST_SOURCES := $(sort $(wildcard tests/unit/tu_*.c)) tests/unit/main.c
