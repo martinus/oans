@@ -1,0 +1,67 @@
+# file: src/storage.c
+#
+# The io-threads heuristic and the line that describes what it decided.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/storage.txt
+#
+# Everything here is silent by construction. A wrong thread count is a slow
+# scan, not an error, and a wrong description is one line of prose nobody
+# checks against the hardware. The recommender's table looked thorough and
+# still let three of these through; the describer had no test at all.
+
+# a zeroed profile recommends no reader threads at all
+# `<= 1` and `== 1` read identically. They differ only at num_devices == 0,
+# which storage_detect() never produces - but a caller that skipped it holds
+# exactly that, and the pool arm then computes 2 * 0 and returns zero. That
+# number sizes three thread pools.
+<<<
+	if (p->num_devices <= 1)
+===
+	if (p->num_devices == 1)
+>>>
+
+# the single-disk clamp is lowered and every existing case still agrees
+# The cases in the table sit at base >= 4 or base <= 2, where a clamp of four
+# and a clamp of three answer the same. Only a three-core machine separates
+# them, and it is the machine most likely to be someone's NAS.
+<<<
+	return base < 4 ? base : 4;
+===
+	return base < 3 ? base : 4;
+>>>
+
+# a spinning pool is given the full CPU-capped default
+# This is the whole point of detecting rotational media: many concurrent
+# readers thrash the heads. Deleting the test hands an HDD the SSD default and
+# the scan gets slower, with nothing in the output saying why.
+<<<
+	if (!p->rotational_known || !p->rotational)
+		return base;
+===
+	return base;
+>>>
+
+# a single disk is described as a one-device pool
+# The describer's device-count test had no test at all, so every spelling of
+# it survived. This is the line a run prints about its own storage, and it is
+# what someone reads when they want to know whether the heuristic saw the
+# hardware correctly.
+<<<
+	if (p->num_devices > 1)
+===
+	if (p->num_devices >= 1)
+>>>
+
+# unknown media is reported as an SSD
+# `rotational` is meaningless when `rotational_known` is false - it is
+# whatever the zeroed profile left there. Reporting it as a definite answer
+# turns "we could not tell" into a claim, which is the one thing this string
+# exists not to do.
+<<<
+	const char *disk = !p->rotational_known ? "unknown media" :
+			   p->rotational ? "rotational (HDD)" :
+					   "non-rotational (SSD)";
+===
+	const char *disk = p->rotational ? "rotational (HDD)" :
+					   "non-rotational (SSD)";
+>>>

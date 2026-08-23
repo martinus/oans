@@ -312,6 +312,53 @@ MU_TEST(test_fiemap_layout_key) {
 
 	mu_check(key_of(enc, 1, 8192, b));
 
+	/*
+	 * More extents than the stack buffer holds, so the heap path runs.
+	 * LAYOUT_KEY_STACK_EXTENTS is 32 and every fixture above has one or
+	 * two, so that branch - and the record-stride arithmetic that sizes
+	 * both buffers - had never been reached.
+	 *
+	 * Only half of a stride mismatch is visible from here, and it is worth
+	 * being exact about which. A stride *wider* than the loop's leaves the
+	 * moved word past `bytes` and unhashed, so the last assertion below
+	 * catches it. A stride *narrower* feeds the unwritten tail of the
+	 * buffer to checksum_block(), which a plain run cannot see - that one
+	 * belongs to the valgrind and ASAN legs, the same shape as the missing
+	 * memset in start_running_checksum().
+	 */
+	{
+		struct fm_rec many[40];
+		unsigned char big[DIGEST_LEN], big2[DIGEST_LEN];
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(many); i++) {
+			many[i].log = (uint64_t)i * 8192;
+			many[i].phys = (uint64_t)(i + 100) * 4096;
+			many[i].len = 4096;
+			many[i].flags = 0;
+		}
+
+		/* Either side of the boundary, and well past it. */
+		mu_check(key_of(many, LAYOUT_KEY_STACK_EXTENTS, 1u << 20, big));
+		mu_check(key_of(many, LAYOUT_KEY_STACK_EXTENTS + 1, 1u << 20, big2));
+		/* Different counts key differently - which rec[1] alone
+		 * guarantees, so this is a sanity check on the fixture rather
+		 * than a claim about the boundary. */
+		mu_assert(memcmp(big, big2, DIGEST_LEN) != 0,
+			  "one extent more than the stack holds keyed the same");
+
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big));
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big2));
+		mu_assert(memcmp(big, big2, DIGEST_LEN) == 0,
+			  "the heap path is not deterministic");
+
+		/* And it still notices a moved address out there, which is the
+		 * whole point of hashing every record rather than a summary. */
+		many[ARRAY_SIZE(many) - 1].phys += 4096;
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big2));
+		mu_assert(memcmp(big, big2, DIGEST_LEN) != 0,
+			  "a moved address in the last record did not change the key");
+	}
+
 	/* Records whose address means nothing, or nothing stable, are refused. */
 	struct fm_rec inl[] = {{0, 0, 512, FIEMAP_EXTENT_DATA_INLINE}};
 	struct fm_rec delalloc[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
@@ -757,6 +804,115 @@ MU_TEST(test_storage_recommend_io_threads) {
 	p = (struct storage_profile){ .rotational = true,
 		.rotational_known = true, .num_devices = 1 };
 	mu_check(storage_recommend_io_threads(&p, 0) == 1);
+
+	/*
+	 * A device count of zero takes the single-disk branch too, and this
+	 * is the one assertion here that is about a hazard rather than a
+	 * preference. storage_detect() seeds num_devices = 1, but a zeroed
+	 * profile is what a caller that skipped it holds - and the pool arm
+	 * would compute 2 * 0 and recommend *no* reader threads at all, which
+	 * sizes three pools. `<= 1` is what keeps that unreachable; `== 1`
+	 * reads identically and does not.
+	 */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 0 };
+	mu_check(storage_recommend_io_threads(&p, 32) == 4);
+
+	/*
+	 * Between the clamp and the cap: with three cores the single-disk arm
+	 * must yield the cores, not the constant. Every case above sits at
+	 * base >= 4 or base <= 2, where `base < 4 ? base : 4` and a clamp of
+	 * three agree - so the clamp could be lowered and nothing noticed.
+	 */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 1 };
+	mu_check(storage_recommend_io_threads(&p, 3) == 3);
+}
+
+MU_TEST(test_prop_a_recommendation_is_never_zero_and_never_over_the_cap) {
+	declare_prop(p, 20000);
+
+	/*
+	 * The table above says what each branch should answer. This says what
+	 * no branch may answer, and it is deliberately phrased without
+	 * reference to the branches: at least one reader thread, and never
+	 * more than the CPU cap allows.
+	 *
+	 * That independence is the point. The floor is the same claim the
+	 * `num_devices <= 1` test carries - a zeroed profile reaching the pool
+	 * arm computes 2 * 0 - but a table case asserts it at one profile,
+	 * where this asserts it at every combination of the three inputs,
+	 * including the ones nobody thought to write down. The result sizes
+	 * three thread pools, so zero is not a wrong number, it is a hang.
+	 */
+	while (prop_next(&p)) {
+		struct storage_profile sp;
+		unsigned int ncpus = (unsigned int)prop_below(&p, 260);
+		unsigned int got, ceiling;
+
+		sp.rotational_known = prop_bool(&p);
+		sp.rotational = prop_bool(&p);
+		/*
+		 * Log-uniform over a bounded range, so a pool of 3 and a pool
+		 * of a million both come up. The bound is deliberate and is
+		 * the one caveat on the claim below: `2 * p->num_devices` is
+		 * unsigned int arithmetic, so a count at or above 2^31 wraps
+		 * and the pool arm can answer zero by a second route the
+		 * `<= 1` guard knows nothing about. num_devices is a btrfs
+		 * pool member count read from BTRFS_IOC_FS_INFO, so no such
+		 * filesystem exists; widening this generator would report an
+		 * unreachable input as a counterexample and say nothing about
+		 * the guard the property is here to hold.
+		 */
+		sp.num_devices = (unsigned int)
+			((prop_u64(&p) >> prop_below(&p, 64)) & 0xfffff);
+
+		got = storage_recommend_io_threads(&sp, ncpus);
+		ceiling = ncpus < AUTO_THREADS_CAP ? ncpus : AUTO_THREADS_CAP;
+		if (ceiling < 1)
+			ceiling = 1;
+
+		prop_check(&p, got >= 1);
+		prop_check(&p, got <= ceiling);
+	}
+}
+
+MU_TEST(test_storage_describe) {
+	struct storage_profile p;
+	char buf[64];
+
+	/*
+	 * The line a run prints for its own storage, and the only place the
+	 * profile is rendered rather than acted on. Its device-count test had
+	 * no test at all, so every spelling of it - `>= 1`, `> 0`, `> 2` -
+	 * described a single disk as a pool or a pool as a single disk with
+	 * nothing going red.
+	 */
+	p = (struct storage_profile){ .rotational = false,
+		.rotational_known = true, .num_devices = 1 };
+	storage_describe(&p, buf, sizeof(buf));
+	mu_assert_string_eq("single device, non-rotational (SSD)", buf);
+
+	/* Two is the boundary: the first count that is a pool. */
+	p.num_devices = 2;
+	p.rotational = true;
+	storage_describe(&p, buf, sizeof(buf));
+	mu_assert_string_eq("btrfs pool of 2 devices, rotational (HDD)", buf);
+
+	/* Unknown media outranks the rotational flag, which is then stale. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = false, .num_devices = 1 };
+	storage_describe(&p, buf, sizeof(buf));
+	mu_assert_string_eq("single device, unknown media", buf);
+
+	/* Truncation is snprintf's job, but the result must stay a C string:
+	 * this is what the caller passes to a %s. */
+	p = (struct storage_profile){ .rotational = true,
+		.rotational_known = true, .num_devices = 12 };
+	memset(buf, 'x', sizeof(buf));
+	storage_describe(&p, buf, 12);
+	mu_assert_string_eq("btrfs pool ", buf);	/* 11 chars + NUL */
+	mu_check(buf[12] == 'x');	/* nothing written past the length */
 }
 
 MU_TEST(test_scan_bucket) {
@@ -5802,6 +5958,243 @@ MU_TEST(test_the_wind_down_notice_is_said_once) {
 	intr_reset();
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * fiemap against a real file
+ *
+ * The pure half of fiemap.c is already well covered - fiemap_maps_share() is
+ * at 87% killed, phys_set_merge() 84% - because synthetic records beat
+ * coaxing a filesystem into a layout. What was at 0% is everything that takes
+ * a *file descriptor*: every function here that issues FS_IOC_FIEMAP.
+ *
+ * Those need no reflink filesystem, only FIEMAP - but not every filesystem
+ * has it. tmpfs installs no ->fiemap at all, so the ioctl fails with
+ * EOPNOTSUPP before the filesystem is consulted, and CLAUDE.md notes that /tmp
+ * is tmpfs on the usual dev box. So fm_open() asks first and says so when the
+ * answer is no, rather than failing an assertion that has nothing to do with
+ * the code under test. DUPEREMOVE_TEST_DIR is preferred when set, since CI
+ * guarantees btrfs or XFS there.
+ *
+ * What these must not do is assert a particular extent count: how a
+ * filesystem lays out a write is its business. Everything below is an
+ * invariant that holds whatever the layout turns out to be.
+ * ---------------------------------------------------------------------------
+ */
+
+#define FM_CHUNK	(256 * 1024)
+
+/* A real file to map. fd is -1 when this filesystem has no FIEMAP, which the
+ * callers treat as a skip rather than as a failure. */
+struct fm_file {
+	int fd;
+	char path[128];
+	uint64_t size;
+};
+
+static void fm_close(struct fm_file *f)
+{
+	if (f->fd >= 0)
+		close(f->fd);
+	if (f->path[0])
+		unlink(f->path);
+}
+
+static struct fm_file fm_open(const char *name, unsigned int chunks, bool sparse)
+{
+	struct fm_file f = { .fd = -1 };
+	_cleanup_(freep) char *buf = malloc(FM_CHUNK);
+	const char *dir = getenv("DUPEREMOVE_TEST_DIR");
+	struct fiemap probe = { .fm_length = ~0ULL };
+	int fd;
+
+	if (!buf)
+		abort();
+	memset(buf, 0xa5, FM_CHUNK);
+	snprintf(f.path, sizeof(f.path), "%s/oans-fiemap-XXXXXX",
+		 dir && *dir ? dir : "/tmp");
+	fd = mkstemp(f.path);
+	if (fd < 0)
+		abort();
+
+	/* Ask before relying on it. tmpfs answers EOPNOTSUPP here, and a bare
+	 * assertion failure would say nothing about why. */
+	if (ioctl(fd, FS_IOC_FIEMAP, &probe) < 0 &&
+	    (errno == EOPNOTSUPP || errno == ENOTTY)) {
+		printf("\n[fiemap] skipping %s: %s has no FIEMAP\n", name, f.path);
+		close(fd);
+		unlink(f.path);
+		f.path[0] = '\0';
+		return f;			/* fd stays -1 */
+	}
+
+	for (unsigned int i = 0; i < chunks; i++) {
+		/* A gap of one chunk between each, so a sparse file really has
+		 * holes rather than a filesystem's idea of a contiguous run. */
+		off_t at = (off_t)i * FM_CHUNK * (sparse ? 2 : 1);
+
+		if (pwrite(fd, buf, FM_CHUNK, at) != FM_CHUNK) {
+			unlink(f.path);
+			abort();
+		}
+		f.size = (uint64_t)at + FM_CHUNK;
+	}
+	/*
+	 * Punch the gaps rather than assuming a skipped write leaves one. XFS
+	 * reserves post-EOF blocks on a buffered extending write - for a file
+	 * this size, about the size of the gap - and reports the reservation as
+	 * a DELALLOC record, so the "hole" would come back mapped. Truncating
+	 * to the written size drops anything left past the end.
+	 */
+	if (sparse) {
+		for (unsigned int i = 1; i < chunks; i++)
+			(void)fallocate(fd, FALLOC_FL_PUNCH_HOLE |
+					FALLOC_FL_KEEP_SIZE,
+					(off_t)(2 * i - 1) * FM_CHUNK, FM_CHUNK);
+	}
+	if (ftruncate(fd, (off_t)f.size)) {
+		unlink(f.path);
+		abort();
+	}
+	/* Without this the data can still be in delalloc, where fiemap reports
+	 * it with no stable physical address - or not at all. */
+	if (fsync(fd)) {
+		unlink(f.path);
+		abort();
+	}
+	f.fd = fd;
+	return f;
+}
+
+/*
+ * The count pass and the mapping pass agree with each other and with the file.
+ *
+ * do_fiemap() is two ioctls - count, then map that many - so the interesting
+ * failure is them disagreeing: a map sized from a stale count either truncates
+ * the extent list or leaves uninitialised records at the end, and every caller
+ * walks fm_mapped_extents believing it.
+ */
+MU_TEST(test_fiemap_maps_a_real_file) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 1, false);
+	_cleanup_(freep) struct fiemap *fm = NULL;
+	unsigned int counted;
+	uint64_t covered = 0;
+
+	if (f.fd < 0)
+		return;
+
+	counted = fiemap_count_extents(f.fd, 0, ~0ULL);
+	mu_assert(counted >= 1, "a written and fsynced file mapped no extents");
+
+	fm = do_fiemap(f.fd);
+	mu_check(fm != NULL);
+	mu_assert(fm->fm_mapped_extents == counted,
+		  "the mapping pass disagreed with the count pass");
+
+	/* Ascending, non-overlapping, and covering what was written. The
+	 * filesystem chooses how many records that takes. */
+	for (unsigned int i = 0; i < fm->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &fm->fm_extents[i];
+
+		if (i == 0)
+			mu_check(e->fe_logical == 0);
+		else
+			mu_assert(e->fe_logical >= fm->fm_extents[i - 1].fe_logical +
+				  fm->fm_extents[i - 1].fe_length,
+				  "extents came back out of order or overlapping");
+		covered += e->fe_length;
+	}
+	mu_assert(covered >= f.size, "the extents do not cover the file");
+
+	/*
+	 * And the single-ioctl shortcut agrees with the full map. It exists so
+	 * the dedupe rescan need not enumerate a huge file, so the one thing
+	 * that must hold is that it answers the same as the long way round.
+	 */
+	{
+		uint64_t poff = 0;
+
+		mu_check(fiemap_first_extent_poff(f.fd, 0, f.size, &poff) == 0);
+		mu_assert(poff == fm->fm_extents[0].fe_physical,
+			  "the shortcut disagreed with the full map");
+	}
+}
+
+/*
+ * A range query maps the range asked for, and answers "hole" rather than
+ * "error" where there is nothing.
+ *
+ * do_fiemap_range() returning NULL for both is deliberate and is why
+ * fiemap_count_shared() can treat NULL as zero shared bytes rather than as a
+ * failure - a distinction that would otherwise turn every hole into an error.
+ */
+MU_TEST(test_fiemap_range_answers_for_the_range_asked_for) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 2, true);
+	_cleanup_(freep) struct fiemap *first = NULL;
+	/* Kept rather than discarded: on the branch where these assertions
+	 * fail the map would otherwise leak, and the valgrind unit leg turns
+	 * one clear failure into a failure plus an unrelated leak report. */
+	_cleanup_(freep) struct fiemap *hole = NULL;
+	_cleanup_(freep) struct fiemap *past = NULL;
+	uint64_t poff = 0;
+
+	if (f.fd < 0)
+		return;
+
+	/* The hole between the two written chunks. */
+	hole = do_fiemap_range(f.fd, FM_CHUNK, FM_CHUNK);
+	mu_assert(hole == NULL, "a hole was reported as an extent");
+	mu_assert(fiemap_first_extent_poff(f.fd, FM_CHUNK, FM_CHUNK, &poff) == -1,
+		  "the shortcut found an extent in a hole");
+
+	/* Past the end of the file. */
+	past = do_fiemap_range(f.fd, f.size + FM_CHUNK, FM_CHUNK);
+	mu_assert(past == NULL, "a range past EOF was reported as an extent");
+
+	/* The first chunk, which is there. */
+	first = do_fiemap_range(f.fd, 0, FM_CHUNK);
+	mu_check(first != NULL);
+	mu_assert(first->fm_mapped_extents >= 1, "the first chunk mapped nothing");
+	mu_check(first->fm_extents[0].fe_logical == 0);
+}
+
+/*
+ * Nothing is shared in a file nobody has deduplicated, and saying otherwise
+ * would credit the run with space it never freed.
+ *
+ * This is the counter behind the "net change in shared extents" line. It
+ * cannot be tested positively here - making an extent SHARED needs reflink,
+ * which this filesystem may not have - but the negative is the direction that
+ * matters: a false positive inflates a figure users read as disk saved.
+ */
+MU_TEST(test_fiemap_counts_nothing_shared_in_a_fresh_file) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 2, true);
+	_cleanup_(freep) struct fiemap *fm = NULL;
+	uint64_t shared = 99;
+
+	if (f.fd < 0)
+		return;
+
+	/*
+	 * Establish that there was something to look at first. Without this,
+	 * `shared == 0` is equally satisfied by fiemap mapping nothing at all -
+	 * fiemap_count_shared() takes an early return on a NULL map - so the
+	 * test would stay green with fiemap_count_extents() stubbed to zero,
+	 * and would say nothing about the SHARED test inside the loop.
+	 */
+	fm = do_fiemap_range(f.fd, 0, f.size);
+	mu_assert(fm != NULL && fm->fm_mapped_extents >= 1,
+		  "the fixture mapped no extents, so nothing below is tested");
+
+	mu_check(fiemap_count_shared(f.fd, 0, f.size, &shared) == 0);
+	mu_assert(shared == 0, "a freshly written file was reported as sharing");
+
+	/* A range that is entirely hole answers zero rather than failing - the
+	 * NULL-is-not-an-error path. */
+	shared = 99;
+	mu_check(fiemap_count_shared(f.fd, FM_CHUNK, FM_CHUNK * 2, &shared) == 0);
+	mu_check(shared == 0);
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -5871,6 +6264,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_progress_copy_path);
 	MU_RUN_TEST(test_progress_path_two_stage_render);
 	MU_RUN_TEST(test_storage_recommend_io_threads);
+	MU_RUN_TEST(test_storage_describe);
+	MU_RUN_TEST(test_prop_a_recommendation_is_never_zero_and_never_over_the_cap);
 	MU_RUN_TEST(test_scan_bucket);
 	MU_RUN_TEST(test_scan_workq_priority);
 	MU_RUN_TEST(test_starved_worker_line_reads_idle);
@@ -5927,6 +6322,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_the_extent_search_driven_by_its_pool);
 	MU_RUN_TEST(test_the_interrupt_flag_and_its_test_hooks);
 	MU_RUN_TEST(test_the_wind_down_notice_is_said_once);
+	MU_RUN_TEST(test_fiemap_maps_a_real_file);
+	MU_RUN_TEST(test_fiemap_range_answers_for_the_range_asked_for);
+	MU_RUN_TEST(test_fiemap_counts_nothing_shared_in_a_fresh_file);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
