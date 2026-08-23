@@ -66,6 +66,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_human_duration);
 	MU_RUN(test_num_digits);
 	MU_RUN(test_longpath);
+	MU_RUN(test_prop_a_chunk_ends_on_a_boundary_and_is_the_longest_that_fits);
+	MU_RUN(test_prop_the_chunk_walk_always_advances);
 	MU_RUN(test_glob_basename);
 	MU_RUN(test_glob_anchored_vs_any_depth);
 	MU_RUN(test_glob_wildcards_respect_separators);

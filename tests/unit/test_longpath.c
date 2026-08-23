@@ -226,3 +226,157 @@ MU_TEST(test_longpath) {
  * rather than returning false: laundering it into "no match" would let every
  * negative assertion below pass vacuously.
  */
+
+/*
+ * The chunk boundary, over every path shape rather than a handful.
+ *
+ * This is where longpath.c's survivors were: 40 of 65, all in chunk_end() and
+ * the loop around it. The reason a table cannot reach them is that the space
+ * has four independent dimensions - total length, component length, where the
+ * slashes fall, and runs of consecutive slashes - and the interesting cases are
+ * the ones where a boundary lands exactly on LONGPATH_MAXLEN. That is the same
+ * argument that made the sanitize_ctrl properties the one clear win in this
+ * tree: a buffer that runs out at every possible offset.
+ *
+ * No filesystem here. chunk_end() is pure, which is the whole reason it was
+ * split out of open_ancestor() - inline, asking what the split is meant
+ * building a real directory tree of the right shape, and the suite has to stay
+ * fast enough that the mutation tool's hang timeout still separates a slow
+ * mutant from a caught one.
+ */
+#define PROP_PATH_MAX_EXTRA 4096
+
+MU_TEST(test_prop_a_chunk_ends_on_a_boundary_and_is_the_longest_that_fits) {
+	declare_prop(p, 1200);
+	_cleanup_(freep) char *buf = malloc(LONGPATH_MAXLEN + PROP_PATH_MAX_EXTRA + 1);
+
+	if (!buf)
+		abort();
+
+	while (prop_next(&p)) {
+		/*
+		 * Lengths that straddle the limit: shorter than it, exactly it,
+		 * and past it by up to a page. A generator that only made long
+		 * paths would never reach the `<= LONGPATH_MAXLEN` arm.
+		 */
+		size_t len = prop_chance(&p, 4)
+			? LONGPATH_MAXLEN	/* the boundary, exactly */
+			: (size_t)prop_range(&p, LONGPATH_MAXLEN - 64,
+					     LONGPATH_MAXLEN + PROP_PATH_MAX_EXTRA);
+		const char *start, *end, *fit;
+		size_t i = 0;
+
+		/*
+		 * Sometimes no separator at all: one component the whole way.
+		 * That is the only shape where `<=` and `<` on the limit
+		 * differ - at exactly LONGPATH_MAXLEN the first takes the
+		 * whole thing and the second falls through to a search that
+		 * finds nothing and answers ENAMETOOLONG for a path that fits.
+		 * Left out of the first draft, and the `<= -> <` mutant
+		 * survived it.
+		 */
+		if (prop_chance(&p, 6)) {
+			memset(buf, 'a', len);
+			buf[len] = '\0';
+			i = len;
+		}
+
+		/* Components of varied width, with the occasional run of
+		 * slashes - the walk skips those, so they must not shift a
+		 * boundary. */
+		while (i < len) {
+			size_t comp = (size_t)prop_range(&p, 1, 300);
+
+			while (comp-- && i < len)
+				buf[i++] = 'a';
+			if (i < len)
+				buf[i++] = '/';
+			if (i < len && prop_chance(&p, 8))
+				buf[i++] = '/';
+		}
+		buf[len] = '\0';
+		start = buf;
+		end = buf + len;
+
+		fit = chunk_end(start, end);
+		if (!fit) {
+			/*
+			 * The only reason to refuse: no boundary in the first
+			 * LONGPATH_MAXLEN + 1 bytes. Asserted directly rather
+			 * than trusted, since "returns NULL" is otherwise
+			 * satisfied by a function that always refuses.
+			 */
+			prop_check(&p, (size_t)(end - start) > LONGPATH_MAXLEN);
+			prop_check(&p, memchr(start, '/',
+					      LONGPATH_MAXLEN + 1) == NULL);
+			continue;
+		}
+
+		/* Fits one syscall argument. */
+		prop_check(&p, (size_t)(fit - start) <= LONGPATH_MAXLEN);
+		/* Ends on a component boundary, or at the end of the path. */
+		prop_check(&p, fit == end || *fit == '/');
+		/* And is the *longest* such prefix: nothing better was
+		 * available inside the limit. This is the half that a
+		 * `return start` would satisfy without it. */
+		if (fit != end) {
+			const char *rest = fit + 1;
+			size_t room = LONGPATH_MAXLEN - (size_t)(fit - start);
+
+			if (rest < end)
+				prop_check(&p, memchr(rest, '/',
+						      room < (size_t)(end - rest)
+						      ? room : (size_t)(end - rest))
+					   == NULL);
+		}
+	}
+}
+
+MU_TEST(test_prop_the_chunk_walk_always_advances) {
+	declare_prop(p, 600);
+	_cleanup_(freep) char *buf = malloc(LONGPATH_MAXLEN * 3 + 1);
+
+	if (!buf)
+		abort();
+
+	/*
+	 * open_ancestor() loops on chunk_end() and would spin forever on a
+	 * split that does not move `p`. The walk is the part with the openat()
+	 * in it, so this replays its pointer arithmetic and nothing else.
+	 */
+	while (prop_next(&p)) {
+		size_t len = (size_t)prop_range(&p, 1, LONGPATH_MAXLEN * 3);
+		const char *q, *end;
+		size_t i = 0, steps = 0;
+
+		while (i < len) {
+			size_t comp = (size_t)prop_range(&p, 1, 900);
+
+			while (comp-- && i < len)
+				buf[i++] = 'a';
+			if (i < len)
+				buf[i++] = '/';
+		}
+		buf[len] = '\0';
+		q = buf;
+		end = buf + len;
+
+		while (q < end) {
+			const char *start, *fit;
+
+			while (q < end && *q == '/')
+				q++;
+			if (q >= end)
+				break;
+			start = q;
+			fit = chunk_end(start, end);
+			if (!fit)
+				break;
+			prop_check(&p, fit > start);	/* or the loop spins */
+			q = fit;
+			if (++steps > len + 2)
+				break;			/* fail below, not hang */
+		}
+		prop_check(&p, steps <= len + 1);
+	}
+}

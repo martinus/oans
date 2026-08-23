@@ -660,6 +660,22 @@ counterexample. No dependencies, one header, minunit-compatible.
   the named-bug files they earn their place differently again — leaving the
   fiemap address set unsorted is caught by nothing else. Expect that
   unevenness rather than a uniform number.
+  - **`longpath.c`'s chunk boundary is the second clear win, and it needed a
+    seam first.** The split lived inside `open_ancestor()`, which opens each
+    chunk as it goes, so asking what the split *is* meant building a real
+    directory tree of the right shape - and the suite has to stay fast enough
+    that the mutation tool's hang timeout still separates a slow mutant from a
+    caught one. Pulled out as `chunk_end()`, a pure function, it is askable
+    about every path shape for nothing: **65 survivors → 61, and `chunk_end`
+    itself 4 → 0.** All four are the `LONGPATH_MAXLEN + 1` the comment there
+    calls deliberate.
+    - **The first draft left one of them alive, and the residue said which.**
+      `<=` → `<` on the limit differs only at *exactly* `LONGPATH_MAXLEN`, and
+      only matters for a path with **no separator at all** - there the mutant
+      answers `ENAMETOOLONG` for a path that fits. The generator capped
+      components at 300 characters, so it never made a slashless 4095-byte
+      path. One `prop_chance` for that shape took it to zero. Read the residue
+      by function and the generator's gap is what it names.
   - The three **hashfile** properties are the same story a third time:
     `src/dbfile.c` swept with and without them is **786 survivors → 785**,
     one mutant. That one is worth the three, though - `i > 0` → `i > 1` in

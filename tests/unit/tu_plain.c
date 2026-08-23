@@ -7,6 +7,5 @@
 /* filerec.c is linked, so these reach only its public API. */
 #include "test_filerec.c"
 #include "test_util.c"
-#include "test_longpath.c"
 #include "test_storage.c"
 #include "test_dedupe.c"
