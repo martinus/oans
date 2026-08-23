@@ -5062,12 +5062,16 @@ MU_TEST(test_a_file_with_nothing_unique_yields_no_nondupe_extents) {
  * `blocksize` is a mutable global that block_len() reads, and an earlier test
  * leaves it at 100. Each of these sets it and puts it back, so they neither
  * depend on test order nor impose one.
+ *
+ * It is the only one that needs saving. The reachable code also reads `debug`,
+ * which no test in this file assigns - a future one that does should save it
+ * here too. `options.dedupe_same_file` is *not* read: only search_extent()
+ * consults it, and these call compare_extents() directly.
  */
 struct fd_fixture {
 	struct hash_tree tree;
 	struct results_tree res;
 	unsigned int saved_blocksize;
-	bool saved_same_file;
 };
 
 static void fd_begin(struct fd_fixture *f)
@@ -5076,7 +5080,6 @@ static void fd_begin(struct fd_fixture *f)
 	init_hash_tree(&f->tree);
 	init_results_tree(&f->res);
 	f->saved_blocksize = blocksize;
-	f->saved_same_file = options.dedupe_same_file;
 	blocksize = FD_BLOCK;
 }
 
@@ -5086,43 +5089,21 @@ static void fd_end(struct fd_fixture *f)
 	free_hash_tree(&f->tree);
 	free_all_filerecs();
 	blocksize = f->saved_blocksize;
-	options.dedupe_same_file = f->saved_same_file;
 }
 
-/* A file of `nblocks` blocks whose digests are named by `digests[i]`; the file
- * size is exact unless `tail` shortens the last block. */
-static struct filerec *fd_file(struct fd_fixture *f, int64_t id,
-			       const unsigned int *digests, unsigned int n,
-			       uint64_t tail)
-{
-	char name[64];
-	struct filerec *file;
-
-	snprintf(name, sizeof(name), "/tree/f%lld", (long long)id);
-	file = filerec_new(name, id, FD_BLOCK * (n - 1) + (tail ? tail : FD_BLOCK));
-	if (!file)
-		abort();
-	for (unsigned int i = 0; i < n; i++) {
-		unsigned char dg[DIGEST_LEN];
-
-		digest_of(dg, digests[i]);
-		if (insert_hashed_block(&f->tree, dg, file, FD_BLOCK * i))
-			abort();
-	}
-	return file;
-}
-
-/* Like fd_file(), but the blocks sit at the offsets given rather than
- * contiguously - so a file can have a hole where no block was hashed. */
+/* Blocks at the offsets given, so a file can have a hole where nothing was
+ * hashed. The file ends `tail` bytes into its last block, or on a block
+ * boundary when `tail` is zero. */
 static struct filerec *fd_file_at(struct fd_fixture *f, int64_t id,
 				  const unsigned int *digests,
-				  const uint64_t *offs, unsigned int n)
+				  const uint64_t *offs, unsigned int n,
+				  uint64_t tail)
 {
 	char name[64];
 	struct filerec *file;
 
 	snprintf(name, sizeof(name), "/tree/f%lld", (long long)id);
-	file = filerec_new(name, id, offs[n - 1] + FD_BLOCK);
+	file = filerec_new(name, id, offs[n - 1] + (tail ? tail : FD_BLOCK));
 	if (!file)
 		abort();
 	for (unsigned int i = 0; i < n; i++) {
@@ -5135,7 +5116,22 @@ static struct filerec *fd_file_at(struct fd_fixture *f, int64_t id,
 	return file;
 }
 
-/* The first block of a file, which is where every search below starts. */
+/* The same, with the blocks packed contiguously from zero. */
+static struct filerec *fd_file(struct fd_fixture *f, int64_t id,
+			       const unsigned int *digests, unsigned int n,
+			       uint64_t tail)
+{
+	uint64_t offs[8];
+
+	if (n > ARRAY_SIZE(offs))
+		abort();
+	for (unsigned int i = 0; i < n; i++)
+		offs[i] = FD_BLOCK * i;
+	return fd_file_at(f, id, digests, offs, n, tail);
+}
+
+/* A block of a file by offset; aborts if there is none, which would mean the
+ * fixture is broken rather than the code under test. */
 static struct file_block *fd_block(struct filerec *file, uint64_t loff)
 {
 	struct file_block *b = find_filerec_block(file, loff);
@@ -5194,7 +5190,7 @@ MU_TEST(test_a_mismatch_splits_the_run_rather_than_ending_the_search) {
 	static const unsigned int right[] = { 1, 9, 3 };
 	struct filerec *a, *b;
 	struct rb_node *n;
-	unsigned int groups = 0;
+	unsigned int groups = 0, seen = 0;
 
 	fd_begin(&f);
 	a = fd_file(&f, 1, left, ARRAY_SIZE(left), 0);
@@ -5217,11 +5213,14 @@ MU_TEST(test_a_mismatch_splits_the_run_rather_than_ending_the_search) {
 		mu_check(d->de_len == FD_BLOCK);
 		list_for_each_entry(e, &d->de_extents, e_list) {
 			mu_check(e->e_loff == 0 || e->e_loff == FD_BLOCK * 2);
-			mu_check(e->e_loff != FD_BLOCK);	/* the gap */
+			seen |= e->e_loff == 0 ? 1u : 2u;
 		}
 		groups++;
 	}
 	mu_check(groups == 2);
+	/* One group at each of the two matching offsets - not both at the same
+	 * one, which the per-extent check above would allow. */
+	mu_check(seen == 3);
 	mu_check(f.res.num_extents == 4);	/* two members per group */
 
 	fd_end(&f);
@@ -5243,26 +5242,30 @@ MU_TEST(test_a_run_stops_where_the_blocks_stop_being_contiguous) {
 	/* Same three digests, but the third block sits past a hole. */
 	static const uint64_t holed[]   = { 0, FD_BLOCK, FD_BLOCK * 3 };
 	struct filerec *a, *b;
-	struct rb_node *n;
-	unsigned int groups = 0;
+	struct dupe_extents *d;
+	struct extent *e;
 
 	fd_begin(&f);
-	a = fd_file_at(&f, 1, dg, gapless, ARRAY_SIZE(dg));
-	b = fd_file_at(&f, 2, dg, holed, ARRAY_SIZE(dg));
+	a = fd_file_at(&f, 1, dg, gapless, ARRAY_SIZE(dg), 0);
+	b = fd_file_at(&f, 2, dg, holed, ARRAY_SIZE(dg), 0);
 
 	mu_check(compare_extents(a, fd_block(a, 0), b, fd_block(b, 0),
 				 FD_BLOCK * 4, &f.res) == 0);
 
-	for (n = rb_first(&f.res.root); n; n = rb_next(n)) {
-		struct dupe_extents *d =
-			rb_entry(n, struct dupe_extents, de_node);
-
-		/* Two blocks, then it stops - never three across the hole. */
-		mu_check(d->de_len == FD_BLOCK * 2 || d->de_len == FD_BLOCK);
-		mu_check(d->de_len != FD_BLOCK * 3);
-		groups++;
-	}
-	mu_check(groups >= 1);
+	/*
+	 * Exactly one group of exactly two blocks, starting at zero. The third
+	 * pair matches on digest and is deliberately never recorded: reaching
+	 * it would mean a range spanning b's hole, i.e. bytes that were never
+	 * compared. Asserting only "not three blocks" would accept every
+	 * found-too-short answer as well, which is half of what this is about.
+	 */
+	mu_check(f.res.num_dupes == 1);
+	d = only_group(&f.res);
+	mu_check(d->de_num_dupes == 2);
+	mu_check(d->de_len == FD_BLOCK * 2);
+	mu_check(f.res.num_extents == 2);
+	list_for_each_entry(e, &d->de_extents, e_list)
+		mu_check(e->e_loff == 0);
 
 	fd_end(&f);
 }
@@ -5293,30 +5296,6 @@ MU_TEST(test_a_short_final_block_shortens_the_recorded_run) {
 	d = only_group(&f.res);
 	/* One whole block plus the 1000-byte tail, not two whole blocks. */
 	mu_check(d->de_len == FD_BLOCK + 1000);
-
-	fd_end(&f);
-}
-
-/*
- * block_len() on its own, at the three shapes it distinguishes. It is called
- * from record_match() to close the range, so its answer becomes the group's
- * length - and the middle case is the one a fixture of whole-block files
- * never reaches.
- */
-MU_TEST(test_block_len_measures_the_tail_of_a_file) {
-	struct fd_fixture f;
-	static const unsigned int dg[] = { 1, 2, 3 };
-	struct filerec *file;
-
-	fd_begin(&f);
-	file = fd_file(&f, 1, dg, ARRAY_SIZE(dg), 1000);
-	mu_check(file->size == FD_BLOCK * 2 + 1000);
-
-	/* Wholly inside the file. */
-	mu_check(block_len(fd_block(file, 0)) == FD_BLOCK);
-	mu_check(block_len(fd_block(file, FD_BLOCK)) == FD_BLOCK);
-	/* The last block, which stops where the file does. */
-	mu_check(block_len(fd_block(file, FD_BLOCK * 2)) == 1000);
 
 	fd_end(&f);
 }
@@ -5442,7 +5421,6 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_a_mismatch_splits_the_run_rather_than_ending_the_search);
 	MU_RUN_TEST(test_a_run_stops_where_the_blocks_stop_being_contiguous);
 	MU_RUN_TEST(test_a_short_final_block_shortens_the_recorded_run);
-	MU_RUN_TEST(test_block_len_measures_the_tail_of_a_file);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run

@@ -61,10 +61,12 @@
 # ---------------------------------------------------------------- ranges
 
 # the recorded range ends one byte past the match
-# record_match() closes the range at an *inclusive* offset, and insert_result()
-# reads a length back out of it as endoff - startoff + 1. Drop the -1 and every
-# group is filed one byte longer than it is - under a length no other extent is
-# filed under, where it meets nothing.
+# record_match() closes the range at an *inclusive* offset. Drop the -1 and
+# every recorded range covers one byte more than was ever compared - and where
+# a run ends on a file's last block, one byte past the end of the file, which
+# the kernel refuses outright. Note what does *not* break: the growth is
+# uniform, so these groups still find each other in find_alloc_dext(), which
+# is why nothing about the grouping looks wrong.
 <<<
 	eoff[0] = block_len(end[0]) + end[0]->b_loff - 1;
 	eoff[1] = block_len(end[1]) + end[1]->b_loff - 1;
@@ -75,8 +77,11 @@
 
 # the last block of a file is measured as a whole block
 # A file that is not a whole number of blocks long ends mid-block, and asking
-# the kernel to deduplicate past the end of a file is a request it refuses. The
-# tail case is the one a fixture of block-aligned files never reaches.
+# the kernel to deduplicate past the end of a file is a request it refuses.
+# Caught by test_block_len, which has covered all three branches since before
+# these tests existed, and again by the record_match() test that reads a
+# group's length back out - the two say different things, one about the
+# measurement and one about what is done with it.
 <<<
 	/* We are in the last "blocksize" part of the file */
 	return (block->b_file->size - block->b_loff) % blocksize;
