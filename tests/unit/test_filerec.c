@@ -1,9 +1,8 @@
 /*
  * The filerec registry and its descriptor refcount.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Its own translation unit. Nothing here needs a static function, so this
+ * links against the sources rather than including them.
  */
 
 MU_TEST(test_filerec_the_registry_finds_what_was_put_in_it) {

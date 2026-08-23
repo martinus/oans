@@ -1,9 +1,8 @@
 /*
  * Escaping, sizes, durations and digit grouping.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Its own translation unit. Nothing here needs a static function, so this
+ * links against the sources rather than including them.
  */
 
 struct fenced { char before[8]; char out[32]; char after[8]; };

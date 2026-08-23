@@ -1,9 +1,10 @@
 /*
  * SIGINT and SIGTERM flushing the open batch (#201).
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Its own translation unit. interrupt.c is #included rather than linked: the
+ * flag, the "reported" latch and the test hooks are statics in it, and
+ * resetting them between tests is how this suite drives a signal without
+ * raising one.
  */
 
 static struct sigaction intr_disposition(int signo)

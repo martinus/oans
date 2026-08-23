@@ -1,73 +1,27 @@
 /*
- * The oans C unit suite: one translation unit, on purpose.
+ * The oans C unit suite: the runner, and nothing else.
  *
- * Every source below is #included rather than linked, because 25 of the
- * functions under test are `static` - among them compare_extents() and
- * record_match(), where writing their tests found a real bug in partial-mode
- * dedupe. A suite that could only reach what the headers declare would not
- * have had those tests at all.
+ * One translation unit per subject now, so this file holds only what must
+ * exist exactly once - the MU_RUN_TEST list, main(), and the state minunit and
+ * proptest keep. The two *_MAIN macros below are what pick this TU to own that
+ * state; defining them anywhere else is a duplicate-symbol link error, and
+ * defining them nowhere leaves the counters undefined at link time. Both loud,
+ * which is the point: per-TU counters would give a suite that runs every test,
+ * passes every assertion, and reports "0 tests" while exiting 0.
  *
- * It also decides what `scripts/mutate/mutate.py` may sweep: a file this does
- * not include is not part of the binary the tests run, so every mutant in it
- * would come back `survived`. The tool refuses such a file rather than
- * reporting a 0% kill rate over code nothing was measuring.
- *
- * The test bodies live in tests/unit/test_*.c, one per subject, and are
- * #included here for the same reason - still one translation unit, still one
- * compile.
+ * The run order below is the order it has always been, and is deliberately not
+ * grouped to match the file layout: every memdb() handle opens the same
+ * shared-cache in-memory database, so several dbfile tests depend on running
+ * before anything has stored a row.
  */
+#define MINUNIT_MAIN
+#define PROPTEST_MAIN
 
-#include <stdbool.h>
-#include <sys/stat.h>
-
-#include "minunit.h"
-#include "proptest.h"
-#include "rbtree.c"
-
-#include "opt.c"
-#include "util.c"
-#include "debug.c"
-#include "interrupt.c"
-#include "csum.c"
-#include "threads.c"
-#include "btrfs-util.c"
-#include "file_scan.c"
-#include "filerec.c"
-#include "dbfile.c"
-#include "hash-tree.c"
-#include "results-tree.c"
-#include "list_sort.c"
-#include "find_dupes.c"
-#include "memstats.c"
-#include "fiemap.c"
-#include "progress.c"
-#include "storage.c"
-#include "longpath.c"
-#include "glob.c"
-#include "dedupe.c"
-
+#include "suite.h"
+#include "tests.h"
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
-static char *exec_path;
-
-/* Fixtures first: every test file below may use them. */
-#include "fixtures.h"
-
-/* The subjects, roughly in the order a run meets them. */
-#include "test_file_scan.c"
-#include "test_util.c"
-#include "test_longpath.c"
-#include "test_glob.c"
-#include "test_csum.c"
-#include "test_storage.c"
-#include "test_progress.c"
-#include "test_fiemap.c"
-#include "test_filerec.c"
-#include "test_hash_tree.c"
-#include "test_dbfile.c"
-#include "test_find_dupes.c"
-#include "test_interrupt.c"
-#include "test_dedupe.c"
+char *exec_path;
 
 MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_running_checksum_survives_save_restore);

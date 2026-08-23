@@ -1,9 +1,8 @@
 /*
  * The io-threads heuristic and the line describing it.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Its own translation unit. Nothing here needs a static function, so this
+ * links against the sources rather than including them.
  */
 
 MU_TEST(test_storage_recommend_io_threads) {

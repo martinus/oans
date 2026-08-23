@@ -65,27 +65,65 @@
 #include <stdio.h>
 #include <math.h>
 
+/*  oans: a TU that defines no test uses neither timer. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define MINUNIT_MAYBE_UNUSED __attribute__((unused))
+#else
+#  define MINUNIT_MAYBE_UNUSED
+#endif
+
 /*  Maximum length of last message */
 #define MINUNIT_MESSAGE_LEN 1024
 /*  Accuracy with which floats are compared */
 #define MINUNIT_EPSILON 1E-12
 
+/*
+ * oans fork of upstream minunit, and the only change to this file.
+ *
+ * Upstream assumes the whole suite is one translation unit, where `static` on
+ * this state is exactly right. oans's suite is one TU per subject, so `static`
+ * would give each of them its own counters: every test would run, every
+ * assertion would pass, and MU_REPORT() in the runner would print *its* copy -
+ * "0 tests, 0 assertions" - and exit 0. A suite that reports nothing while
+ * looking green is the one failure this repository's tooling exists to catch,
+ * so it must not be possible to build it by accident.
+ *
+ * MINUNIT_MAIN is defined by tests/unit/main.c and nowhere else. A second
+ * definer is a duplicate-symbol link error, and no definer leaves the counters
+ * undefined at link time - both loud.
+ */
+#ifdef MINUNIT_MAIN
+
 /*  Misc. counters */
-static int minunit_run = 0;
-static int minunit_assert = 0;
-static int minunit_fail = 0;
-static int minunit_status = 0;
+int minunit_run = 0;
+int minunit_assert = 0;
+int minunit_fail = 0;
+int minunit_status = 0;
 
 /*  Timers */
-static double minunit_real_timer = 0;
-static double minunit_proc_timer = 0;
+double minunit_real_timer = 0;
+double minunit_proc_timer = 0;
 
 /*  Last message */
-static char minunit_last_message[MINUNIT_MESSAGE_LEN];
+char minunit_last_message[MINUNIT_MESSAGE_LEN];
 
 /*  Test setup and teardown function pointers */
-static void (*minunit_setup)(void) = NULL;
-static void (*minunit_teardown)(void) = NULL;
+void (*minunit_setup)(void) = NULL;
+void (*minunit_teardown)(void) = NULL;
+
+#else
+
+extern int minunit_run;
+extern int minunit_assert;
+extern int minunit_fail;
+extern int minunit_status;
+extern double minunit_real_timer;
+extern double minunit_proc_timer;
+extern char minunit_last_message[MINUNIT_MESSAGE_LEN];
+extern void (*minunit_setup)(void);
+extern void (*minunit_teardown)(void);
+
+#endif
 
 /*  Definitions */
 #define MU_TEST(method_name) static void method_name(void)
@@ -233,6 +271,7 @@ static void (*minunit_teardown)(void) = NULL;
  * The returned real time is only useful for computing an elapsed time
  * between two calls to this function.
  */
+static double mu_timer_real(void) MINUNIT_MAYBE_UNUSED;
 static double mu_timer_real(void)
 {
 #if defined(_WIN32)
@@ -308,6 +347,7 @@ static double mu_timer_real(void)
  * Returns the amount of CPU time used by the current process,
  * in seconds, or -1.0 if an error occurred.
  */
+static double mu_timer_cpu(void) MINUNIT_MAYBE_UNUSED;
 static double mu_timer_cpu(void)
 {
 #if defined(_WIN32)

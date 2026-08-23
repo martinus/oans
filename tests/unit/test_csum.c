@@ -1,9 +1,9 @@
 /*
  * Running-checksum save and restore (#159).
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Its own translation unit. csum.c is #included rather than linked: the
+ * checkpoint header and the xxhash state are defined in it, not in csum.h,
+ * so a test that asserts on their size cannot see them otherwise.
  */
 
 MU_TEST(test_running_checksum_survives_save_restore) {
