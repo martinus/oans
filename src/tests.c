@@ -5354,6 +5354,183 @@ MU_TEST(test_a_short_final_block_shortens_the_recorded_run) {
 	fd_end(&f);
 }
 
+/*
+ * The search driven the way the dedupe phase drives it.
+ *
+ * This is `--dedupe-options=partial`: a thread pool over the global filerec
+ * list, each worker asking the hashfile which of its file's extents nothing
+ * else shares, then searching those block by block for matches the extent pass
+ * could not see.
+ *
+ * **One test, several scenarios, and that is not laziness.** The pool must be
+ * created once per process, because search_file_extents() caches its database
+ * handle in a `static __thread` and GLib caches idle pool threads: a second
+ * extents_search_init() hands work to the same OS threads, whose thread-local
+ * still points at the handle the first free_pool() released, and whose
+ * `if (!db)` is therefore false. ASAN calls that a heap-use-after-free, and it
+ * is - but only for a caller that builds the pool twice. Production builds it
+ * once around the whole dedupe phase (oans.c) and calls the search once per
+ * generation window inside, so the handle lives exactly as long as the pool
+ * that owns it. Splitting these into four MU_TESTs would test a lifetime oans
+ * does not have.
+ */
+struct search_fixture {
+	struct fd_fixture fd;
+	unsigned int saved_cpu_threads;
+	int saved_quiet;
+	bool saved_same_file;
+};
+
+/*
+ * Teardown by scope exit, not at the end of the body: mu_check() *returns* on
+ * failure, so a failed assertion would otherwise leave the pool alive with its
+ * per-thread handles open - and those handles are the only thing keeping the
+ * shared in-memory database alive, so its rows would survive into every later
+ * test. One failing assertion cost eight unrelated dbfile tests before this
+ * was a cleanup attribute.
+ */
+static void search_end(struct search_fixture *s)
+{
+	extents_search_free();
+	options.cpu_threads = s->saved_cpu_threads;
+	options.dedupe_same_file = s->saved_same_file;
+	quiet = s->saved_quiet;
+	fd_end(&s->fd);
+}
+
+static void search_begin(struct search_fixture *s, struct dbhandle *db)
+{
+	struct dbfile_config cfg = {0};
+
+	fd_begin(&s->fd);			/* sets the global blocksize */
+	s->saved_cpu_threads = options.cpu_threads;
+	s->saved_quiet = quiet;
+	s->saved_same_file = options.dedupe_same_file;
+	options.cpu_threads = 2;
+	options.dedupe_same_file = false;
+	/* Silences find_additional_dedupe()'s banner. The progress bar it also
+	 * starts cannot be: psearch_progress_thread() printf()s unguarded. */
+	quiet = 1;
+
+	/*
+	 * The stored config has to agree with the blocksize just set. Every
+	 * dbfile_open_handle() runs dbfile_check(), which treats the hashfile's
+	 * blocksize as authoritative and writes it back over the global - so a
+	 * worker opening its own handle would otherwise undo fd_begin()
+	 * mid-test, and the runs come back measured in the wrong unit.
+	 */
+	cfg.blocksize = blocksize;
+	memcpy(cfg.hash_type, HASH_TYPE, 8);
+	cfg.major = DB_FILE_MAJOR;
+	cfg.minor = DB_FILE_MINOR;
+	if (dbfile_sync_config(db, &cfg))
+		abort();
+
+	extents_search_init();
+}
+
+/* Between scenarios: the trees and the filerec registry go, and so do the rows,
+ * since every memdb() handle is the same shared in-memory database. */
+static void search_reset(struct search_fixture *s, struct dbhandle *db)
+{
+	free_results_tree(&s->fd.res);
+	free_hash_tree(&s->fd.tree);
+	free_all_filerecs();
+	exec(db, "delete from files");		/* hashes cascade */
+	init_hash_tree(&s->fd.tree);
+	init_results_tree(&s->fd.res);
+}
+
+/* A file with `n` blocks, plus one extent row whose digest nothing else shares
+ * - which is what makes the search consider the file at all. */
+static struct filerec *search_file(struct search_fixture *s,
+				   struct dbhandle *db, const char *name,
+				   uint64_t ino, unsigned int extent_dg,
+				   const unsigned int *blocks, unsigned int n)
+{
+	struct extent_csum ext[1];
+	int64_t id = put_dupe(db, name, ino, extent_dg, FD_BLOCK * n, 1, 0, 1);
+	struct filerec *file;
+
+	ext[0].loff = 0;
+	ext[0].poff = FD_BLOCK * ino;
+	ext[0].len = FD_BLOCK * n;
+	digest_of(ext[0].digest, extent_dg);
+	if (dbfile_store_extent_hashes(db, id, 1, ext))
+		abort();
+
+	file = fd_file(&s->fd, id, blocks, n, 0);
+	if (!file)
+		abort();
+	return file;
+}
+
+MU_TEST(test_the_extent_search_driven_by_its_pool) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	_cleanup_(search_end) struct search_fixture s = {0};
+	static const unsigned int blocks[] = { 11, 12, 13 };
+	struct dupe_extents *d;
+
+	search_begin(&s, db);
+
+	/*
+	 * A match the extent pass could not see: two extents that hash
+	 * differently, holding blocks that agree. If this ever finds nothing,
+	 * partial mode has quietly become a no-op - which would otherwise show
+	 * up only as "we seem to reclaim less than we used to".
+	 */
+	search_file(&s, db, "/tree/a", 1, 41, blocks, ARRAY_SIZE(blocks));
+	search_file(&s, db, "/tree/b", 2, 42, blocks, ARRAY_SIZE(blocks));
+
+	mu_check(find_additional_dedupe(&s.fd.res) == 0);
+	mu_assert(s.fd.res.num_dupes == 1, "a block-level match was not found");
+	d = only_group(&s.fd.res);
+	mu_check(d->de_num_dupes == 2);
+	mu_check(d->de_len == FD_BLOCK * ARRAY_SIZE(blocks));
+
+	/*
+	 * The search is idle by the time it returns, which is #123 rather than
+	 * tidiness: each worker holds a filerec from the global list, and the
+	 * caller goes straight back to reaping batches - which frees them.
+	 * Returning with work in flight lets a worker read a freed filerec.
+	 * That reproduced in about one memcheck run in twenty.
+	 */
+	mu_assert(extents_search_idle(), "the search returned with work still running");
+
+	/* A file of no bytes is skipped rather than handed to the pool, and the
+	 * two real files still find each other. */
+	search_reset(&s, db);
+	search_file(&s, db, "/tree/c", 3, 43, blocks, ARRAY_SIZE(blocks));
+	search_file(&s, db, "/tree/d", 4, 44, blocks, ARRAY_SIZE(blocks));
+	if (!filerec_new("/tree/empty", 99, 0))
+		abort();
+
+	mu_check(find_additional_dedupe(&s.fd.res) == 0);
+	mu_assert(s.fd.res.num_dupes == 1, "an empty file disturbed the search");
+	mu_check(extents_search_idle());
+
+	/*
+	 * Two halves of one file are not matched against each other unless
+	 * asked for. oans will deduplicate a file against itself on request and
+	 * must not by default - the win is usually nil and the surprise is not.
+	 */
+	search_reset(&s, db);
+	{
+		static const unsigned int twice[] = { 61, 62, 61, 62 };
+
+		search_file(&s, db, "/tree/self", 5, 45, twice, ARRAY_SIZE(twice));
+		mu_check(find_additional_dedupe(&s.fd.res) == 0);
+		mu_assert(s.fd.res.num_dupes == 0,
+			  "a file was matched against itself by default");
+
+		/* ...and does when it is asked. */
+		options.dedupe_same_file = true;
+		mu_check(find_additional_dedupe(&s.fd.res) == 0);
+		mu_assert(s.fd.res.num_dupes == 1,
+			  "dedupe_same_file did not enable a self match");
+	}
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -5476,6 +5653,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_each_side_of_a_match_records_its_own_offsets);
 	MU_RUN_TEST(test_a_run_stops_where_the_blocks_stop_being_contiguous);
 	MU_RUN_TEST(test_a_short_final_block_shortens_the_recorded_run);
+	MU_RUN_TEST(test_the_extent_search_driven_by_its_pool);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
