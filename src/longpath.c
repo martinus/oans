@@ -50,6 +50,30 @@ static void close_keep_errno(int fd)
  * rather than one component per call: a ~4 KiB path costs 2-3 opens instead of
  * ~20, and the cost is O(len / PATH_MAX) instead of O(components).
  */
+/*
+ * Where the next chunk ends: the longest prefix of [start, end) that fits one
+ * syscall argument and ends on a component boundary - all of it, or up to the
+ * last '/' within the limit. NULL means a single component longer than any
+ * openat() would accept, which is ENAMETOOLONG.
+ *
+ * Split out of open_ancestor() because this is the arithmetic and the rest is
+ * the walk. Inline it stays unobservable: the caller opens each chunk as it
+ * goes, so asking what the split *is* meant building a real directory tree of
+ * the right shape. Out here it can be asked about every path shape there is
+ * without touching a filesystem, which is what the property test does - and
+ * this is where the mutants lived, 40 of longpath.c's 65 survivors being this
+ * boundary and the loop around it.
+ *
+ * Searching LONGPATH_MAXLEN + 1 bytes is deliberate: it lets a boundary
+ * sitting exactly on the limit count, and the property pins that.
+ */
+static const char *chunk_end(const char *start, const char *end)
+{
+	if ((size_t)(end - start) <= LONGPATH_MAXLEN)
+		return end;
+	return memrchr(start, '/', LONGPATH_MAXLEN + 1);
+}
+
 static int open_ancestor(const char *begin, const char *end)
 {
 	const char *p = begin;
@@ -70,20 +94,8 @@ static int open_ancestor(const char *begin, const char *end)
 		if (p >= end)
 			break;
 
-		/*
-		 * Take the longest prefix of the remainder that fits one syscall
-		 * argument and ends on a component boundary: either all of it, or
-		 * up to the last '/' within the limit. Searching LONGPATH_MAXLEN
-		 * + 1 bytes lets a boundary sitting exactly on the limit count.
-		 * No '/' in range means a single component longer than any
-		 * openat() would accept.
-		 */
 		start = p;
-		if ((size_t)(end - start) <= LONGPATH_MAXLEN)
-			fit = end;
-		else
-			fit = memrchr(start, '/', LONGPATH_MAXLEN + 1);
-
+		fit = chunk_end(start, end);
 		if (!fit) {
 			close_keep_errno(dfd);
 			errno = ENAMETOOLONG;
