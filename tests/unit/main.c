@@ -31,6 +31,8 @@ void (*minunit_setup)(void) = NULL;
 void (*minunit_teardown)(void) = NULL;
 uint64_t prop_seed_value;
 bool prop_seed_resolved;
+unsigned int prop_scale_value;
+bool prop_scale_resolved;
 
 unsigned int blocksize = DEFAULT_BLOCKSIZE;
 char *exec_path;

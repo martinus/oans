@@ -51,6 +51,7 @@
 #include "opt.h"
 #include "util.h"
 #include "debug.h"
+#include "btrfs-util.h"
 #include "dedupe.h"
 #include "glob.h"
 #include "storage.h"

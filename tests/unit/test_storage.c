@@ -174,7 +174,7 @@ static void rm_rf(const char *path)
 static void fake_rotational(const char *root, unsigned maj, unsigned min,
 			    const char *content)
 {
-	char dir[PATH_MAX], file[PATH_MAX], cmd[PATH_MAX + 16];
+	char dir[PATH_MAX / 2], file[PATH_MAX], cmd[PATH_MAX + 32];
 	FILE *f;
 
 	snprintf(dir, sizeof(dir), "%s/dev/block/%u:%u/queue", root, maj, min);

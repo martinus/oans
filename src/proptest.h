@@ -63,6 +63,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -221,12 +222,65 @@ static inline uint64_t prop_stream(const char *name)
 	return h;
 }
 
+/*
+ * How many times more than a property asks for. `OANS_PROPTEST_SCALE=100 ./test`
+ * is a soak run: the same properties, two orders of magnitude more cases.
+ *
+ * A multiplier rather than a fixed count, so the ordinary run stays the
+ * number each property chose for itself - those are tuned, and the glob ones
+ * in particular are shaped around how expensive compiling a GRegex is.
+ *
+ * Each property still draws from its own stream, so scaling *extends* a run
+ * rather than replacing it: the first N cases of a soak are exactly the cases
+ * an unscaled run would have tried. A soak that fails at case 40,000 says
+ * something the default run genuinely could not have found, and the failure
+ * still names the seed and the case number to replay it.
+ *
+ * File scope and defined once, for the reason prop_seed_value is: a `static`
+ * inside a `static inline` is per translation unit, and the suite is eight of
+ * them.
+ */
+#ifndef PROP_SCALE_MAX
+#define PROP_SCALE_MAX 100000u
+#endif
+
+extern unsigned int prop_scale_value;
+extern bool prop_scale_resolved;
+
+static inline unsigned int prop_scale(void)
+{
+	const char *env;
+
+	if (prop_scale_resolved)
+		return prop_scale_value;
+	prop_scale_resolved = true;
+	prop_scale_value = 1;
+	env = getenv("OANS_PROPTEST_SCALE");
+	if (env) {
+		unsigned long v = strtoul(env, NULL, 0);
+
+		if (v >= 1 && v <= PROP_SCALE_MAX)
+			prop_scale_value = (unsigned int)v;
+		else
+			printf("\n[proptest] ignoring OANS_PROPTEST_SCALE=%s "
+			       "(want 1..%u)\n", env, PROP_SCALE_MAX);
+	}
+	if (prop_scale_value != 1)
+		printf("\n[proptest] soak: %ux the usual cases\n",
+		       prop_scale_value);
+	return prop_scale_value;
+}
+
 static inline struct prop prop_init(const char *name, unsigned int iterations)
 {
 	struct prop p = {
 		.state = prop_stream(name),
 		.iteration = 0,
-		.iterations = iterations,
+		/* Saturating: a scale big enough to overflow would mean a run
+		 * nobody waits for anyway, so clamp rather than wrap to a
+		 * *smaller* number than asked for. */
+		.iterations = (iterations > UINT_MAX / prop_scale())
+			      ? UINT_MAX : iterations * prop_scale(),
 	};
 
 	return p;
