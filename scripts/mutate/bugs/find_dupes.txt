@@ -1,0 +1,102 @@
+# file: src/find_dupes.c
+#
+# Invariants of the extent search, each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/find_dupes.txt
+#
+# This is what --dedupe-options=partial runs: two files' block trees walked in
+# lockstep, looking for runs of blocks that share a digest *and* sit
+# contiguously in both files. Everything here fails silently in the usual way -
+# a run found too long is a request the kernel byte-verifies and refuses, a run
+# found too short is a duplicate nobody ever finds, and either way the run
+# exits 0 having deduplicated slightly less than it could.
+#
+# Pure memory: compare_extents() and record_match() are static in a file
+# tests.c #includes, so they are called directly rather than through the thread
+# pool and the database that drive them in production.
+
+# ---------------------------------------------------------------- the fix
+
+# the match starts before the fast-forward instead of after it
+# This is the bug these tests found. The loop's whole job is to skip blocks
+# whose digests disagree; recording the position from *before* it makes the
+# match begin inside that gap. The range then covers bytes that differ, so
+# FIDEDUPERANGE refuses the whole request - and the genuinely matching tail it
+# was folded into is never deduplicated on its own. Partial mode quietly finds
+# less than it should, and nothing anywhere says so.
+<<<
+	while (block->b_parent != orig->b_parent && block->b_loff < extent_end) {
+		/*
+		 * Check that we don't walk off either tree
+		 */
+		if (end_of_block_list(orig) || end_of_block_list(block))
+			return 0;
+
+		orig = get_next_block(orig);
+		block = get_next_block(block);
+	}
+	/*
+	 * *After* the fast-forward, not before: the match starts where the
+	 * digests start agreeing. Recording the pre-skip position instead
+	 * hands the kernel a range whose bytes differ, which it byte-verifies
+	 * and refuses whole - taking the genuinely matching tail down with it.
+	 */
+	start[0] = orig;
+	start[1] = block;
+===
+	start[0] = orig;
+	start[1] = block;
+	while (block->b_parent != orig->b_parent && block->b_loff < extent_end) {
+		/*
+		 * Check that we don't walk off either tree
+		 */
+		if (end_of_block_list(orig) || end_of_block_list(block))
+			return 0;
+
+		orig = get_next_block(orig);
+		block = get_next_block(block);
+	}
+>>>
+
+# ---------------------------------------------------------------- ranges
+
+# the recorded range ends one byte past the match
+# record_match() closes the range at an *inclusive* offset. Drop the -1 and
+# every recorded range covers one byte more than was ever compared - and where
+# a run ends on a file's last block, one byte past the end of the file, which
+# the kernel refuses outright. Note what does *not* break: the growth is
+# uniform, so these groups still find each other in find_alloc_dext(), which
+# is why nothing about the grouping looks wrong.
+<<<
+	eoff[0] = block_len(end[0]) + end[0]->b_loff - 1;
+	eoff[1] = block_len(end[1]) + end[1]->b_loff - 1;
+===
+	eoff[0] = block_len(end[0]) + end[0]->b_loff;
+	eoff[1] = block_len(end[1]) + end[1]->b_loff;
+>>>
+
+# the last block of a file is measured as a whole block
+# A file that is not a whole number of blocks long ends mid-block, and asking
+# the kernel to deduplicate past the end of a file is a request it refuses.
+# Caught by test_block_len, which has covered all three branches since before
+# these tests existed, and again by the record_match() test that reads a
+# group's length back out - the two say different things, one about the
+# measurement and one about what is done with it.
+<<<
+	/* We are in the last "blocksize" part of the file */
+	return (block->b_file->size - block->b_loff) % blocksize;
+===
+	return blocksize;
+>>>
+
+# a run is allowed to continue over a gap in either file
+# The two files' blocks have to stay contiguous as well as matching: a run that
+# jumps a hole describes a range containing bytes that were never compared.
+<<<
+		if (orig->b_loff != (orig_blkno + blocksize) ||
+		    block->b_loff != (walk_blkno + blocksize)) {
+			matchmore = false;
+			break;
+		}
+===
+>>>

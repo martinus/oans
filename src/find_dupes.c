@@ -153,8 +153,6 @@ static int compare_extents(struct filerec *orig_file,
 	extent_end = block->b_loff + search_len - 1;
 
 next_match:
-	start[0] = orig;
-	start[1] = block;
 	/*
 	 * Fast-forward to a match, if we can find one. This doesn't
 	 * run on the first match as callers start the search on
@@ -171,6 +169,14 @@ next_match:
 		orig = get_next_block(orig);
 		block = get_next_block(block);
 	}
+	/*
+	 * *After* the fast-forward, not before: the match starts where the
+	 * digests start agreeing. Recording the pre-skip position instead
+	 * hands the kernel a range whose bytes differ, which it byte-verifies
+	 * and refuses whole - taking the genuinely matching tail down with it.
+	 */
+	start[0] = orig;
+	start[1] = block;
 	/*
 	 * XXX: There's no need for this, we ought to just generate a
 	 * unique identifier for our tree.
