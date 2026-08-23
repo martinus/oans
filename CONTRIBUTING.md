@@ -74,7 +74,7 @@ mutants. The tool cannot tell an absent test from a weak one; the grouping can.
 
 Two things it cannot see, both worth knowing before reading a `survived`:
 
-- **it runs the C unit suite only** (`src/tests.c`), not the end-to-end Python
+- **it runs the C unit suite only** (`tests/unit/`), not the end-to-end Python
   suite, which drives the binary rather than linking its code. For the dedupe
   phase, the scan pipeline and the progress block, a survivor means nothing.
 - **it builds without a sanitizer by default**, so a mutant that reads one slot

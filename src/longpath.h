@@ -31,7 +31,7 @@
  *   - the hashfile, /proc, and device nodes, which are never scan targets.
  *
  * Covered by tests/integration/test_long_path.py (scan, dedupe, rescan, prune,
- * and a mixed deep+shallow tree) and test_longpath in src/tests.c.
+ * and a mixed deep+shallow tree) and test_longpath in tests/unit/test_longpath.c.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public

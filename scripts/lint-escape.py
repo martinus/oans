@@ -54,9 +54,12 @@ PATH_NAMES = (
     r"sc->excludes\[\w+\]",
 )
 
-# util.c defines the escapers; tests.c #includes every other .c file, so it
-# would double-report all of them.
-SKIP_FILES = {"util.c", "tests.c"}
+# util.c defines the escapers, so it is where the raw bytes are allowed.
+#
+# The unit suite is out of scope rather than skipped: this walks src/*.c, and
+# the tests moved to tests/unit/. A path a test prints is one the test made
+# up, not one found in a walk, and this rule is about untrusted names only.
+SKIP_FILES = {"util.c"}
 
 WAIVER = re.compile(r"escape-ok:\s*(\S.*?)\s*$")
 WAIVER_LOOKBACK = 3

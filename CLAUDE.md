@@ -4,8 +4,9 @@
 the kernel `FIDEDUPERANGE` ioctl (atomic, byte-verified). Hashes live in a
 SQLite **hashfile** (WAL mode, `synchronous=OFF`, `cache_size=-65536` = 64 MB).
 
-C sources are under `src/` (main `src/oans.c`); man-page sources under
-`docs/man/`. The binary is `oans`; `make install` adds a `duperemove` compat
+C sources are under `src/` (main `src/oans.c`); the C unit suite under
+`tests/unit/`, one file per subject behind a single-translation-unit manifest;
+man-page sources under `docs/man/`. The binary is `oans`; `make install` adds a `duperemove` compat
 symlink. Some identifiers keep the old name on purpose: the `DUPEREMOVE*` env
 vars and the `DuperemoveTest` python base class.
 
@@ -101,9 +102,32 @@ in `tests/`; no shell tests.
   before trusting any before/after. (The `~/git` tree, ~174k files on btrfs, is
   the usual benchmark target.)
 
+## The C unit suite's layout
+
+`tests/unit/`, one file per subject, and **one translation unit**. `main.c` is
+the manifest: it `#include`s every source *and* every `test_*.c` beside it.
+
+- **The single TU is load-bearing, not incidental.** 25 of the 236 static
+  functions in those sources are called from tests — among them
+  `compare_extents()` and `record_match()`, where writing the tests found a real
+  bug in partial-mode dedupe. Link the suite instead of including it and those
+  tests cannot exist. It is also what `mutate.py` measures: a file the manifest
+  omits is not in the binary, so every mutant in it would read `survived`.
+- **`fixtures.h` is earned, not a dumping ground.** A helper goes there because
+  more than one test file wants it (`memdb()`, `exec()`, `put_row()`,
+  `mkfilerec()`, `digest_of()`); anything one subject uses lives beside that
+  subject. The order inside it is the order the helpers were written in, which
+  is what keeps each declared before its first use.
+- **Adding a subject is two edits**: the `test_*.c` file, and its `#include` in
+  `main.c`. The `MU_RUN_TEST` list stays in `main.c`, so the suite's running
+  order is still readable in one place.
+- **It was one 6,374-line `src/tests.c` until the split**, which is why
+  `Makefile`'s `CFILES` no longer needs a `filter-out`: every `src/*.c` now
+  belongs to the binary.
+
 ## Mutation & property testing (the C unit suite)
 
-Two additions to `src/tests.c`'s side of the house. Neither touches the
+Two additions to the C unit suite's side of the house (`tests/unit/`). Neither touches the
 integration suite, and the distinction matters for reading either of them.
 
 ### What eight iterations of this actually taught
@@ -187,7 +211,7 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     whatever covers them is decoration". A test called decoration when it was
     never run, which is the direction every bug in this tool has erred. This is
     how nine blocks in one file once became three that ran.
-- **A `survived` is a narrower claim than it reads.** The suite is `src/tests.c`
+- **A `survived` is a narrower claim than it reads.** The suite is `tests/unit/`
   alone: the end-to-end Python suite drives the *binary* and is not in the loop,
   so for the dedupe phase, the scan pipeline and the progress block a survivor
   means nothing at all. The tool says so in its own fingerprint.
@@ -228,9 +252,9 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   runs*, so a mutant the tests caught would exit nonzero at the build step and
   be scored `compiler` — the compiler credited with protection the tests
   provided. Don't merge the two targets back together.
-- **A file `src/tests.c` does not `#include` is refused, not swept.** `oans.c`
+- **A file `tests/unit/main.c` does not `#include` is refused, not swept.** `oans.c`
   and `run_dedupe.c` belong to the shipped binary alone, and `make test-build`
-  compiles only `tests.c` - so every mutant in them came back `survived` and
+  compiles only the manifest - so every mutant in them came back `survived` and
   the report read "whatever covers them is decoration" over 1,394 mutants that
   were never under test. The tool now appends an `#error` to the target and
   builds: if that succeeds, nothing the test binary is made of included the
@@ -240,7 +264,7 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
   edit it here — change it there, run that suite, re-copy into all three and
   update each `mutate_core.sha256`. `make lint` fails if this copy has drifted.
   Only `scripts/mutate/mutate.py` (the ~130-line adapter) is oans's.
-- **A mutant costs one compile of `src/tests.c`** — every source is `#include`d
+- **A mutant costs one compile of `tests/unit/main.c`** — every source is `#include`d
   into it, so ~20,000 lines in one translation unit, no incremental build, and
   nothing for ccache to hit since each mutant is a preprocessed source nothing
   has ever seen. That compile *is* the run: the suite itself is 0.3 s. The
@@ -491,7 +515,7 @@ first tests for it found a real bug.
   `find_additional_dedupe`/`search_file_extents`/`search_extent` and the pool
   helpers, which need the thread pool, the progress block and a hashfile to
   drive. `compare_extents()` and `record_match()` are reachable directly
-  because `tests.c` `#include`s the file, which is what made this iteration
+  because the suite's manifest `#include`s the file, which is what made this iteration
   possible without any of that.
 - `block_len()` already had `test_block_len`, covering all three branches
   including past-EOF. A second one was written for it here before that was

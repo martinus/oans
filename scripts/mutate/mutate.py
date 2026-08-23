@@ -21,8 +21,8 @@ there is no one file that is obviously *the* code. The default is only a default
 a run without `--file` is almost always the wrong question.
 
 **What this can and cannot see.** The suite it scores against is `make test` -
-`src/tests.c`, which `#include`s the other sources so that it can reach their
-static functions. That is the whole of what a mutant is measured by here, and
+`tests/unit/main.c`, which `#include`s the other sources so that it can reach
+their static functions, and the per-subject test files beside it. That is the whole of what a mutant is measured by here, and
 what it leaves out is the end-to-end Python suite in `tests/`, which needs a
 btrfs or XFS scratch directory and drives the `oans` binary rather than linking
 its code. So a survivor means "nothing in the C unit tests noticed", which is a
@@ -32,7 +32,7 @@ it is the wrong question to have asked. The pure functions are where this earns
 its keep: fiemap arithmetic, the glob compiler, `sanitize_ctrl`, the checksum
 state, the scan work queue.
 
-A mutant costs one compile of `src/tests.c` and one run of the suite, which is
+A mutant costs one compile of `tests/unit/main.c` and one run of the suite, which is
 about five seconds - the suite itself is four milliseconds, so this is a build
 harness with a test run attached. There is no incremental build to be had: every
 source is `#include`d into that one translation unit, so any mutant rebuilds all
@@ -73,7 +73,8 @@ def bug_file_target(path):
 
 #: What a lane compiles with, unless the caller says otherwise.
 #:
-#: A mutant is one compile of `src/tests.c`, which `#include`s 24 sources - some
+#: A mutant is one compile of `tests/unit/main.c`, which `#include`s 23 sources
+#: and 14 test files - some
 #: 20,000 lines in a single translation unit, with no incremental build to be had
 #: and nothing for ccache to hit, since every mutant is a preprocessed source
 #: nothing has ever seen. That compile *is* the run. Measured on this tree,
@@ -116,11 +117,11 @@ class Oans(mutate_core.Project):
     # from a file that simply had no duplicate.
     target = os.path.join("src", "csum.c")
 
-    # The only translation unit there is. `src/tests.c` includes the other
+    # The only translation unit there is. `tests/unit/main.c` includes the
     # sources rather than linking them, which is how the suite reaches their
-    # static functions - so it is both what the pre-filter compiles and what
-    # every mutant rebuilds.
-    syntax_tu = os.path.join("src", "tests.c")
+    # static functions, and the test files beside it for the same reason - so
+    # it is both what the pre-filter compiles and what every mutant rebuilds.
+    syntax_tu = os.path.join("tests", "unit", "main.c")
 
     # make builds in the tree, so a lane's build directory is the lane.
     build_dir = "."
@@ -147,7 +148,7 @@ class Oans(mutate_core.Project):
     lane_bytes = 24 * mutate_core.MIB
 
     # Measured on this tree with MUTANT_CFLAGS: one mutant is ~1.3 s of
-    # compiling and linking `src/tests.c` and 0.3 s to run the suite. Nearly all
+    # compiling and linking `tests/unit/main.c` and 0.3 s to run the suite. Nearly all
     # of it is one serial compile inside one lane, so the lanes divide it and the
     # machine does not - the same shape as nanobench and the opposite of
     # unordered_dense's ~90 translation units. At the makefile's own -O2 this
@@ -205,8 +206,8 @@ class Oans(mutate_core.Project):
         return "none"
 
     def default_syntax_tu(self, path):
-        """Every source here is compiled through `src/tests.c`, so that is the
-        pre-filter's TU whichever one is mutated - unlike the core's default,
+        """Every source here is compiled through `tests/unit/main.c`, so that is
+        the pre-filter's TU whichever one is mutated - unlike the core's default,
         which would check a `.c` file on its own and miss anything that only
         breaks where the includes meet.
 
@@ -239,7 +240,7 @@ class Oans(mutate_core.Project):
         return dict(test_dir=os.environ.get("DUPEREMOVE_TEST_DIR"))
 
     def extra_fingerprint(self, facts):
-        rows = ["suite           src/tests.c (C unit tests only)"]
+        rows = ["suite           tests/unit/ (C unit tests only)"]
         notes = [
             "NOTE: the end-to-end suite in tests/ is not run here. It drives\n"
             "      the oans binary against a btrfs or XFS scratch tree, so a\n"

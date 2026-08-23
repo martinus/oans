@@ -46,9 +46,14 @@ DIRFD_CALLS = (
     "readlinkat", "mkdirat", "utimensat",
 )
 
-# longpath.c *is* the sanctioned implementation of the walk; tests.c builds its
-# own scratch trees and #includes every other .c file (double-reporting them).
-SKIP_FILES = {"longpath.c", "tests.c"}
+# longpath.c *is* the sanctioned implementation of the walk, so it is the one
+# file allowed to call the bare syscalls.
+#
+# The unit suite is out of scope rather than skipped: this walks src/*.c, and
+# the tests moved to tests/unit/. They build their own scratch trees with
+# whatever is convenient, and none of it is the product walking a user's
+# filesystem - which is the only thing this rule is about.
+SKIP_FILES = {"longpath.c"}
 
 WAIVER = re.compile(r"longpath-ok:\s*(\S.*?)\s*$")
 WAIVER_LOOKBACK = 3

@@ -41,9 +41,9 @@ endif
 MANPAGE    = docs/man/oans.8
 COMPLETION = completion/zsh/_oans
 
-# All C sources live under src/. tests.c is built on its own (the test rule):
-# it #includes other .c files to reach their static/inlined code.
-CFILES  := $(filter-out src/tests.c,$(sort $(wildcard src/*.c)))
+# All C sources live under src/, and all of them belong to the binary: the unit
+# suite lives under tests/unit/ instead, so this glob needs no exception.
+CFILES  := $(sort $(wildcard src/*.c))
 OBJECTS := $(CFILES:.c=.o)
 DEPENDS := $(CFILES:.c=.d)
 
@@ -132,7 +132,9 @@ src/oans.o: .version-stamp
 oans: $(OBJECTS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBRARY_FLAGS)
 
-# C unit tests: tests.c pulls in the other .c files, so build it standalone.
+# C unit tests. tests/unit/main.c #includes the sources - so that a test can
+# reach a static function - and the per-subject test files beside it, which is
+# why the whole suite is still one translation unit and one compile.
 #
 # Building and running are separate targets because a harness that reads the
 # exit status has to tell the two apart. scripts/mutate/mutate.py builds a
@@ -143,7 +145,8 @@ oans: $(OBJECTS)
 # `make test` is unchanged for everyone else.
 .PHONY: test-build
 test-build:
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) src/tests.c -o test $(LIBRARY_FLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -Itests/unit $(LDFLAGS) tests/unit/main.c \
+		-o test $(LIBRARY_FLAGS)
 
 .PHONY: test
 test: test-build

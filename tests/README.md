@@ -2,8 +2,12 @@
 
 Two layers:
 
-- **Unit tests** — `../src/tests.c`, built and run by `make test`. They exercise
-  pure functions (`get_extent`, block length, the scan's seen-inode set, …).
+- **Unit tests** — `unit/`, built and run by `make test`. One file per subject
+  (`test_dbfile.c`, `test_fiemap.c`, …) plus `fixtures.h` for the builders more
+  than one of them needs. `unit/main.c` is the manifest: it `#include`s the
+  sources *and* the test files, so the whole suite stays a single translation
+  unit — which is what lets a test reach a `static` function, and what decides
+  which files `scripts/mutate/mutate.py` is allowed to sweep.
 - **Integration tests** — `integration/`, run by `make integration`. Python
   stdlib `unittest` (no third-party dependencies). They drive the built
   `oans` binary against a scratch directory tree and assert on the
@@ -95,9 +99,11 @@ Key helpers on `DuperemoveTest` (see `harness.py` for the full set):
 
 ## The C unit suite
 
-`src/tests.c` is a separate thing from everything above: one translation unit
-that `#include`s the other sources, so it can reach their static functions, run
-by `make test` in a few hundred milliseconds. Two kinds of test live in it.
+`unit/` is a separate thing from everything above: one translation unit that
+`#include`s the other sources, so it can reach their static functions, run by
+`make test` in a few hundred milliseconds. One file per subject, with
+`main.c` as the manifest and `fixtures.h` for what more than one of them
+needs. Two kinds of test live in there.
 
 **Tables of cases**, in minunit's `MU_TEST`, are the majority. They say what a
 function is for, and read as documentation of it.
