@@ -98,6 +98,29 @@ struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
 		abort();
 	sqlite3_free(err);
 }
+
+/*
+ * Make this connection refuse writes.
+ *
+ * dbfile.c has 82 `perror_sqlite` + `goto out` pairs and no unit test could
+ * reach one: they guard a bind or a step failing, which a healthy in-memory
+ * database never does. That was triaged as "the next honest move is a
+ * fault-injection seam" - and the seam turns out to be sqlite's own, needing
+ * no change to the product at all.
+ *
+ * `query_only` is a *connection* setting, so poisoning one handle leaves the
+ * shared in-memory database every other test uses untouched. Writes then fail
+ * at step with SQLITE_READONLY, which is exactly the shape those pairs handle.
+ *
+ * What this pins is the invariant that matters for a cache nothing downstream
+ * validates: a write that failed must be *reported*, not swallowed into a run
+ * that exits 0 and looks like a correct one.
+ */
+[[maybe_unused]] static void db_refuse_writes(struct dbhandle *db)
+{
+	exec(db, "PRAGMA query_only = ON");
+}
+
 [[maybe_unused]] static uint64_t rows(struct dbhandle *db, const char *table)
 {
 	char sql[64];
