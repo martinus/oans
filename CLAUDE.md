@@ -263,7 +263,8 @@ on, and it is worth reading before starting a ninth.
   fail.** Not a weak test — a test whose assertion held no matter what the code
   did. The list, because the shapes repeat: a fixture whose winner led on every
   column (so a `min(id)` election passed the #197 test); an `is_anchor`
-  assertion that passed against its own mutation; two symmetric file layouts,
+  assertion that passed against its own mutation, and which turned out to be
+  guarding state with no reader at all (#237); two symmetric file layouts,
   which made "which side of the pair was written" unobservable and cost 47 of
   72 mutants; a helper wrapping `list_first_entry()` on a possibly-empty list,
   which never returns NULL, so every `mu_check(t != NULL)` around it held
@@ -579,12 +580,28 @@ and `mkfilerec()`/`free_all_filerecs()` - which is why they came last.
   the real ranking picks - and the same trap sat in the tie-break case, where
   names, inos and ids all ascended together so a comparator with no tie-break
   at all still answered correctly.
-- **`is_anchor` is the one C statement in `dbfile_load_same_files()` that
-  exists for #197, and nothing observed it** - deleting it left every other
-  test green. It is asserted as a pair now (`de_anchored` on the whole-file
-  group, `!de_anchored` on an extent group), which pins the asymmetry rather
-  than each half looking arbitrary. Nothing *reads* the flag in production
-  (#237); that assertion is how the disconnection would be noticed.
+- **`de_anchored` is gone, and the way it was defended is the lesson (#237).**
+  It was written from `GET_DUPLICATE_FILES`'s `is_target` column and *never
+  read* — deleting the write left every other test green. The response at the
+  time was to assert the flag itself, on the argument that the assertion was
+  "how the disconnection would be noticed". That reasoning is backwards: with
+  no reader there is no connection to break, so what the assertion pinned was
+  the existence of dead state, and a bug block guarding it could only ever be
+  caught by that one assertion. Worse, state that *looks* like a guard invites
+  someone to restore the missing reader and reintroduce the per-pass
+  re-election #197 removed.
+  - **Row order is the actual mechanism.** `order by is_target desc, f.id`
+    carries the rank out of the query, `insert_extent_list_free()` appends, and
+    `dedupe_extent_list()` takes `list_first_entry()`. So the target being first
+    *is* the election — there is nothing else to check, and `target_of()` in the
+    #197 test was already checking it.
+  - **The trade is measurable, which is why it is the right one.** The bug block
+    that broke the flag was caught only by the assertion written for it; the one
+    that replaced it — dropping the `order by` — is caught by
+    `test_whole_file_dupes_load_at_poff_zero` and
+    `test_the_whole_file_target_prefers_readonly_then_least_fragmented`, tests
+    that are about behaviour. Prefer a guard on the mechanism over a guard on a
+    marker that merely accompanies it.
 - **The tool does not mutate string literals**, so the `GET_DUPLICATE_*` SQL
   cannot be swept - a test that only exercises SQL filtering guards against
   hand edits but moves no kill rate. `bugs/dbfile.txt` is where those go, and

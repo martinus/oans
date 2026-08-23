@@ -351,16 +351,23 @@ static void clean_deduped(struct dupe_extents **ret_dext,
 }
 
 /*
- * Choose which member of the group becomes the dedupe target, i.e. the source
- * the kernel reads and every other member is pointed at.
+ * The dedupe target - the source the kernel reads, and what every other member
+ * is pointed at - is the group's *first* member, here and in the dedupe loop
+ * below.
  *
- * Deduping every copy against a fragmented target makes each copy inherit that
- * fragmentation: one extent-tree op per target extent per copy, and all copies
- * left fragmented on disk (measured ~linear in target extents once past a fixed
- * per-copy floor). For whole-file dedupe - where members are whole files whose
- * layouts can differ - pick the least-fragmented member as the target by moving
- * it to the front of the list; the loop below always dedupes against the first
- * entry. Extent-dedupe members are single extents, so this is skipped there.
+ * Nothing in this file picks it. GET_DUPLICATE_FILES does, ranking each group
+ * with row_number() over (partition by digest, size order by (flags & 2) desc,
+ * nr_extents, id) and sorting that member first: read-only first, because the
+ * kernel will not write into one (#172), then least-fragmented, then lowest id
+ * to break the tie. Every column is fixed at scan time, so every window elects
+ * the same target and the copies converge on one physical extent instead of one
+ * cluster per pass (#197).
+ *
+ * Why it matters that it is the least fragmented: deduping every copy against a
+ * fragmented target makes each copy inherit that fragmentation - one extent-tree
+ * op per target extent per copy, and all copies left fragmented on disk
+ * (measured ~linear in target extents once past a fixed per-copy floor).
+ * Extent-dedupe members are single extents, so the ranking is moot there.
  */
 /* Show this group on the thread's status line: target path (the group's first
  * member) plus the bytes the kernel still has to byte-verify as work total. */

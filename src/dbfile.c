@@ -2342,8 +2342,7 @@ int dbfile_load_extent_hashes(struct dbhandle *db, struct results_tree *res,
 		if (ret)
 			return ret;
 
-		ret = insert_one_result(res, digest, file, loff, len, poff,
-					false);
+		ret = insert_one_result(res, digest, file, loff, len, poff);
 		if (ret)
 			return ENOMEM;
 	}
@@ -2551,15 +2550,10 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 	}
 
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
-		bool is_anchor;
-
 		fileid = sqlite3_column_int64(stmt, 0);
 		size = sqlite3_column_int64(stmt, 1);
 		digest = (unsigned char *)sqlite3_column_blob(stmt, 2);
 		filename = sqlite3_column_text(stmt, 3);
-		/* The query elects the group's target and sorts it first; the
-		 * worker must not re-elect one (#197). */
-		is_anchor = sqlite3_column_int(stmt, 5) != 0;
 
 		file = filerec_find(fileid);
 		if (!file) {
@@ -2568,7 +2562,17 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 				return ENOMEM;
 		}
 
-		ret = insert_one_result(res, digest, file, 0, size, 0, is_anchor);
+		/*
+		 * The order of these calls *is* the target election (#197).
+		 * GET_DUPLICATE_FILES ranks each group and sorts `is_target
+		 * desc` first, insert_extent_list_free() appends, and
+		 * dedupe_extent_list() takes list_first_entry() - so the target
+		 * arrives first and stays first. Nothing reads the is_target
+		 * column; loading in the query's order is what carries it. Do
+		 * not add an ORDER BY of your own here, and do not sort
+		 * de_extents afterwards.
+		 */
+		ret = insert_one_result(res, digest, file, 0, size, 0);
 		if (ret)
 			return ENOMEM;
 	}
