@@ -311,6 +311,16 @@ struct file_extent {
 	uint64_t	loff;
 	uint64_t	len;
 };
+
+/*
+ * Extents of `file` that nothing else shares, malloc'd for the caller to free.
+ *
+ * On failure both out-parameters are left as NULL and 0, so there is nothing to
+ * read and nothing to free: an error and an empty answer are the same state.
+ * Check the return value, not the count - a loader that published what it had
+ * read before it failed would hand back a plausible array of a plausible
+ * length, which is exactly what this used to do (#238).
+ */
 int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 				     struct file_extent **ret_extents,
 				     unsigned int *num_extents);

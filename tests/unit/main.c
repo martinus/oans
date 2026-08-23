@@ -108,6 +108,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_extent_hashes_load_as_groups_carrying_their_offsets);
 	MU_RUN(test_nondupe_extents_are_the_ones_nothing_else_shares);
 	MU_RUN(test_nondupe_extents_grow_past_the_initial_capacity);
+	MU_RUN(test_an_interrupted_load_publishes_nothing);
 	MU_RUN(test_a_file_with_nothing_unique_yields_no_nondupe_extents);
 	MU_RUN(test_a_whole_matching_run_is_recorded_as_one_group);
 	MU_RUN(test_a_mismatch_splits_the_run_rather_than_ending_the_search);

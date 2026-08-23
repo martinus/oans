@@ -121,6 +121,39 @@ struct fm_rec { uint64_t log, phys, len; uint32_t flags; };
 	exec(db, "PRAGMA query_only = ON");
 }
 
+static int abort_query_cb(void *unused [[maybe_unused]])
+{
+	return 1;			/* non-zero: abort the running statement */
+}
+
+/*
+ * Make the next query on this connection fail partway, after roughly `ops`
+ * VDBE instructions.
+ *
+ * `PRAGMA query_only` only refuses writes, so it cannot reach a *loader's*
+ * error path. A progress handler answering non-zero makes sqlite3_step()
+ * return SQLITE_INTERRUPT instead, which is the one way to fail a SELECT from
+ * outside without dropping a table - and every memdb() handle shares one
+ * in-memory database, so a schema change here would break whichever tests run
+ * after this one. The handler is per-connection, so it stays inside the test.
+ *
+ * `ops` is the whole point rather than a detail: it decides whether the
+ * failure lands before any row was read or after several, and a loader that
+ * accumulates into a growing buffer is only interesting in the second case.
+ * Too small and the statement dies before it returns anything, which is a
+ * vacuous test that no assertion can tell apart from a good one - so a test
+ * relying on this must be checked by putting the bug back.
+ */
+[[maybe_unused]] static void db_abort_queries_after(struct dbhandle *db, int ops)
+{
+	sqlite3_progress_handler(db->db, ops, abort_query_cb, NULL);
+}
+
+[[maybe_unused]] static void db_allow_queries(struct dbhandle *db)
+{
+	sqlite3_progress_handler(db->db, 0, NULL, NULL);
+}
+
 [[maybe_unused]] static uint64_t rows(struct dbhandle *db, const char *table)
 {
 	char sql[64];
