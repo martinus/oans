@@ -1,0 +1,95 @@
+# file: src/interrupt.c
+#
+# Invariants of the graceful shutdown (#201), each broken on purpose.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/interrupt.txt
+#
+# The whole feature fails silently. A flag that is never raised makes Ctrl-C
+# look ignored for minutes and then print "Nothing to deduplicate"; a second
+# signal that kills before the flush throws away exactly the work this exists
+# to keep. Nothing in the output distinguishes any of it from a slow run.
+
+# the handler does not restore the default action on delivery
+# SA_RESETHAND is what makes the *second* Ctrl-C kill at once. Without it a
+# user hammering it during a long flush gets no response at all, which is the
+# behaviour that made people reach for SIGKILL - and SIGKILL is the one signal
+# that still discards the open batch.
+<<<
+	sa.sa_flags = SA_RESTART | SA_RESETHAND;
+===
+	sa.sa_flags = SA_RESTART;
+>>>
+
+# a walker blocked in read() fails with EINTR instead of resuming
+# SA_RESTART is why no error path in the scan has to know signals exist. Drop
+# it and a directory walk interrupted mid-syscall returns an error the caller
+# reads as a broken filesystem rather than as a shutdown.
+<<<
+	sa.sa_flags = SA_RESTART | SA_RESETHAND;
+===
+	sa.sa_flags = SA_RESETHAND;
+>>>
+
+# only SIGTERM is handled, not SIGINT
+# Ctrl-C then kills outright with the batch still open, which is exactly the
+# pre-#201 behaviour this replaced.
+<<<
+	static const int signals[] = { SIGINT, SIGTERM };
+===
+	static const int signals[] = { SIGTERM };
+>>>
+
+# the file hook raises one tick late
+# atomic_fetch_add() returns the *old* value, so `+ 1 ==` fires on the Nth
+# tick and dropping it fires on the N+1th. The counter is files that have
+# finished hashing, so the durability assertion in the integration suite is
+# exact: when the signal lands, N files are already in the open batch. Off by
+# one and that test asserts against a batch holding something else.
+<<<
+	if (atomic_fetch_add(&tick_files, 1) + 1 == limit_files)
+===
+	if (atomic_fetch_add(&tick_files, 1) == limit_files)
+>>>
+
+# the file hook keeps counting after the run is interrupted
+# Not a second raise: the comparison is `==` against a counter that only
+# grows, so once past the limit no later tick can fire. What it costs is an
+# atomic increment per file after shutdown has begun, on the counter the csum
+# workers share - work in the shutdown path, which is the one place the
+# feature exists to keep short.
+<<<
+	if (!limit_files || interrupted())
+===
+	if (!limit_files && interrupted())
+>>>
+
+# the batch hook loses its guard entirely
+# This is the one where the second raise really happens. The batch hook
+# compares with `>=`, so with no limit set every call satisfies 1 >= 0: the
+# first raise is handled and SA_RESETHAND restores the default, and the second
+# terminates the process. That is also why the test's no-limit loop stops at
+# the first raise - otherwise this mutant would kill the suite instead of
+# being scored.
+<<<
+	if (!limit_batches || interrupted())
+		return;
+===
+>>>
+
+# the wind-down notice is repeated by every loop that notices
+# Several loops call it. The latch is what keeps the reassurance to one line
+# instead of one per worker, which would read as something going wrong.
+<<<
+	if (!interrupted() || atomic_exchange(&reported, true))
+===
+	if (!interrupted())
+>>>
+
+# TERM is not recognised, so the scheduled-stop case raises SIGINT
+# `systemctl stop oans@...` is the case #201 was written for; a hook that
+# cannot select TERM cannot test it.
+<<<
+	if (sig && (!strcmp(sig, "TERM") || !strcmp(sig, "SIGTERM")))
+===
+	if (sig && !strcmp(sig, "INT"))
+>>>
