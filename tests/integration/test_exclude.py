@@ -80,7 +80,7 @@ class ExcludeTest(DuperemoveTest):
         """Create `files`, scan with one --exclude, assert how many survive.
 
         Seven of the cases below differ only in those three values; the pattern
-        semantics themselves are pinned in src/tests.c, so what these add is
+        semantics themselves are pinned in tests/unit/test_glob.c, so what these add is
         that the walk really prunes on them.
         """
         for f in files:

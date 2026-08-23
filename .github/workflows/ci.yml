@@ -210,7 +210,7 @@ jobs:
   # deleted looks exactly the same from here.
   #
   # Cheap enough to gate on, unlike the same idea in the other two repositories
-  # that share this tool: a mutant is one compile of src/tests.c and one run of
+  # that share this tool: a mutant is one compile of tests/unit/main.c and one run of
   # a suite that takes a third of a second. It needs no scratch filesystem,
   # which is why it is one job and not a matrix.
   mutation:
