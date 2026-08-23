@@ -312,6 +312,44 @@ MU_TEST(test_fiemap_layout_key) {
 
 	mu_check(key_of(enc, 1, 8192, b));
 
+	/*
+	 * More extents than the stack buffer holds, so the heap path runs.
+	 * LAYOUT_KEY_STACK_EXTENTS is 32 and every fixture above has one or
+	 * two, so that branch - and the record-stride arithmetic that sizes
+	 * both buffers - had never been reached. A stride that disagrees with
+	 * the loop writes past whichever buffer is in use, which is a
+	 * fragmented file's key computed over its neighbours' memory.
+	 */
+	{
+		struct fm_rec many[40];
+		unsigned char big[DIGEST_LEN], big2[DIGEST_LEN];
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(many); i++) {
+			many[i].log = (uint64_t)i * 8192;
+			many[i].phys = (uint64_t)(i + 100) * 4096;
+			many[i].len = 4096;
+			many[i].flags = 0;
+		}
+
+		/* Either side of the boundary, and well past it. */
+		mu_check(key_of(many, LAYOUT_KEY_STACK_EXTENTS, 1u << 20, big));
+		mu_check(key_of(many, LAYOUT_KEY_STACK_EXTENTS + 1, 1u << 20, big2));
+		mu_assert(memcmp(big, big2, DIGEST_LEN) != 0,
+			  "one extent more than the stack holds keyed the same");
+
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big));
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big2));
+		mu_assert(memcmp(big, big2, DIGEST_LEN) == 0,
+			  "the heap path is not deterministic");
+
+		/* And it still notices a moved address out there, which is the
+		 * whole point of hashing every record rather than a summary. */
+		many[ARRAY_SIZE(many) - 1].phys += 4096;
+		mu_check(key_of(many, ARRAY_SIZE(many), 1u << 20, big2));
+		mu_assert(memcmp(big, big2, DIGEST_LEN) != 0,
+			  "a moved address in the last record did not change the key");
+	}
+
 	/* Records whose address means nothing, or nothing stable, are refused. */
 	struct fm_rec inl[] = {{0, 0, 512, FIEMAP_EXTENT_DATA_INLINE}};
 	struct fm_rec delalloc[] = {{0, 0, 8192, FIEMAP_EXTENT_DELALLOC}};
@@ -5802,6 +5840,174 @@ MU_TEST(test_the_wind_down_notice_is_said_once) {
 	intr_reset();
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * fiemap against a real file
+ *
+ * The pure half of fiemap.c is already well covered - fiemap_maps_share() is
+ * at 87% killed, phys_set_merge() 84% - because synthetic records beat
+ * coaxing a filesystem into a layout. What was at 0% is everything that takes
+ * a *file descriptor*: the four functions that actually issue FS_IOC_FIEMAP.
+ *
+ * Those need no reflink filesystem, only FIEMAP, which ext4 and tmpfs both
+ * implement - so unlike the dedupe paths they are testable anywhere the suite
+ * runs. What they must not do is assert a particular extent count: how a
+ * filesystem lays out a write is its business. Everything below is an
+ * invariant that holds whatever the layout turns out to be.
+ * ---------------------------------------------------------------------------
+ */
+
+#define FM_CHUNK	(256 * 1024)
+
+/* A real file with `chunks` blocks of data, optionally separated by holes.
+ * Returns the fd; the caller closes and unlinks via fm_close(). */
+struct fm_file {
+	int fd;
+	char path[64];
+	uint64_t size;
+};
+
+static void fm_close(struct fm_file *f)
+{
+	if (f->fd >= 0)
+		close(f->fd);
+	if (f->path[0])
+		unlink(f->path);
+}
+
+static struct fm_file fm_open(unsigned int chunks, bool sparse)
+{
+	struct fm_file f = { .fd = -1 };
+	_cleanup_(freep) char *buf = malloc(FM_CHUNK);
+
+	if (!buf)
+		abort();
+	memset(buf, 0xa5, FM_CHUNK);
+	snprintf(f.path, sizeof(f.path), "/tmp/oans-fiemap-XXXXXX");
+	f.fd = mkstemp(f.path);
+	if (f.fd < 0)
+		abort();
+
+	for (unsigned int i = 0; i < chunks; i++) {
+		/* A gap of one chunk between each, so a sparse file really has
+		 * holes rather than a filesystem's idea of a contiguous run. */
+		off_t at = (off_t)i * FM_CHUNK * (sparse ? 2 : 1);
+
+		if (pwrite(f.fd, buf, FM_CHUNK, at) != FM_CHUNK)
+			abort();
+		f.size = (uint64_t)at + FM_CHUNK;
+	}
+	/* Without this the data can still be in delalloc, where fiemap reports
+	 * it with no stable physical address - or not at all. */
+	if (fsync(f.fd))
+		abort();
+	return f;
+}
+
+/*
+ * The count pass and the mapping pass agree with each other and with the file.
+ *
+ * do_fiemap() is two ioctls - count, then map that many - so the interesting
+ * failure is them disagreeing: a map sized from a stale count either truncates
+ * the extent list or leaves uninitialised records at the end, and every caller
+ * walks fm_mapped_extents believing it.
+ */
+MU_TEST(test_fiemap_maps_a_real_file) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(1, false);
+	_cleanup_(freep) struct fiemap *fm = NULL;
+	unsigned int counted;
+	uint64_t covered = 0;
+
+	counted = fiemap_count_extents(f.fd, 0, ~0ULL);
+	mu_assert(counted >= 1, "a written and fsynced file mapped no extents");
+
+	fm = do_fiemap(f.fd);
+	mu_check(fm != NULL);
+	mu_assert(fm->fm_mapped_extents == counted,
+		  "the mapping pass disagreed with the count pass");
+
+	/* Ascending, non-overlapping, and covering what was written. The
+	 * filesystem chooses how many records that takes. */
+	for (unsigned int i = 0; i < fm->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &fm->fm_extents[i];
+
+		if (i == 0)
+			mu_check(e->fe_logical == 0);
+		else
+			mu_assert(e->fe_logical >= fm->fm_extents[i - 1].fe_logical +
+				  fm->fm_extents[i - 1].fe_length,
+				  "extents came back out of order or overlapping");
+		covered += e->fe_length;
+	}
+	mu_assert(covered >= f.size, "the extents do not cover the file");
+
+	/*
+	 * And the single-ioctl shortcut agrees with the full map. It exists so
+	 * the dedupe rescan need not enumerate a huge file, so the one thing
+	 * that must hold is that it answers the same as the long way round.
+	 */
+	{
+		uint64_t poff = 0;
+
+		mu_check(fiemap_first_extent_poff(f.fd, 0, f.size, &poff) == 0);
+		mu_assert(poff == fm->fm_extents[0].fe_physical,
+			  "the shortcut disagreed with the full map");
+	}
+}
+
+/*
+ * A range query maps the range asked for, and answers "hole" rather than
+ * "error" where there is nothing.
+ *
+ * do_fiemap_range() returning NULL for both is deliberate and is why
+ * fiemap_count_shared() can treat NULL as zero shared bytes rather than as a
+ * failure - a distinction that would otherwise turn every hole into an error.
+ */
+MU_TEST(test_fiemap_range_answers_for_the_range_asked_for) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(2, true);
+	_cleanup_(freep) struct fiemap *first = NULL;
+	uint64_t poff = 0;
+
+	/* The hole between the two written chunks. */
+	mu_assert(do_fiemap_range(f.fd, FM_CHUNK, FM_CHUNK) == NULL,
+		  "a hole was reported as an extent");
+	mu_assert(fiemap_first_extent_poff(f.fd, FM_CHUNK, FM_CHUNK, &poff) == -1,
+		  "the shortcut found an extent in a hole");
+
+	/* Past the end of the file. */
+	mu_assert(do_fiemap_range(f.fd, f.size + FM_CHUNK, FM_CHUNK) == NULL,
+		  "a range past EOF was reported as an extent");
+
+	/* The first chunk, which is there. */
+	first = do_fiemap_range(f.fd, 0, FM_CHUNK);
+	mu_check(first != NULL);
+	mu_assert(first->fm_mapped_extents >= 1, "the first chunk mapped nothing");
+	mu_check(first->fm_extents[0].fe_logical == 0);
+}
+
+/*
+ * Nothing is shared in a file nobody has deduplicated, and saying otherwise
+ * would credit the run with space it never freed.
+ *
+ * This is the counter behind the "net change in shared extents" line. It
+ * cannot be tested positively here - making an extent SHARED needs reflink,
+ * which this filesystem may not have - but the negative is the direction that
+ * matters: a false positive inflates a figure users read as disk saved.
+ */
+MU_TEST(test_fiemap_counts_nothing_shared_in_a_fresh_file) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(2, true);
+	uint64_t shared = 99;
+
+	mu_check(fiemap_count_shared(f.fd, 0, f.size, &shared) == 0);
+	mu_assert(shared == 0, "a freshly written file was reported as sharing");
+
+	/* A range that is entirely hole answers zero rather than failing - the
+	 * NULL-is-not-an-error path. */
+	shared = 99;
+	mu_check(fiemap_count_shared(f.fd, FM_CHUNK, FM_CHUNK * 2, &shared) == 0);
+	mu_check(shared == 0);
+}
+
 MU_TEST(test_dedupe_classify_probe)
 {
 	/* Dispatched, and the destination was processed: SAME or DIFFERS. */
@@ -5927,6 +6133,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_the_extent_search_driven_by_its_pool);
 	MU_RUN_TEST(test_the_interrupt_flag_and_its_test_hooks);
 	MU_RUN_TEST(test_the_wind_down_notice_is_said_once);
+	MU_RUN_TEST(test_fiemap_maps_a_real_file);
+	MU_RUN_TEST(test_fiemap_range_answers_for_the_range_asked_for);
+	MU_RUN_TEST(test_fiemap_counts_nothing_shared_in_a_fresh_file);
 	MU_RUN_TEST(test_dedupe_classify_probe);
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
