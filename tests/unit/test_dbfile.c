@@ -1327,6 +1327,57 @@ MU_TEST(test_nondupe_extents_grow_past_the_initial_capacity) {
 }
 
 /*
+ * A step that fails partway publishes nothing - not a freed pointer, and not
+ * the count of what it had read so far (#238).
+ *
+ * The only caller checks the return value before it looks at either
+ * out-parameter, so nothing misbehaves today; what is wrong is a contract that
+ * invites the opposite. An out-parameter that was written is ordinarily the
+ * caller's to read and to free, and here both would be a use-after-free. This
+ * repository has already paid for that shape once, in the dbfile_prepare
+ * recreate path.
+ *
+ * `ops` was chosen by measurement, not by taste: the assertions below are only
+ * about anything if the interrupt lands *after* some rows were read, and at
+ * 4000 it does. Reverting the fix fails both of them; at 100 it fails neither,
+ * because the statement dies before returning a single row and the buggy code
+ * publishes the same NULL and zero the fixed one does.
+ */
+MU_TEST(test_an_interrupted_load_publishes_nothing) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct file_extent *got = (struct file_extent *)0x1;
+	struct filerec *f;
+	struct extent_csum ext[64];
+	unsigned int n = 12345;
+	int64_t a;
+
+	free_all_filerecs();
+	a = put_dupe(db, "/tree/interrupted", 1, 71, 1u << 20, 1, 0, 64);
+	f = filerec_new("/tree/interrupted", a, 1u << 20);
+	if (!f)
+		abort();
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(ext); i++) {
+		ext[i].loff = i * 4096;
+		ext[i].poff = (i + 700) * 4096;
+		ext[i].len = 4096;
+		digest_of(ext[i].digest, 700 + i);	/* all distinct */
+	}
+	mu_check(dbfile_store_extent_hashes(db, a, ARRAY_SIZE(ext), ext) == 0);
+
+	db_abort_queries_after(db, 4000);
+	mu_check(dbfile_load_nondupe_file_extents(db, f, &got, &n) != 0);
+	db_allow_queries(db);
+
+	/* Both, because clearing one and not the other is its own footgun: a
+	 * partial count beside a NULL pointer reads as an array to walk. */
+	mu_check(got == NULL);
+	mu_check(n == 0);
+
+	free_all_filerecs();
+}
+
+/*
  * A file whose every extent is shared has no candidates, and says so with a
  * count of zero rather than by leaving the caller's count untouched -
  * find_dupes tests `!num_extents` before it looks at the array.

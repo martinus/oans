@@ -315,3 +315,26 @@
 "(SELECT 1 FROM extents as e where e.digest = extents.digest "		\
 "and e.rowid = extents.rowid);"
 >>>
+
+# ---------------------------------------------------------------- #238
+
+# a failed load publishes the buffer it was about to free
+# The out-parameters are assigned before the error path frees the buffer, so a
+# caller that reads them on failure gets a pointer to freed memory and a count
+# of what had been read so far. The one caller checks the return value first,
+# which is the only reason this was latent rather than a use-after-free; a
+# second caller written to the ordinary out-parameter convention would have it.
+<<<
+	if (ret) {
+		free(extents);
+		extents = NULL;
+		count = 0;
+	}
+	*ret_extents = extents;
+	*num_extents = count;
+===
+	*ret_extents = extents;
+	*num_extents = count;
+	if (ret && extents)
+		free(extents);
+>>>

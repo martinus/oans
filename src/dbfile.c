@@ -2391,16 +2391,27 @@ int dbfile_load_nondupe_file_extents(struct dbhandle *db, struct filerec *file,
 		count++;
 	}
 
-	*num_extents = count;
 	if (ret != SQLITE_DONE) {
 		perror_sqlite(ret, "stepping nondupe extents statement");
 		goto out;
 	}
 	ret = 0;
 out:
-	*ret_extents = extents;
-	if (ret && extents)
+	/*
+	 * Publish only what survives. Assigning the out-parameters before the
+	 * free would hand a failing caller a pointer to freed memory, and a
+	 * partial count beside it - and the count is the more dangerous half,
+	 * since a caller that trusts it over the return value reads freed
+	 * memory of a plausible length. Clearing both is what makes "this
+	 * returned an error" and "there is nothing here" the same state.
+	 */
+	if (ret) {
 		free(extents);
+		extents = NULL;
+		count = 0;
+	}
+	*ret_extents = extents;
+	*num_extents = count;
 	return ret;
 }
 
