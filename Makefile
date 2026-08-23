@@ -195,6 +195,7 @@ lint:
 	@python3 scripts/lint-longpath.py
 	@python3 scripts/lint-escape.py
 	@python3 scripts/lint-mutate-core.py
+	@python3 scripts/mutate/test_report.py
 
 # Replay the known bugs in scripts/mutate/bugs/ and fail if any survives - the
 # check that says the tests would still notice #147, #159, #186, #187, #191 and
