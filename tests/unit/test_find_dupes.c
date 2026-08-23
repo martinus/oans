@@ -1,11 +1,9 @@
 /*
  * The extent search that --dedupe-options=partial runs.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_scan.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 MU_TEST(test_block_len) {
 	struct file_block block;
 	struct filerec file;
@@ -555,24 +553,3 @@ MU_TEST(test_the_extent_search_driven_by_its_pool) {
 		mu_check(d->de_len == FD_BLOCK * 2);
 	}
 }
-
-/*
- * ---------------------------------------------------------------------------
- * The interrupt flag (#201)
- *
- * SIGINT and SIGTERM set a flag; every loop that owns state notices it and
- * unwinds through its ordinary exit, so the batched writer commits on the way
- * out. What fails silently here is the whole of it: a flag that is never set
- * makes a Ctrl-C look ignored for minutes, and a second one that kills before
- * the flush throws away exactly the work the feature exists to keep.
- *
- * One test with ordered scenarios, because the state is global *and* one-shot:
- * SA_RESETHAND puts the default action back on delivery, so a raise with no
- * handler installed would kill the suite rather than fail it. Every scenario
- * below re-installs before it raises, and puts the flag back afterwards.
- * tests.c #includes interrupt.c, so the statics are reachable to do that -
- * without it none of this would be testable at all.
- * ---------------------------------------------------------------------------
- */
-
-/* What the kernel currently has installed for a signal. */

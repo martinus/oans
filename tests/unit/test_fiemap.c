@@ -1,11 +1,9 @@
 /*
  * Extent maps: the layout key, the sharing walk, and the ioctl wrapper.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_fiemap.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 MU_TEST(test_get_extent) {
 	/* Three data extents with holes between them:
 	 * [0, 4k)   hole   [8k, 12k)   hole   [16k, 20k) */

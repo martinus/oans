@@ -1,11 +1,9 @@
 /*
  * --exclude matching, in .gitignore syntax.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_glob.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 static bool gs_hit(const char *pattern, const char *path, bool is_dir)
 {
 	char *err = NULL;

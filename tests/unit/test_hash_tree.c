@@ -1,11 +1,9 @@
 /*
  * The in-memory block tree and results tree.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_dbfile.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 #define PROP_DIGESTS	5
 MU_TEST(test_prop_the_hash_tree_counts_what_it_holds) {
 	declare_prop(p, 120);

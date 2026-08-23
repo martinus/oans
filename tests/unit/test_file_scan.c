@@ -1,11 +1,9 @@
 /*
  * The walk: zero blocks, rename detection, the inode set and the queue.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_scan.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 MU_TEST(test_is_block_zeroed) {
 	blocksize = 100;
 	char block[100] = {0,};

@@ -1,11 +1,9 @@
 /*
  * The hashfile: storage, change detection, and the dedupe-phase loaders.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_dbfile.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 static struct dbfile_stats stats_of(struct dbhandle *db)
 {
 	struct dbfile_stats st = {0};

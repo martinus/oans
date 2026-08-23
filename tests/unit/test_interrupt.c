@@ -1,9 +1,14 @@
 /*
  * SIGINT and SIGTERM flushing the open batch (#201).
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_interrupt.c, which is where interrupt.c is #included.
+ *
+ * One test with ordered scenarios, because the state is global *and* one-shot:
+ * SA_RESETHAND puts the default action back on delivery, so a raise with no
+ * handler installed would kill the suite rather than fail it. Every scenario
+ * below re-installs before it raises, and puts the flag back afterwards.
+ * tu_interrupt.c #includes interrupt.c, so the statics are reachable to do
+ * that - without it none of this would be testable at all.
  */
 
 static struct sigaction intr_disposition(int signo)

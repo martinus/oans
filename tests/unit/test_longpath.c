@@ -1,9 +1,8 @@
 /*
  * Paths past PATH_MAX (#117).
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_plain.c, which #includes no source at all: nothing
+ * here reaches a static, so it links against them like any consumer.
  */
 
 #define LP_COMP_LEN 255

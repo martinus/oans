@@ -1,11 +1,9 @@
 /*
  * The live progress block.
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_scan.c, which is where the sources these tests reach
+ * into are #included.
  */
-
 MU_TEST(test_progress_copy_path) {
 	char buf[32];
 

@@ -70,22 +70,32 @@
 /*  Accuracy with which floats are compared */
 #define MINUNIT_EPSILON 1E-12
 
-/*  Misc. counters */
-static int minunit_run = 0;
-static int minunit_assert = 0;
-static int minunit_fail = 0;
-static int minunit_status = 0;
-
-/*  Timers */
-static double minunit_real_timer = 0;
-static double minunit_proc_timer = 0;
-
-/*  Last message */
-static char minunit_last_message[MINUNIT_MESSAGE_LEN];
-
-/*  Test setup and teardown function pointers */
-static void (*minunit_setup)(void) = NULL;
-static void (*minunit_teardown)(void) = NULL;
+/*
+ * oans fork of upstream minunit. Two changes, both about the suite being
+ * several translation units rather than one: this block, and the two
+ * mu_timer_* helpers below made `static inline` so a TU that runs no test does
+ * not report them unused.
+ *
+ * Upstream declares this state `static`, which is exactly right for one TU and
+ * silently wrong for eight: each would count its own, and MU_REPORT() in the
+ * runner would print "0 tests, 0 assertions" and exit 0. A suite that reports
+ * nothing while looking green is the one failure this repository's tooling
+ * exists to catch, so it must not be buildable by accident.
+ *
+ * Plain `extern`, defined once in tests/unit/main.c beside `blocksize` - the
+ * same shape src/memstats.h and every other shared global here already use.
+ * Two definers is a duplicate symbol, none is an undefined reference: both
+ * loud, with no per-TU switch to get wrong.
+ */
+extern int minunit_run;
+extern int minunit_assert;
+extern int minunit_fail;
+extern int minunit_status;
+extern double minunit_real_timer;
+extern double minunit_proc_timer;
+extern char minunit_last_message[MINUNIT_MESSAGE_LEN];
+extern void (*minunit_setup)(void);
+extern void (*minunit_teardown)(void);
 
 /*  Definitions */
 #define MU_TEST(method_name) static void method_name(void)
@@ -233,7 +243,7 @@ static void (*minunit_teardown)(void) = NULL;
  * The returned real time is only useful for computing an elapsed time
  * between two calls to this function.
  */
-static double mu_timer_real(void)
+static inline double mu_timer_real(void)
 {
 #if defined(_WIN32)
 	/* Windows 2000 and later. ---------------------------------- */
@@ -308,7 +318,7 @@ static double mu_timer_real(void)
  * Returns the amount of CPU time used by the current process,
  * in seconds, or -1.0 if an error occurred.
  */
-static double mu_timer_cpu(void)
+static inline double mu_timer_cpu(void)
 {
 #if defined(_WIN32)
 	/* Windows -------------------------------------------------- */

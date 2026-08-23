@@ -1,9 +1,8 @@
 /*
  * Classifying what the FIDEDUPERANGE probe answered (#224).
  *
- * Part of the oans unit suite. tests/unit/main.c includes this file along
- * with the sources it exercises, so a test still reaches a static function
- * the way it always did.
+ * Compiled as part of tu_plain.c, which #includes no source at all: nothing
+ * here reaches a static, so it links against them like any consumer.
  */
 
 MU_TEST(test_dedupe_classify_probe)
