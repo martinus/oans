@@ -204,9 +204,15 @@ class ProgressTtyTest(DuperemoveTest):
             self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 256 * 1024)
         tree = os.path.join(self.work, "tree")
 
+        # dict(os.environ, ...) rather than a bare dict: _run_in_pty() passes
+        # this straight to execvpe(), which *replaces* the environment rather
+        # than adding to it. A bare dict therefore drops TSAN_OPTIONS, so this
+        # one process ran with no suppressions file while the other 248 had
+        # one - and reported the GLib queue-node race the file exists to
+        # filter, as a stranded worker row. See #236.
         screen = _render(_run_in_pty(
             [DUPEREMOVE, "-dr", "--hashfile", self.hf, tree],
-            env={"DUPEREMOVE_INTERRUPT_AFTER": "4"}))
+            env=dict(os.environ, DUPEREMOVE_INTERRUPT_AFTER="4")))
         shown = "\n  ".join(screen)
 
         stranded = [ln for ln in screen if WORKER_ROW.match(ln)]
