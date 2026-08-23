@@ -100,3 +100,33 @@
 		}
 ===
 >>>
+
+# ---------------------------------------------------------------- the pool
+
+# the search returns without waiting for its workers
+# #123. Each worker holds a filerec from the global list, and the caller - the
+# streaming dedupe producer - goes straight back to reaping batches, which
+# frees them. Returning with work in flight lets a worker read a filerec that
+# has already been freed; it reproduced in about one memcheck run in twenty.
+# The test holds the workers back for 300ms to make this deterministic, which
+# has to exceed psearch_join()'s own latency rather than just the workers':
+# with the wait gone, find_additional_dedupe() still blocks in printer_stop()
+# for the rest of the progress thread's 100ms sleep, and any shorter delay is
+# hidden behind that.
+<<<
+	threads_pool_wait_idle(&search_pool);
+===
+>>>
+
+# an empty file is skipped without being counted as processed
+# The progress total is the whole filerec list, so a skip that forgets to
+# count leaves the search reading as permanently unfinished. Note that
+# deleting the *whole* branch rather than just this line is equivalent and is
+# deliberately not listed: the file then goes to the pool, whose worker counts
+# it instead, and nothing downstream can tell the two apart.
+<<<
+			psearch_update_processed_count(1);
+			continue;
+===
+			continue;
+>>>

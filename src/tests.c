@@ -5392,6 +5392,7 @@ struct search_fixture {
 static void search_end(struct search_fixture *s)
 {
 	extents_search_free();
+	search_delay_us = 0;
 	options.cpu_threads = s->saved_cpu_threads;
 	options.dedupe_same_file = s->saved_same_file;
 	quiet = s->saved_quiet;
@@ -5441,28 +5442,31 @@ static void search_reset(struct search_fixture *s, struct dbhandle *db)
 	init_results_tree(&s->fd.res);
 }
 
-/* A file with `n` blocks, plus one extent row whose digest nothing else shares
- * - which is what makes the search consider the file at all. */
-static struct filerec *search_file(struct search_fixture *s,
-				   struct dbhandle *db, const char *name,
-				   uint64_t ino, unsigned int extent_dg,
-				   const unsigned int *blocks, unsigned int n)
+/*
+ * A file with `n` blocks, plus one extent row whose digest nothing else shares
+ * - which is what makes the search consider the file at all.
+ *
+ * The row's name and the filerec's differ, deliberately and harmlessly: only
+ * the row is looked up by name, and fd_file() names the in-memory file after
+ * its id. poff is zero because nothing under test reads it - search_extent()
+ * takes only loff and len, and the rest reaches a dprintf.
+ */
+static void search_file(struct search_fixture *s, struct dbhandle *db,
+			const char *name, uint64_t ino, unsigned int extent_dg,
+			const unsigned int *blocks, unsigned int n)
 {
 	struct extent_csum ext[1];
 	int64_t id = put_dupe(db, name, ino, extent_dg, FD_BLOCK * n, 1, 0, 1);
-	struct filerec *file;
 
 	ext[0].loff = 0;
-	ext[0].poff = FD_BLOCK * ino;
+	ext[0].poff = 0;
 	ext[0].len = FD_BLOCK * n;
 	digest_of(ext[0].digest, extent_dg);
 	if (dbfile_store_extent_hashes(db, id, 1, ext))
 		abort();
 
-	file = fd_file(&s->fd, id, blocks, n, 0);
-	if (!file)
+	if (!fd_file(&s->fd, id, blocks, n, 0))
 		abort();
-	return file;
 }
 
 MU_TEST(test_the_extent_search_driven_by_its_pool) {
@@ -5482,7 +5486,24 @@ MU_TEST(test_the_extent_search_driven_by_its_pool) {
 	search_file(&s, db, "/tree/a", 1, 41, blocks, ARRAY_SIZE(blocks));
 	search_file(&s, db, "/tree/b", 2, 42, blocks, ARRAY_SIZE(blocks));
 
+	/*
+	 * Hold the workers back for this one call, so the idleness assertion
+	 * below is a claim rather than a race the fixture wins by default.
+	 * It has to exceed psearch_join()'s latency, not just the workers':
+	 * with the wait deleted, find_additional_dedupe() still blocks in
+	 * psearch_join() -> printer_stop() for the remainder of the progress
+	 * thread's 100ms sleep, which masks any shorter delay. Measured: at
+	 * 2ms the deletion survives, at 300ms it is caught.
+	 *
+	 * Set directly rather than via DUPEREMOVE_SEARCH_DELAY_MS because
+	 * tests.c #includes find_dupes.c and extents_search_init() reads the
+	 * environment. Scoped to this call alone - paying it on all four costs
+	 * a second of suite time, and suite runtime feeds the mutation tool's
+	 * hang timeout.
+	 */
+	search_delay_us = 300000;
 	mu_check(find_additional_dedupe(&s.fd.res) == 0);
+	search_delay_us = 0;
 	mu_assert(s.fd.res.num_dupes == 1, "a block-level match was not found");
 	d = only_group(&s.fd.res);
 	mu_check(d->de_num_dupes == 2);
@@ -5508,6 +5529,17 @@ MU_TEST(test_the_extent_search_driven_by_its_pool) {
 	mu_check(find_additional_dedupe(&s.fd.res) == 0);
 	mu_assert(s.fd.res.num_dupes == 1, "an empty file disturbed the search");
 	mu_check(extents_search_idle());
+	/*
+	 * The results tree cannot see the skip at all: a worker handed the
+	 * empty file would find no extent rows for it and return without
+	 * touching the tree, so `num_dupes == 1` holds either way. What the
+	 * branch uniquely does is count the file as processed itself, so that
+	 * is what is asserted - three files, all accounted for. Deleting the
+	 * count gives two; deleting the `continue` gives four, because the
+	 * worker counts it as well.
+	 */
+	mu_assert(search_processed == 3,
+		  "an empty file was not counted as processed exactly once");
 
 	/*
 	 * Two halves of one file are not matched against each other unless
@@ -5528,6 +5560,13 @@ MU_TEST(test_the_extent_search_driven_by_its_pool) {
 		mu_check(find_additional_dedupe(&s.fd.res) == 0);
 		mu_assert(s.fd.res.num_dupes == 1,
 			  "dedupe_same_file did not enable a self match");
+		/* And it is the right group: blocks 0-1 matched against 2-3.
+		 * Checking only that *a* group exists would survive a mutant
+		 * that recorded the wrong range - which is the bug this file
+		 * was written around. */
+		d = only_group(&s.fd.res);
+		mu_check(d->de_num_dupes == 2);
+		mu_check(d->de_len == FD_BLOCK * 2);
 	}
 }
 
