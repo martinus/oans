@@ -54,17 +54,5 @@
 ===
 >>>
 
-# the anchor flag is assigned rather than latched
-# A group spanning several dedupe passes must keep the target the first pass
-# chose, or each pass converges the copies onto a different physical extent and
-# the run never settles. The mutation only shows if a *later* member arrives
-# without the flag, which is the shape a test has to be written for.
-<<<
-	if (is_anchor)
-		dext->de_anchored = true;
-===
-	dext->de_anchored = is_anchor;
->>>
-
 # ---------------------------------------------------------------- hash tree
 

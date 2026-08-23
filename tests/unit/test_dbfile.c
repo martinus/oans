@@ -980,6 +980,13 @@ MU_TEST(test_every_window_elects_the_same_whole_file_target) {
 	mu_check(dbfile_load_same_files(db, &second, 2, 3) == 0);
 	t2 = target_of(only_group(&second));
 
+	/*
+	 * These two are the #197 guard in full: target_of() is
+	 * list_first_entry(), so naming the same file from both windows says
+	 * the query ranked the whole group and the loader preserved that order.
+	 * There is no separate flag to check - there was one, and it had no
+	 * reader (#237).
+	 */
 	mu_assert_string_eq("/tree/old2", t1);
 	mu_assert_string_eq("/tree/old2", t2);
 
@@ -987,16 +994,6 @@ MU_TEST(test_every_window_elects_the_same_whole_file_target) {
 	 * else: two members, not four. */
 	mu_check(only_group(&first)->de_num_dupes == 2);
 	mu_check(only_group(&second)->de_num_dupes == 2);
-
-	/*
-	 * The loader marks the group anchored, from the query's is_target
-	 * column. Nothing reads the flag today (#237), which is precisely why
-	 * it is asserted here: without this the one C statement in
-	 * dbfile_load_same_files() that exists for #197 can be deleted with
-	 * every other test still green.
-	 */
-	mu_check(only_group(&first)->de_anchored);
-	mu_check(only_group(&second)->de_anchored);
 
 	free_results_tree(&first);
 	free_results_tree(&second);
@@ -1199,14 +1196,6 @@ MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
 	d = only_group(&res);
 	mu_check(d->de_len == 4096);
 	mu_check(!memcmp(d->de_hash, shared, DIGEST_LEN));
-
-	/*
-	 * Never anchored: only the whole-file loader elects a target, because
-	 * only there do the members have differing layouts to rank. The pair
-	 * with the assertion in the #197 test above is what pins that
-	 * asymmetry rather than each half separately looking arbitrary.
-	 */
-	mu_check(!d->de_anchored);
 
 	/* Each member keeps the physical offset its row recorded - the extent
 	 * path reads it to decide what is already shared. */

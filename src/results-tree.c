@@ -219,7 +219,7 @@ static struct dupe_extents *find_alloc_dext(struct results_tree *res,
  */
 int insert_one_result(struct results_tree *res, unsigned char *digest,
 		      struct filerec *file, uint64_t startoff, uint64_t len,
-		      uint64_t poff, bool is_anchor)
+		      uint64_t poff)
 {
 	struct extent *extent = alloc_extent(file, startoff);
 	struct dupe_extents *dext;
@@ -235,8 +235,6 @@ int insert_one_result(struct results_tree *res, unsigned char *digest,
 		return ENOMEM;
 
 	abort_on(dext->de_len != len);
-	if (is_anchor)
-		dext->de_anchored = true;
 
 	g_mutex_lock(&dext->de_mutex);
 	insert_extent_list_free(dext, &extent);

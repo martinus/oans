@@ -269,14 +269,21 @@
 "	where dedupe_seq <= ?2 and (digest, size) in ( "			\
 >>>
 
-# the anchor flag never reaches the group
-# The one C statement in the loader that exists for #197. Nothing reads the
-# flag today (#237), so this survives everything except a test that asserts it
-# - which is the point: it is how the disconnection would be noticed.
+# the elected target is no longer loaded first
+# Row order *is* the target election (#197). The rank is computed in the tgt
+# CTE, but `order by is_target desc` is what carries it out of the query, and
+# insert_extent_list_free() appends - so dropping it leaves the group's first
+# member, and therefore dedupe_extent_list()'s target, up to whatever order
+# SQLite felt like returning. Every pass may then pick a different one and the
+# copies never converge on one physical extent.
+#
+# This block replaces one that broke the de_anchored flag, which had no reader
+# and was removed with #237. The ordering is the mechanism the flag was mistaken
+# for, and unlike the flag it is load-bearing.
 <<<
-		ret = insert_one_result(res, digest, file, 0, size, 0, is_anchor);
+"order by is_target desc, f.id;"
 ===
-		ret = insert_one_result(res, digest, file, 0, size, 0, false);
+"order by f.id;"
 >>>
 
 # block hashes reach find_dupes in whatever order the query yielded

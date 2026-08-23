@@ -309,8 +309,7 @@ MU_TEST(test_prop_a_dup_group_counts_its_own_members) {
 			 * its own allocation rather than counting it.
 			 */
 			if (insert_one_result(&res, digests[d], files[f],
-					      slot * PROP_LEN * 4, lens[l],
-					      0, false))
+					      slot * PROP_LEN * 4, lens[l], 0))
 				abort();
 			if (!has_group[d][l]) {
 				has_group[d][l] = true;
@@ -391,7 +390,7 @@ MU_TEST(test_removing_an_extent_collapses_a_group_of_one) {
 
 	for (unsigned int i = 0; i < 3; i++)
 		mu_check(insert_one_result(&res, digest, mkfilerec(i + 1), 0,
-					   PROP_LEN, 0, false) == 0);
+					   PROP_LEN, 0) == 0);
 	mu_check(res.num_extents == 3 && res.num_dupes == 1);
 
 	/* Three members: one comes out, two remain, and it says so. */
@@ -434,18 +433,18 @@ MU_TEST(test_a_group_is_keyed_on_digest_and_length_together) {
 	digest_of(digest, 1);
 	digest_of(other, 2);
 
-	mu_check(insert_one_result(&res, digest, a, 0, PROP_LEN, 0, false) == 0);
-	mu_check(insert_one_result(&res, digest, b, 0, PROP_LEN, 0, false) == 0);
+	mu_check(insert_one_result(&res, digest, a, 0, PROP_LEN, 0) == 0);
+	mu_check(insert_one_result(&res, digest, b, 0, PROP_LEN, 0) == 0);
 	mu_check(res.num_dupes == 1);
 
 	/* Same digest, different length: a second group, not an abort. */
 	mu_check(insert_one_result(&res, digest, a, PROP_LEN * 2, PROP_LEN * 2,
-				   0, false) == 0);
+				   0) == 0);
 	mu_check(res.num_dupes == 2);
 
 	/* Different digest, same length: a third. */
-	mu_check(insert_one_result(&res, other, a, PROP_LEN * 8, PROP_LEN, 0,
-				   false) == 0);
+	mu_check(insert_one_result(&res, other, a, PROP_LEN * 8, PROP_LEN,
+				   0) == 0);
 	mu_check(res.num_dupes == 3);
 	mu_check(res.num_extents == 4);
 
@@ -454,43 +453,6 @@ MU_TEST(test_a_group_is_keyed_on_digest_and_length_together) {
 	mu_check(find_dupe_extents(&res, digest, PROP_LEN * 2) != NULL);
 	mu_check(find_dupe_extents(&res, other, PROP_LEN) != NULL);
 	mu_check(find_dupe_extents(&res, other, PROP_LEN * 2) == NULL);
-
-	free_results_tree(&res);
-	free_all_filerecs();
-}
-
-/*
- * The anchor flag latches: once a member claims it, later members that do not
- * cannot clear it. That is what pins a group spanning several dedupe passes to
- * one target instead of re-picking a least-fragmented one per pass.
- *
- * The order matters, and it is the whole test. Asserting it right after the
- * anchored insert would pass just as well against `de_anchored = is_anchor`,
- * because nothing follows to overwrite it - so "sticks" is only a claim if a
- * non-anchored insert comes afterwards.
- */
-MU_TEST(test_the_anchor_flag_latches_once_claimed) {
-	struct results_tree res;
-	unsigned char digest[DIGEST_LEN];
-	struct dupe_extents *d;
-
-	free_all_filerecs();
-	init_results_tree(&res);
-	digest_of(digest, 1);
-
-	mu_check(insert_one_result(&res, digest, mkfilerec(1), 0, PROP_LEN, 0,
-				   false) == 0);
-	d = find_dupe_extents(&res, digest, PROP_LEN);
-	mu_check(d && !d->de_anchored);
-
-	mu_check(insert_one_result(&res, digest, mkfilerec(2), 0, PROP_LEN, 0,
-				   true) == 0);
-	mu_check(d->de_anchored);
-
-	/* The one that matters: a later plain member must not clear it. */
-	mu_check(insert_one_result(&res, digest, mkfilerec(3), 0, PROP_LEN, 0,
-				   false) == 0);
-	mu_check(d->de_anchored);
 
 	free_results_tree(&res);
 	free_all_filerecs();
