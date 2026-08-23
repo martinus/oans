@@ -33,7 +33,24 @@ extern int quiet;
 /*
  * All four print around the live progress block; see progress_printf() in
  * progress.c for what that costs and why every message must go through it.
+ *
+ * Two of these names are also libc's. `dprintf(3)` is POSIX and `vprintf(3)`
+ * is C89, and glibc turns both into macros in bits/stdio2.h *when
+ * _FORTIFY_SOURCE is on* - which needs optimization, so a -O0 build never sees
+ * them. clang then reports -Wmacro-redefined and -Werror stops the build; gcc
+ * does not. That combination went unbuilt for as long as WERROR=1 was
+ * silently dropping -O2 (see scripts/lint-build-flags.py), which is why this
+ * only surfaced now.
+ *
+ * Undefining first is safe here rather than merely quiet: every `dprintf(` in
+ * the tree is this macro - format string first - and nothing calls POSIX
+ * dprintf(fd, ...) or C vprintf(fmt, ap). Shadowing two libc names is still a
+ * trap for whoever wants the real ones one day; renaming them is a
+ * tree-wide change and belongs in its own commit, not in a build fix.
  */
+#undef dprintf
+#undef vprintf
+
 #define dprintf(format, ...) if (debug) progress_printf(stdout, format, ##__VA_ARGS__)
 #define vprintf(format, ...) if (verbose) progress_printf(stdout, format, ##__VA_ARGS__)
 #define qprintf(format, ...) if (!quiet) progress_printf(stdout, format, ##__VA_ARGS__)
