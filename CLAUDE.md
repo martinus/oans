@@ -153,6 +153,59 @@ else.
 - **Adding a subject is two edits**: the `test_*.c`, and its `#include` in the
   right `tu_*.c` (plus `TEST_INLINED` if it needs a static).
 
+## WERROR=1 was silently disabling -O2, in every CI job
+
+`ifdef WERROR` does `override CFLAGS += -Werror`, and **once a variable carries
+the `override` origin GNU make ignores every later ordinary assignment to it**.
+The release block's `CFLAGS += -O2 $(HARDENING)` sat below that, so with WERROR
+set it evaporated. No warning, no error - just a different binary.
+
+`.github/workflows/ci.yml` sets `WERROR: 1` for every job, so every check this
+project runs - btrfs, xfs, the four valgrind shards, the three sanitizer legs,
+the mutation sweep - was verifying `-O0` code while what ships is `-O2`. That is
+exactly where UB-sensitive differences hide, and this file already records that
+17 of `dbfile.c`'s 1,879 mutants differ between the two builds.
+
+- **The fix is one word**: `override CFLAGS += -O2 $(HARDENING)`. Order does not
+  save you - any later plain assignment loses, wherever it sits.
+- **`scripts/lint-build-flags.py` asserts it** rather than a comment claiming
+  it, because the original comment was right and the code was wrong for however
+  long CI has been green. It asks `make -Bn` what it would run with and without
+  `WERROR` and compares the `-O` level. `-Bn` and not `-n`: with the tree built,
+  `make -n` prints nothing and a check reading an empty command list passes for
+  the wrong reason.
+- **Diagnose this from the binary, not the makefile.** `readelf
+  --debug-dump=info ./test | grep DW_AT_producer` prints the flags gcc actually
+  compiled with, grouped - which is how the mixed build was found (19 TUs at
+  `-O0`, one at `-O2` from a stray plain `make`). An object-size comparison sent
+  me the wrong way twice; the producer string cannot.
+- **Fixing it immediately surfaced two `-Wformat-truncation` warnings CI had
+  never seen**, because that analysis needs optimization to run at all. Both
+  were deliberate truncations whose intent lived in a comment; they now spell
+  the bound out in code the compiler can follow.
+- **The suite is ~2x faster optimized** - measured on the property soak, 221 s →
+  109 s for an identical 659,961,110 assertions. The fixed ~0.85 s of startup
+  does not optimize, so small runs show less.
+
+## Soaking the property tests
+
+`OANS_PROPTEST_SCALE=100 ./test` multiplies every property's case count. A
+multiplier rather than a fixed number, so the ordinary run keeps the count each
+property chose - those are tuned, and the glob ones are shaped around what
+compiling a `GRegex` costs.
+
+- **A soak extends a run rather than replacing it.** Each property draws from
+  its own stream, so the first N cases of a soak are exactly the cases an
+  unscaled run would try. A failure at case 40,000 is something the default
+  genuinely could not reach, and still names the seed and case to replay.
+- **The wide pass is the half that teaches.** Six random seeds at scale 100 say
+  the properties are not tuned to the default seed; the deep pass at scale 500
+  mostly confirms, since more cases cannot find a bug in a property that is
+  already a tautology - and this tree has had one of those.
+- Measured clean at ~1.45 billion assertions across seven runs. Read that as
+  "no rare input shape is missing from the generators", not as "the properties
+  are good".
+
 ## Mutation & property testing (the C unit suite)
 
 Two additions to the C unit suite's side of the house (`tests/unit/`). Neither touches the

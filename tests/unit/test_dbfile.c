@@ -1465,4 +1465,7 @@ MU_TEST(test_reads_still_answer_while_writes_are_refused) {
 	mu_check(dbfile_describe_file(db, 4010, 1, &out) == 0);
 	mu_assert(out.id == fileid,
 		  "the read path stopped answering, so the test above proves nothing");
+	/* describe_file strdup()s the name into `out`; dbfile.h says free it
+	 * through file_cleanup(). LeakSanitizer caught this missing. */
+	file_cleanup(&out);
 }

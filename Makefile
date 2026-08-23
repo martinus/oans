@@ -227,6 +227,7 @@ integration-valgrind: oans
 lint:
 	@python3 scripts/lint-longpath.py
 	@python3 scripts/lint-escape.py
+	@python3 scripts/lint-build-flags.py
 	@python3 scripts/lint-test-registry.py
 	@python3 scripts/lint-mutate-core.py
 	@python3 scripts/mutate/test_report.py
