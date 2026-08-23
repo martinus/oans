@@ -77,10 +77,12 @@ int interrupt_signo(void)
 	return atomic_load_explicit(&caught_signal, memory_order_relaxed);
 }
 
+/* File scope rather than function scope so a test can put it back; the
+ * storage duration and initialisation are the same either way. */
+static _Atomic bool reported;
+
 void interrupt_report(void)
 {
-	static _Atomic bool reported;
-
 	if (!interrupted() || atomic_exchange(&reported, true))
 		return;
 

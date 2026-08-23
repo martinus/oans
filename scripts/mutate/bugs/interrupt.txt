@@ -39,26 +39,41 @@
 	static const int signals[] = { SIGTERM };
 >>>
 
-# the file hook raises one tick early
-# The counter is files that have *finished hashing*, so the durability
-# assertion in the integration suite is exact: when the signal lands, N files
-# are already in the open batch. Off by one and the test asserts against a
-# batch holding something else.
+# the file hook raises one tick late
+# atomic_fetch_add() returns the *old* value, so `+ 1 ==` fires on the Nth
+# tick and dropping it fires on the N+1th. The counter is files that have
+# finished hashing, so the durability assertion in the integration suite is
+# exact: when the signal lands, N files are already in the open batch. Off by
+# one and that test asserts against a batch holding something else.
 <<<
 	if (atomic_fetch_add(&tick_files, 1) + 1 == limit_files)
 ===
 	if (atomic_fetch_add(&tick_files, 1) == limit_files)
 >>>
 
-# the hook keeps counting after the run is interrupted
-# On the file side the counter is shared by the csum workers, so a tick past
-# the raise is a second raise waiting to happen - against a disposition
-# SA_RESETHAND has already put back to the default, which kills the process
-# with the batch still open.
+# the file hook keeps counting after the run is interrupted
+# Not a second raise: the comparison is `==` against a counter that only
+# grows, so once past the limit no later tick can fire. What it costs is an
+# atomic increment per file after shutdown has begun, on the counter the csum
+# workers share - work in the shutdown path, which is the one place the
+# feature exists to keep short.
 <<<
 	if (!limit_files || interrupted())
 ===
 	if (!limit_files && interrupted())
+>>>
+
+# the batch hook loses its guard entirely
+# This is the one where the second raise really happens. The batch hook
+# compares with `>=`, so with no limit set every call satisfies 1 >= 0: the
+# first raise is handled and SA_RESETHAND restores the default, and the second
+# terminates the process. That is also why the test's no-limit loop stops at
+# the first raise - otherwise this mutant would kill the suite instead of
+# being scored.
+<<<
+	if (!limit_batches || interrupted())
+		return;
+===
 >>>
 
 # the wind-down notice is repeated by every loop that notices

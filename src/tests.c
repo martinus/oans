@@ -5604,6 +5604,7 @@ static struct sigaction intr_disposition(int signo)
 static void intr_reset(void)
 {
 	atomic_store(&caught_signal, 0);
+	atomic_store(&reported, false);
 	atomic_store(&tick_files, 0);
 	tick_batches = 0;
 	limit_files = 0;
@@ -5612,6 +5613,13 @@ static void intr_reset(void)
 	unsetenv("DUPEREMOVE_INTERRUPT_AFTER");
 	unsetenv("DUPEREMOVE_INTERRUPT_AFTER_BATCHES");
 	unsetenv("DUPEREMOVE_INTERRUPT_SIGNAL");
+	/*
+	 * And the dispositions, which nothing else here would restore: leaving
+	 * the handler installed means a SIGTERM aimed at a hung ./test is
+	 * swallowed once and appears to do nothing.
+	 */
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
 }
 
 MU_TEST(test_the_interrupt_flag_and_its_test_hooks) {
@@ -5664,11 +5672,11 @@ MU_TEST(test_the_interrupt_flag_and_its_test_hooks) {
 
 	/*
 	 * Once the flag is up the hook stops counting entirely, which is the
-	 * other half of `!limit_files || interrupted()`. Without that guard a
-	 * tick after interruption would keep incrementing - and on the file
-	 * side, where the counter is atomic because the csum workers share it,
-	 * that is a second raise waiting to happen against a disposition
-	 * SA_RESETHAND has already put back to the default.
+	 * other half of `!limit_files || interrupted()`. On the file side that
+	 * cannot raise a second time - the comparison is `==` against a counter
+	 * that only grows - so what the guard saves is an atomic increment per
+	 * file after shutdown has begun. It is the *batch* hook, comparing with
+	 * `>=`, where losing this guard raises again and kills.
 	 */
 	{
 		unsigned long at_raise = atomic_load(&tick_files);
@@ -5717,7 +5725,16 @@ MU_TEST(test_the_interrupt_flag_and_its_test_hooks) {
 	 * the first file of every ordinary run. */
 	intr_reset();
 	interrupt_install();
-	for (int i = 0; i < 8; i++) {
+	/*
+	 * Bounded by !interrupted(), which is not caution about the test but
+	 * about the suite: the batch hook compares with >=, so deleting its
+	 * `!limit_batches || interrupted()` guard makes 1 >= 0 true on every
+	 * call. The first raise is handled and SA_RESETHAND puts the default
+	 * back; a second would terminate the process, and every test after
+	 * this one would simply never run. Stopping at the first raise turns
+	 * that mutant into a clean failure below.
+	 */
+	for (int i = 0; i < 8 && !interrupted(); i++) {
 		interrupt_test_file_tick();
 		interrupt_test_batch_tick();
 	}
@@ -5741,6 +5758,7 @@ MU_TEST(test_the_wind_down_notice_is_said_once) {
 	int saved = dup(STDERR_FILENO);
 	char buf[4096] = {0};
 	unsigned int seen = 0;
+	off_t quiet_before;
 	ssize_t n;
 
 	if (fd < 0 || saved < 0)
@@ -5749,8 +5767,12 @@ MU_TEST(test_the_wind_down_notice_is_said_once) {
 	intr_reset();
 	dup2(fd, STDERR_FILENO);
 
-	/* Nothing has happened yet, so there is nothing to announce. */
+	/* Nothing has happened yet, so there is nothing to announce. The
+	 * offset is read here and judged after stderr is back, so no assertion
+	 * fires while the capture is up. */
 	interrupt_report();
+	fflush(stderr);
+	quiet_before = lseek(fd, 0, SEEK_END);
 
 	/* Now there is - and saying it twice would be the bug. */
 	atomic_store(&caught_signal, SIGINT);
@@ -5760,6 +5782,9 @@ MU_TEST(test_the_wind_down_notice_is_said_once) {
 
 	dup2(saved, STDERR_FILENO);
 	close(saved);
+
+	mu_assert(quiet_before == 0,
+		  "the notice was printed before any signal arrived");
 
 	n = pread(fd, buf, sizeof(buf) - 1, 0);
 	close(fd);
