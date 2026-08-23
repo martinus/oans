@@ -5227,6 +5227,60 @@ MU_TEST(test_a_mismatch_splits_the_run_rather_than_ending_the_search) {
 }
 
 /*
+ * The two sides are recorded separately, and asymmetric offsets are what makes
+ * that observable.
+ *
+ * record_match() fills recs[], soff[] and eoff[] as pairs, one slot per file.
+ * With both files laid out identically - which every other test here does,
+ * because it is the natural fixture - slot 0 and slot 1 hold the same numbers,
+ * so writing either into both, or reading the wrong one, changes nothing any
+ * assertion can see. Putting the matching run at a different offset in each
+ * file makes the two slots hold different values, and the pair of recorded
+ * offsets then pins which is which.
+ */
+MU_TEST(test_each_side_of_a_match_records_its_own_offsets) {
+	struct fd_fixture f;
+	static const unsigned int dg[] = { 1, 2, 3 };
+	static const uint64_t early[] = { 0, FD_BLOCK, FD_BLOCK * 2 };
+	static const uint64_t late[]  = { FD_BLOCK * 2, FD_BLOCK * 3, FD_BLOCK * 4 };
+	struct filerec *a, *b;
+	struct dupe_extents *d;
+	struct extent *e;
+	unsigned int seen = 0;
+
+	fd_begin(&f);
+	a = fd_file_at(&f, 1, dg, early, ARRAY_SIZE(dg), 0);
+	b = fd_file_at(&f, 2, dg, late, ARRAY_SIZE(dg), 0);
+
+	mu_check(compare_extents(a, fd_block(a, 0), b, fd_block(b, FD_BLOCK * 2),
+				 FD_BLOCK * 8, &f.res) == 0);
+
+	mu_check(f.res.num_dupes == 1);
+	d = only_group(&f.res);
+	mu_check(d->de_num_dupes == 2);
+	mu_check(d->de_len == FD_BLOCK * 3);
+
+	/*
+	 * a's copy starts at 0 and b's at two blocks in - each from its own
+	 * slot. A slot written from the wrong side puts both at one offset.
+	 */
+	list_for_each_entry(e, &d->de_extents, e_list) {
+		if (e->e_file == a) {
+			mu_check(e->e_loff == 0);
+			seen |= 1u;
+		} else if (e->e_file == b) {
+			mu_check(e->e_loff == FD_BLOCK * 2);
+			seen |= 2u;
+		} else {
+			mu_fail("an extent belonging to neither file");
+		}
+	}
+	mu_check(seen == 3);	/* one member from each file, not two of one */
+
+	fd_end(&f);
+}
+
+/*
  * A run stops where the blocks stop being contiguous, even though they still
  * match.
  *
@@ -5419,6 +5473,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN_TEST(test_a_file_with_nothing_unique_yields_no_nondupe_extents);
 	MU_RUN_TEST(test_a_whole_matching_run_is_recorded_as_one_group);
 	MU_RUN_TEST(test_a_mismatch_splits_the_run_rather_than_ending_the_search);
+	MU_RUN_TEST(test_each_side_of_a_match_records_its_own_offsets);
 	MU_RUN_TEST(test_a_run_stops_where_the_blocks_stop_being_contiguous);
 	MU_RUN_TEST(test_a_short_final_block_shortens_the_recorded_run);
 	MU_RUN_TEST(test_dedupe_classify_probe);
