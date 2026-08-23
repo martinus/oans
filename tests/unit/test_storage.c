@@ -144,7 +144,16 @@ MU_TEST(test_storage_describe) {
 	p = (struct storage_profile){ .rotational = true,
 		.rotational_known = true, .num_devices = 12 };
 	memset(buf, 'x', sizeof(buf));
-	storage_describe(&p, buf, 12);
+	/*
+	 * volatile so the size is not a compile-time constant. storage.c is
+	 * #included into this TU, so at -O2 gcc can otherwise see a literal 12
+	 * reaching snprintf() and reports the truncation this test exists to
+	 * cause - a warning about the test, raised against the product. No
+	 * production caller passes a buffer this small.
+	 */
+	volatile size_t small = 12;
+
+	storage_describe(&p, buf, small);
 	mu_assert_string_eq("btrfs pool ", buf);	/* 11 chars + NUL */
 	mu_check(buf[12] == 'x');	/* nothing written past the length */
 }

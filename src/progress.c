@@ -351,12 +351,27 @@ static void ellipsize_path(const char *path, char *out, size_t out_len,
 
 void progress_copy_path(char *dst, size_t cap, const char *src)
 {
+	size_t n;
+
 	if (cap == 0)
 		return;
-	if (strlen(src) < cap || cap < ELIDE_MIN_CAP)
-		snprintf(dst, cap, "%s", src);
-	else
+	if (strlen(src) >= cap && cap >= ELIDE_MIN_CAP) {
 		ellipsize_path(src, dst, cap, (int)cap - 3);
+		return;
+	}
+
+	/*
+	 * A plain truncating copy, and the truncation is deliberate - a buffer
+	 * too small to elide cleanly is documented above as getting exactly
+	 * this. snprintf() does the same thing, but -Wformat-truncation cannot
+	 * tell a deliberate truncation from an accidental one and warns at -O2,
+	 * so the bound is spelled out instead of implied.
+	 */
+	n = strlen(src);
+	if (n >= cap)
+		n = cap - 1;
+	memcpy(dst, src, n);
+	dst[n] = '\0';
 }
 
 static const char *const stage_name[STAGE_COUNT] = {

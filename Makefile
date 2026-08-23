@@ -102,7 +102,16 @@ else
 	# Release hardening (needs optimization, hence not in the debug build).
 	# Override with HARDENING= to disable.
 	HARDENING ?= -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fstack-clash-protection
-	CFLAGS += -O2 $(HARDENING)
+	# `override`, and it is load-bearing. WERROR=1 does `override CFLAGS +=`
+	# above, and once a variable carries that origin GNU make *ignores* every
+	# later ordinary assignment to it - so a plain `CFLAGS +=` here vanished
+	# whenever WERROR was set, with no warning. CI sets WERROR=1 for every job,
+	# so every check this project runs was building -O0 while what ships is
+	# -O2: the sanitizer legs, valgrind and the mutation sweep were all
+	# measuring code the release never executes. Verified by DW_AT_producer,
+	# which records what the compiler actually did rather than what the
+	# makefile appears to say.
+	override CFLAGS += -O2 $(HARDENING)
 	LIBRARY_FLAGS += -Wl,-z,relro -Wl,-z,now
 endif
 
