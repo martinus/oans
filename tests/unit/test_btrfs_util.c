@@ -16,10 +16,21 @@
  * end-to-end suite on it.
  */
 
-/* A descriptor that is definitely not a btrfs subvolume. */
+/*
+ * A descriptor that is definitely not a btrfs subvolume.
+ *
+ * It has to be a filesystem that cannot be btrfs, not merely one that usually
+ * isn't: this opened "/" until a Fedora dev box - btrfs root, which is the
+ * default there and the shape oans exists for - answered SUBVOL_INFO for real
+ * and failed the test. CI never saw it, because CI's root is not btrfs.
+ *
+ * procfs can never be btrfs and is always mounted on the only platform this
+ * builds for, so the ioctl reaches a filesystem that has no handler for it and
+ * refuses with ENOTTY - the same real error a user pointing oans at ext4 gets.
+ */
 static int not_a_subvol(void)
 {
-	int fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	int fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
 	if (fd < 0)
 		abort();
