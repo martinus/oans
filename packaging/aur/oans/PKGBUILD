@@ -1,6 +1,6 @@
 # Maintainer: martinus <martin.ankerl@gmail.com>
 pkgname=oans
-pkgver=1.11.1
+pkgver=1.12.0
 pkgrel=1
 pkgdesc="Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork"
 arch=('x86_64')
@@ -14,7 +14,7 @@ makedepends=('pkgconf' 'xxhash' 'libbsd')
 provides=('duperemove')
 conflicts=('duperemove')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('986e413f16b861c98c4e18794c657872d06ea11387111386bc4a940b9bc1dca0')
+sha256sums=('ef8bf6100c766b555ae180a73d2c6f263588459045a78a98c20a0ab016030290')
 
 # The Makefile derives VERSION from `git describe`, which a release tarball has
 # no metadata for - without this the binary reports "oans unknown". It must be
