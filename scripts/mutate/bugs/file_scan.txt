@@ -32,3 +32,17 @@
 ===
 		if (!e)
 >>>
+
+# ---------------------------------------------------------------- #278
+
+# a file that became a directory aborts the run again
+# The walk queued a regular file; by the time the consumer gets it, it is a
+# directory. Aborting loses the open write batch - up to ten seconds of hashes.
+<<<
+	if (!S_ISREG(st->stx_mode)) {
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+		return 0;
+	}
+===
+	abort_on(!S_ISREG(st->stx_mode));
+>>>

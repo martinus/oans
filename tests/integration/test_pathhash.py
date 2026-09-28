@@ -51,10 +51,31 @@ class PathIdentityTest(DuperemoveTest):
 
     def test_remove_nonexistent_path_is_noop(self):
         # Removing a path not in the hashfile changes nothing (and must not
-        # remove a different path that happens to share a hash bucket).
+        # remove a different path that happens to share a hash bucket) - and
+        # says so, with exit 1, rather than "Removed" (#282).
         self.mkrand("tree/a", 8000)
         self.mkrand("tree/b", 8000)
         self.scan(self.path("tree"))
         self.dm("-R", self.path("tree/not-there"))
-        self.assertDmOk()
+        self.assertEqual(1, self.rc, self.out)
+        self.assertIn("is not in the hashfile", self.out)
         self.assertEqual(2, self.hf_count("files"), "no rows removed for a missing path")
+
+    def test_remove_takes_a_relative_path(self):
+        """Stored names are absolute; a relative -R argument used to say
+        "Removed" and remove nothing (#282)."""
+        self.mkrand("tree/a", 8000)
+        self.mkrand("tree/b", 8000)
+        self.scan(self.path("tree"))
+        self.dm("-R", os.path.relpath(self.path("tree/a")))
+        self.assertDmOk()
+        self.assertEqual(0, self.hf_scalar(
+            "select count(*) from files where filename like '%/tree/a'"))
+
+    def test_remove_takes_a_path_already_gone_from_disk(self):
+        self.mkrand("tree/a", 8000)
+        self.scan(self.path("tree"))
+        os.unlink(self.path("tree/a"))
+        self.dm("-R", os.path.relpath(self.path("tree/a")))
+        self.assertDmOk()
+        self.assertEqual(0, self.hf_count("files"))

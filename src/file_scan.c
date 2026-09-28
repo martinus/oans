@@ -1206,7 +1206,19 @@ static int probe_fs(char *path, struct fs_probe *probe)
 			return 1;
 		}
 
-		uuid_parse(uuid_found, probe->uuid);
+		/*
+		 * A tag that is not in UUID form would leave a null UUID, and
+		 * a null locked UUID reads as "not locked yet" on every walker
+		 * (#282).
+		 */
+		if (uuid_parse(uuid_found, probe->uuid) ||
+		    uuid_is_null(probe->uuid)) {
+			eprintf("libblkid gave \"%s\" as the UUID of device "
+				"%s, which is not one\n", uuid_found,
+				mnt_fs_get_source(dev));
+			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
+			return 1;
+		}
 	}
 	return 0;
 }
@@ -1214,6 +1226,30 @@ static int probe_fs(char *path, struct fs_probe *probe)
 static inline uint64_t timestamp_to_nano(struct statx_timestamp t)
 {
 	return t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+/*
+ * `path` is not on the filesystem this run is locked to (#282). A root the user
+ * named - on the command line or the stdin list - is then a root the run does
+ * not cover: say so, and count it so the run exits 2. It used to be dropped
+ * with no message and exit 0, and a replay kept dropping it. A filesystem
+ * mounted below a root stays out as before, and -v says so.
+ */
+static bool other_fs(const char *path, bool parent_checked)
+{
+	if (!parent_checked) {
+		declare_display_path(disp, path);
+
+		eprintf("Skipping %s: it is on another filesystem than the "
+			"first path, and one run scans one filesystem\n", disp);
+		nr_roots_unusable++;
+	} else if (verbose) {
+		declare_display_path(disp, path);
+
+		vprintf("Skipping %s: another filesystem is mounted there\n",
+			disp);
+	}
+	return false;
 }
 
 /* Check if path should be processed:
@@ -1320,7 +1356,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		dprintf("Looking our fs uuid from the hashfile\n");
 		ret = dbfile_get_config(db->db, &cfg);
 		if (ret)
-			return 1;
+			return seed_reject(parent_checked);
 
 		if (!uuid_is_null(cfg.fs_uuid))
 			uuid_copy(locked_fs.uuid, cfg.fs_uuid);
@@ -1369,10 +1405,12 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 			eprintf("%s lives on fs ", disp);
 			debug_print_uuid(probe.uuid);
-			eprintf(" will we are locked on fs ");
+			eprintf(" while the hashfile is locked on fs ");
 			debug_print_uuid(locked_fs.uuid);
 			eprintf(".\n");
 			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
+			if (!parent_checked)
+				nr_roots_unusable++;
 			return seed_reject(parent_checked);
 		}
 
@@ -1387,7 +1425,8 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	}
 
 	if (!locked_fs.is_btrfs)
-		return locked_fs.dev == stx_to_dev(st);
+		return locked_fs.dev == stx_to_dev(st) ||
+		       other_fs(path, parent_checked);
 
 	/*
 	 * On btrfs each subvolume has a distinct st_dev, so verify by fs UUID
@@ -1399,11 +1438,14 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 		return true;
 
 	ret = probe_fs(path, &probe);
-	if (ret)
+	if (ret) {
+		if (!parent_checked)
+			nr_roots_unusable++;
 		return false;
+	}
 
 	if (uuid_compare(probe.uuid, locked_fs.uuid) != 0)
-		return false;
+		return other_fs(path, parent_checked);
 
 	verified_dev_put(dev);
 	return true;
@@ -1718,7 +1760,15 @@ static void process_dir(const char *path, struct dbhandle *db)
 		 * the child's absolute path may exceed PATH_MAX, which the
 		 * kernel would reject with ENAMETOOLONG (#117).
 		 */
-		if (statx(dirfd(dirp), entry->d_name, 0, STATX_BASIC_STATS, &st) ||
+		/*
+		 * AT_SYMLINK_NOFOLLOW: d_type already left symlinks out, and
+		 * what goes where is decided from this statx, not from d_type.
+		 * An entry replaced between readdir() and here - a file by a
+		 * directory, or by a symlink to one - used to be pushed as a
+		 * file and abort the run in the consumer (#278).
+		 */
+		if (statx(dirfd(dirp), entry->d_name, AT_SYMLINK_NOFOLLOW,
+			  STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS)) {
 			declare_display_path(disp, child);
 
@@ -1731,9 +1781,9 @@ static void process_dir(const char *path, struct dbhandle *db)
 		if (!check_file(db, child, &st, true))
 			continue;
 
-		if (entry->d_type == DT_REG)
+		if (S_ISREG(st.stx_mode))
 			fileq_push(child, &st);
-		else
+		else if (options.recurse_dirs)
 			dirq_push(strdup(child));
 	}
 }
@@ -2261,7 +2311,15 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 	bool file_renamed, unchanged, resumed = false;
 	struct scan_resume resume = {0,};
 
-	abort_on(!S_ISREG(st->stx_mode));
+	/*
+	 * Every producer stats without following symlinks and checks the mode,
+	 * so this is a file that stopped being one; skip it rather than abort
+	 * the run and lose the open batch (#278).
+	 */
+	if (!S_ISREG(st->stx_mode)) {
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+		return 0;
+	}
 
 	pscan_examined();	/* count every file the listing walk visits */
 	scan_read_tick(db);
@@ -3605,7 +3663,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (!ctxt.file_csum)
 		return;
 
-	ctxt.fd = longpath_open(file->path, O_RDONLY);
+	/*
+	 * O_NOFOLLOW: every path queued here was stat'ed without following its
+	 * last component (#278), so a symlink now is one swapped in since.
+	 */
+	ctxt.fd = longpath_open(file->path, O_RDONLY | O_NOFOLLOW);
 	if (ctxt.fd == -1) {
 		declare_display_path(disp, file->path);
 

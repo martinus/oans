@@ -315,7 +315,9 @@ file is recorded once.
 
 **-R** *file*...
   ~ Remove the named paths from the hashfile and exit; a single **-** reads the
-    list from standard input. Requires **\--hashfile**. (Deleted files are also
+    list from standard input. Requires **\--hashfile**. A relative path is
+    resolved against the current directory first. A path the hashfile does not
+    hold is reported, and the exit status is then 1. (Deleted files are also
     pruned automatically on the next scan; **-R** is for removing paths that
     still exist.)
 
@@ -585,8 +587,9 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
 
 **2**
   ~ The run completed, but covered **less than it was asked to**: a path named
-    on the command line could not be resolved or stat'ed, or a replayed
-    configuration had lost one of its stored roots. Everything else was still
+    on the command line could not be resolved or stat'ed, lies on another
+    filesystem than the first one (one run scans one filesystem), or a
+    replayed configuration had lost one of its stored roots. Everything else was still
     scanned and deduplicated. Typical causes are a typo, an unmounted path, a
     renamed share, or a shell glob that was quoted by accident.
 

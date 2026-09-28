@@ -86,3 +86,15 @@
 ===
 	return strdup(path);
 >>>
+
+# ---------------------------------------------------------------- #282
+
+# a path that is gone from disk is not resolved through its directory
+# -R exists to drop rows of files that are gone, and the walk stores paths with
+# symlinks resolved; made absolute lexically, a gone file under a symlinked
+# directory names a row the hashfile does not have.
+<<<
+	rdir = realpath(dir, NULL);	/* longpath-ok: as above. */
+===
+	rdir = NULL;
+>>>

@@ -67,6 +67,22 @@ MU_TEST(test_is_area_ignored) {
 	free(fm);
 }
 
+/*
+ * A file the walk queued can be something else by the time the consumer gets
+ * it. That used to abort the run, losing the open write batch (#278); it is
+ * skipped and counted, before anything touches the hashfile.
+ */
+MU_TEST(test_a_file_that_became_a_directory_is_skipped) {
+	struct statx st = { .stx_mode = S_IFDIR | 0755 };
+	uint64_t before[SCAN_SKIP__COUNT], after[SCAN_SKIP__COUNT];
+
+	filescan_get_skips(before);
+	mu_check(__scan_file("/nowhere", NULL, &st) == 0);
+	filescan_get_skips(after);
+	mu_check(after[SCAN_SKIP_NOT_REGULAR] ==
+		 before[SCAN_SKIP_NOT_REGULAR] + 1);
+}
+
 MU_TEST(test_is_file_renamed) {
 	char *new_path = "/tmp/somefile";
 	char *path_in_db = "/tmp/somefile";
