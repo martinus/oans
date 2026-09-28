@@ -20,7 +20,8 @@ import signal
 import subprocess
 import time
 
-from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
+from harness import (DUPEREMOVE, DuperemoveTest, requires_real_binary,
+                     requires_reflink)
 
 KiB = 1 << 10
 
@@ -188,6 +189,8 @@ class SignalFlushTest(DuperemoveTest):
         self.assertDmOk("convergence run")
         self.assertReclaimedNothing("the tree is already deduped")
 
+    # The hook-driven tests above do run under the valgrind wrapper.
+    @requires_real_binary
     def test_a_real_signal_is_handled_like_the_hook(self):
         """The hook raises a real signal, but nothing beats sending one.
 
@@ -197,13 +200,6 @@ class SignalFlushTest(DuperemoveTest):
         is a race with the disk, so the durability claim is left to the
         hook-driven tests above, which pin it exactly.
         """
-        # Under make integration-valgrind, DUPEREMOVE is a shell wrapper: the
-        # signal would reach the script (which dies on it, exit -2), not oans.
-        # The hook-driven tests above do run there, under memcheck.
-        with open(DUPEREMOVE, "rb") as f:
-            if f.read(2) == b"#!":
-                self.skipTest("DUPEREMOVE is a wrapper script, not the binary")
-
         for i in range(2000):
             self.write(f"tree/f{i:04d}.bin", os.urandom(64 * KiB))
         self.sync()

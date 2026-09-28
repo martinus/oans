@@ -344,6 +344,7 @@ int dbfile_update_scanned_file(struct dbhandle *db, int64_t fileid,
 				unsigned int nr_extents);
 int dbfile_begin_trans(sqlite3 *db);
 int dbfile_commit_trans(sqlite3 *db);
+void dbfile_checkpoint(sqlite3 *db);
 int dbfile_abort_trans(sqlite3 *db);
 int dbfile_update_extent_poff(struct dbhandle *db, int64_t fileid,
 				uint64_t loff, uint64_t poff);

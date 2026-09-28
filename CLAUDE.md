@@ -880,9 +880,28 @@ counterexample. No dependencies, one header, minunit-compatible.
   holds its read snapshot across queries; wrapping the per-file change-detection
   reads in a single transaction (refreshed ~10s) cut `F_SETLK` from ~2/file
   (283k on a 141k rescan) to ~800, ~24% faster. The writer batches on the same
-  cadence so the reader snapshot doesn't pin the WAL against checkpointing.
-  Reader and writer must be **separate connections** (`db` listing handle vs
-  `wdb`/`scan_writer`).
+  cadence. Reader and writer must be **separate connections** (`db` listing
+  handle vs `wdb`/`scan_writer`).
+- **An open read transaction stops WAL checkpoints (#261).** A checkpoint
+  cannot copy a frame that is newer than the snapshot of an open reader. If the
+  snapshot saw a fully checkpointed WAL, the checkpoint copies nothing. And the
+  WAL file restarts from its start only after a checkpoint has copied all of
+  it. Three rules follow for the listing read transaction:
+  - **End it when the walk ends.** It used to stay open until all hashing was
+    done. One 8 TB image then gave a 513 GB WAL next to a 336 MB hashfile.
+    Measured on one 3 GiB file at 4K blocks: before, the database stayed at
+    0 MiB and the WAL grew for the whole scan; after, the WAL stayed at 4 MiB.
+  - **End it when the consumer waits longer than `COMMIT_INTERVAL_SEC`** for
+    the next file (`walk_fileq_pop()`), because a refresh happens only when a
+    file arrives.
+  - **Commit the write batch between the old and the new snapshot**
+    (`scan_read_tick()`). Snapshots taken back to back always lag the last
+    commit, so no checkpoint copies everything and the WAL never restarts while
+    the walk runs.
+  Any new long-lived reader must obey the same rules. Pinned by
+  `test_wal_checkpoint.py`, which uses `DUPEREMOVE_CHECKPOINT_PAUSE=N` (SIGSTOP
+  at the Nth hash checkpoint) to hold a run in the middle of a file. It covers
+  only the first rule.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`

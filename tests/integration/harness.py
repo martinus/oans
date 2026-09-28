@@ -197,6 +197,21 @@ requires_reflink = unittest.skipUnless(
     REFLINK, "scratch filesystem has no reflink support (needed for dedupe)")
 
 
+def _is_wrapper_script(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+# Under make integration-valgrind, DUPEREMOVE is a shell wrapper: a signal sent
+# to the child reaches the script, not oans. For tests that signal oans.
+requires_real_binary = unittest.skipIf(
+    _is_wrapper_script(DUPEREMOVE),
+    "DUPEREMOVE is a wrapper script, not the binary")
+
+
 # --------------------------------------------------------------------------
 # Filesystem type probe
 # --------------------------------------------------------------------------
