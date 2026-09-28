@@ -827,12 +827,14 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  *
  * A digest qualifies with two copies in the window, or one plus an anchor -
  * the same as "more than one copy up to ?2". Both branches below read grp, so
- * SQLite computes g0 once and scans the result twice. (Do not add "as
- * materialized" to say so: that keyword needs SQLite 3.35, and nothing else
- * here needs more than 3.25.) The cross join keeps the window's files as the
- * outer loop (idx_files_dedupeseq) and reads their blocks by fileid; the
- * planner would otherwise probe every copy of each digest in grp, old ones
- * included.
+ * SQLite 3.35 and later computes g0 once and scans the result twice. Older
+ * versions compute it twice, and are still faster than before (3.31: 0.17 s
+ * against 0.44 s per pass). Do not add "as materialized" to force it: that
+ * keyword needs 3.35, and nothing else here needs more than 3.25.
+ *
+ * The cross join keeps the window's files as the outer loop
+ * (idx_files_dedupeseq) and reads their blocks by fileid; the planner would
+ * otherwise probe every copy of each digest in grp, old ones included.
  *
  * The rows come out in the order the loaders need: every anchor first, then
  * the window's rows by file and then by rowid. So within one digest the older
