@@ -1354,6 +1354,12 @@ the line above it (the summary, a progress row); `ESC[2J` clears the screen.
   `escape-ok: <why>` (the only legitimate reason so far is the hashfile path,
   which is oans's own argument rather than something found in a walk). Modelled
   on `lint-longpath.py`, and wired into the same `make lint` CI job.
+  - **The lint could not see a path passed as the last argument (#276)**, the
+    most common place for one: its lookahead wanted a `,` or `)` after the
+    name, and the argument text it searched had the closing `)` cut off. Four
+    dedupe-worker messages and a resume notice printed scanned names raw
+    behind it. `scripts/test_lint_escape.py` runs in `make lint` and pins
+    each argument position, so a lint that cannot fail now fails.
 - **Escape at the print site, never in the stored string.** The path is what
   oans opens, stats and stores; only the display copy is escaped. The idiom is
   `declare_display_path(disp, p);` then print `disp` — a *declaration* macro, in

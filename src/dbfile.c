@@ -907,7 +907,7 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 					"(application_id 0x%08x); refusing to "
 					"touch it. Check the --hashfile path.\n",
 					filename, (unsigned)app_id);
-			else
+			else	/* escape-ok: oans's own --hashfile argument. */
 				eprintf("Error: %s is not an oans hashfile; "
 					"refusing to touch it. Check the "
 					"--hashfile path.\n", filename);

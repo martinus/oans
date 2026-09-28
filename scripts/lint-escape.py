@@ -67,7 +67,7 @@ WAIVER_LOOKBACK = 3
 _PRINT_RE = re.compile(
     r"(?<![_A-Za-z0-9])(" + "|".join(PRINT_CALLS) + r")\s*\(")
 _ARG_RE = re.compile(
-    r"(?<![_A-Za-z0-9.>\[])(" + "|".join(PATH_NAMES) + r")\s*(?=[,)])")
+    r"(?<![_A-Za-z0-9.>\[])(" + "|".join(PATH_NAMES) + r")\s*(?=\s*[,)]|\s*\Z)")
 # Whatever declare_display_path() introduced is escaped by construction, even
 # when it is spelled with an otherwise path-shaped name like `name`.
 _SAFE_RE = re.compile(r"declare_display_path\s*\(\s*(\w+)\s*,")

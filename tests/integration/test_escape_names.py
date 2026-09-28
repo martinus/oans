@@ -73,6 +73,18 @@ class EscapeNamesTest(DuperemoveTest):
         for _name, escaped in EVIL_NAMES:
             self.assertIn(escaped, out)
 
+    @requires_reflink
+    def test_already_shared_notice_escapes_names(self):
+        """Printed from a dedupe worker, and missed by the lint because the
+        name was the call's last argument (#276)."""
+        d = self._tree()
+        self.run_raw("-rd", d)
+        self.drop_hashfile()                # load the shared pairs again
+        out = self.run_raw("-rdv", d)
+        self.assertIn(b"already shares the target", out,
+                      "the notice under test was printed")
+        self.assertNoControlBytes(out)
+
     def test_scan_and_listing_escape_names(self):
         d = self._tree(size=8192)
         self.assertNoControlBytes(self.run_raw("-rv", d))

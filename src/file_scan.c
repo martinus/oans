@@ -2035,8 +2035,12 @@ static bool resume_scan(struct dbhandle *db, int64_t fileid, uint64_t size,
 	dbfile_unlock();
 
 	if (!usable) {
-		vprintf("Discarding an unusable checkpoint for %s; hashing it "
-			"from the start\n", name);
+		if (verbose) {
+			declare_display_path(disp, name);
+
+			vprintf("Discarding an unusable checkpoint for %s; "
+				"hashing it from the start\n", disp);
+		}
 		return false;
 	}
 
