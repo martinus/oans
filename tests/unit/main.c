@@ -119,6 +119,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_a_short_final_block_shortens_the_recorded_run);
 	MU_RUN(test_the_extent_search_driven_by_its_pool);
 	MU_RUN(test_the_interrupt_flag_and_its_test_hooks);
+	MU_RUN(test_a_worker_past_the_limit_waits_for_the_raise);
 	MU_RUN(test_the_wind_down_notice_is_said_once);
 	MU_RUN(test_fiemap_maps_a_real_file);
 	MU_RUN(test_fiemap_range_answers_for_the_range_asked_for);
