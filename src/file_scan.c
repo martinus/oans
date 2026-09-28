@@ -701,7 +701,8 @@ static unsigned int nr_roots_unusable;
 static GPtrArray *scan_root_paths;
 
 /* True if `path` is one of the roots, or lives underneath one. */
-static bool path_under_a_root(const char *path)
+/* The root `path` is under, or NULL. */
+static const char *path_under_a_root(const char *path)
 {
 	for (guint i = 0; i < scan_root_paths->len; i++) {
 		const char *root = g_ptr_array_index(scan_root_paths, i);
@@ -713,9 +714,9 @@ static bool path_under_a_root(const char *path)
 		 * that merely shares a prefix ("/data" vs "/database"). */
 		if (path[len] == '\0' || path[len] == '/' ||
 		    (len == 1 && root[0] == '/'))
-			return true;
+			return root;
 	}
-	return false;
+	return NULL;
 }
 
 
@@ -1041,7 +1042,7 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 	bool rdonly;
 	int fd;
 
-	fd = longpath_open(path, O_RDONLY);
+	fd = longpath_open(path, O_RDONLY | O_NONBLOCK);	/* a FIFO: #281 */
 	if (fd == -1)
 		return false;	/* unreadable is someone else's error to report */
 	rdonly = ro_subvol_lookup(fd, dev, true);
@@ -1102,7 +1103,8 @@ static int probe_fs(char *path, struct fs_probe *probe)
 	struct statfs fs;
 	int ret;
 	_cleanup_(mnt_unref_table_cleanup) struct libmnt_table *tb = NULL;
-	_cleanup_(closefd) int fd = longpath_open(path, O_RDONLY);
+	/* O_NONBLOCK: a FIFO root must not block the probe (#281). */
+	_cleanup_(closefd) int fd = longpath_open(path, O_RDONLY | O_NONBLOCK);
 	_cleanup_(freep) char *uuid_found = NULL;
 	/* Every message below names the path, and this runs once per root (or
 	 * per fs), not per file - so escape it once here rather than in each
@@ -2164,7 +2166,41 @@ static void queue_file_for_scan(const char *path, int64_t fileid,
  * hashfile may describe trees this run was not asked about, and hashing those
  * would be doing work the user did not request. Anything declined is simply
  * left to the walk, which applies the same rules.
+ *
+ * And only for a file the walk would reach from that root (walk_would_reach()):
+ * below a subdirectory only with -r, and through no directory that is
+ * excluded, a symlink or another filesystem. An exclude works only because the
+ * walk never enters the directory, so a prefix match seeded a file under
+ * `--exclude vm` all the same (#281).
  */
+static bool walk_would_reach(struct dbhandle *db, const char *root,
+			     const char *path)
+{
+	_cleanup_(freep) char *dir = strdup(path);
+	char *p;
+
+	if (!dir)
+		return false;
+	if (strcmp(dir, root) == 0)
+		return true;			/* the root itself */
+	for (p = dir + strlen(root);; *p = '/') {
+		struct statx st;
+
+		p = strchr(p + 1, '/');
+		if (!p)
+			return true;		/* the file's own component */
+		if (!options.recurse_dirs)
+			return false;
+		*p = '\0';
+		/* longpath-ok: as for the file below; declining is safe. */
+		if (statx(AT_FDCWD, dir, AT_SYMLINK_NOFOLLOW,
+			  STATX_BASIC_STATS, &st) ||
+		    !(st.stx_mask & STATX_BASIC_STATS) ||
+		    !S_ISDIR(st.stx_mode) || !check_file(db, dir, &st, true))
+			return false;
+	}
+}
+
 static void seed_checkpointed_files(struct dbhandle *db)
 {
 	char **paths;
@@ -2179,12 +2215,15 @@ static void seed_checkpointed_files(struct dbhandle *db)
 	for (int i = 0; i < n; i++) {
 		struct statx st;
 
-		if (!path_under_a_root(paths[i]))
+		const char *root = path_under_a_root(paths[i]);
+
+		if (!root || !walk_would_reach(db, root, paths[i]))
 			continue;
 		/* longpath-ok: seeding is only a shortcut, so declining is
 		 * always safe - a path over PATH_MAX fails here and is left to
 		 * the walk, which reaches it from a directory fd (#117). */
-		if (statx(AT_FDCWD, paths[i], 0, STATX_BASIC_STATS, &st) ||
+		if (statx(AT_FDCWD, paths[i], AT_SYMLINK_NOFOLLOW,
+			  STATX_BASIC_STATS, &st) ||
 		    !(st.stx_mask & STATX_BASIC_STATS) || !S_ISREG(st.stx_mode))
 			continue;
 		/* parent_checked: this is not a top-level seed, so a rejection
@@ -2742,40 +2781,62 @@ static void free_file_to_scan(struct file_to_scan **filep)
  * the context is still the from-scratch one. Everything stored for the file
  * goes, though, including the checkpoint itself.
  */
+static bool decline_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
+			   struct pscan_thread *tprogress, struct dbhandle *db,
+			   const char *why)
+{
+	struct scan_resume *r = file->resume;
+
+	if (verbose) {
+		declare_display_path(disp, file->path);
+
+		vprintf("%s: %s at %"PRIu64" bytes; hashing from the start\n",
+			disp, why, r->off);
+	}
+	scan_resume_drop(r);
+	ctxt->extent_cursor = 0;
+
+	/* The skipped bytes are back on the bill, here and in the run-wide
+	 * total __scan_file() sized without them. The row's path and size are
+	 * already right. */
+	tprogress->file_scanned_bytes = 0;
+	pscan_set_progress(0, r->off);
+	r->off = 0;
+
+	dbfile_lock();
+	if (scan_write_begin() == 0) {
+		dbfile_remove_hashes(db, file->fileid);
+		dbfile_remove_checkpoint(db, file->fileid);
+		scan_write_end();
+	}
+	dbfile_unlock();
+	return false;
+}
+
 static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 			 struct pscan_thread *tprogress, struct dbhandle *db)
 {
 	struct scan_resume *r = file->resume;
-	struct fiemap_extent *e;
+	struct fiemap_extent *e = get_extent(ctxt->fiemap, r->off,
+					     &ctxt->extent_cursor);
 
 	if (r->ext_csum) {
-		e = get_extent(ctxt->fiemap, r->off, &ctxt->extent_cursor);
 		if (!e || e->fe_logical != r->ext_loff ||
-		    e->fe_length != r->ext_len) {
-			declare_display_path(disp, file->path);
-
-			vprintf("%s: extent layout changed since the checkpoint "
-				"at %"PRIu64" bytes; hashing from the start\n",
-				disp, r->off);
-			scan_resume_drop(r);
-			ctxt->extent_cursor = 0;
-
-			/* The skipped bytes are back on the bill, here and in
-			 * the run-wide total __scan_file() sized without them.
-			 * The row's path and size are already right. */
-			tprogress->file_scanned_bytes = 0;
-			pscan_set_progress(0, r->off);
-			r->off = 0;
-
-			dbfile_lock();
-			if (scan_write_begin() == 0) {
-				dbfile_remove_hashes(db, file->fileid);
-				dbfile_remove_checkpoint(db, file->fileid);
-				scan_write_end();
-			}
-			dbfile_unlock();
-			return false;
-		}
+		    e->fe_length != r->ext_len)
+			return decline_resume(ctxt, file, tprogress, db,
+				"extent layout changed since the checkpoint");
+	} else if (!options.only_whole_files && e &&
+		   e->fe_logical < r->off &&
+		   !(e->fe_flags & FIEMAP_SKIP_FLAGS)) {
+		/*
+		 * No extent digest in progress, yet the offset is inside a data
+		 * extent: an only_whole_files run wrote this checkpoint, and it
+		 * kept no extent state (#281). Resumed, the extent's digest
+		 * would cover only the part from here on - wrong for good, and
+		 * silently, since a digest cannot be checked.
+		 */
+		return decline_resume(ctxt, file, tprogress, db,
+			"the checkpoint carries no extent state");
 	}
 
 	/* free_scan_ctxt() owns the checksums from here on. */
@@ -3806,6 +3867,25 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			break;
 
 		/*
+		 * Interrupted mid-file. A 1 TiB file must not hold the shutdown
+		 * for hours, so give up here - but check-point first, off the
+		 * usual interval, or everything since the last one is re-read
+		 * next run. That checkpoint force-commits the shared batch, so
+		 * it also makes every other file in it durable (#159, #201).
+		 *
+		 * Every pass, not only at the interval (#281): it sat below
+		 * the interval test, so a worker noticed Ctrl-C once per GiB,
+		 * and never without a hashfile, and this checkpoint could not
+		 * fire at all. A lost batch (#274) stops the file too.
+		 */
+		if (interrupted() || filescan_batch_lost()) {
+			if (checkpoints_enabled && ctxt.off > last_checkpoint &&
+			    !filescan_batch_lost())
+				write_checkpoint(&hashes, &ctxt, file->mtime);
+			return;
+		}
+
+		/*
 		 * Far enough in to be worth protecting. Any offset here can be
 		 * described: ctxt.off is exactly what the file checksum has
 		 * consumed, extents completed before it are staged and ready to
@@ -3827,20 +3907,6 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			continue;
 		}
 		last_checkpoint = ctxt.off;
-
-		/*
-		 * Interrupted mid-file. A 1 TiB file must not hold the shutdown
-		 * for hours, so give up here - but check-point first, off the
-		 * usual interval, or everything since the last one is re-read
-		 * next run. That checkpoint force-commits the shared batch, so
-		 * it also makes every other file in it durable (#159, #201).
-		 */
-		if (interrupted()) {
-			if (checkpoints_enabled && ctxt.off > last_checkpoint)
-				write_checkpoint(&hashes, &ctxt, file->mtime);
-			return;
-		}
-
 		checkpoints++;
 
 		/* Test hook: hold the run here, mid-file, for a test to look. */

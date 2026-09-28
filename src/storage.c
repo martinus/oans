@@ -144,7 +144,9 @@ int storage_detect(const char *path, struct storage_profile *p)
 	 * this function should not be another thing standing in the way of
 	 * lifting it.
 	 */
-	fd = longpath_open(path, O_RDONLY | O_CLOEXEC);
+	/* O_NONBLOCK: a FIFO named as a root would block this open until a
+	 * writer came, and SA_RESTART restarts it after Ctrl-C (#281). */
+	fd = longpath_open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0)
 		return -errno;
 

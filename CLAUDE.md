@@ -1171,6 +1171,18 @@ run picks the file up there.
     the named roots would hash terabytes nobody asked for. `scan_root_paths`
     exists solely for this (prefix match, guarding against `/data` vs
     `/database`).
+  - **And only if the walk would reach it (#281).** A prefix match is not
+    that: `--exclude` works by the walk never entering a directory, so a
+    checkpointed file under an excluded one was seeded and hashed anyway, as
+    was one in a subdirectory on a run without `-r`, or behind a directory
+    since replaced by a symlink. `walk_would_reach()` walks the path down from
+    its root - `-r` below the root, and each directory stat'ed without
+    following symlinks and put through `check_file()`.
+  - **A checkpoint without extent state inside a data extent is refused
+    (#281).** `only_whole_files` keeps no extent digest, so a default run
+    resuming its checkpoint hashed the extent from the checkpoint on and
+    stored that. `adopt_resume()` declines when the offset is past the start
+    of a data extent and no extent state came with it.
   - **Mark it seen (`mark_inode_seen` + `mark_file_seen`) or the walk queues it
     twice** and two workers hash one file at once. Pinned by asserting
     `run_history.files_scanned`, which is 2 instead of 1 when this is dropped.
@@ -1251,6 +1263,15 @@ v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
   through it is not a shutdown); `csum_whole_file` abandons the file it is on
   after writing an off-interval checkpoint, so a 1 TiB file costs one buffer of
   latency instead of hours.
+  - **That was not true until #281.** The `interrupted()` check sat below the
+    checkpoint-interval test, so a worker saw Ctrl-C once per GiB, never
+    without a hashfile, and the off-interval checkpoint could not fire at all
+    (dead since #212). Measured before: a 4 GiB file read 3,895 MiB past the
+    SIGINT without a hashfile. It is checked on every pass now, and a lost
+    batch (#274) stops the file the same way.
+  - **Opens that only probe use `O_NONBLOCK`.** A FIFO named as a root made
+    `storage_detect()`'s `open()` wait for a writer, and `SA_RESTART`
+    restarted it after the first Ctrl-C.
 - **The dedupe phase stops admitting batches and nothing else.** No new drain
   points: in-flight batches reap normally, `FIDEDUPERANGE` is atomic, and the
   generation-ordered watermark already guarantees `dedupe_seq` names only
