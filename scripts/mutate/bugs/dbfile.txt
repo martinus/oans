@@ -187,9 +187,9 @@
 # the column and every started-but-unhashed file reads as up to date: it is
 # never hashed again, and it silently never takes part in dedupe.
 <<<
-"select mtime, size, filename, id, digest is not null from files "	\
+"select mtime, size, filename, id, digest is not null, flags from files " \
 ===
-"select mtime, size, filename, id, 1 from files "			\
+"select mtime, size, filename, id, 1, flags from files "		\
 >>>
 
 # the two size limits are read through one scratch variable, unreset
