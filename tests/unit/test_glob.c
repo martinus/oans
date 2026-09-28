@@ -134,6 +134,49 @@ MU_TEST(test_glob_character_classes) {
 	mu_check(!gs_hit("a.txt", "/x/axtxt", false));
 }
 
+/*
+ * #283: a class never matches the separator, negated or not - gitignore
+ * matches names, and '/' is never part of one. POSIX classes are PCRE2 syntax
+ * too, and used to be mangled into a class of the characters "[:digt".
+ */
+MU_TEST(test_glob_a_class_is_one_name_character) {
+	mu_check(!gs_hit("a[!b]c", "/x/a/c", false));
+	mu_check(gs_hit("a[!b]c", "/x/axc", false));
+	mu_check(!gs_hit("a[/]c", "/x/a/c", false));
+	mu_check(gs_hit("[[:digit:]]x", "/d/5x", false));
+	mu_check(!gs_hit("[[:digit:]]x", "/d/ax", false));
+	mu_check(gs_hit("f[[:alpha:]0-9]", "/d/f7", false));
+}
+
+/*
+ * #283: a name that is not valid UTF-8 - old Latin-1 names on a NAS - is
+ * matched over bytes. In the UTF-8 regex no wildcard crossed such a byte, so
+ * the exclude silently did not apply. A valid UTF-8 name still takes `?` as
+ * one character.
+ */
+MU_TEST(test_glob_a_name_that_is_not_utf8_is_matched) {
+	mu_check(gs_hit("*.iso", "/d/caf\xe9.iso", false));
+	mu_check(gs_hit("/vol/*/cache", "/vol/\xe9/cache", true));
+	mu_check(gs_hit("/vol/**/cache", "/vol/\xe9/x/cache", true));
+	mu_check(gs_hit("?.txt", "/vol/\xe9.txt", false));
+	mu_check(!gs_hit("?.txt", "/vol/\xe9\xe9.txt", false));
+
+	mu_check(gs_hit("?.txt", "/vol/\xc3\xa9.txt", false));	/* é */
+	mu_check(!gs_hit("??.txt", "/vol/\xc3\xa9.txt", false));
+}
+
+/*
+ * #283: `**` and the any-depth prefix cross a newline in a name, so a crafted
+ * name cannot step out from under an exclude; and `$` is the end of the path,
+ * not the spot before a trailing newline.
+ */
+MU_TEST(test_glob_a_newline_in_a_name_is_just_a_character) {
+	mu_check(gs_hit("/data/private/**", "/data/private/a\nb", false));
+	mu_check(gs_hit("Steam/temp", "/data/x\ny/Steam/temp", true));
+	mu_check(gs_hit("foo", "/d/foo", false));
+	mu_check(!gs_hit("foo", "/d/foo\n", false));
+}
+
 MU_TEST(test_glob_directory_only) {
 	/* A trailing '/' restricts the pattern to directories. */
 	mu_check(gs_hit("cache/", "/a/cache", true));
@@ -238,9 +281,17 @@ static void gen_glob_path(struct prop *p, char *buf, size_t sz)
 		size_t len = (size_t)prop_range(p, 1, 3);
 
 		buf[o++] = '/';
-		for (size_t i = 0; i < len; i++)
-			buf[o++] = prop_chance(p, 6) ? '.'
-						     : (char)prop_range(p, 'a', 'c');
+		for (size_t i = 0; i < len; i++) {
+			/* A newline and a byte that is not UTF-8 are both
+			 * legal in a name, and both used to escape a pattern
+			 * (#283). */
+			switch (prop_below(p, 12)) {
+			case 0: case 1: buf[o++] = '.'; break;
+			case 2: buf[o++] = '\n'; break;
+			case 3: buf[o++] = (char)0xe9; break;
+			default: buf[o++] = (char)prop_range(p, 'a', 'c');
+			}
+		}
 	}
 	buf[o] = '\0';
 }

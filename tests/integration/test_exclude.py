@@ -163,3 +163,16 @@ class ExcludeTest(DuperemoveTest):
         self.dm("-r", "--exclude=f[abc", self.path("tree"))
         self.assertNotEqual(0, self.rc, "an unterminated class is an error")
         self.assertIn("unterminated", self.out)
+
+    def test_a_name_that_is_not_utf8_is_excluded(self):
+        """A Latin-1 name is not valid UTF-8, and no wildcard crossed its
+        byte, so `*.iso` did not exclude `caf\\xe9.iso` (#283)."""
+        d = self.path("tree")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d.encode(), b"caf\xe9.iso"), "wb") as f:
+            f.write(os.urandom(8000))
+        self.mkrand("tree/keep", 8000)
+        self.scan(d, "--exclude", "*.iso")
+        self.assertDmOk()
+        self.assertEqual(1, self.hf_count("files"))
+

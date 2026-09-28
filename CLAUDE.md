@@ -1431,6 +1431,18 @@ Negation (`!`) is deliberately unsupported.
   match cost is independent of pattern count. `GRegex` is PCRE2 and GLib is
   already linked — no new dependency. Exact absolute paths skip the regex via a
   hash lookup.
+- **Every pattern is compiled twice (#283)**: for UTF-8, where `?` and a class
+  take one character, and `G_REGEX_RAW`, over bytes. `raw_path()` picks per
+  name: PCRE2 leaves matching invalid UTF-8 undefined, and in practice no
+  wildcard crossed such a byte, so `*.iso` silently missed a Latin-1
+  `caf\xe9.iso`. In the names that are not UTF-8 - Latin-1, mostly - a byte
+  *is* a character, which is why that split beats translating `?` and classes
+  into byte sequences. Both get `DOTALL` (a name may hold a newline, and `**`
+  stopped at one, letting a crafted name out from under an exclude) and
+  `DOLLAR_ENDONLY` (`foo` excluded `foo\n`). A class never matches `/`, and
+  POSIX classes (`[[:digit:]]`) pass through instead of being escaped into a
+  class of their letters. The property path generator draws `\n` and `\xe9`
+  for this; with the old code two properties fail on their own.
 - **Compile once in `filescan_init()`**, on the main thread before any walker
   exists; the set is read-only afterwards so walkers need no lock. Don't move
   the compile later or make it lazy.

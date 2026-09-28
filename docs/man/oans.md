@@ -192,8 +192,10 @@ file is recorded once.
       `--exclude 'cache/'` skips directories named `cache` but keeps files of
       that name.
     - `*` matches any run of characters **except `/`**, `?` matches one
-      non-`/` character, `[a-z]` and `[!a-z]` are character classes, and `**`
-      crosses directory boundaries.
+      non-`/` character, `[a-z]`, `[!a-z]` and POSIX classes such as
+      `[[:digit:]]` match one non-`/` character, and `**` crosses directory
+      boundaries. A name that is not valid UTF-8 (an old Latin-1 name, say) is
+      matched byte by byte, so there `?` matches one byte.
 
     <!-- -->
 
