@@ -51,6 +51,11 @@ bool filescan_seed_failed(void);
  * and the wording, the way filescan_report_excludes() does.
  */
 bool filescan_report_fs_unusable(void);
+/*
+ * True once a failed hashfile write has cost the scan its open batch (#274).
+ * The scan stops, and the run must fail: the next run rehashes those files.
+ */
+bool filescan_batch_lost(void);
 
 /*
  * How many scan roots named on the command line (or in a "-" stdin list) could
