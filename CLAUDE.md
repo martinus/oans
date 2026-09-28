@@ -921,10 +921,17 @@ counterexample. No dependencies, one header, minunit-compatible.
   probe for older members per group through the digest index.
   - The two loaders (`GET_DUPLICATE_BLOCKS`/`_EXTENTS`) are rewritten that way,
     with identical rows and order, verified pass by pass on synthetic
-    hashfiles. The pre-analysis (`EXTENTS_GROUP_IS_NEW`) still has the old
-    shape on purpose: incrementally it is 6-9 s against ~20 s for both fixes
-    tried, and it churns only when most rows are new (10.8 GiB on a first scan
-    of the fragmented tree). A fix there must beat it on both.
+    hashfiles.
+  - **A list of rowids counts too.** The representatives' `rowid in (select
+    min(rowid) ... group by digest)` arrives in digest order, i.e. random
+    rowid order; `order by 1` sorts it first. Measured where every new file
+    has an older twin (a snapshot, #206): 5.1 GiB -> 363 MiB.
+  - **The pre-analysis keeps its scoped `IN` form for incremental runs** —
+    6-9 s there against ~20 s for both rewrites tried. At `seq_lo == 0` it
+    drops the predicate instead (`COUNT_*_WORK("1")`), which is exact since
+    every generation is >= 1: on the fragmented tree's first scan, 33 s and
+    10.8 GiB of temp writes -> 19 s and none. Between the two, a large
+    increment still churns in proportion to how much is new.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`

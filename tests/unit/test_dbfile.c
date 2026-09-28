@@ -1331,6 +1331,52 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 }
 
 /*
+ * The progress pre-analysis counts only groups with a member newer than
+ * seq_lo, and their bytes as the dedupe will do them: every new member against
+ * an older one, or all but one when every member is new. (Its group predicate
+ * only narrows the work - `having new_cnt > 0` decides which groups count - so
+ * leaving the predicate out at seq_lo == 0, #260, changes no figure here.)
+ *
+ * Generation 90 holds an already-deduped file pair and extent pair,
+ * generation 91 one new pair of each. Other tests' rows sit in lower
+ * generations, so with seq_lo = 90 only this fixture can be counted.
+ */
+MU_TEST(test_the_work_estimate_counts_only_groups_with_a_new_member) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct extent_csum ext = { .loff = 0, .poff = 4096, .len = 4096 };
+	int64_t id[4];
+	uint64_t groups, bytes;
+
+	/* Whole-file pairs: old (a, b) and new (c, d). */
+	put_dupe(db, "/work/a", 70, 70, 65536, 90, 0, 1);
+	put_dupe(db, "/work/b", 71, 70, 65536, 90, 0, 1);
+	put_dupe(db, "/work/c", 72, 71, 65536, 91, 0, 1);
+	put_dupe(db, "/work/d", 73, 71, 65536, 91, 0, 1);
+
+	/* Extent pairs in files that are not whole-file duplicates. */
+	id[0] = put_dupe(db, "/work/e", 74, 72, 65536, 90, 0, 1);
+	id[1] = put_dupe(db, "/work/f", 75, 73, 65536, 90, 0, 1);
+	id[2] = put_dupe(db, "/work/g", 76, 74, 65536, 91, 0, 1);
+	id[3] = put_dupe(db, "/work/h", 77, 75, 65536, 91, 0, 1);
+	digest_of(ext.digest, 78);
+	for (unsigned int i = 0; i < 2; i++)
+		mu_check(dbfile_store_extent_hashes(db, id[i], 1, &ext) == 0);
+	digest_of(ext.digest, 79);
+	for (unsigned int i = 2; i < 4; i++)
+		mu_check(dbfile_store_extent_hashes(db, id[i], 1, &ext) == 0);
+
+	dbfile_count_dupe_work(db, 90, true, &groups, &bytes);
+	mu_check(groups == 1);
+	mu_check(bytes == 65536);
+
+	dbfile_count_dupe_work(db, 90, false, &groups, &bytes);
+	mu_check(groups == 1);			/* the larger of 1 and 1 */
+	mu_check(bytes == 65536 + 4096);
+
+	exec(db, "delete from files where filename like '/work/%'"); /* hashes cascade */
+}
+
+/*
  * The extents of one file that nothing else in the hashfile shares.
  *
  * `--dedupe-options=partial` asks this for each file, then searches those
