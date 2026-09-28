@@ -469,13 +469,14 @@ static unsigned int block_batch_max = BLOCK_BATCH_MAX;
  * deterministically, where racing a real signal against a read is not.
  *
  * DUPEREMOVE_CHECKPOINT_PAUSE stops the whole process (SIGSTOP) at that many
- * checkpoints into a file, and SIGCONT resumes the hashing. It holds a run in
- * the middle of a large file, so a test can look at the hashfile as the run
- * leaves it there (#261).
+ * checkpoints into a file, once the walk has ended, and SIGCONT resumes the
+ * hashing. It holds a run in the middle of a large file after the listing is
+ * done, so a test can look at the hashfile as the run leaves it there (#261).
  */
 static uint64_t checkpoint_interval = CHECKPOINT_INTERVAL_BYTES;
 static unsigned int checkpoint_stop_after;
 static unsigned int checkpoint_pause_at;
+static atomic_bool walk_listed;	/* set once the consumer is done listing */
 
 struct hashes {
 	unsigned int extents_count;
@@ -1767,6 +1768,7 @@ int filescan_walk_run(struct dbhandle *db)
 
 	/* The csum workers may write for hours yet; don't pin the WAL (#261). */
 	scan_read_flush();
+	atomic_store(&walk_listed, true);
 
 	for (i = 0; i < walk_nthreads; i++)
 		g_thread_join(threads[i]);
@@ -3620,8 +3622,11 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		checkpoints++;
 
 		/* Test hook: hold the run here, mid-file, for a test to look. */
-		if (checkpoints == checkpoint_pause_at)
+		if (checkpoints == checkpoint_pause_at) {
+			while (!atomic_load(&walk_listed))
+				g_usleep(1000);
 			raise(SIGSTOP);
+		}
 
 		/* Test hook: stand in for the kill this exists to survive. */
 		if (checkpoints == checkpoint_stop_after) {

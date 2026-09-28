@@ -122,6 +122,16 @@ static inline gpointer oans_tsan_queue_pop(GAsyncQueue *q)
 	return data;
 }
 
+static inline gpointer oans_tsan_queue_timeout_pop(GAsyncQueue *q,
+						   guint64 timeout)
+{
+	gpointer data = g_async_queue_timeout_pop(q, timeout);
+
+	if (data)
+		__tsan_acquire(data);
+	return data;
+}
+
 /*
  * A GThreadPool worker is entered by GLib itself, so there is no pop call to
  * wrap - the pool trampoline (or the worker) calls this on the item instead.
@@ -178,6 +188,7 @@ static inline void oans_tsan_pool_free(GThreadPool *pool, gboolean immediate,
 #define g_thread_pool_free(p, i, w)	oans_tsan_pool_free(p, i, w)
 #define g_async_queue_push(q, d)	oans_tsan_queue_push(q, d)
 #define g_async_queue_pop(q)		oans_tsan_queue_pop(q)
+#define g_async_queue_timeout_pop(q, t)	oans_tsan_queue_timeout_pop(q, t)
 
 #else	/* not a TSAN build: nothing to annotate */
 

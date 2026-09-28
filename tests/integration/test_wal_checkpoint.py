@@ -5,8 +5,8 @@ file until the hashing ended, so no checkpoint could copy the WAL and it grew
 to 513 GB. The test holds a run in the middle of one file with
 DUPEREMOVE_CHECKPOINT_PAUSE, which stops the process at a named hash checkpoint:
 a timed poll would race the hashing, and a fast disk finishes the file first.
-The walk is over by then and every write so far is committed, so a checkpoint
-from outside must copy all of it.
+The hook waits for the walk to end before it stops the run, and every write so
+far is committed, so a checkpoint from outside must copy all of it.
 """
 
 import os

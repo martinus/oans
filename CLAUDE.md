@@ -901,7 +901,14 @@ counterexample. No dependencies, one header, minunit-compatible.
   Any new long-lived reader must obey the same rules. Pinned by
   `test_wal_checkpoint.py`, which uses `DUPEREMOVE_CHECKPOINT_PAUSE=N` (SIGSTOP
   at the Nth hash checkpoint) to hold a run in the middle of a file. It covers
-  only the first rule.
+  only the first rule. The hook waits for the walk to end before it stops the
+  run: without that wait, a loaded CI runner reached the checkpoint before the
+  consumer ended its snapshot, and the test failed on the fixed code.
+  - **The consumer's timed pop needs its own ThreadSanitizer wrapper.**
+    `src/tsan.h` annotates each GLib queue call by name, and
+    `g_async_queue_timeout_pop()` was not among them, so every item handed from
+    a walker to the consumer read as a race (exit 66 in the sanitizer leg).
+    Wrap any new GLib hand-off call the same way.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`
