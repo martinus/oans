@@ -197,13 +197,13 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 {
 	int done = 0;
 	int target_status;
-	uint64_t target_freed;
+	uint64_t target_freed, target_done;
 	struct filerec *f;
 	const char *status_str = "[unknown status]";
 
 	while (!done) {
 		done = pop_one_dedupe_result(ctxt, &target_status,
-					     &target_freed, &f);
+					     &target_freed, &target_done, &f);
 		/* Space freed, not length compared (#187). */
 		if (freed_bytes)
 			*freed_bytes += target_freed;
@@ -221,8 +221,11 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 			continue;
 
 		if (target_status == FILE_DEDUPE_RANGE_DIFFERS) {
-			status_str = "content does not match the target "
-				     "(kernel byte-compare); left untouched";
+			status_str = target_done ?
+				"content stopped matching the target "
+				"(kernel byte-compare); deduplicated up to there" :
+				"content does not match the target "
+				"(kernel byte-compare); left untouched";
 			atomic_fetch_add(&dedupe_dest_differs, 1);
 		} else {
 			if (target_status < 0)
@@ -547,7 +550,9 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			if (fstat(extent->e_file->fd, &st) == 0 &&
 			    (whole_file_dedup ?
 			     (uint64_t)st.st_size != len :
-			     (uint64_t)st.st_size + 4095 < extent->e_loff + len)) {
+			     (uint64_t)st.st_size +
+			     dedupe_blocksize(extent->e_file->fd) - 1 <
+			     extent->e_loff + len)) {
 				atomic_fetch_add(&dedupe_dest_changed, 1);
 				if (verbose) {
 					declare_display_path(disp,
@@ -717,13 +722,13 @@ run_dedupe:
 			}
 
 			ret = dedupe_extents(ctxt);
-			if (ret == 0) {
-				process_dedupe_results(ctxt, freed_bytes);
-			} else {
+			if (ret) {
 				ret = errno;
 				eprintf("FAILURE: Dedupe ioctl returns %d: %s\n",
 					ret, strerror(ret));
 			}
+			/* Earlier rounds may have shared part of it (#280). */
+			process_dedupe_results(ctxt, freed_bytes);
 		}
 close_files:
 		filerec_close_open_list(&open_files);

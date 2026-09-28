@@ -8,7 +8,9 @@ need a reflink-capable filesystem.
 """
 
 import os
-from harness import DuperemoveTest, requires_reflink
+import subprocess
+from harness import (DuperemoveTest, requires_reflink, requires_btrfs,
+                     phys_extents)
 
 
 @requires_reflink
@@ -53,3 +55,40 @@ class EinvalTest(DuperemoveTest):
         self.assertEqual(before, self.tree_digest(self.path("tree")), "data preserved")
 
     # A sparse file with a *unique* head and a shared tail placed after a hole.
+
+
+@requires_btrfs
+class EinvalScopeTest(DuperemoveTest):
+    """One EINVAL shortened every later request in the run (#280).
+
+    A destination whose NODATASUM flag differs from the target's (a file
+    copied out of a `chattr +C` directory) comes back EINVAL. oans then
+    retries with whole blocks, for kernels that reject an unaligned length -
+    but it kept that for the rest of the process, on every thread. btrfs
+    shares a file's last partial block when both files end there, so every
+    later pair kept its tail unshared, and the already-shared check, which
+    compares whole blocks, called them done on every later run.
+    """
+    serial = True
+
+    def test_an_einval_in_one_group_leaves_the_next_whole(self):
+        big = os.urandom(1 << 20)       # the larger group is deduped first
+        self.write("tree/a1", big)
+        a2 = self.path("tree/a2")
+        open(a2, "wb").close()
+        if subprocess.run(["chattr", "+C", a2]).returncode:
+            self.skipTest("chattr +C not supported here")
+        with open(a2, "ab") as f:
+            f.write(big)
+        small = os.urandom(10000)
+        b1 = self.write("tree/b1", small)
+        b2 = self.write("tree/b2", small)
+        self.sync()
+
+        self.dm("-rdv", self.path("tree"), "--io-threads=1", quiet=False)
+        self.assertEqual(0, self.rc, self.out)
+        self.assertIn("Invalid argument", self.out, "setup: a2 was refused")
+        self.sync()
+        self.assertEqual(phys_extents(b1), phys_extents(b2),
+                         "b2 shares all of b1, its last partial block too")
+

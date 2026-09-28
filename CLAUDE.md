@@ -1852,11 +1852,31 @@ that same tree (6.6 GiB → 1.4 GiB → 131 MiB → 21.3 MiB → **0 B**):
   record. Holes count too: fiemap omits them, matching holes on both sides *are*
   shared (a browser cache is mostly hole), and a hole facing data is not.
 - **Compare whole blocks only.** The kernel rounds a dedupe length down to a
-  filesystem block, so a trailing partial block can never be shared and
-  comparing it makes the check permanently unsatisfiable. Trim with
-  `dedupe_blocksize()` — but **fall back to the untrimmed length below one
-  block**, or the skip is silently disabled for every sub-block file (that alone
-  was the last 21.3 MiB).
+  filesystem block, so a trailing partial block that is not at both files' EOF
+  is never shared, and comparing it makes the check permanently unsatisfiable.
+  Trim with `dedupe_shareable_len()` — but **fall back to the untrimmed length
+  below one block**, or the skip is silently disabled for every sub-block file
+  (that alone was the last 21.3 MiB).
+  - **At EOF on both sides the tail block *is* shared.** Measured on btrfs,
+    kernel 7.1 (#280): a 10,000-byte pair deduped with length 10,000 ends as
+    one shared 3-block extent; a 5,000-byte range ending at neither EOF is
+    shortened to 4,096 and still *reported* as 5,000. So trimming stays right
+    for the check, which only compares less, but a *request* must not be
+    trimmed unless the kernel asks for it.
+  - **The kernel asks per request, and so does oans now (#280).** An EINVAL
+    on the first destination makes oans retry with whole blocks, for kernels
+    that reject an unaligned length. That was a process-wide static, so one
+    EINVAL - a NODATASUM mismatch from a file copied out of a `chattr +C`
+    directory is enough - trimmed every later request on every thread, left
+    every later file's tail unshared, and the check above then called those
+    files done forever. It is `dedupe_ctxt.aligned` now, and the retry is
+    skipped when the length is already whole blocks.
+  - The "changed since scan" size check allows `dedupe_blocksize() - 1` of
+    fiemap overshoot, not 4095: on 16K and 64K blocks the old slack skipped
+    most shared tails as changed.
+  - A destination that fails in a later 32 MiB round keeps the credit of the
+    rounds before it, and an ioctl that fails outright still reports its
+    destinations (`fail_in_flight()`).
 
 Diagnosing this class: **bisect by scope.** Every subdirectory and every *pair*
 of subdirectories converged while their union did not — that pattern means the
