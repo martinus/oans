@@ -2098,6 +2098,43 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 }
 
 /*
+ * Whether an up-to-date row's digest can stand, for a row an older binary
+ * hashed (#273). Those filled a whole read buffer with zeroes whenever it
+ * touched a preallocated extent, so only a file with an UNWRITTEN extent can
+ * carry a wrong digest - and an unchanged file is never hashed again, so the
+ * wrong one would stay for good. One fiemap per such row, once: a file with no
+ * UNWRITTEN extent gets FILE_UNWRITTEN_CHECKED and is not asked again, and one
+ * with it is rehashed, which sets the bit too.
+ *
+ * A file that cannot be opened or mapped keeps its digest and is asked again
+ * next run: hashing would fail on it the same way.
+ */
+static bool unwritten_digest_ok(const char *path, int64_t fileid)
+{
+	_cleanup_(closefd) int fd = longpath_open(path, O_RDONLY);
+	_cleanup_(freep) struct fiemap *fiemap = NULL;
+
+	if (fd == -1)
+		return true;
+	fiemap = do_fiemap(fd);
+	if (!fiemap)
+		return true;
+
+	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++)
+		if (fiemap->fm_extents[i].fe_flags & FIEMAP_EXTENT_UNWRITTEN)
+			return false;
+
+	dbfile_lock();
+	if (scan_write_begin() == 0) {
+		dbfile_add_file_flags(scan_writer, fileid,
+				      FILE_UNWRITTEN_CHECKED);
+		scan_write_end();
+	}
+	dbfile_unlock();
+	return true;
+}
+
+/*
  * Returns nonzero on fatal errors only
  * This function schedules csum_whole_file()
  * The caller must call check_file() before and must not call
@@ -2171,7 +2208,9 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 		    && dbfile.size == st->stx_size;
 
 	/* Database is up-to-date, nothing more to do */
-	if (unchanged && dbfile.digest_valid && !file_renamed) {
+	if (unchanged && dbfile.digest_valid && !file_renamed &&
+	    ((dbfile.flags & FILE_UNWRITTEN_CHECKED) ||
+	     unwritten_digest_ok(path, dbfile.id))) {
 		mark_file_seen(dbfile.id);	/* still on disk: prune can skip it */
 		return 0;
 	}
@@ -2606,44 +2645,51 @@ static int add_block_hash(struct hashes *hashes,
 }
 
 /*
- * Check if the area should be scanned.
+ * True if nothing in [start, start + len) is backed by data: every byte of it
+ * lies in a hole or in an extent with FIEMAP_SKIP_FLAGS (preallocated or
+ * inline), and at least one such extent overlaps it. That area reads back as
+ * zeroes, so the caller may fake it instead of reading it.
  *
- * `cursor` is the caller's get_extent() resume hint (see fiemap.c). The walk
- * below queries strictly increasing offsets, so without a hint every iteration
- * rescans the extent array from index 0 - quadratic in the extent count. On a
- * heavily fragmented file (65k extents in 1 GiB is ordinary for btrfs CoW, and
- * dedupe itself fragments) that dominated the scan at ~49% of CPU. Threading
- * the hint through makes one pass over a file O(extents). A stale hint stays
- * correct: get_extent() validates it and falls back to a full scan.
+ * It must be the *whole* area (#273). This used to answer true as soon as any
+ * extent it reached was preallocated, and on a hole it took the next extent
+ * without checking that it starts inside the area at all - so a buffer of real
+ * data followed by a preallocated tail was hashed as zeroes, and two different
+ * files got one digest.
+ *
+ * `cursor` is the caller's get_extent() resume hint (see fiemap.c). The scan
+ * queries strictly increasing offsets, so without a hint every call rescans the
+ * extent array from index 0 - quadratic in the extent count. On a heavily
+ * fragmented file (65k extents in 1 GiB is ordinary for btrfs CoW, and dedupe
+ * itself fragments) that dominated the scan at ~49% of CPU. Only the lookup at
+ * `start` is written back: that is the offset the caller asks about next, and
+ * a hint pointing further ahead would be stale for it.
  */
 static bool is_area_ignored(struct fiemap *fiemap, size_t start, size_t len,
 			    unsigned int *cursor)
 {
 	size_t end = start + len;
-	struct fiemap_extent *current_extent;
 	unsigned int cur = cursor ? *cursor : 0;
-	bool ignored = false;
+	bool first = true, skipped = false;
 
 	while (start < end) {
-		current_extent = get_extent(fiemap, start, &cur);
+		struct fiemap_extent *e = get_extent(fiemap, start, &cur);
 
-		/* File changed since we fiemap */
-		if (!current_extent)
+		if (first && cursor)
+			*cursor = cur;
+		first = false;
+
+		/* The rest of the area is a hole. */
+		if (!e || e->fe_logical >= end)
 			break;
 
-		if (current_extent->fe_flags & FIEMAP_SKIP_FLAGS) {
-			ignored = true;
-			break;
-		}
+		if (!(e->fe_flags & FIEMAP_SKIP_FLAGS))
+			return false;
 
-		if (current_extent->fe_flags & FIEMAP_EXTENT_LAST)
-			break;
-		start = current_extent->fe_logical + current_extent->fe_length + 1;
+		skipped = true;
+		start = e->fe_logical + e->fe_length;
 	}
 
-	if (cursor)
-		*cursor = cur;
-	return ignored;
+	return skipped;
 }
 
 /*
@@ -3158,7 +3204,8 @@ static bool try_layout_copy(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		return false;
 
 	/* Where the file lives is this file's business, not the donor's. */
-	flags = filescan_fd_is_readonly_subvol(ctxt->fd) ? FILE_RO_SUBVOL : 0;
+	flags = FILE_UNWRITTEN_CHECKED |
+		(filescan_fd_is_readonly_subvol(ctxt->fd) ? FILE_RO_SUBVOL : 0);
 
 	tprogress->status = thread_waiting_lock;
 	dbfile_lock();
@@ -3718,6 +3765,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * of needless work: https://github.com/markfasheh/duperemove/issues/316
 	 */
 	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
+			FILE_UNWRITTEN_CHECKED |
 			(inlined ? FILE_INLINED : 0) |
 			(rdonly_subvol ? FILE_RO_SUBVOL : 0),
 			ctxt.fiemap->fm_mapped_extents);

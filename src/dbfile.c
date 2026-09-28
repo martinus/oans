@@ -1009,7 +1009,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	 * digest at all - the row is written before hashing starts, not after.
 	 */
 #define SELECT_FILE_CHANGES						\
-"select mtime, size, filename, id, digest is not null from files "	\
+"select mtime, size, filename, id, digest is not null, flags from files " \
 "where ino = ?1 and subvol = ?2;"
 	dbfile_prepare_stmt(select_file_changes, SELECT_FILE_CHANGES);
 
@@ -1058,6 +1058,10 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	 */
 #define UPDATE_DEDUPE_SEQ "update files set dedupe_seq = ?2 where id = ?1;"
 	dbfile_prepare_stmt(update_dedupe_seq, UPDATE_DEDUPE_SEQ);
+
+	/* Mark an up-to-date row as rechecked (#273). */
+#define ADD_FILE_FLAGS "update files set flags = flags | ?2 where id = ?1;"
+	dbfile_prepare_stmt(add_file_flags, ADD_FILE_FLAGS);
 
 	/* Snapshot-aware scan (#206). The donor's stored extent rows are the
 	 * record array its fiemap reported, so they double as the exact
@@ -2223,6 +2227,13 @@ int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq)
 	return run_by_fileid_arg(stmt, fileid, seq);
 }
 
+int dbfile_add_file_flags(struct dbhandle *db, int64_t fileid,
+			  unsigned int flags)
+{
+	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.add_file_flags;
+	return run_by_fileid_arg(stmt, fileid, flags);
+}
+
 int dbfile_store_extent_hashes(struct dbhandle *db, int64_t fileid,
 				uint64_t nb_hash, struct extent_csum *hashes)
 {
@@ -2579,6 +2590,7 @@ int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 
 	dbfile->id = sqlite3_column_int64(stmt, 3);
 	dbfile->digest_valid = sqlite3_column_int(stmt, 4) != 0;
+	dbfile->flags = sqlite3_column_int(stmt, 5);
 
 	ret = 0;
 
