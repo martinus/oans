@@ -301,9 +301,9 @@
 # oans stores no extents for an inlined file and the kernel declines to
 # deduplicate it, so every group formed around one is work that can only fail.
 <<<
-"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
+"	where not (flags & 1) and (digest, size) in ( "			\
 ===
-"	where dedupe_seq <= ?2 and (digest, size) in ( "			\
+"	where (digest, size) in ( "					\
 >>>
 
 # the elected target is no longer loaded first
@@ -360,6 +360,62 @@
 "and e.rowid = extents.rowid);"
 >>>
 
+# ---------------------------------------------------------------- #272, #279
+
+# a whole-file group counts only the members up to the window's end
+# The target is elected over every member, so it can sit in a later window. A
+# member alone in an earlier window then saw a group of one and was skipped,
+# and the target's window did not load it either: never deduped, even on a
+# first scan.
+<<<
+"	where not (flags & 1) and (digest, size) in ( "			\
+===
+"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
+>>>
+
+# a whole-file target new this run leaves the older copies where they are
+# The older copies were deduped onto the previous target in an earlier run.
+# Loaded as the new target alone - a group of one - nothing moves them, and no
+# later run loads the group again.
+<<<
+"	or (t.seq > ?1 and t.seq <= ?2 and f.dedupe_seq <= ?3)) "	\
+===
+"	) "								\
+>>>
+
+# the estimate does not count the older copies a new target brings
+<<<
+"                  case when " FILES_TARGET_IS_NEW " then o - 1 else 0 end) " \
+===
+"                  0) "							\
+>>>
+
+# later windows anchor an extent group on the older copy with the lowest rowid
+# Rowids follow hashing order, not listing order, so this is often not the
+# member the first window made the target, and a later window can dedupe onto
+# a copy the earlier one is still moving.
+<<<
+"		order by wo.dedupe_seq, wo.id, o.rowid limit 1) end "	\
+===
+"		order by o.rowid limit 1) end "				\
+>>>
+
+# later windows anchor on the lowest file id among the older copies
+# The fix #279 first proposed. A resumed file keeps its id but gets a later
+# generation, so the lowest id can be a copy a later window is still moving.
+<<<
+"		order by wo.dedupe_seq, wo.id, o.rowid limit 1) end "	\
+===
+"		order by wo.id, o.rowid limit 1) end "			\
+>>>
+
+# the first window orders its rows by file id alone
+<<<
+"order by n, s, fileid, r;"
+===
+"order by n, fileid, r;"
+>>>
+
 # ---------------------------------------------------------------- #238
 
 # a failed load publishes the buffer it was about to free
@@ -413,7 +469,7 @@
 # target, and each pass can pick a different one.
 <<<
 "	from grp join extents e on e.rowid = grp.anchor) "		\
-"order by n, fileid, r;"
+"order by n, s, fileid, r;"
 ===
 "	from grp join extents e on e.rowid = grp.anchor) "		\
 "order by fileid, r;"
@@ -437,10 +493,10 @@
 # n - 1 copies instead of n. The bar then reaches 100% before the dedupe ends.
 <<<
 #define COUNT_FILES_WORK_SINCE						\
-	COUNT_FILES_WORK(FILES_OLD_MEMBER, "and f.dedupe_seq > ?1 ", "+f.digest")
+	COUNT_FILES_WORK(FILES_OLD_MEMBERS, "and f.dedupe_seq > ?1 ", "+f.digest")
 ===
 #define COUNT_FILES_WORK_SINCE						\
-	COUNT_FILES_WORK("?1 < 0", "and f.dedupe_seq > ?1 ", "+f.digest")
+	COUNT_FILES_WORK("(?1 < 0)", "and f.dedupe_seq > ?1 ", "+f.digest")
 >>>
 
 # the estimate stops asking for an older member of an extent group

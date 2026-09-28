@@ -317,8 +317,10 @@ def measure(db, query, sql, first, last):
     key = LOADERS[query][1]
     total_t = total_w = 0
     groups = []
+    # ?3, where it is used, is where the dedupe phase started (#272).
+    extra = (first,) if "?3" in sql else ()
     for lo, hi in windows(first, last):
-        t, w, rows = run(db, sql, (lo, hi))
+        t, w, rows = run(db, sql, (lo, hi) + extra)
         total_t, total_w = total_t + t, total_w + w
         g = collections.defaultdict(list)
         for r in rows:

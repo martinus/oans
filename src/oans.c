@@ -1170,7 +1170,7 @@ static void print_header(void)
  * seq_hi] and print them. The dedupe path uses the streaming pipeline below.
  */
 static void report_duplicates(struct dbhandle *db, unsigned int seq_lo,
-			      unsigned int seq_hi)
+			      unsigned int seq_hi, unsigned int first_seq)
 {
 	int ret;
 	struct results_tree res;
@@ -1180,7 +1180,7 @@ static void report_duplicates(struct dbhandle *db, unsigned int seq_lo,
 	init_hash_tree(&dups_tree);
 
 	vprintf("Loading identical files...\n");
-	ret = dbfile_load_same_files(db, &res, seq_lo, seq_hi);
+	ret = dbfile_load_same_files(db, &res, seq_lo, seq_hi, first_seq);
 	if (ret)
 		goto out;
 
@@ -1249,14 +1249,15 @@ static void load_unlock(bool inmem) { if (inmem) dbfile_unlock(); }
 /* Load one generation window's groups into a batch and submit them. */
 static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 			      struct dedupe_batch *batch,
-			      unsigned int seq_lo, unsigned int seq_hi)
+			      unsigned int seq_lo, unsigned int seq_hi,
+			      unsigned int first_seq)
 {
 	int ret;
 
 	pdedupe_set_activity("loading identical files");
 	load_lock(inmem);
 	ret = dbfile_load_same_files(pdb, dedupe_batch_files(batch),
-				     seq_lo, seq_hi);
+				     seq_lo, seq_hi, first_seq);
 	load_unlock(inmem);
 	if (ret)
 		eprintf("Error loading whole-file duplicates for generations "
@@ -1359,7 +1360,7 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 
 		pdedupe_set_batch(++pass);
 		batch = dedupe_begin_batch(hi);
-		stream_load_batch(pdb, inmem, batch, i, hi);
+		stream_load_batch(pdb, inmem, batch, i, hi, first_seq);
 		dedupe_seal_batch(batch);
 		interrupt_test_batch_tick();
 	}
@@ -1482,7 +1483,7 @@ static void process_duplicates(struct dbhandle *db)
 			/* Report path is sequential; drop the previous window's
 			 * filerecs, which report_duplicates() recreates. */
 			free_all_filerecs();
-			report_duplicates(db, i, hi);
+			report_duplicates(db, i, hi, first_seq);
 		}
 	}
 

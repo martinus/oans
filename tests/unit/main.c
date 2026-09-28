@@ -107,6 +107,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_block_hashes_load_into_the_tree_in_offset_order);
 	MU_RUN(test_extent_hashes_load_as_groups_carrying_their_offsets);
 	MU_RUN(test_block_groups_spanning_passes_load_with_their_older_member);
+	MU_RUN(test_a_new_whole_file_target_takes_the_older_copies_with_it);
+	MU_RUN(test_every_window_takes_the_same_extent_target);
 	MU_RUN(test_extent_groups_spanning_passes_load_with_their_older_member);
 	MU_RUN(test_the_work_estimate_counts_only_groups_with_a_new_member);
 	MU_RUN(test_the_first_scan_work_estimate_counts_every_group);
