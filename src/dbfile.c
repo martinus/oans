@@ -241,11 +241,131 @@ static void dbfile_stamp_application_id(sqlite3 *db)
 	sqlite3_exec(db, sql, NULL, NULL, NULL);
 }
 
-/* True for a brand-new hashfile: create_tables() has run but nothing has
- * written the config rows yet (that happens after the check, in sync_config). */
-static bool dbfile_config_empty(sqlite3 *db)
+/*
+ * One integer from `sql`, or 0 when it returns no row. Unlike
+ * dbfile_query_u64(), a failure is an error rather than a 0: "no such table"
+ * and "file is not a database" must not read as "empty".
+ */
+static int query_i64(sqlite3 *db, const char *sql, int64_t *out)
 {
-	return dbfile_query_u64(db, "select 1 from config limit 1;") == 0;
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	int ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+
+	*out = 0;
+	if (ret)
+		return ret;
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW) {
+		*out = sqlite3_column_int64(stmt, 0);
+		return 0;
+	}
+	return ret == SQLITE_DONE ? 0 : ret;
+}
+
+enum hashfile_kind {
+	HASHFILE_NEW,		/* empty: no schema, no brand */
+	HASHFILE_OURS,		/* carries the oans brand */
+	HASHFILE_OLD,		/* an unbranded duperemove or pre-brand oans one */
+	HASHFILE_FOREIGN,	/* anything else: not ours to touch */
+};
+
+/*
+ * What `db` is, asked before anything writes to it (#275). A mistyped
+ * --hashfile can name another program's database, and every step of opening
+ * one writes: the journal mode, the tables, the brand, and on a failed check
+ * the unlink that recreates it. So only a file that is empty, or that is
+ * provably a hashfile, may reach them. An unbranded hashfile is recognised by
+ * the config row every duperemove and oans version wrote.
+ *
+ * Returns an SQLite error for a file that could not be asked - locked past the
+ * busy timeout, say - so that it is never mistaken for a foreign one. A file
+ * that is not a database at all is foreign.
+ */
+static int dbfile_identify(sqlite3 *db, int64_t *app_id,
+			   enum hashfile_kind *kind)
+{
+	int64_t v;
+	int ret;
+
+	*kind = HASHFILE_FOREIGN;
+	ret = query_i64(db, "PRAGMA application_id;", app_id);
+	if (ret)
+		return ret == SQLITE_NOTADB ? 0 : ret;
+	if (*app_id == OANS_APP_ID) {
+		*kind = HASHFILE_OURS;
+		return 0;
+	}
+	if (*app_id != 0)
+		return 0;
+
+	ret = query_i64(db, "select count(*) from sqlite_master;", &v);
+	if (ret || v == 0) {
+		if (!ret)
+			*kind = HASHFILE_NEW;
+		return ret;
+	}
+
+	ret = query_i64(db, "select count(*) from sqlite_master where "
+			"type = 'table' and name = 'config';", &v);
+	if (ret || v == 0)
+		return ret;
+	ret = query_i64(db, "select count(*) from config where "
+			"keyname = 'version_major';", &v);
+	if (!ret && v)
+		*kind = HASHFILE_OLD;
+	return ret;
+}
+
+/*
+ * A report does not run create_tables(), so a hashfile from before run_history
+ * or one of its columns existed lacks it, and --history and --json failed on it
+ * until a scan upgraded the file (#275). A TEMP view of the same name shadows
+ * the table for this connection alone, with 0 for what is missing. The temp
+ * schema is not the file: nothing is written to it.
+ */
+static int shadow_run_history(sqlite3 *db)
+{
+	static const char * const cols[] = {
+		"ts", "duration_ms", "files_scanned", "reclaimed", "groups",
+		"kernel_bytes", "deduped", "skip_permission", "skip_unreadable",
+		"skip_path_too_long", "skip_unsupported_fs", "readonly_subvols",
+	};
+	GString *sql;
+	int64_t table, have;
+	unsigned int missing = 0;
+	int ret;
+
+	ret = query_i64(db, "select count(*) from sqlite_master where "
+			"type = 'table' and name = 'run_history';", &table);
+	if (ret)
+		return ret;
+
+	sql = g_string_new("create temp view run_history as select ");
+	for (unsigned int i = 0; i < ARRAY_SIZE(cols); i++) {
+		char *q = sqlite3_mprintf("select count(*) from "
+			"pragma_table_info('run_history') where name = %Q;",
+			cols[i]);
+
+		ret = q ? query_i64(db, q, &have) : SQLITE_NOMEM;
+		sqlite3_free(q);
+		if (ret)
+			goto out;
+		if (!have)
+			missing++;
+		g_string_append_printf(sql, "%s%s%s", i ? ", " : "",
+				       have ? "" : "0 as ", cols[i]);
+	}
+	if (!missing)
+		goto out;
+
+	g_string_append(sql, table ? " from main.run_history;"
+				   : " where 0;");
+	ret = sqlite3_exec(db, sql->str, NULL, NULL, NULL);
+	if (ret)
+		perror_sqlite(ret, "reading an older run history");
+out:
+	g_string_free(sql, TRUE);
+	return ret;
 }
 
 static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
@@ -513,7 +633,7 @@ int dbfile_create_search_indexes(struct dbhandle *db)
 	return ret;
 }
 
-static int dbfile_set_modes(sqlite3 *db)
+static int dbfile_set_modes(sqlite3 *db, bool readonly)
 {
 	int ret;
 
@@ -523,7 +643,13 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
-	ret = sqlite3_exec(db, "PRAGMA journal_mode = WAL", NULL, NULL, NULL);
+	/*
+	 * The one pragma here that is stored in the file. A report opens
+	 * read-only and must write nothing (#275); SQLite reads a WAL file as one
+	 * without being told.
+	 */
+	ret = readonly ? 0 : sqlite3_exec(db, "PRAGMA journal_mode = WAL",
+					  NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret, "configuring database (journal mode)");
 		return ret;
@@ -629,11 +755,11 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 	}
 
 	/*
-	 * A brand-new hashfile (empty config) is ours: brand it now, before the
-	 * strict application_id check below. An existing file must already carry
-	 * the brand or dbfile_check() rejects it and we recreate it fresh.
+	 * dbfile_identify() let only an empty file through unbranded, so one
+	 * without the brand here is new and ours: brand it before the strict
+	 * check below. (The in-memory database is new on its first handle.)
 	 */
-	if (dbfile_config_empty(db)) {
+	if (dbfile_query_u64(db, "PRAGMA application_id;") == 0) {
 		dbfile_stamp_application_id(db);
 		hashfile_rebuilt = true;
 	}
@@ -694,7 +820,9 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 	int ret;
 	sqlite3 *db;
 
-	if (!filename) {
+	bool memdb = !filename;
+
+	if (memdb) {
 		filename = MEMDB_FILENAME;
 		force_create = true;
 	}
@@ -717,7 +845,78 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 		return NULL;
 	}
 
-	ret = dbfile_set_modes(db);
+	/*
+	 * Before anything asks the file a question: a report may run while
+	 * another oans writes, and a lock must be waited out, not read as an
+	 * answer. dbfile_set_modes() sets the same timeout again.
+	 */
+	sqlite3_busy_timeout(db, 30000);
+
+	if (!memdb) {
+		int64_t app_id;
+		enum hashfile_kind kind;
+
+		ret = dbfile_identify(db, &app_id, &kind);
+		if (ret) {
+			/* escape-ok: oans's own --hashfile argument. */
+			eprintf("Error: cannot read hashfile %s: %s\n",
+				filename, sqlite3_errstr(ret));
+			sqlite3_close(db);
+			return NULL;
+		}
+
+		switch (kind) {
+		case HASHFILE_OURS:
+			if (readonly && shadow_run_history(db)) {
+				sqlite3_close(db);
+				return NULL;
+			}
+			break;
+		case HASHFILE_NEW:
+			if (!readonly)
+				break;
+			/* escape-ok: oans's own --hashfile argument. */
+			eprintf("Hashfile %s is empty\n", filename);
+			sqlite3_close(db);
+			return NULL;
+		case HASHFILE_OLD:
+			if (readonly) {
+				/* escape-ok: oans's own --hashfile argument. */
+				eprintf("Hashfile %s was written by duperemove "
+					"or an older oans; a scan rebuilds it\n",
+					filename);
+				sqlite3_close(db);
+				return NULL;
+			}
+			eprintf("Recreating hashfile ..\n");
+			sqlite3_close(db);
+			/* longpath-ok: the hashfile itself. */
+			if (unlink(filename) && errno != ENOENT) {
+				ret = errno;
+				/* escape-ok: oans's own --hashfile argument. */
+				eprintf("Error %d while unlinking old db file "
+					"\"%s\" : %s\n", ret, filename,
+					strerror(ret));
+				return NULL;
+			}
+			return __dbfile_open_handle(filename, true, false);
+		case HASHFILE_FOREIGN:
+			/* escape-ok: oans's own --hashfile argument. */
+			if (app_id)
+				eprintf("Error: %s belongs to another program "
+					"(application_id 0x%08x); refusing to "
+					"touch it. Check the --hashfile path.\n",
+					filename, (unsigned)app_id);
+			else
+				eprintf("Error: %s is not an oans hashfile; "
+					"refusing to touch it. Check the "
+					"--hashfile path.\n", filename);
+			sqlite3_close(db);
+			return NULL;
+		}
+	}
+
+	ret = dbfile_set_modes(db, readonly);
 	if (ret) {
 		sqlite3_close(db);
 		return NULL;
@@ -786,6 +985,24 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 
 	if (!result->db)
 		goto err;
+
+#define COUNT_B_HASHES "select COUNT(*) from blocks;"
+	dbfile_prepare_stmt(count_b_hashes, COUNT_B_HASHES);
+
+#define COUNT_E_HASHES "select COUNT(*) from extents;"
+	dbfile_prepare_stmt(count_e_hashes, COUNT_E_HASHES);
+
+#define COUNT_FILES "select COUNT(*) from files;"
+	dbfile_prepare_stmt(count_files, COUNT_FILES);
+
+	/*
+	 * A report reads through these three and its own queries, nothing
+	 * else. The rest name columns and tables that create_tables() adds to an
+	 * older hashfile - which a read-only open does not run - so preparing
+	 * them failed every report on a hashfile no scan had upgraded yet (#275).
+	 */
+	if (readonly)
+		return result;
 
 #define	INSERT_BLOCK							\
 "INSERT INTO blocks (fileid, loff, digest) VALUES (?1, ?2, ?3);"
@@ -1012,15 +1229,6 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "select mtime, size, filename, id, digest is not null, flags from files " \
 "where ino = ?1 and subvol = ?2;"
 	dbfile_prepare_stmt(select_file_changes, SELECT_FILE_CHANGES);
-
-#define COUNT_B_HASHES "select COUNT(*) from blocks;"
-	dbfile_prepare_stmt(count_b_hashes, COUNT_B_HASHES);
-
-#define COUNT_E_HASHES "select COUNT(*) from extents;"
-	dbfile_prepare_stmt(count_e_hashes, COUNT_E_HASHES);
-
-#define COUNT_FILES "select COUNT(*) from files;"
-	dbfile_prepare_stmt(count_files, COUNT_FILES);
 
 #define GET_MAX_DEDUPE_SEQ "select max(dedupe_seq) from files;"
 	dbfile_prepare_stmt(get_max_dedupe_seq, GET_MAX_DEDUPE_SEQ);

@@ -103,7 +103,10 @@ file is recorded once.
     keeps the memory footprint modest and makes runs **incremental** and
     **resumable**.
 
-    If *FILE* does not exist it is created. If it exists, `oans` compares the
+    If *FILE* does not exist it is created. A hashfile from `duperemove` or an
+    older `oans` is rebuilt; any other existing database is refused and left
+    untouched (exit status 1), since a mistyped path can name another
+    program's data. If it exists, `oans` compares the
     stored size/mtime of each recorded path and re-hashes only what changed.
     Paths that no longer exist on disk are pruned automatically (by existence,
     so files merely outside the paths scanned this run are kept); the database

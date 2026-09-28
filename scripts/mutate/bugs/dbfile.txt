@@ -111,6 +111,36 @@
 "flags INTEGER, UNIQUE(ino), UNIQUE(path_hash));"
 >>>
 
+# ---------------------------------------------------------------- #275
+
+# any unbranded database reads as a new hashfile
+# The upstream shape: branded whenever it looked empty to oans, so a mistyped
+# --hashfile naming another program's database got oans's tables and brand.
+<<<
+	if (v == 0)
+		return HASHFILE_NEW;
+===
+	if (v >= 0)
+		return HASHFILE_NEW;
+>>>
+
+# another program's brand is not a reason to stop
+<<<
+	if (*app_id != 0)
+		return HASHFILE_FOREIGN;
+===
+>>>
+
+# any config table makes a database an old hashfile, to be unlinked
+# An unbranded hashfile is rebuilt, which starts with unlink(). A config table
+# is a common name; the version_major row is what only a hashfile has.
+<<<
+	if (query_i64(db, "select count(*) from config where "
+		      "keyname = 'version_major';", &v) || v == 0)
+		return HASHFILE_FOREIGN;
+===
+>>>
+
 # ---------------------------------------------------------------- history
 
 # the error buckets report a lifetime total rather than the last run
