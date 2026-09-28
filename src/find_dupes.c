@@ -391,7 +391,6 @@ static void find_dupes_thread(void *item, void *priv [[maybe_unused]])
 int find_additional_dedupe(struct results_tree *dupe_extents)
 {
 	int ret = 0;
-	GError *err = NULL;
 	struct filerec *file;
 
 	qprintf("Using %u threads to search within extents for "
@@ -420,15 +419,7 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 		ctxt->file = file;
 		ctxt->dupe_extents = dupe_extents;
 
-		threads_pool_push(&search_pool, ctxt, &err);
-		if (err) {
-			eprintf("Error from thread pool: %s\n ",
-				err->message);
-			g_error_free(err);
-			free(ctxt);
-			ret = ENOMEM;
-			break;
-		}
+		threads_pool_push(&search_pool, ctxt);
 	}
 
 	/*

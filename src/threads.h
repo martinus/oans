@@ -64,11 +64,29 @@ void register_cleanup(struct threads_pool *pool, void *function, void *ptr);
 void free_pool(struct threads_pool *pool);
 
 /*
- * Queue one item. Use this rather than g_thread_pool_push() on pool->pool
- * directly: it is what keeps the outstanding count - and therefore
- * threads_pool_wait_idle() - honest.
+ * g_thread_pool_push(), minus the trap in its error (#277). GLib reports an
+ * error only when it could not start a new thread, and the item is queued all
+ * the same ("data is simply appended to the queue of work to do"): it runs on a
+ * thread the pool already has. So the error is a warning, printed once, and
+ * never "not queued" - read that way, the search freed an item a worker still
+ * held and dropped the outstanding count twice, and the dedupe phase aborted.
+ * Only a pool with no thread at all is fatal, since nothing would ever run the
+ * item. Systemd's TasksMax and RLIMIT_NPROC are the realistic triggers.
+ *
+ * pool_push_init() reads the DUPEREMOVE_POOL_SPAWN_FAIL test hook, which
+ * reports that error after every real push. Call it on the main thread before
+ * any pool exists.
  */
-void threads_pool_push(struct threads_pool *pool, void *item, GError **err);
+void pool_push_init(void);
+/* True if a thread could not be started. The item is queued either way. */
+bool pool_push(GThreadPool *pool, void *item);
+
+/*
+ * Queue one item. Use this rather than pushing to pool->pool directly: it is
+ * what keeps the outstanding count - and therefore threads_pool_wait_idle() -
+ * honest.
+ */
+void threads_pool_push(struct threads_pool *pool, void *item);
 
 /*
  * Block until every item pushed so far has finished. Callers that hand workers

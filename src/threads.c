@@ -16,6 +16,8 @@
 #include "debug.h"
 #include "tsan.h"
 
+#include <stdatomic.h>
+
 static void pool_work_done(struct threads_pool *pool)
 {
 	g_mutex_lock(&pool->mutex);
@@ -68,18 +70,50 @@ void setup_pool(struct threads_pool *pool, threads_pool_worker function,
 	}
 }
 
-void threads_pool_push(struct threads_pool *pool, void *item, GError **err)
+/* DUPEREMOVE_POOL_SPAWN_FAIL: report every push as a failed thread start. */
+static bool spawn_fail_hook;
+
+void pool_push_init(void)
+{
+	spawn_fail_hook = getenv("DUPEREMOVE_POOL_SPAWN_FAIL") != NULL;
+}
+
+bool pool_push(GThreadPool *pool, void *item)
+{
+	static atomic_bool warned;
+	GError *err = NULL;
+
+	g_thread_pool_push(pool, item, &err);
+	if (!err && spawn_fail_hook)
+		err = g_error_new_literal(G_THREAD_ERROR, G_THREAD_ERROR_AGAIN,
+					  "test hook");
+	if (!err)
+		return false;
+
+	/*
+	 * Queued all the same, so it runs on a thread the pool already has. With
+	 * none at all it never would, and whoever waits for it would hang.
+	 */
+	if (g_thread_pool_get_num_threads(pool) == 0) {
+		eprintf("Error: could not start a worker thread: %s\n",
+			err->message);
+		abort_on(1);
+	}
+	if (!atomic_exchange(&warned, true))
+		eprintf("Warning: could not start another worker thread (%s); "
+			"continuing with the ones running\n", err->message);
+	g_error_free(err);
+	return true;
+}
+
+void threads_pool_push(struct threads_pool *pool, void *item)
 {
 	/* Count it before it can run: a worker may finish before push returns. */
 	g_mutex_lock(&pool->mutex);
 	pool->outstanding++;
 	g_mutex_unlock(&pool->mutex);
 
-	g_thread_pool_push(pool->pool, item, err);
-
-	/* Never queued, so nothing will ever decrement it. */
-	if (err && *err)
-		pool_work_done(pool);
+	pool_push(pool->pool, item);
 }
 
 /*

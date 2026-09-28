@@ -961,7 +961,6 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 	struct extent *extent;
 	_cleanup_(freep) struct dupe_extents **sorted = NULL;
 	unsigned int nr = 0, i;
-	GError *err = NULL;
 
 	sorted = malloc((size_t)res->num_dupes * sizeof(*sorted));
 	abort_on(!sorted);	/* OOM: the whole program is out of memory */
@@ -1022,12 +1021,7 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 		 * count only matters once the producer has sealed the batch.
 		 */
 		atomic_fetch_add(&batch->outstanding, 1);
-		g_thread_pool_push(dedupe_pool, item, &err);
-		if (err) {
-			eprintf("Fatal error while deduping: %s\n", err->message);
-			g_error_free(err);
-			abort_on(1);
-		}
+		pool_push(dedupe_pool, item);
 		pdedupe_add_queued(1);
 		/* Byte analog of add_queued: lets the renderer clamp the total
 		 * up for block-hash-discovered groups not in the upfront sum. */
