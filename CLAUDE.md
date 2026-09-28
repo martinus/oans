@@ -24,6 +24,11 @@ normal machine with the README's deps needs none of it.
 - **GitHub is a fork:** every `gh` command needs `--repo martinus/oans`.
 - **Never merge a PR without the user explicitly saying "merge it".** Rhythm:
   branch → PR → wait. The user often asks for a `/simplify` pass first.
+- **No Claude attribution anywhere.** Do not add a `Co-Authored-By` or
+  `Claude-Session` trailer to a commit. Do not add a "Generated with Claude
+  Code" line or a session link to a PR, an issue, a comment, a review or
+  release notes. `.claude/settings.json` turns off the trailers and PR lines
+  that Claude Code adds itself. This rule covers the text you write yourself.
 - **`scripts/verify.sh`** is the pre-PR gate: build (warnings = failure),
   `make check`, and a valgrind scan+dedupe+replay smoke.
 - **`make doc`** regenerates the man page from `docs/man/oans.md` and needs
@@ -919,13 +924,27 @@ counterexample. No dependencies, one header, minunit-compatible.
   (fragmented extents). Group the new rows with `GROUP BY` instead — that goes
   through the sorter, which writes sequential runs (129 MiB and 66 MiB) — and
   probe for older members per group through the digest index.
-  - The two loaders (`GET_DUPLICATE_BLOCKS`/`_EXTENTS`) are rewritten that way,
-    with identical rows and order, verified pass by pass on synthetic
-    hashfiles.
-  - **A list of rowids counts too.** The representatives' `rowid in (select
-    min(rowid) ... group by digest)` arrives in digest order, i.e. random
-    rowid order; `order by 1` sorts it first. Measured where every new file
-    has an older twin (a snapshot, #206): 5.1 GiB -> 363 MiB.
+  - **The pass loaders read the window once (#265).** `GET_DUPLICATE_BLOCKS`
+    and `_EXTENTS` group the window in `g0`, and the same step finds each
+    group's older member (the anchor, the lowest rowid from an earlier pass)
+    with one index probe. The rows then come from the window's files
+    (`cross join`, so the files stay the outer loop) plus the anchors by rowid.
+    Before, the window was grouped once and then read a second time, digest by
+    digest, together with every older copy. Measured with SQLite 3.45 on
+    synthetic hashfiles, over all passes: syn blocks 31.7 → 24.6 s,
+    fragmented extents 11.3 → 7.4 s, snapshot extents 67.9 → 35.7 s. One new
+    generation over a full hashfile, the scheduled-run case: fragmented
+    extents 10.3 → 0.14 s, syn blocks 0.54 → 0.25 s, snapshot extents
+    0.79 → 0.34 s. The sorter can write up to 2× more temp data, but in
+    sequential runs.
+  - **The row order is part of the contract** (the loader comments say why).
+    The new SQL gave the same member sequence in every group as the old SQL,
+    pass by pass, on four synthetic hashfiles and on a real 192k-file tree.
+    Pinned by `test_extent_groups_spanning_passes_load_with_their_older_member`,
+    whose new member has the lower id, as a resumed file (#159) does.
+  - **No `AS MATERIALIZED`**: it would fail to prepare on Debian 11, Ubuntu
+    20.04 and RHEL 8 (SQLite < 3.35). Measured: the same plan and times
+    without it.
   - **The pre-analysis keeps its scoped `IN` form for incremental runs** —
     6-9 s there against ~20 s for both rewrites tried. At `seq_lo == 0` it
     drops the predicate instead (`COUNT_*_WORK("1")`), which is exact since
@@ -1509,7 +1528,8 @@ Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
 1024). `process_duplicates` loops `for i=dedupe_seq; i<max` over generations;
 each group is deduped exactly once (a no-change rerun nets 0). The
 `GET_DUPLICATE_*` loaders load only the members new in a pass plus one stable
-representative (min id) as the target, marked `de_anchored` to pin it — this
+member from an earlier pass as the target, loaded first (the anchor; see #265
+in "Hashfile / SQLite gotchas" and #197/#237 for whole files) — this
 fixed both wasted per-pass re-load/re-fiemap of already-deduped members and
 per-pass target drift (a group spanning passes used to converge to one cluster
 *per pass* instead of a single extent). Exercise with `DUPEREMOVE_FILES_PER_PASS`

@@ -353,25 +353,41 @@
 # a duplicate that spans two passes - a file scanned today matching one from
 # last week - is never deduplicated, and the run still exits 0.
 <<<
-"	having count(*) > 1 or (?1 > 0 and exists ( "			\
-"		select 1 from blocks o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
+"	select w.digest, count(*), case when ?1 > 0 then ( "		\
 ===
-"	having count(*) > 1 or (0 and exists ( "			\
-"		select 1 from blocks o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
+"	select w.digest, count(*), case when 0 then ( "		\
 >>>
 
 # the older-member probe counts members from generations after the pass
-# Then a new extent whose only twin is not scanned into this pass yet makes a
-# "group" of one member, which the worker can only throw away - and in the
-# case the bound exists for, it also loads groups a later pass will load again.
+# Then the "older" member of a group can be one of this pass's own rows, or one
+# a later pass has not reached yet: a new extent whose only twin comes later
+# loads as a group of one, which the worker can only throw away.
 <<<
-"		select 1 from extents o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and o.len = w.len "		\
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") "))) " \
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
 ===
-"		select 1 from extents o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and o.len = w.len "		\
-"		and wo.dedupe_seq > 0 and not " FILEDUP_MEMBER("wo") "))) " \
+"		and wo.dedupe_seq > 0 and not " FILEDUP_MEMBER("wo")	\
+>>>
+
+# ---------------------------------------------------------------- #265
+
+# the older member of an extent group is no longer loaded first
+# Extent dedupe takes the first member as its target. Ordered by file id alone,
+# a new member with a lower id - a resumed file keeps its old row - becomes the
+# target, and each pass can pick a different one.
+<<<
+"	from grp join extents e on e.rowid = grp.anchor) "		\
+"order by n, fileid, r;"
+===
+"	from grp join extents e on e.rowid = grp.anchor) "		\
+"order by fileid, r;"
+>>>
+
+# a whole-file duplicate can be an extent group's older member
+# The whole-file pass deletes the extent rows of those files, and it can run at
+# the same time as this load. Then an extent group can load a row that is being
+# deleted, and use it as its target.
+<<<
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+===
+"		and wo.dedupe_seq <= ?1 "					\
 >>>
