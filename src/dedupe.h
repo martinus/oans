@@ -42,6 +42,16 @@ struct dedupe_ctxt {
 	unsigned int		same_size;
 
 	/*
+	 * This request's destination came back EINVAL once, so its lengths
+	 * are rounded down to whole blocks from here on - for older kernels
+	 * that reject an unaligned length rather than shorten it. Per request,
+	 * not per process (#280): one EINVAL, say from a NODATASUM mismatch,
+	 * used to shorten every later request on every thread, and so leave
+	 * every later file's last partial block unshared for good.
+	 */
+	bool			aligned;
+
+	/*
 	 * request tracking.
 	 *	queued: request is awaiting dedupe
 	 *	in_progress: currently undergoing dedupe operations
@@ -81,6 +91,9 @@ void free_dedupe_ctxt(struct dedupe_ctxt *ctxt);
  */
 uint64_t dedupe_shareable_len(int fd, uint64_t len);
 
+/* The filesystem's block size, queried once per process. */
+unsigned int dedupe_blocksize(int fd);
+
 /*
  * Queue one destination. `unshared` is how many of its bytes are not already
  * on the target's storage - what this dedupe would actually stop duplicating,
@@ -100,11 +113,14 @@ int add_extent_to_dedupe(struct dedupe_ctxt *ctxt, uint64_t loff,
 int dedupe_extents(struct dedupe_ctxt *ctxt);
 /*
  * `bytes_freed` is the destination's `unshared` bytes, capped at what the
- * kernel actually processed and zero unless it accepted the request - i.e.
- * space this dedupe stopped duplicating, not length it compared.
+ * kernel actually processed - i.e. space this dedupe stopped duplicating, not
+ * length it compared. `bytes_done` is what the kernel processed. Both count
+ * the rounds that succeeded even when a later one failed (#280): the 32 MiB
+ * rounds are separate ioctls, and what an earlier one shared stays shared.
  */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
-			  uint64_t *bytes_freed, struct filerec **file);
+			  uint64_t *bytes_freed, uint64_t *bytes_done,
+			  struct filerec **file);
 
 /* What a FIDEDUPERANGE probe learned about a filesystem (#224). */
 enum dedupe_support {

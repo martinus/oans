@@ -34,12 +34,6 @@
 #include "debug.h"
 #include "util.h"
 
-/*
- * Used to determine if requests must be aligned with the underlying block size
- * If 0, there is no need to align requests
- */
-static unsigned int fs_blocksize = 0;
-
 struct dedupe_req {
 	struct filerec		*req_file;
 	struct list_head	req_list; /* see comment in dedupe.h */
@@ -166,9 +160,7 @@ static unsigned int get_fs_blocksize(int fd)
 }
 
 /*
- * The filesystem's block size, queried once. Unlike fs_blocksize above - which
- * stays 0 until a request actually comes back EINVAL, and so doubles as "this
- * kernel will not shorten for us" - this is always a real value.
+ * The filesystem's block size, queried once.
  *
  * Every dedupe worker reaches this, so the cache is atomic. Relaxed is enough:
  * racing threads all store the same value (one filesystem, one fstatfs answer),
@@ -186,6 +178,11 @@ static unsigned int cached_blocksize(int fd)
 		atomic_store_explicit(&cached, bs, memory_order_relaxed);
 	}
 	return bs;
+}
+
+unsigned int dedupe_blocksize(int fd)
+{
+	return cached_blocksize(fd);
 }
 
 uint64_t dedupe_shareable_len(int fd, uint64_t len)
@@ -293,9 +290,9 @@ static void set_aligned_same_length(struct dedupe_ctxt *ctxt,
 	same->src_length = ctxt->len;
 	if (same->src_length > DEDUPE_ROUND_LEN)
 		same->src_length = DEDUPE_ROUND_LEN;
-	/* Only once we know this kernel returns EINVAL rather than shortening
-	 * for us; the rounding rule itself is dedupe_shareable_len's. */
-	if (fs_blocksize != 0)
+	/* Only once this request came back EINVAL, rather than shortened for
+	 * us; the rounding rule itself is dedupe_shareable_len's. */
+	if (ctxt->aligned)
 		same->src_length = dedupe_shareable_len(ctxt->ioctl_file->fd,
 							same->src_length);
 }
@@ -358,7 +355,8 @@ static void process_dedupes(struct dedupe_ctxt *ctxt,
 	ctxt->len -= max_deduped;
 	ctxt->ioctl_file_off += max_deduped;
 
-	if (fs_blocksize != 0 && ctxt->len < fs_blocksize) {
+	if (ctxt->aligned &&
+	    ctxt->len < cached_blocksize(ctxt->ioctl_file->fd)) {
 		/*
 		 * If we go around again in this situation, we'll just
 		 * get -EINVAL on all the fds. Short circuit this then
@@ -463,6 +461,27 @@ static void prefetch_dedupe_round(struct dedupe_ctxt *ctxt,
 			       same->src_length);
 }
 
+/*
+ * The ioctl itself failed, so no destination of this round got a status. Hand
+ * every request still in flight back as failed with `err`, keeping what earlier
+ * rounds shared (#280): they used to be left unreported, and their space
+ * uncredited. errno survives for the caller's message.
+ */
+static void fail_in_flight(struct dedupe_ctxt *ctxt, int err)
+{
+	struct dedupe_req *req, *tmp;
+
+	list_for_each_entry_safe(req, tmp, &ctxt->in_progress, req_list) {
+		req->req_status = -err;
+		list_move_tail(&req->req_list, &ctxt->completed);
+	}
+	list_for_each_entry_safe(req, tmp, &ctxt->queued, req_list) {
+		req->req_status = -err;
+		list_move_tail(&req->req_list, &ctxt->completed);
+	}
+	errno = err;
+}
+
 int dedupe_extents(struct dedupe_ctxt *ctxt)
 {
 	int ret = 0;
@@ -479,16 +498,23 @@ int dedupe_extents(struct dedupe_ctxt *ctxt)
 
 retry:
 		ret = ioctl(ctxt->ioctl_file->fd, FIDEDUPERANGE, ctxt->same);
-		if (ret)
+		if (ret) {
+			fail_in_flight(ctxt, errno);
 			break;
+		}
 
 		if (debug)
 			print_btrfs_same_info(ctxt);
 
-		if (ctxt->same->info[0].status == -EINVAL && !fs_blocksize) {
-			fs_blocksize = cached_blocksize(ctxt->ioctl_file->fd);
+		if (ctxt->same->info[0].status == -EINVAL && !ctxt->aligned) {
+			uint64_t asked = ctxt->same->src_length;
+
+			ctxt->aligned = true;
 			set_aligned_same_length(ctxt, ctxt->same);
-			goto retry;
+			/* Already whole blocks: the EINVAL is about something
+			 * else, and the same request would get it again. */
+			if (ctxt->same->src_length != asked)
+				goto retry;
 		}
 
 		round = 0;
@@ -523,7 +549,8 @@ retry:
  * Returns 1 when we have no more items.
  */
 int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
-			  uint64_t *bytes_freed, struct filerec **file)
+			  uint64_t *bytes_freed, uint64_t *bytes_done,
+			  struct filerec **file)
 {
 	struct dedupe_req *req;
 
@@ -537,10 +564,10 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 	list_del_init(&req->req_list);
 
 	*status = req->req_status;
-	/* Zero unless the kernel took it, and never more than it processed. */
-	*bytes_freed = req->req_status ? 0 :
-		(req->req_unshared < req->req_total ?
-		 req->req_unshared : req->req_total);
+	/* Never more than the kernel processed, in the rounds it accepted. */
+	*bytes_freed = req->req_unshared < req->req_total ?
+		       req->req_unshared : req->req_total;
+	*bytes_done = req->req_total;
 	*file = req->req_file;
 
 	free_dedupe_req(req);
