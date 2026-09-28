@@ -1,0 +1,34 @@
+# file: src/file_scan.c
+#
+# Real bugs in the scan, put back one at a time, and what notices.
+#
+#     scripts/mutate/mutate.py --bugs scripts/mutate/bugs/file_scan.txt
+#
+# Only the unit suite runs here. The #273 recheck of rows an older binary
+# wrote is pinned by tests/integration/test_prealloc.py instead, which drives
+# a real fallocate().
+
+# ---------------------------------------------------------------- #273
+
+# a buffer that reaches a preallocated extent is faked whole, data and all
+# The upstream shape: data extents are walked past, and the first preallocated
+# one decides for the whole buffer. Two files with different data before the
+# same preallocated tail then get one digest.
+<<<
+		if (!(e->fe_flags & FIEMAP_SKIP_FLAGS))
+			return false;
+===
+		if (!(e->fe_flags & FIEMAP_SKIP_FLAGS)) {
+			start = e->fe_logical + e->fe_length;
+			continue;
+		}
+>>>
+
+# on a hole, an extent past the end of the area decides for it
+# get_extent() answers the *next* extent for an offset in a hole, which can
+# start megabytes after the buffer ends.
+<<<
+		if (!e || e->fe_logical >= end)
+===
+		if (!e)
+>>>

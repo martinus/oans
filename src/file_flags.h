@@ -22,4 +22,13 @@
  */
 #define FILE_RO_SUBVOL		0x0002
 
+/*
+ * The digest was computed by a binary that reads the data next to a
+ * preallocated (UNWRITTEN) extent. Older ones filled a whole read buffer with
+ * zeroes as soon as it touched such an extent, so two different files could
+ * get one digest (#273). A row without this bit is rechecked once: rehashed if
+ * the file still has an UNWRITTEN extent, and just marked otherwise.
+ */
+#define FILE_UNWRITTEN_CHECKED	0x0004
+
 #endif

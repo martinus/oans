@@ -19,6 +19,54 @@ MU_TEST(test_is_block_zeroed) {
 	mu_check(is_block_zeroed(NULL) == false);
 }
 
+/*
+ * A read buffer may be faked with zeroes only when no byte of it is data
+ * (#273). Answering true for any buffer that merely reached a preallocated
+ * extent gave two different files one digest.
+ */
+MU_TEST(test_is_area_ignored) {
+	const uint32_t U = FIEMAP_EXTENT_UNWRITTEN, L = FIEMAP_EXTENT_LAST;
+	const uint64_t K = 1024, M = 1024 * K;
+	/* data [0, 512K), preallocated [512K, 1M) */
+	const struct fm_rec tail[] = { { 0, 1 * M, 512 * K, 0 },
+				       { 512 * K, 2 * M, 512 * K, U | L } };
+	/* data [0, 64K), hole, preallocated [8M, 9M) */
+	const struct fm_rec gap[] = { { 0, 1 * M, 64 * K, 0 },
+				      { 8 * M, 2 * M, M, U | L } };
+	/* preallocated [0, 4K), hole, preallocated [8K, 12K), data [12K, 16K) */
+	const struct fm_rec mixed[] = { { 0, 1 * M, 4 * K, U },
+					{ 8 * K, 2 * M, 4 * K, U },
+					{ 12 * K, 3 * M, 4 * K, L } };
+	struct fiemap *fm = mkmap(tail, 2);
+	unsigned int cur = 0;
+
+	mu_check(!is_area_ignored(fm, 0, M, NULL));	/* data, then prealloc */
+	mu_check(is_area_ignored(fm, 512 * K, 512 * K, NULL));
+	mu_check(!is_area_ignored(fm, 508 * K, 4 * K, NULL));	/* last data block */
+	mu_check(is_area_ignored(fm, 512 * K, 4 * K, NULL));
+
+	/* The hint is left at the extent the area starts in, not further on. */
+	mu_check(!is_area_ignored(fm, 0, M, &cur));
+	mu_check(cur == 0);
+	mu_check(is_area_ignored(fm, 512 * K, 512 * K, &cur));
+	mu_check(cur == 1);
+	free(fm);
+
+	/* On a hole, the next extent must start inside the area to count. */
+	fm = mkmap(gap, 2);
+	mu_check(!is_area_ignored(fm, 0, M, NULL));
+	mu_check(!is_area_ignored(fm, 64 * K, M, NULL));
+	mu_check(is_area_ignored(fm, 8 * M - 4 * K, 8 * K, NULL));
+	free(fm);
+
+	/* Holes between preallocated extents are fine; data anywhere is not. */
+	fm = mkmap(mixed, 3);
+	mu_check(is_area_ignored(fm, 0, 12 * K, NULL));
+	mu_check(!is_area_ignored(fm, 0, 16 * K, NULL));
+	mu_check(!is_area_ignored(fm, 8 * K, 8 * K, NULL));
+	free(fm);
+}
+
 MU_TEST(test_is_file_renamed) {
 	char *new_path = "/tmp/somefile";
 	char *path_in_db = "/tmp/somefile";

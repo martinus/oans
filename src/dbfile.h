@@ -62,6 +62,7 @@ struct stmts {
 	sqlite3_stmt *select_checkpoint;
 	sqlite3_stmt *delete_checkpoint;
 	sqlite3_stmt *update_dedupe_seq;
+	sqlite3_stmt *add_file_flags;
 	sqlite3_stmt *select_layout;
 	sqlite3_stmt *copy_extent_hashes;
 	sqlite3_stmt *copy_block_hashes;
@@ -429,6 +430,9 @@ int dbfile_load_checkpointed_paths(struct dbhandle *db, char ***out, int *nout);
 /* Put a resumed file in this run's dedupe generation, leaving its row (and so
  * its checkpoint and stored hashes) otherwise intact. */
 int dbfile_update_dedupe_seq(struct dbhandle *db, int64_t fileid, uint64_t seq);
+/* Set FILE_* bits on a row, leaving the others as they are. */
+int dbfile_add_file_flags(struct dbhandle *db, int64_t fileid,
+			  unsigned int flags);
 
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
 

@@ -22,7 +22,7 @@ Read the section for the code you are about to touch before you edit it.
 | Touching | Read |
 | --- | --- |
 | `src/file_scan.c`: the walk | Scan parallelism; What oans will scan (#224); File names are untrusted input (#202); --exclude matching |
-| `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201) |
+| `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Preallocated extents (#273); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201) |
 | `src/dbfile.c`: schema, config, history | Hashfile identity & schema version; Hashfile / SQLite gotchas; Self-describing hashfile |
 | `src/dbfile.c`: `GET_DUPLICATE_*`, `COUNT_*` | Hashfile / SQLite gotchas (#260, #265, #270); dedupe_seq; The dedupe-phase loaders |
 | `src/run_dedupe.c`, `src/dedupe.c` | Streaming dedupe pipeline; Dedupe must converge (#186); Correctness invariants; Valgrind |
@@ -1169,6 +1169,30 @@ run picks the file up there.
   **identical to one straight-through scan**; that is the property that matters,
   since nothing downstream could tell a wrong digest from a file with no
   duplicate.
+
+## Preallocated extents are read, not faked (#273)
+
+`is_area_ignored()` lets `fill_buffer()` fake a 1 MiB read buffer with zeroes
+instead of reading it. It may do that only when **no byte of the area is
+data**: every byte lies in a hole or in a `FIEMAP_SKIP_FLAGS` extent. The
+upstream code answered true as soon as it reached any preallocated extent, and
+on a hole it took the next extent without checking that it starts inside the
+area. So 512 KiB of data before a `posix_fallocate` tail was hashed as zeroes,
+and two different files got one digest. journald files, torrents, VM images and
+databases all have that layout.
+
+- **The right digest is the one of the same bytes written out.** That is what
+  `test_prealloc.py` compares against; "the two digests differ" alone would
+  pass for a digest of garbage.
+- **Old hashfiles are repaired per row, not by a `DB_FILE_MINOR` bump.** An
+  unchanged file is never hashed again, so a wrong digest would stay for good.
+  Every file this binary hashes or copies gets `FILE_UNWRITTEN_CHECKED`
+  (`flags & 4`). An up-to-date row without the bit costs one fiemap: it is
+  rehashed if the file has an `UNWRITTEN` extent and just marked otherwise.
+  A global "done" key was rejected because one hashfile can cover several
+  trees scanned on different days. Old binaries read `flags` only as `& 1` and
+  `& 2`, so the bit is safe for them; one that rewrites the row drops it, which
+  costs one more fiemap.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 
