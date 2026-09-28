@@ -132,6 +132,7 @@ MU_TEST_SUITE(test_suite) {
 
 	/* The hashfile, against an in-memory SQLite - the same path a run
 	 * without --hashfile takes, so none of this is a test-only seam. */
+	MU_RUN(test_dbfile_identify_touches_only_what_is_ours);
 	MU_RUN(test_dbfile_files_are_unique_on_the_inode_pair);
 	MU_RUN(test_dbfile_pruning_a_deleted_file_takes_its_hashes);
 	MU_RUN(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint);

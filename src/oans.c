@@ -2005,22 +2005,32 @@ int main(int argc, char **argv)
 	 */
 	increase_limits();
 
+	/*
+	 * The report modes answer -1 when the hashfile cannot be opened, which a
+	 * shell sees as 255; EXIT STATUS says 1 (#275, #284).
+	 */
+	ret = INT_MIN;
 	if (list_only_opt)
-		return list_db_files(options.hashfile);
+		ret = list_db_files(options.hashfile);
 	else if (rm_only_opt)
-		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
+		ret = rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
 	else if (stats_only_opt)
-		return print_hashfile_stats(options.hashfile);
+		ret = print_hashfile_stats(options.hashfile);
 	else if (history_only_opt)
-		return print_hashfile_history(options.hashfile);
+		ret = print_hashfile_history(options.hashfile);
 	else if (json_only_opt)
-		return print_metrics_json(options.hashfile);
+		ret = print_metrics_json(options.hashfile);
 	else if (prune_blocks_opt)
-		return prune_block_hashes(options.hashfile);
+		ret = prune_block_hashes(options.hashfile);
+	if (ret != INT_MIN)
+		return ret < 0 ? 1 : ret;
+	ret = 0;
 
 	db = dbfile_open_handle(options.hashfile);
-	if (!db)
+	if (!db) {
+		ret = 1;	/* EXIT STATUS in the man page (#284) */
 		goto out;
+	}
 
 	dbfile_set_gdb(db);
 

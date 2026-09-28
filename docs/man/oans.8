@@ -123,6 +123,9 @@ runs \f[B]incremental\f[R] and \f[B]resumable\f[R].
 .RS
 .PP
 If \f[I]FILE\f[R] does not exist it is created.
+A hashfile from \f[CR]duperemove\f[R] or an older \f[CR]oans\f[R] is
+rebuilt; any other existing database is refused and left untouched (exit
+status 1), since a mistyped path can name another program\(cqs data.
 If it exists, \f[CR]oans\f[R] compares the stored size/mtime of each
 recorded path and re\-hashes only what changed.
 Paths that no longer exist on disk are pruned automatically (by

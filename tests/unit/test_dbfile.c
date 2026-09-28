@@ -58,6 +58,50 @@ static struct scan_checkpoint mkcheckpoint(void *file_state, void *ext_state,
  */
 /* A digest that differs in every byte for each n, so a comparator reading the
  * wrong end of it still sees a difference. */
+/*
+ * What a --hashfile is, decided before anything writes to it (#275). A private
+ * :memory: database per case, not memdb(): identification is about one file,
+ * and the shared one already holds oans's tables.
+ */
+static enum hashfile_kind identify(const char *sql, int64_t *app_id)
+{
+	sqlite3 *db = NULL;
+	enum hashfile_kind kind;
+
+	if (sqlite3_open(":memory:", &db) ||
+	    sqlite3_exec(db, sql, NULL, NULL, NULL))
+		abort();		/* the fixture is broken, not the code */
+	if (dbfile_identify(db, app_id, &kind))
+		abort();
+	sqlite3_close(db);
+	return kind;
+}
+
+MU_TEST(test_dbfile_identify_touches_only_what_is_ours) {
+	int64_t id;
+
+	mu_check(identify("select 1", &id) == HASHFILE_NEW);
+	mu_check(id == 0);
+	mu_check(identify("pragma application_id = 1868656243; "
+			  "create table x(a)", &id) == HASHFILE_OURS);
+
+	/* Unbranded, with the row every duperemove and oans version wrote. */
+	mu_check(identify("create table config(keyname, keyval); insert into "
+			  "config values ('version_major', 4)", &id) ==
+		 HASHFILE_OLD);
+
+	/* Another program's, branded or not - even with an empty schema. */
+	mu_check(identify("pragma application_id = 305419896", &id) ==
+		 HASHFILE_FOREIGN);
+	mu_check(id == 305419896);
+	mu_check(identify("create table notes(x)", &id) == HASHFILE_FOREIGN);
+	mu_check(identify("create table config(keyname, keyval); insert into "
+			  "config values ('owner', 'me')", &id) ==
+		 HASHFILE_FOREIGN);
+	mu_check(identify("create table config(keyname, keyval)", &id) ==
+		 HASHFILE_FOREIGN);
+}
+
 MU_TEST(test_dbfile_files_are_unique_on_the_inode_pair) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
 
