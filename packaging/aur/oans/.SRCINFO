@@ -1,6 +1,6 @@
 pkgbase = oans
 	pkgdesc = Fast, safe filesystem deduplication for btrfs & xfs — a duperemove fork
-	pkgver = 1.11.1
+	pkgver = 1.12.2
 	pkgrel = 1
 	url = https://github.com/martinus/oans
 	arch = x86_64
@@ -13,7 +13,7 @@ pkgbase = oans
 	depends = util-linux-libs
 	provides = duperemove
 	conflicts = duperemove
-	source = oans-1.11.1.tar.gz::https://github.com/martinus/oans/archive/refs/tags/v1.11.1.tar.gz
-	sha256sums = 986e413f16b861c98c4e18794c657872d06ea11387111386bc4a940b9bc1dca0
+	source = oans-1.12.2.tar.gz::https://github.com/martinus/oans/archive/refs/tags/v1.12.2.tar.gz
+	sha256sums = 50be61a80796005030349a5eeb5fee0d680652b2f3f951b321d6c4adbc40bd09
 
 pkgname = oans
