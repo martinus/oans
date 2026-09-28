@@ -131,16 +131,17 @@ int human_size_snprintf(uint64_t size, char *str, size_t str_bytes)
 	return snprintf(str, str_bytes, "%.1f %s", v, units[u]);
 }
 
-uint64_t parse_size(char *s)
+int parse_size(const char *s, uint64_t *out)
 {
 	int i;
 	char c;
-	uint64_t mult = 1;
+	uint64_t mult = 1, v;
 
 	for (i = 0; s && s[i] && isdigit(s[i]); i++) ;
 	if (!i) {
-		eprintf("ERROR: size value is empty\n");
-		exit(50);
+		eprintf("Error: a size needs a number, \"%s\" found\n",
+			s ? s : "");
+		return -1;
 	}
 
 	if (s[i]) {
@@ -156,32 +157,40 @@ uint64_t parse_size(char *s)
 			mult *= 1024;
 			/* fallthrough */
 		case 'g':
-		case 'G':
 			mult *= 1024;
 			/* fallthrough */
 		case 'm':
-		case 'M':
 			mult *= 1024;
 			/* fallthrough */
 		case 'k':
-		case 'K':
 			mult *= 1024;
 			/* fallthrough */
 		case 'b':
 			break;
 		default:
-			eprintf("ERROR: Unknown size descriptor "
-				"'%c'\n", c);
-			exit(1);
+			eprintf("Error: unknown size suffix '%c' in \"%s\"\n",
+				s[i], s);
+			return -1;
 		}
 	}
 	if (s[i] && s[i+1]) {
-		eprintf("ERROR: Illegal suffix contains "
-			"character '%c' in wrong position\n",
-			s[i+1]);
-		exit(51);
+		eprintf("Error: a size takes one suffix letter, \"%s\" found\n",
+			s);
+		return -1;
 	}
-	return strtoull(s, NULL, 10) * mult;
+
+	/*
+	 * Neither the number nor the product may wrap (#284): `16E` used to
+	 * come out as 0 and `20E` as 4 EiB.
+	 */
+	errno = 0;
+	v = strtoull(s, NULL, 10);
+	if (errno == ERANGE || v > UINT64_MAX / mult) {
+		eprintf("Error: size \"%s\" does not fit in 64 bits\n", s);
+		return -1;
+	}
+	*out = v * mult;
+	return 0;
 }
 
 int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes)

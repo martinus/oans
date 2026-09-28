@@ -15,9 +15,11 @@ rather than refuses.
 """
 
 import json
+import subprocess
+import shlex
 import unittest
 
-from harness import DuperemoveTest, requires_reflink
+from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
 
 WARNING = "has no -d"
 
@@ -41,9 +43,40 @@ class ReplayNoDedupeTest(DuperemoveTest):
         tree = self._tree()
         self.dm("-r", tree)
         self.dm()
-        self.assertIn("-rd", self.out, "no fix-up command offered")
+        self.assertIn("-r -d", self.out, "no fix-up command offered")
         self.assertIn(self.hf, self.out, "fix-up command omits the hashfile")
         self.assertIn(tree, self.out, "fix-up command omits the stored path")
+
+    @requires_reflink
+    def test_the_command_it_prints_keeps_every_stored_setting(self):
+        """#285: the fix-up is a normal run, so it stores its own config.
+        It used to name only -r, -d and the roots, so running it erased the
+        stored excludes and size limits - and from then on the timer scanned
+        and deduplicated exactly what the job was set up to skip."""
+        tree = self._tree()
+        self.dm("-r", "--exclude=u2", "--min-filesize=2K", "--skip-zeroes",
+                "--dedupe-options=nosame", tree)
+        before = self.stored()
+        self.dm()
+        line = next(l for l in self.out.splitlines()
+                    if l.strip().startswith("oans "))
+        argv = shlex.split(line.strip())
+        argv[0] = DUPEREMOVE
+        proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        self.assertEqual(0, proc.returncode, proc.stdout)
+        after = self.stored()
+        self.assertEqual(before[1:], after[1:], "a stored setting was lost")
+        self.assertEqual(1, after[0], "and -d is stored now")
+
+    def stored(self):
+        return (self.hf_scalar("select keyval from config "
+                               "where keyname = 'opt_run_dedupe'"),
+                self.hf_query("select * from scan_excludes"),
+                self.hf_query("select keyname, keyval from config "
+                              "where keyname like 'opt_%' "
+                              "and keyname <> 'opt_run_dedupe' "
+                              "order by keyname"))
 
     def test_the_warning_survives_quiet(self):
         """-q is what the shipped systemd unit runs, so it must show there."""

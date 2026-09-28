@@ -118,8 +118,13 @@ file is recorded once.
 
     Because the hashfile also records the run's options, paths, and **\--exclude**
     patterns, you need not repeat them: **`oans --hashfile=FILE`** with no *file*
-    arguments **replays the last run** (any other options on that command line
-    are ignored). That includes **-d**: a hashfile seeded by a read-only preview
+    arguments **replays the last run**. The stored settings - **-r**, **-d**,
+    the size limits, **\--skip-zeroes**, **\--skip-readonly-subvols**,
+    **\--dedupe-options** and the excludes - win over the command line. Options
+    that shape only this run (**\--io-threads**, **\--cpu-threads**, **-B**,
+    **-q**, **-v**) still apply, and an extra **\--exclude** applies to this run
+    without being stored; the block size is always the hashfile's. That includes
+    **-d**: a hashfile seeded by a read-only preview
     run replays as read-only forever, so `oans` warns on such a replay and
     prints the command to update it. If none of the stored paths still exist `oans` refuses rather
     than prune every entry — guarding against, e.g., an unmounted drive — while
@@ -138,11 +143,12 @@ file is recorded once.
     larger blocks fragment less. Most users never need to change this.
 
 **-B** *N*, **\--batchsize**=*N*
-  ~ Run the dedupe phase after every *N* newly scanned files instead of once at
-    the end. This caps memory use on large data sets and when partial matching
-    is enabled, at a small cost to multithreading efficiency. Default **1024**,
-    a good value for extent-based dedupe; drop it toward **1** when working on
-    very large files (VM images, backups).
+  ~ Group newly scanned files into *generations* of *N* files. Default
+    **1024**; *N* is from 1 to 2^31. The dedupe phase always runs once the scan
+    is over, and works through the generations in passes of about 65,536 files,
+    so up to that number **-B** changes neither the passes nor the memory they
+    use. Above it, each pass is one generation of *N* files, which takes more
+    memory.
 
 **-m** *SIZE*, **\--min-filesize**=*SIZE*
   ~ Skip regular files smaller than *SIZE* bytes (suffixes `K`/`M`/`G`
@@ -228,7 +234,7 @@ file is recorded once.
     **[no]partial**
       ~ Also compare *portions* of extents (block-level matching), finding
         dedupe that pure extent matching misses. Powerful but CPU-intensive and
-        larger on disk; pair it with **\--batchsize** to bound memory. Default
+        larger on disk. Default
         **off**. (This path is under active development and its semantics may
         change.)
 
@@ -600,7 +606,8 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
     for an `OnFailure=` setup.
 
 **130**, **143**
-  ~ Interrupted by **SIGINT** (Ctrl-C) or **SIGTERM**. Work already done was
+  ~ Interrupted by **SIGINT** (Ctrl-C) or **SIGTERM**, also when the run had
+    lost a root and would otherwise exit **2**. Work already done was
     committed to the hashfile; re-run to continue where it stopped.
 
 Skips the user asked for do **not** affect the exit status: **\--exclude**

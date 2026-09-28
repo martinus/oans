@@ -32,7 +32,13 @@
  * Code for parsing and printing human readable numbers is taken from
  * btrfs-progs/util.c and modified locally to suit my purposes.
  */
-uint64_t parse_size(char *s);
+/*
+ * A size with an optional one-letter binary suffix (k, m, g, t, p, e, or b for
+ * bytes), into *out. Returns 0, or -1 having said what is wrong; the caller's
+ * exit status is then 1, like any other bad option (#284: it used to exit 50 or
+ * 51 by itself, and wrap on overflow).
+ */
+int parse_size(const char *s, uint64_t *out);
 
 /*
  * `path` spelled the way the walk stores paths: absolute, with symlinks

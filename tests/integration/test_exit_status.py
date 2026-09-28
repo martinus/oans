@@ -80,6 +80,51 @@ class ExitStatusTest(DuperemoveTest):
         self.assertEqual(EXIT_INCOMPLETE, self.rc,
                          "a replay that lost a root reported success")
 
+    def test_a_bad_option_value_exits_one(self):
+        """#284: each of these crashed, ran with a value nobody asked for, or
+        exited with a status the man page does not list."""
+        tree = self._tree()
+        for args in (("-B", "0"),              # SIGFPE after the scan
+                     ("-B", "4G"),             # narrowed to 0: the same
+                     ("--io-threads=-1",),     # 4294967295 workers, abort
+                     ("--io-threads=8x",),     # taken as 8
+                     ("--cpu-threads=0",),
+                     ("-m", "10KB"),           # exit 51
+                     ("-m", ""),               # exit 50
+                     ("--max-filesize=16E",),  # wrapped to 0
+                     ("-b", "4194308K")):      # 2^32 + 4K, taken as 4K
+            self.dm("-r", *args, tree)
+            self.assertEqual(1, self.rc, f"{args}: {self.out}")
+
+    def test_a_bare_replay_of_a_missing_hashfile_creates_nothing(self):
+        """#284: a typo in the path left an empty hashfile behind."""
+        typo = os.path.join(self.work, "typo.db")
+        self.dm("--hashfile", typo, hashfile=False)
+        self.assertEqual(1, self.rc, self.out)
+        self.assertFalse(os.path.exists(typo))
+
+    def test_a_report_on_a_hashfile_that_cannot_be_opened_exits_one(self):
+        for mode in ("--stats", "--history", "--json", "-L"):
+            self.dm(mode, "--hashfile", "/nonexistent/dir/x.db",
+                    hashfile=False)
+            self.assertEqual(1, self.rc, f"{mode}: {self.out}")
+
+    def test_an_interrupted_replay_that_lost_a_root_says_interrupted(self):
+        """#284: the signal's status wins over "incomplete", as it does over
+        success - a wrapper has to see that the run was stopped."""
+        for i in range(4):
+            self.mkrand(f"r1/x{i}.bin", 50000)
+        self.mkrand("r2/y.bin", 50000)
+        self.sync()
+        self.dm("-r", self.path("r1"), self.path("r2"))
+        self.assertDmOk()
+        import shutil
+        shutil.rmtree(self.path("r2"))
+        for i in range(4):                     # something left to hash
+            os.utime(self.path(f"r1/x{i}.bin"), (1, 1))
+        self.dm(env={"DUPEREMOVE_INTERRUPT_AFTER": "1"})
+        self.assertEqual(130, self.rc, self.out)
+
     # -- the cases that must NOT fail --------------------------------------
 
     def test_clean_run_exits_zero(self):
