@@ -1179,6 +1179,20 @@ int dbfile_commit_trans(sqlite3 *db)
 	return ret;
 }
 
+/*
+ * Copy what the WAL holds into the database, as far as open readers allow.
+ * Once all of it is copied, the next write transaction restarts the WAL from
+ * its start instead of growing it (#261). A no-op without WAL.
+ */
+void dbfile_checkpoint(sqlite3 *db)
+{
+	int ret = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_PASSIVE,
+					    NULL, NULL);
+
+	if (ret && ret != SQLITE_BUSY)	/* busy: another checkpoint runs */
+		perror_sqlite(ret, "checkpointing the WAL");
+}
+
 int dbfile_abort_trans(sqlite3 *db)
 {
 	int ret;

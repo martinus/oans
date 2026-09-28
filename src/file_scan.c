@@ -41,6 +41,7 @@
 #include <sys/sysmacros.h>
 #include <uuid/uuid.h>
 #include <stdatomic.h>
+#include <signal.h>
 
 #include <glib.h>
 
@@ -319,26 +320,47 @@ static void scan_write_abort(void)
 	scan_trans_open = false;
 }
 
-/* Commit the listing read transaction if one is open. */
+/*
+ * End the listing read transaction if one is open, then commit the write batch
+ * and checkpoint while no snapshot is open.
+ *
+ * An open snapshot pins the WAL (#261): a checkpoint cannot copy frames past
+ * it, and the WAL restarts from its start only once a checkpoint has copied all
+ * of it. A new snapshot taken at once always lags the last commit, so without
+ * this gap no checkpoint would ever copy everything, and the WAL would only
+ * grow. Listing thread only, without the write lock.
+ */
 static void scan_read_flush(void)
 {
-	if (scan_read_open) {
-		dbfile_commit_trans(scan_read_db->db);
-		scan_read_open = false;
-	}
+	if (!scan_read_open)
+		return;
+	dbfile_commit_trans(scan_read_db->db);
+	scan_read_open = false;
+
+	dbfile_lock();
+	scan_write_flush();
+	dbfile_checkpoint(scan_writer->db);
+	dbfile_unlock();
+}
+
+/* Seconds until the listing read transaction is due for a refresh. */
+static double scan_read_left(double now)
+{
+	return scan_read_start + COMMIT_INTERVAL_SEC - now;
 }
 
 /*
  * Keep one read transaction open across the per-file change-detection lookups,
- * refreshed on the COMMIT_INTERVAL_SEC cadence so the reader snapshot doesn't
- * pin the WAL against checkpointing. Listing thread only, so no locking.
+ * refreshed on the COMMIT_INTERVAL_SEC cadence. Listing thread only. This runs
+ * only when a file arrives: walk_fileq_pop() and the end of the walk end the
+ * snapshot when none does.
  */
 static void scan_read_tick(struct dbhandle *db)
 {
 	double now = elapsed_seconds();
 
 	scan_read_db = db;
-	if (scan_read_open && now - scan_read_start >= COMMIT_INTERVAL_SEC)
+	if (scan_read_left(now) <= 0)
 		scan_read_flush();
 	if (!scan_read_open && dbfile_begin_trans(db->db) == 0) {
 		scan_read_open = true;
@@ -445,9 +467,16 @@ static unsigned int block_batch_max = BLOCK_BATCH_MAX;
  * without a multi-gigabyte file. DUPEREMOVE_CHECKPOINT_STOP abandons a file
  * after that many checkpoints, which is what an interrupted run leaves behind -
  * deterministically, where racing a real signal against a read is not.
+ *
+ * DUPEREMOVE_CHECKPOINT_PAUSE stops the whole process (SIGSTOP) at that many
+ * checkpoints into a file, once the walk has ended, and SIGCONT resumes the
+ * hashing. It holds a run in the middle of a large file after the listing is
+ * done, so a test can look at the hashfile as the run leaves it there (#261).
  */
 static uint64_t checkpoint_interval = CHECKPOINT_INTERVAL_BYTES;
 static unsigned int checkpoint_stop_after;
+static unsigned int checkpoint_pause_at;
+static atomic_bool walk_listed;	/* set once the consumer is done listing */
 
 struct hashes {
 	unsigned int extents_count;
@@ -1656,6 +1685,26 @@ void filescan_walk_begin(void)
 }
 
 /*
+ * Next item from the walk, for the consumer. While the listing read
+ * transaction is open, wait no longer than its refresh deadline, then end it
+ * and wait as long as it takes: a consumer idle on a slow walk must not pin
+ * the WAL (#261).
+ */
+static struct scan_item *walk_fileq_pop(void)
+{
+	if (scan_read_open) {
+		double left = MAX(scan_read_left(elapsed_seconds()), 0);
+		struct scan_item *it = g_async_queue_timeout_pop(walk_fileq,
+					(guint64)(left * G_USEC_PER_SEC));
+
+		if (it)
+			return it;
+		scan_read_flush();
+	}
+	return g_async_queue_pop(walk_fileq);
+}
+
+/*
  * Start the walkers and consume every file they find on the current thread.
  * The roots have already been seeded (scan_file), so locked_fs is set.
  */
@@ -1689,7 +1738,7 @@ int filescan_walk_run(struct dbhandle *db)
 
 	/* Consumer: single-threaded __scan_file() for every file found. */
 	for (;;) {
-		struct scan_item *it = g_async_queue_pop(walk_fileq);
+		struct scan_item *it = walk_fileq_pop();
 
 		if (it == WALK_STOP)
 			break;
@@ -1716,6 +1765,10 @@ int filescan_walk_run(struct dbhandle *db)
 		}
 		free(it);
 	}
+
+	/* The csum workers may write for hours yet; don't pin the WAL (#261). */
+	scan_read_flush();
+	atomic_store(&walk_listed, true);
 
 	for (i = 0; i < walk_nthreads; i++)
 		g_thread_join(threads[i]);
@@ -3566,9 +3619,17 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			return;
 		}
 
+		checkpoints++;
+
+		/* Test hook: hold the run here, mid-file, for a test to look. */
+		if (checkpoints == checkpoint_pause_at) {
+			while (!atomic_load(&walk_listed))
+				g_usleep(1000);
+			raise(SIGSTOP);
+		}
+
 		/* Test hook: stand in for the kill this exists to survive. */
-		if (checkpoint_stop_after &&
-		    ++checkpoints >= checkpoint_stop_after) {
+		if (checkpoints == checkpoint_stop_after) {
 			declare_display_path(disp, file->path);
 
 			vprintf("%s: stopping after %u checkpoints at %"PRIu64
@@ -3984,33 +4045,34 @@ void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
 					    memory_order_relaxed);
 }
 
+/* Set *out from a test-hook variable, if it holds a number in [1, max]. */
+static void env_uint(const char *name, unsigned long max, unsigned int *out)
+{
+	const char *env = getenv(name);
+	unsigned long v;
+
+	if (!env)
+		return;
+	v = strtoul(env, NULL, 10);
+	if (v > 0 && v <= max)
+		*out = (unsigned int)v;
+}
+
 void filescan_init(void)
 {
-	const char *batch_env = getenv("DUPEREMOVE_BLOCK_BATCH");
 	const char *ckpt_env = getenv("DUPEREMOVE_CHECKPOINT_BYTES");
-	const char *stop_env = getenv("DUPEREMOVE_CHECKPOINT_STOP");
 
 	force_fs_probe = getenv("DUPEREMOVE_FORCE_FS_PROBE") != NULL;
 
-	if (batch_env) {
-		unsigned long v = strtoul(batch_env, NULL, 10);
-
-		if (v > 0 && v <= BLOCK_BATCH_MAX)
-			block_batch_max = (unsigned int)v;
-	}
+	env_uint("DUPEREMOVE_BLOCK_BATCH", BLOCK_BATCH_MAX, &block_batch_max);
+	env_uint("DUPEREMOVE_CHECKPOINT_STOP", UINT_MAX, &checkpoint_stop_after);
+	env_uint("DUPEREMOVE_CHECKPOINT_PAUSE", UINT_MAX, &checkpoint_pause_at);
 
 	if (ckpt_env) {
 		unsigned long long v = strtoull(ckpt_env, NULL, 10);
 
 		if (v > 0)
 			checkpoint_interval = v;
-	}
-
-	if (stop_env) {
-		unsigned long v = strtoul(stop_env, NULL, 10);
-
-		if (v > 0 && v <= UINT_MAX)
-			checkpoint_stop_after = (unsigned int)v;
 	}
 
 	abort_on(scan_workq.workers);
@@ -4040,9 +4102,7 @@ void filescan_init(void)
 void filescan_free(void)
 {
 	scan_workq_drain();		/* wait for all queued files to finish */
-	/* All workers have joined: flush the batched reads and drop the writer. */
-	scan_read_flush();
-	scan_writer_close();
+	scan_writer_close();		/* all workers have joined */
 	subvol_cache_free();
 	verified_dev_free();
 	seen_inodes_free();
