@@ -74,6 +74,7 @@ COUNTS = {
                        'COUNT_EXTENTS_WORK("1")')],
 }
 QUERIES = list(COUNTS) + list(LOADERS)
+CASES = ["first", "half", "one"]
 SCHEMA = ["CREATE_TABLE_FILES", "CREATE_TABLE_EXTENTS", "CREATE_TABLE_BLOCKS",
           "CREATE_FILES_DEDUPESEQ_INDEX", "CREATE_SEARCH_INDEXES"]
 
@@ -85,9 +86,9 @@ def expand(source, exprs):
     """Expand C string macros with the preprocessor.
 
     Takes the file's string macros (a #define whose body holds a string
-    literal, continuation lines included), appends `const char *Q_n = <expr>;`
-    for each wanted expression, and reads the concatenated string literals
-    back out of `cc -E`. Only those #defines are kept, so no header or code is
+    literal, continuation lines included), appends `const char *Q = <expr>;`,
+    and reads the concatenated string literals back out of `cc -E`, once per
+    expression. Only those #defines are kept, so no header or code is
     needed; the other macros are left out because some of them use `#` in a
     way the preprocessor rejects when it sees them without their context.
     Returns {expr: sql or None}.
@@ -106,10 +107,15 @@ def expand(source, exprs):
                              input=f"{body}\nconst char *Q = {e};",
                              capture_output=True, text=True).stdout
         m = re.search(r"const char \*Q = (.*);", out, re.S)
-        lits = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)) if m else []
-        # An expression whose macros this version lacks expands to bare
-        # identifiers, not string literals.
-        res[e] = "".join(ast.literal_eval('"%s"' % l) for l in lits) if lits else None
+        expr = m.group(1) if m else ""
+        lit = r'"((?:[^"\\]|\\.)*)"'
+        # Anything but string literals left over - a macro this version lacks,
+        # or one the filter above dropped - means the SQL is not all there.
+        if not expr.strip() or re.sub(lit, "", expr).strip():
+            res[e] = None
+            continue
+        res[e] = "".join(ast.literal_eval('"%s"' % l)
+                         for l in re.findall(lit, expr))
     return res
 
 
@@ -262,7 +268,7 @@ def build(path, profile, scale, schema):
     db = sqlite3.connect(tmp)
     db.execute("pragma journal_mode=off")
     db.execute("pragma synchronous=off")
-    for s in ("CREATE_TABLE_FILES", "CREATE_TABLE_EXTENTS", "CREATE_TABLE_BLOCKS"):
+    for s in SCHEMA[:3]:                        # the three tables
         db.executescript(schema[s])
     db.execute("alter table files add column nr_extents integer not null default 0")
     rows = Rows(db)
@@ -335,7 +341,7 @@ def main():
     ap.add_argument("-q", "--query", action="append", choices=QUERIES,
                     help="query to time (repeatable; default: all)")
     ap.add_argument("-c", "--case", action="append",
-                    choices=["first", "half", "one"],
+                    choices=CASES,
                     help="first scan, half new, or one new generation "
                          "(repeatable; default: all)")
     ap.add_argument("--base", default="origin/master",
@@ -364,7 +370,7 @@ def main():
             return None
         return table[LOADERS[q][0]]
 
-    cases = args.case or ["first", "half", "one"]
+    cases = args.case or CASES
     differ = False
     hdr = (f"{'profile':11} {'query':14} {'case':6} "
            f"{'base s':>8} {'temp MiB':>9} {'new s':>8} {'temp MiB':>9}  result")
@@ -376,30 +382,41 @@ def main():
             build(path, profile, args.scale, new_sql)
             print(f"# built in {time.time() - t0:.0f} s, "
                   f"{path.stat().st_size >> 20} MiB", flush=True)
+        # Read the file once, so the side that runs first does not pay for a
+        # cold page cache: that alone once made one query 20.8 s against 0.3 s.
+        with open(path, "rb") as f:
+            while f.read(1 << 24):
+                pass
         db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         db.execute("pragma cache_size = -65536")   # as dbfile_set_modes()
         last = db.execute("select max(dedupe_seq) from files").fetchone()[0]
-        start = {"first": 0, "half": last // 2, "one": last - 1}
+        start = dict(zip(CASES, (0, last // 2, last - 1)))
         print(f"\n{hdr}")
         for q in args.query or QUERIES:
             b, n = sql(base_sql, q), sql(new_sql, q)
             if not b or not n:
                 print(f"{profile:11} {q:14} (not in one of the two versions)")
                 continue
+            # The same SQL on both sides is timed once: a loader nobody
+            # changed would otherwise cost a full second run for "same".
+            sides = (("new", n),) if b == n else (("base", b), ("new", n))
             for case in cases:
                 best = {}
                 for _ in range(args.rounds):
-                    for side, s in (("base", b), ("new", n)):
+                    for side, s in sides:
                         r = measure(db, q, s, start[case], last)
                         if side not in best or r[0] < best[side][0]:
                             best[side] = r
-                same = best["base"][2] == best["new"][2]
-                differ |= not same
-                print(f"{profile:11} {q:14} {case:6} "
-                      f"{best['base'][0]:8.2f} {best['base'][1] >> 20:9} "
+                if b == n:
+                    base, verdict = "        =          =", "SQL unchanged"
+                else:
+                    same = best["base"][2] == best["new"][2]
+                    differ |= not same
+                    base = f"{best['base'][0]:8.2f} {best['base'][1] >> 20:9}"
+                    verdict = "same" if same else "DIFFERENT"
+                print(f"{profile:11} {q:14} {case:6} {base} "
                       f"{best['new'][0]:8.2f} {best['new'][1] >> 20:9}  "
-                      f"{describe(best['new'][2], q)}, "
-                      f"{'same' if same else 'DIFFERENT'}", flush=True)
+                      f"{describe(best['new'][2], q)}, {verdict}", flush=True)
         db.close()
     if differ:
         print("\nDIFFERENT: the working tree's SQL returns other results "

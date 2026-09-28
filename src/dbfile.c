@@ -763,6 +763,19 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 "	where fdup.digest = " F ".digest and fdup.size = " F ".size "	\
 "	and fdup.id <> " F ".id and not (fdup.flags & 1))) "
 
+/*
+ * The extent rows that can be the older member of the group of extent W: same
+ * (digest, len), from a generation before this dedupe phase (?1), and not in
+ * a whole-file group. The loader takes the first of them as the group's
+ * anchor (GET_DUPLICATE_EXTENTS); the work estimate asks only whether one
+ * exists (dbfile_count_dupe_work). Defined once for the same reason as
+ * FILEDUP_MEMBER: if the two disagree, the progress total is wrong.
+ */
+#define EXTENTS_OLDER_COPY(W)						\
+"from extents o join files wo on o.fileid = wo.id "			\
+"where o.digest = " W ".digest and o.len = " W ".len "			\
+"and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")
+
 static struct dbhandle *open_handle(char *filename, bool readonly)
 {
 	struct dbhandle *result = calloc(1, sizeof(struct dbhandle));
@@ -891,10 +904,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 #define GET_DUPLICATE_EXTENTS						\
 "with g0(digest, len, cnt, anchor) as ( "				\
 "	select w.digest, w.len, count(*), case when ?1 > 0 then ( "	\
-"		select o.rowid from extents o "				\
-"		join files wo on o.fileid = wo.id "			\
-"		where o.digest = w.digest and o.len = w.len "		\
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+"		select o.rowid " EXTENTS_OLDER_COPY("w")			\
 "		order by o.rowid limit 1) end "				\
 "	from extents w join files wf on w.fileid = wf.id "		\
 "	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
@@ -2721,9 +2731,7 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 "	and o.dedupe_seq <= ?1 and not (o.flags & 1))"
 
 #define EXTENTS_OLD_MEMBER						\
-"exists (select 1 from extents o join files wo on o.fileid = wo.id "	\
-"	where o.digest = e.digest and o.len = e.len "			\
-"	and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") ")"
+"exists (select 1 " EXTENTS_OLDER_COPY("e") ")"
 
 #define COUNT_FILES_WORK(OLD, WINDOW, KEY)				\
 "select count(w), coalesce(sum(w), 0) from ( "				\

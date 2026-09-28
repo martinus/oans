@@ -964,10 +964,10 @@ counterexample. No dependencies, one header, minunit-compatible.
     `IN` form and churned temp pages the same way, and it asked "is there an
     older member" once per extent row. Now `COUNT_*_WORK_SINCE` groups the new
     rows and probes once per group; `_ALL` (at `seq_lo == 0`) has no window and
-    no probe. Measured with `scripts/bench-queries.py` (below), same results in
-    every case: fragmented extents 19.8 s / 5.6 GiB temp -> 7.8 s / 0,
-    snapshot extents 29.7 s / 7.2 GiB -> 12.7 s / 40 MiB, a 2M-file hashfile's
-    whole-file count 5.0 s / 3.1 GiB -> 3.4 s / 0.
+    no probe. Measured with `scripts/bench-queries.py` (see "Profiling &
+    measurement"), same results in every case: fragmented extents 19.8 s /
+    5.6 GiB temp -> 7.8 s / 0, snapshot extents 29.7 s / 7.2 GiB -> 12.7 s /
+    40 MiB, a 2M-file hashfile's whole-file count 5.0 s / 3.1 GiB -> 3.4 s / 0.
     - **`group by +f.digest` in `_SINCE`, and it matters.** Without the `+`,
       SQLite reads the whole digest index in group order and filters the
       window after: on 2M files a one-generation run took 3 s instead of 0.
@@ -976,6 +976,10 @@ counterexample. No dependencies, one header, minunit-compatible.
       the probe twice per group.
     - `?1` must appear in every form, since the C code always binds it; `_ALL`
       spells its "no older member" as `?1 > 0`.
+    - **One definition of an older extent copy, `EXTENTS_OLDER_COPY`**, used
+      by both the loader's anchor probe and the estimate, like
+      `FILEDUP_MEMBER`. Two copies of that rule can drift, and then the bar
+      stops short or waits at 99% with nothing failing.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`
