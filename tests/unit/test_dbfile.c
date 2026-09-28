@@ -1087,9 +1087,10 @@ MU_TEST(test_loading_one_filerec_treats_a_missing_id_as_success) {
  *
  * The loader ends with sort_file_hash_heads() because find_dupes walks each
  * file's blocks under a hash expecting increasing offsets. GET_DUPLICATE_BLOCKS
- * orders only by (dedupe_seq > ?1), fileid, and add_file_hash_head() appends in
- * arrival order - so rows genuinely arrive jumbled and this is the one place
- * that ordering is established for the dedupe phase.
+ * orders a file's rows by rowid, which is the order they were stored in, not
+ * by offset, and add_file_hash_head() appends in arrival order - so rows
+ * genuinely arrive jumbled and this is the one place that ordering is
+ * established for the dedupe phase.
  */
 MU_TEST(test_block_hashes_load_into_the_tree_in_offset_order) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
@@ -1226,14 +1227,19 @@ MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
  *     the window. It must not load: a member the pass has not reached yet is
  *     not a member, and counting it would load a group of one.
  *
+ * The new member is stored before the older one, so it has the lower id. A
+ * resumed file (#159) is like that: it keeps its row and gets this run's
+ * generation. So only the loader's own ordering, not the id order, can put
+ * the older member first.
+ *
  * Rows use their own inodes and digests and are deleted at the end: every
  * memdb() handle is the same database, so they would otherwise be seen by the
  * tests that run after this one.
  */
 static void span_fixture(struct dbhandle *db, int64_t id[3])
 {
-	id[0] = put_dupe(db, "/span/old", 61, 61, 65536, 1, 0, 2);
 	id[1] = put_dupe(db, "/span/new", 62, 62, 65536, 2, 0, 2);
+	id[0] = put_dupe(db, "/span/old", 61, 61, 65536, 1, 0, 2);
 	id[2] = put_dupe(db, "/span/later", 63, 63, 65536, 3, 0, 1);
 }
 
@@ -1287,18 +1293,36 @@ MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
 	span_cleanup(db);
 }
 
+/*
+ * The extent loader also has to skip whole-file duplicates when it looks for
+ * the older member: the whole-file pass deletes their extent rows, and may be
+ * doing so while this load runs. So the fixture adds an older whole-file pair
+ * whose extents carry both digests and are stored first, with the lowest
+ * rowids. Taken as the older member, it would become the target of `span` and
+ * would make `later` a group of two.
+ */
 MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
 	struct results_tree res;
 	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
-	struct extent_csum ext;
+	struct extent_csum ext, whole[2];
 	struct dupe_extents *d;
-	int64_t id[3];
+	int64_t id[3], w;
 
 	free_all_filerecs();
 	init_results_tree(&res);
 	digest_of(span, 66);
 	digest_of(later, 67);
+
+	whole[0] = (struct extent_csum){ .loff = 0, .poff = 20480, .len = 4096 };
+	memcpy(whole[0].digest, span, DIGEST_LEN);
+	whole[1] = (struct extent_csum){ .loff = 4096, .poff = 24576, .len = 4096 };
+	memcpy(whole[1].digest, later, DIGEST_LEN);
+	for (unsigned int i = 0; i < 2; i++) {
+		w = put_dupe(db, i ? "/span/whole2" : "/span/whole1", 68 + i, 68,
+			     65536, 1, 0, 2);
+		mu_check(dbfile_store_extent_hashes(db, w, 2, whole) == 0);
+	}
 	span_fixture(db, id);
 
 	ext.loff = 0;

@@ -814,40 +814,53 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 	dbfile_prepare_stmt(load_filerec, LOAD_FILEREC);
 
 /*
- * The group key set is built from this pass's rows with GROUP BY, never as an
- * IN (...) list of them (#260). An IN list over the window's rows is a temp
- * B-tree filled in random digest order, and SQLite gives it a tiny page cache,
- * so almost every insert rewrites a page - GiB of temp writes per pass. GROUP BY
- * goes through the sorter, which writes sequential runs. Measurements are in
+ * One generation window's duplicate blocks: every block of a file new this
+ * pass whose digest has another copy up to ?2, plus one older copy (the
+ * "anchor") for each digest that has one.
+ *
+ * The window is read once, in g0, and never again by digest (#260, #265). g0
+ * groups the window's rows through the sorter - never an IN (...) list of them,
+ * which is a temp B-tree filled in random digest order that rewrites a page per
+ * row. For each digest, g0 also finds the anchor: the lowest rowid among copies
+ * from earlier passes (dedupe_seq <= ?1), one index probe per digest. No
+ * earlier pass exists when ?1 = 0, so the probe is skipped there.
+ *
+ * A digest qualifies with two copies in the window, or one plus an anchor -
+ * the same as "more than one copy up to ?2". Both branches below read grp, so
+ * SQLite computes g0 once and scans the result twice. (Do not add "as
+ * materialized" to say so: that keyword needs SQLite 3.35, and nothing else
+ * here needs more than 3.25.) The cross join keeps the window's files as the
+ * outer loop (idx_files_dedupeseq) and reads their blocks by fileid; the
+ * planner would otherwise probe every copy of each digest in grp, old ones
+ * included.
+ *
+ * The rows come out in the order the loaders need: every anchor first, then
+ * the window's rows by file and then by rowid. So within one digest the older
+ * copy leads, and the new copies follow in file order. Measurements are in
  * CLAUDE.md ("Hashfile / SQLite gotchas").
- *
- * A group qualifies with two members in the window, or one plus an older one
- * (dedupe_seq <= ?1) - the same as "more than one member up to ?2". No older
- * generation exists when ?1 = 0, so the probe is skipped there.
- *
- * Otherwise the same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed
- * on digest.
  */
 #define GET_DUPLICATE_BLOCKS						\
-"with grp(digest) as ( "						\
-"	select w.digest from blocks w "					\
-"	join files wf on w.fileid = wf.id "				\
+"with g0(digest, cnt, anchor) as ( "					\
+"	select w.digest, count(*), case when ?1 > 0 then ( "		\
+"		select o.rowid from blocks o "				\
+"		join files wo on o.fileid = wo.id "			\
+"		where o.digest = w.digest and wo.dedupe_seq <= ?1 "	\
+"		order by o.rowid limit 1) end "				\
+"	from blocks w join files wf on w.fileid = wf.id "		\
 "	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
-"	group by w.digest "						\
-"	having count(*) > 1 or (?1 > 0 and exists ( "			\
-"		select 1 from blocks o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
-"select blocks.digest, fileid, loff from blocks "			\
-"join files on fileid = id "						\
-"where blocks.digest in (select digest from grp) and ( "		\
-"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
-"	or blocks.rowid in ( "						\
-"		select min(b.rowid) from blocks b "			\
-"		join files f on b.fileid = f.id "			\
-"		where f.dedupe_seq <= ?1 "				\
-"		and b.digest in (select digest from grp) "		\
-"		group by b.digest order by 1)) "			\
-"order by (dedupe_seq > ?1), fileid;"
+"	group by w.digest), "						\
+"grp as ( "							\
+"	select digest, anchor from g0 "					\
+"	where cnt > 1 or anchor is not null) "				\
+"select digest, fileid, loff from ( "					\
+"	select b.digest, b.fileid, b.loff, 1 as n, b.rowid as r "	\
+"	from files f cross join blocks b on b.fileid = f.id "		\
+"	where f.dedupe_seq > ?1 and f.dedupe_seq <= ?2 "		\
+"	and b.digest in (select digest from grp) "			\
+"	union all "							\
+"	select b.digest, b.fileid, b.loff, 0, b.rowid "			\
+"	from grp join blocks b on b.rowid = grp.anchor) "		\
+"order by n, fileid, r;"
 	dbfile_prepare_stmt(get_duplicate_blocks, GET_DUPLICATE_BLOCKS);
 
 /*
@@ -858,49 +871,47 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * result of only one extent.
  */
 /*
- * Same generation-pass reduction as GET_DUPLICATE_FILES: load the extents new
- * this pass plus one already-deduped representative per group (min rowid among
+ * Same generation-pass reduction as GET_DUPLICATE_FILES, and the same query
+ * shape as GET_DUPLICATE_BLOCKS, keyed on (digest, len): the extents new this
+ * pass plus one already-deduped copy per group (the anchor, min rowid among
  * members from an earlier pass), rather than every member. Extent dedupe takes
- * the first list entry as target, so ordering the representative first keeps a
- * stable target across passes (convergence) without a per-group flag.
+ * the first list entry as target, so ordering the anchor first keeps a stable
+ * target across passes (convergence) without a per-group flag.
  *
  * Extents whose file is a whole-file dup-group member (FILEDUP_MEMBER) are
- * excluded *statically*, everywhere `extents` is referenced. The whole-file
- * pass deletes exactly those rows (dbfile_remove_extent_hashes) for every
- * member it processes, so the end state is identical to relying on that
- * deletion having happened first - but the static exclusion means the extent
- * load no longer depends on the whole-file pass finishing, which is what lets
- * the two passes pipeline.
- *
- * grp is built with GROUP BY over the window, not as an IN list of it, for the
- * reason given at GET_DUPLICATE_BLOCKS (#260). The same goes for the list of
- * representatives' rowids: GROUP BY emits them in digest order, which is a
- * random rowid order, so `order by 1` sorts them before they fill the list.
+ * excluded *statically*, everywhere `extents` is read. The whole-file pass
+ * deletes exactly those rows (dbfile_remove_extent_hashes) for every member it
+ * processes, so the end state is identical to relying on that deletion having
+ * happened first - but the static exclusion means the extent load no longer
+ * depends on the whole-file pass finishing, which is what lets the two passes
+ * pipeline.
  */
 #define GET_DUPLICATE_EXTENTS						\
-"with grp(digest, len) as ( "						\
-"	select w.digest, w.len from extents w "				\
-"	join files wf on w.fileid = wf.id "				\
+"with g0(digest, len, cnt, anchor) as ( "				\
+"	select w.digest, w.len, count(*), case when ?1 > 0 then ( "	\
+"		select o.rowid from extents o "				\
+"		join files wo on o.fileid = wo.id "			\
+"		where o.digest = w.digest and o.len = w.len "		\
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+"		order by o.rowid limit 1) end "				\
+"	from extents w join files wf on w.fileid = wf.id "		\
 "	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
 "	and not " FILEDUP_MEMBER("wf")					\
-"	group by w.digest, w.len "					\
-"	having count(*) > 1 or (?1 > 0 and exists ( "			\
-"		select 1 from extents o join files wo on o.fileid = wo.id " \
-"		where o.digest = w.digest and o.len = w.len "		\
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") "))) " \
-"select extents.digest, fileid, loff, len, poff from extents "		\
-"join files on fileid = id "						\
-"where not " FILEDUP_MEMBER("files")					\
-"and (extents.digest, len) in (select digest, len from grp) and ( "	\
-"	(dedupe_seq > ?1 and dedupe_seq <= ?2) "			\
-"	or extents.rowid in ( "						\
-"		select min(e.rowid) from extents e "			\
-"		join files f on e.fileid = f.id "			\
-"		where f.dedupe_seq <= ?1 "				\
-"		and not " FILEDUP_MEMBER("f")				\
-"		and (e.digest, e.len) in (select digest, len from grp) "\
-"		group by e.digest, e.len order by 1)) "		\
-"order by (dedupe_seq > ?1), fileid;"
+"	group by w.digest, w.len), "					\
+"grp as ( "							\
+"	select digest, len, anchor from g0 "				\
+"	where cnt > 1 or anchor is not null) "				\
+"select digest, fileid, loff, len, poff from ( "			\
+"	select e.digest, e.fileid, e.loff, e.len, e.poff, "		\
+"	       1 as n, e.rowid as r "					\
+"	from files f cross join extents e on e.fileid = f.id "		\
+"	where f.dedupe_seq > ?1 and f.dedupe_seq <= ?2 "		\
+"	and not " FILEDUP_MEMBER("f")					\
+"	and (e.digest, e.len) in (select digest, len from grp) "	\
+"	union all "							\
+"	select e.digest, e.fileid, e.loff, e.len, e.poff, 0, e.rowid "	\
+"	from grp join extents e on e.rowid = grp.anchor) "		\
+"order by n, fileid, r;"
 	dbfile_prepare_stmt(get_duplicate_extents, GET_DUPLICATE_EXTENTS);
 
 /*
