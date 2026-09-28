@@ -46,9 +46,23 @@
 # exact: when the signal lands, N files are already in the open batch. Off by
 # one and that test asserts against a batch holding something else.
 <<<
-	if (atomic_fetch_add(&tick_files, 1) + 1 == limit_files)
+	n = atomic_fetch_add(&tick_files, 1) + 1;
 ===
-	if (atomic_fetch_add(&tick_files, 1) == limit_files)
+	n = atomic_fetch_add(&tick_files, 1);
+>>>
+
+# a worker past the file limit does not wait for the raise
+# The worker that counts file N increments first and raises second. A loaded
+# runner can pause it in between, and then every other worker hashes all the
+# files that are left before the signal lands: the run is never cut short, and
+# test_signal_flush fails with "300 not less than 300" (#267).
+<<<
+	} else if (n > limit_files) {
+		while (!atomic_load(&file_raise_done))
+			sched_yield();
+	}
+===
+	}
 >>>
 
 # the file hook keeps counting after the run is interrupted

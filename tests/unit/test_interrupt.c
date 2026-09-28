@@ -166,6 +166,50 @@ MU_TEST(test_the_interrupt_flag_and_its_test_hooks) {
 }
 
 /*
+ * A worker that counts past the file limit waits until the raise has returned
+ * (#267). The raising worker increments first and raises second, and a loaded
+ * CI runner once paused it in between: the other workers then hashed every
+ * file that was left, and the run was not cut short at all.
+ *
+ * The fixture is that pause: the counter already at the limit, the raise not
+ * done yet. A second thread ticks and must still be waiting a little later.
+ * The check can only fail in one direction - a slow runner that has not
+ * started the thread yet reads as "still waiting", never as "went on".
+ */
+static void *intr_tick_thread(void *returned)
+{
+	interrupt_test_file_tick();
+	atomic_store((_Atomic bool *)returned, true);
+	return NULL;
+}
+
+MU_TEST(test_a_worker_past_the_limit_waits_for_the_raise) {
+	_Atomic bool returned = false;
+	bool went_on_early;
+	pthread_t t;
+
+	intr_reset();
+	setenv("DUPEREMOVE_INTERRUPT_AFTER", "1", 1);
+	interrupt_install();
+	atomic_store(&tick_files, 1);		/* file 1 counted, not raised */
+
+	if (pthread_create(&t, NULL, intr_tick_thread, &returned))
+		abort();
+	usleep(20000);
+	went_on_early = atomic_load(&returned);
+
+	/* Let it go before asserting: mu_assert returns, and a thread still
+	 * spinning would outlive the test. */
+	atomic_store(&file_raise_done, true);
+	pthread_join(t, NULL);
+	intr_reset();
+
+	mu_assert(!went_on_early,
+		  "a worker past the limit went on before the raise was done");
+	mu_check(atomic_load(&returned));
+}
+
+/*
  * The wind-down notice is said once, and only once there is something to say.
  *
  * Every loop that notices the flag may call this, and several do - the point
