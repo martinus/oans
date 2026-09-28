@@ -891,10 +891,19 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 /*
  * Same generation-pass reduction as GET_DUPLICATE_FILES, and the same query
  * shape as GET_DUPLICATE_BLOCKS, keyed on (digest, len): the extents new this
- * pass plus one already-deduped copy per group (the anchor, min rowid among
- * members from an earlier pass), rather than every member. Extent dedupe takes
- * the first list entry as target, so ordering the anchor first keeps a stable
- * target across passes (convergence) without a per-group flag.
+ * pass plus one already-deduped copy per group (the anchor), rather than every
+ * member. Extent dedupe takes the first list entry as target, so ordering the
+ * anchor first keeps a stable target across passes without a per-group flag.
+ *
+ * Stable only if every window picks the same member (#279), as #199 made every
+ * window do for whole files: up to two batches are in flight, and a window
+ * whose target an earlier window is still moving strands its copies on storage
+ * nothing frees. The first window used to take the lowest file id and every
+ * later one the older copy with the lowest rowid; rowids follow hashing order,
+ * and a large file listed first is hashed last. Both now take the smallest
+ * (generation, file id, rowid). The earliest generation's member is in the
+ * first window that has the group, and in every later window it is an older
+ * copy; a copy that arrives later, in this run or the next, never outranks it.
  *
  * Extents whose file is a whole-file dup-group member (FILEDUP_MEMBER) are
  * excluded *statically*, everywhere `extents` is read. The whole-file pass
@@ -908,7 +917,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "with g0(digest, len, cnt, anchor) as ( "				\
 "	select w.digest, w.len, count(*), case when ?1 > 0 then ( "	\
 "		select o.rowid " EXTENTS_OLDER_COPY("w")			\
-"		order by o.rowid limit 1) end "				\
+"		order by wo.dedupe_seq, wo.id, o.rowid limit 1) end "	\
 "	from extents w join files wf on w.fileid = wf.id "		\
 "	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
 "	and not " FILEDUP_MEMBER("wf")					\
@@ -918,15 +927,15 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "	where cnt > 1 or anchor is not null) "				\
 "select digest, fileid, loff, len, poff from ( "			\
 "	select e.digest, e.fileid, e.loff, e.len, e.poff, "		\
-"	       1 as n, e.rowid as r "					\
+"	       1 as n, f.dedupe_seq as s, e.rowid as r "		\
 "	from files f cross join extents e on e.fileid = f.id "		\
 "	where f.dedupe_seq > ?1 and f.dedupe_seq <= ?2 "		\
 "	and not " FILEDUP_MEMBER("f")					\
 "	and (e.digest, e.len) in (select digest, len from grp) "	\
 "	union all "							\
-"	select e.digest, e.fileid, e.loff, e.len, e.poff, 0, e.rowid "	\
+"	select e.digest, e.fileid, e.loff, e.len, e.poff, 0, 0, e.rowid " \
 "	from grp join extents e on e.rowid = grp.anchor) "		\
-"order by n, fileid, r;"
+"order by n, s, fileid, r;"
 	dbfile_prepare_stmt(get_duplicate_extents, GET_DUPLICATE_EXTENTS);
 
 /*
@@ -961,18 +970,33 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * lowest id to break ties. Every window sees the same rows, so every window
  * reaches the same answer, and since the target is never a destination it never
  * moves underneath anyone.
+ *
+ * `grp` counts every member too, not only those up to ?2. The target can sit
+ * in a later window, and a member alone in an earlier one used to see a group
+ * of one there; the target's window did not load it either, so it was never
+ * deduped - 27% of the duplicate bytes of a first scan of a synthetic 600k-file
+ * hashfile.
+ *
+ * Every window of *one run*, that is. A copy that arrives in a later run can
+ * outrank every older one (fewer extents, or read-only), and the older copies
+ * were deduped onto the previous target in an earlier run (#272). So the
+ * window holding a target that is new this run (its generation in (?1, ?2],
+ * and so above ?3, where this dedupe phase started) also loads every member at
+ * or below ?3, and they move onto it. Members of earlier windows of this run
+ * are not reloaded: every window of the run elected the same target, so they
+ * are on it already.
  */
 #define GET_DUPLICATE_FILES							\
 "with grp(digest, size) as ( "							\
 "	select digest, size from files "				\
-"	where dedupe_seq <= ?2 and not (flags & 1) and (digest, size) in ( "	\
+"	where not (flags & 1) and (digest, size) in ( "			\
 "		select digest, size from files "				\
 "		where dedupe_seq > ?1 and dedupe_seq <= ?2 "			\
 "		and not (flags & 1)) "						\
 "	group by digest, size having count(*) > 1), "			\
-"tgt(digest, size, fileid) as ( "					\
-"	select digest, size, id from ( "				\
-"		select digest, size, id, row_number() over ( "		\
+"tgt(digest, size, fileid, seq) as ( "				\
+"	select digest, size, id, dedupe_seq from ( "			\
+"		select digest, size, id, dedupe_seq, row_number() over ( "	\
 "			partition by digest, size "			\
 "			order by (flags & 2) desc, nr_extents, id) rn "	\
 "		from files where not (flags & 1) "			\
@@ -982,7 +1006,8 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "       (f.id = t.fileid) as is_target "					\
 "from files f join tgt t on t.digest = f.digest and t.size = f.size "	\
 "where not (f.flags & 1) and ( "					\
-"	(f.dedupe_seq > ?1 and f.dedupe_seq <= ?2) or f.id = t.fileid) "	\
+"	(f.dedupe_seq > ?1 and f.dedupe_seq <= ?2) or f.id = t.fileid "	\
+"	or (t.seq > ?1 and t.seq <= ?2 and f.dedupe_seq <= ?3)) "	\
 "order by is_target desc, f.id;"
 	dbfile_prepare_stmt(get_duplicate_files, GET_DUPLICATE_FILES);
 
@@ -2611,7 +2636,8 @@ out:
 }
 
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
-			   unsigned int seq_lo, unsigned int seq_hi)
+			   unsigned int seq_lo, unsigned int seq_hi,
+			   unsigned int phase_lo)
 {
 	int ret;
 	_cleanup_(sqlite3_reset_stmt) sqlite3_stmt *stmt = db->stmts.get_duplicate_files;
@@ -2624,6 +2650,8 @@ int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
 	ret = sqlite3_bind_int64(stmt, 1, seq_lo);
 	if (!ret)
 		ret = sqlite3_bind_int64(stmt, 2, seq_hi);
+	if (!ret)
+		ret = sqlite3_bind_int64(stmt, 3, phase_lo);
 	if (ret) {
 		perror_sqlite(ret, "binding value");
 		return ret;
@@ -2750,21 +2778,36 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
  * The extent query takes the window's files first (cross join) and reads
  * their extents by fileid, so FILEDUP_MEMBER runs once per file.
  */
-#define FILES_OLD_MEMBER						\
-"exists (select 1 from files o "					\
+#define FILES_OLD_MEMBERS						\
+"(select count(*) from files o "					\
 "	where o.digest = f.digest and o.size = f.size "			\
 "	and o.dedupe_seq <= ?1 and not (o.flags & 1))"
+
+/*
+ * Whether the group's elected target (GET_DUPLICATE_FILES's ranking) is new
+ * this run. If so, its window also moves the o older copies onto it (#272),
+ * so the group is c - 1 + o copies instead of c.
+ */
+#define FILES_TARGET_IS_NEW						\
+"(select t.dedupe_seq > ?1 from files t "				\
+"	where t.digest = g.digest and t.size = g.size "			\
+"	and not (t.flags & 1) "						\
+"	order by (t.flags & 2) desc, t.nr_extents, t.id limit 1)"
 
 #define EXTENTS_OLD_MEMBER						\
 "exists (select 1 " EXTENTS_OLDER_COPY("e") ")"
 
 #define COUNT_FILES_WORK(OLD, WINDOW, KEY)				\
 "select count(w), coalesce(sum(w), 0) from ( "				\
-"  select case when " OLD " then size * count(*) "			\
-"              when count(*) > 1 then size * (count(*) - 1) end as w "	\
-"  from files f "							\
-"  where f.digest is not null and not (f.flags & 1) " WINDOW		\
-"  group by " KEY ", f.size)"
+"  select case when o > 0 then size * (c + "				\
+"                  case when " FILES_TARGET_IS_NEW " then o - 1 else 0 end) " \
+"              when c > 1 then size * (c - 1) end as w "		\
+"  from ( "								\
+"    select f.digest as digest, f.size as size, count(*) as c, "	\
+"           " OLD " as o "						\
+"    from files f "							\
+"    where f.digest is not null and not (f.flags & 1) " WINDOW		\
+"    group by " KEY ", f.size) g)"
 
 #define COUNT_EXTENTS_WORK(OLD, WINDOW)					\
 "select count(w), coalesce(sum(w), 0) from ( "				\
@@ -2775,9 +2818,9 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 "  group by e.digest, e.len)"
 
 #define COUNT_FILES_WORK_SINCE						\
-	COUNT_FILES_WORK(FILES_OLD_MEMBER, "and f.dedupe_seq > ?1 ", "+f.digest")
+	COUNT_FILES_WORK(FILES_OLD_MEMBERS, "and f.dedupe_seq > ?1 ", "+f.digest")
 #define COUNT_FILES_WORK_ALL						\
-	COUNT_FILES_WORK("?1 > 0", "", "f.digest")
+	COUNT_FILES_WORK("(?1 > 0)", "", "f.digest")
 #define COUNT_EXTENTS_WORK_SINCE					\
 	COUNT_EXTENTS_WORK(EXTENTS_OLD_MEMBER, "and f.dedupe_seq > ?1 ")
 #define COUNT_EXTENTS_WORK_ALL						\

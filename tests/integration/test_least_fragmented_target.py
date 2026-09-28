@@ -37,3 +37,30 @@ class LeastFragmentedTargetTest(DuperemoveTest):
             self.assertLessEqual(
                 len(fiemap_extents(p)), 4,
                 f"{os.path.basename(p)} should be contiguous after dedupe")
+
+    def test_a_contiguous_copy_added_later_takes_the_older_ones_along(self):
+        """#272: the election ranges over every member, so a contiguous copy
+        that arrives in a later run wins it - and the older copies, deduped
+        onto each other in the earlier run, have to move onto it. They used to
+        stay where they were: the new copy was loaded alone, a group of one,
+        and no later run loaded the group again."""
+        content = os.urandom(4 * MiB)
+        frags = [self.fragment(f"tree/frag{i}", content) for i in range(2)]
+        self.sync()
+        self.dedupe(self.path("tree"))
+        self.assertDmOk()
+        self.assertShared(frags[0], frags[1], "setup: the first run deduped")
+
+        contig = self.write("tree/contig", content)
+        self.sync()
+        self.assertLessEqual(len(fiemap_extents(contig)), 2,
+                             "setup: contig is ~one extent")
+        self.dedupe(self.path("tree"))
+        self.assertDmOk()
+        self.sync()
+        for p in frags:
+            self.assertShared(contig, p, f"{os.path.basename(p)} moved")
+
+        self.dm("-rd", self.path("tree"), quiet=False)
+        self.assertDmOk()
+        self.assertReclaimedNothing("a third run has nothing left to do")

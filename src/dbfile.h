@@ -363,8 +363,14 @@ int dbfile_remove_file(struct dbhandle *db, const char *filename);
 
 int dbfile_describe_file(struct dbhandle *db, uint64_t ino, uint64_t subvol,
 				struct file *dbfile);
+/*
+ * Load the whole-file groups with a member in generations (seq_lo, seq_hi]. The
+ * dedupe phase started at phase_lo: a group whose target is new this run also
+ * brings its members from before it (#272).
+ */
 int dbfile_load_same_files(struct dbhandle *db, struct results_tree *res,
-			   unsigned int seq_lo, unsigned int seq_hi);
+			   unsigned int seq_lo, unsigned int seq_hi,
+			   unsigned int phase_lo);
 
 int dbfile_rename_file(struct dbhandle *db, int64_t fileid, char *path);
 

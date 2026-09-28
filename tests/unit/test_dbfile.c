@@ -862,7 +862,7 @@ MU_TEST(test_whole_file_dupes_load_at_poff_zero) {
 	/* ...and neither is one of the same digest at a different size. */
 	put_dupe(db, "/tree/e", 5, 7, 4096, 1, 0, 1);
 
-	mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+	mu_check(dbfile_load_same_files(db, &res, 0, 1, 0) == 0);
 
 	mu_check(res.num_dupes == 1);
 	d = only_group(&res);
@@ -897,7 +897,7 @@ static const char *elected_target(const char *const names[3],
 	for (unsigned int i = 0; i < 3; i++)
 		put_dupe(db, names[i], i + 1, 7, 8192, 1, flags[i],
 			 nr_extents[i]);
-	if (dbfile_load_same_files(db, &res, 0, 1))
+	if (dbfile_load_same_files(db, &res, 0, 1, 0))
 		abort();
 	snprintf(winner, sizeof(winner), "%s", target_of(only_group(&res)));
 	free_results_tree(&res);
@@ -973,11 +973,11 @@ MU_TEST(test_every_window_elects_the_same_whole_file_target) {
 	put_dupe(db, "/tree/new", 4, 7, 8192, 3, 0, 4);
 
 	init_results_tree(&first);
-	mu_check(dbfile_load_same_files(db, &first, 1, 2) == 0);
+	mu_check(dbfile_load_same_files(db, &first, 1, 2, 1) == 0);
 	t1 = target_of(only_group(&first));
 
 	init_results_tree(&second);
-	mu_check(dbfile_load_same_files(db, &second, 2, 3) == 0);
+	mu_check(dbfile_load_same_files(db, &second, 2, 3, 1) == 0);
 	t2 = target_of(only_group(&second));
 
 	/*
@@ -1033,7 +1033,7 @@ MU_TEST(test_an_inlined_file_is_never_loaded_as_a_duplicate) {
 	put_dupe(db, "/tree/solo", 4, 9, 4096, 1, 0, 1);
 	put_dupe(db, "/tree/solo-inl", 5, 9, 4096, 1, FILE_INLINED, 0);
 
-	mu_check(dbfile_load_same_files(db, &res, 0, 1) == 0);
+	mu_check(dbfile_load_same_files(db, &res, 0, 1, 0) == 0);
 
 	mu_check(res.num_dupes == 1);		/* the digest-7 group, only */
 	mu_check(find_dupe_extents(&res, solo, 4096) == NULL);
@@ -1291,6 +1291,231 @@ MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
 	free_hash_tree(&tree);
 	free_all_filerecs();
 	span_cleanup(db);
+}
+
+/*
+ * #272: a copy that arrives in a later run and outranks every older one - fewer
+ * extents, or read-only - wins the election, which ranges over every member
+ * (#197). The older copies were deduped onto the *previous* target in an
+ * earlier run, so the window holding the new target has to load them too, or
+ * nothing ever moves them: they were loaded as nothing but the new target, a
+ * group of one, and the next run had nothing new to load at all.
+ *
+ * Each case is one group with its own generations; the dedupe phase starts at
+ * `phase`, so members at or below it are from an earlier run.
+ */
+struct t272 { const char *name; unsigned int seq, flags, nr; };
+
+static void t272_put(struct dbhandle *db, const struct t272 *f, unsigned int n)
+{
+	free_all_filerecs();
+	for (unsigned int i = 0; i < n; i++)
+		put_dupe(db, f[i].name, 720 + i, 272, 8192, f[i].seq,
+			 f[i].flags, f[i].nr);
+}
+
+/* The window's group, as "target:member,member,..." in load order. */
+static const char *t272_load(struct dbhandle *db, unsigned int lo,
+			     unsigned int hi, unsigned int phase)
+{
+	static char out[256];
+	struct results_tree res;
+	struct extent *e;
+	size_t len = 0;
+
+	init_results_tree(&res);
+	if (dbfile_load_same_files(db, &res, lo, hi, phase))
+		abort();
+	out[0] = 0;
+	if (res.num_dupes) {
+		list_for_each_entry(e, &only_group(&res)->de_extents, e_list)
+			len += snprintf(out + len, sizeof(out) - len, "%s%s",
+					len ? "," : "", e->e_file->filename + 6);
+	}
+	free_results_tree(&res);
+	free_all_filerecs();
+	return out;
+}
+
+static uint64_t t272_work(struct dbhandle *db, unsigned int phase)
+{
+	uint64_t groups, bytes;
+
+	dbfile_count_dupe_work(db, phase, true, &groups, &bytes);
+	return bytes / 8192;			/* in copies */
+}
+
+MU_TEST(test_a_new_whole_file_target_takes_the_older_copies_with_it) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+
+	/* Fewer extents: c arrives in one piece, a and b were fragmented. */
+	{
+		static const struct t272 f[] = {
+			{ "/t272/a", 610, 0, 3 }, { "/t272/b", 610, 0, 3 },
+			{ "/t272/c", 611, 0, 1 },
+		};
+
+		t272_put(db, f, 3);
+		mu_assert_string_eq("c,a,b", t272_load(db, 610, 611, 610));
+		mu_check(t272_work(db, 610) == 2);
+		/* The next run has nothing new, and nothing is left behind. */
+		mu_assert_string_eq("", t272_load(db, 611, 612, 611));
+		exec(db, "delete from files where filename like '/t272/%'");
+	}
+
+	/* Read-only: a new snapshot outranks writable older copies (#172). */
+	{
+		static const struct t272 f[] = {
+			{ "/t272/a", 620, 0, 1 }, { "/t272/b", 620, 0, 1 },
+			{ "/t272/c", 621, FILE_RO_SUBVOL, 4 },
+		};
+
+		t272_put(db, f, 3);
+		mu_assert_string_eq("c,a,b", t272_load(db, 620, 621, 620));
+		mu_check(t272_work(db, 620) == 2);
+		exec(db, "delete from files where filename like '/t272/%'");
+	}
+
+	/* The control: an older copy stays the target, and only c moves. */
+	{
+		static const struct t272 f[] = {
+			{ "/t272/a", 630, 0, 1 }, { "/t272/b", 630, 0, 1 },
+			{ "/t272/c", 631, 0, 3 },
+		};
+
+		t272_put(db, f, 3);
+		mu_assert_string_eq("a,c", t272_load(db, 630, 631, 630));
+		mu_check(t272_work(db, 630) == 1);
+		exec(db, "delete from files where filename like '/t272/%'");
+	}
+
+	/*
+	 * Two windows in one run, the target in the second. The first window
+	 * already moves d onto c - every window elects c - so the second loads
+	 * the older copies and not d, and the work adds up across the windows:
+	 * one copy, then two.
+	 */
+	{
+		static const struct t272 f[] = {
+			{ "/t272/a", 640, 0, 3 }, { "/t272/b", 640, 0, 3 },
+			{ "/t272/d", 641, 0, 5 }, { "/t272/c", 642, 0, 1 },
+		};
+
+		t272_put(db, f, 4);
+		mu_assert_string_eq("c,d", t272_load(db, 640, 641, 640));
+		mu_assert_string_eq("c,a,b", t272_load(db, 641, 642, 640));
+		mu_check(t272_work(db, 640) == 3);
+		exec(db, "delete from files where filename like '/t272/%'");
+	}
+
+	/*
+	 * The same inside one run, even a first one: d is alone in its window
+	 * and the target comes later. The group used to count only members up
+	 * to the window's end, so d's window saw a group of one and skipped it,
+	 * and c's window did not load d either - d was never deduped. On a
+	 * synthetic 600k-file hashfile that was 27% of the duplicate bytes of
+	 * a first scan.
+	 */
+	{
+		static const struct t272 f[] = {
+			{ "/t272/d", 651, 0, 5 }, { "/t272/c", 652, 0, 1 },
+		};
+
+		t272_put(db, f, 2);
+		mu_assert_string_eq("c,d", t272_load(db, 650, 651, 650));
+		/* d moved already; c alone is a group of one, never deduped. */
+		mu_assert_string_eq("c", t272_load(db, 651, 652, 650));
+		mu_check(t272_work(db, 650) == 1);
+		exec(db, "delete from files where filename like '/t272/%'");
+	}
+}
+
+/*
+ * #279: every window must take the same member of an extent group first, as
+ * #199 made every window do for whole files. The first window took the lowest
+ * file id and every later one the older copy with the lowest rowid, and rowids
+ * follow hashing order, not listing order. With two batches in flight, a later
+ * window could then dedupe onto a copy the earlier one was still moving.
+ *
+ * The key both use now is (generation, file id, rowid): the first window's
+ * target is the earliest generation's, and a later window finds it among the
+ * older copies. Each case stores rows in an order that makes the weaker keys
+ * disagree.
+ */
+static const char *extent_target(struct dbhandle *db, unsigned int lo,
+				 unsigned int hi, unsigned char *digest)
+{
+	static char out[64];
+	struct results_tree res;
+	struct dupe_extents *d;
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	if (dbfile_load_extent_hashes(db, &res, lo, hi))
+		abort();
+	d = find_dupe_extents(&res, digest, 4096);
+	snprintf(out, sizeof(out), "%s", d ? target_of(d) + 6 : "");
+	free_results_tree(&res);
+	free_all_filerecs();
+	return out;
+}
+
+static int64_t t279_put(struct dbhandle *db, const char *name, unsigned int n,
+			unsigned int seq)
+{
+	/* A whole-file digest of its own, so no file is a whole-file dup. */
+	return put_dupe(db, name, 790 + n, 790 + n, 65536, seq, 0, 1);
+}
+
+static void t279_extent(struct dbhandle *db, int64_t id,
+			const unsigned char *digest)
+{
+	struct extent_csum e = { .loff = 0, .poff = 4096 * (uint64_t)id,
+				 .len = 4096 };
+
+	memcpy(e.digest, digest, DIGEST_LEN);
+	if (dbfile_store_extent_hashes(db, id, 1, &e))
+		abort();
+}
+
+MU_TEST(test_every_window_takes_the_same_extent_target) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	unsigned char dg[DIGEST_LEN];
+	int64_t x, y, z;
+
+	digest_of(dg, 279);
+
+	/*
+	 * x and y share the first window; x has the lower id, y was hashed
+	 * first and so has the lower rowid. The issue's reproduction.
+	 */
+	x = t279_put(db, "/t279/x", 0, 650);
+	y = t279_put(db, "/t279/y", 1, 650);
+	z = t279_put(db, "/t279/z", 2, 651);
+	t279_extent(db, y, dg);
+	t279_extent(db, x, dg);
+	t279_extent(db, z, dg);
+	mu_assert_string_eq("x", extent_target(db, 649, 650, dg));
+	mu_assert_string_eq("x", extent_target(db, 650, 651, dg));
+	exec(db, "delete from files where filename like '/t279/%'");
+
+	/*
+	 * m arrives a generation after t but has the lower id, as a resumed
+	 * file does (#159), and the lower rowid. The window after m's must
+	 * still take t: m was being moved onto it.
+	 */
+	y = t279_put(db, "/t279/m", 3, 661);
+	x = t279_put(db, "/t279/t", 4, 660);
+	z = t279_put(db, "/t279/n", 5, 662);
+	t279_extent(db, y, dg);
+	t279_extent(db, x, dg);
+	t279_extent(db, z, dg);
+	mu_assert_string_eq("t", extent_target(db, 660, 661, dg));
+	mu_assert_string_eq("t", extent_target(db, 661, 662, dg));
+
+	/* One window over both generations takes t first as well. */
+	mu_assert_string_eq("t", extent_target(db, 659, 662, dg));
+	exec(db, "delete from files where filename like '/t279/%'");
 }
 
 /*
