@@ -36,7 +36,9 @@
 
 struct glob_pat {
 	char		*pattern;	/* as written; also the literal hash key */
-	GRegex		*re;		/* NULL for exact-match entries */
+	GRegex		*re;		/* NULL for exact-match entries, or
+					 * a pattern that is not UTF-8 */
+	GRegex		*re_raw;	/* the same over bytes; see raw_path() */
 	bool		dir_only;
 	bool		internal;	/* added by oans, not by the user */
 	/*
@@ -53,6 +55,7 @@ struct glob_set {
 	GPtrArray	*pats;		/* struct glob_pat *, in add order */
 	GHashTable	*literals;	/* pattern -> struct glob_pat * */
 	GRegex		*re;		/* every glob fragment, one alternation */
+	GRegex		*re_raw;	/* the same, compiled over bytes */
 };
 
 static void glob_pat_free(gpointer p)
@@ -60,6 +63,7 @@ static void glob_pat_free(gpointer p)
 	struct glob_pat *gp = p;
 
 	g_clear_pointer(&gp->re, g_regex_unref);
+	g_clear_pointer(&gp->re_raw, g_regex_unref);
 	g_free(gp->pattern);
 	g_free(gp);
 }
@@ -78,6 +82,7 @@ void glob_set_free(struct glob_set *gs)
 	if (!gs)
 		return;
 	g_clear_pointer(&gs->re, g_regex_unref);
+	g_clear_pointer(&gs->re_raw, g_regex_unref);
 	g_hash_table_destroy(gs->literals);
 	g_ptr_array_free(gs->pats, TRUE);
 	g_free(gs);
@@ -93,13 +98,13 @@ static bool append_class(GString *out, const char *pat, size_t len, size_t *i)
 	size_t mark = out->len;
 	size_t j = *i + 1;
 
-	g_string_append_c(out, '[');
+	bool negated = j < len && (pat[j] == '!' || pat[j] == '^');
 
-	/* Both spellings of negation; PCRE2 only knows '^'. */
-	if (j < len && (pat[j] == '!' || pat[j] == '^')) {
-		g_string_append_c(out, '^');
+	/* A class never matches the separator (#283), negated or not: gitignore
+	 * matches a name, and '/' is never part of one. */
+	g_string_append(out, negated ? "[^/" : "(?!/)[");
+	if (negated)
 		j++;
-	}
 	/* A ']' immediately after the (possibly negated) open bracket is data. */
 	if (j < len && pat[j] == ']') {
 		g_string_append(out, "\\]");
@@ -111,6 +116,19 @@ static bool append_class(GString *out, const char *pat, size_t len, size_t *i)
 			g_string_append_c(out, ']');
 			*i = j;
 			return true;
+		}
+		/* A POSIX class, [:digit:] and the like, is PCRE2 syntax too. */
+		if (pat[j] == '[' && j + 1 < len && pat[j + 1] == ':') {
+			size_t k = j + 2;
+
+			while (k < len && g_ascii_isalpha(pat[k]))
+				k++;
+			if (k > j + 2 && k + 1 < len && pat[k] == ':' &&
+			    pat[k + 1] == ']') {
+				g_string_append_len(out, pat + j, k + 2 - j);
+				j = k + 1;
+				continue;
+			}
 		}
 		/* '-' and ranges pass through; only these two would change
 		 * meaning inside a PCRE2 class. */
@@ -226,6 +244,32 @@ void glob_set_add_literal(struct glob_set *gs, const char *path)
 	add_literal(gs, path, true);
 }
 
+/*
+ * G_REGEX_OPTIMIZE turns on PCRE2's JIT. It is not optional here: matching runs
+ * once per directory entry on every walker thread, and measured ~12x slower
+ * without it.
+ *
+ * DOTALL and DOLLAR_ENDONLY because a name may contain a newline (#283):
+ * without them `**` and the any-depth prefix stop at one, which let a crafted
+ * name out from under an exclude, and `$` also matched before a trailing one,
+ * so `foo` excluded `foo\n`.
+ */
+#define GLOB_REGEX_FLAGS \
+	(G_REGEX_OPTIMIZE | G_REGEX_DOTALL | G_REGEX_DOLLAR_ENDONLY)
+
+/*
+ * Whether `path` has to be matched over bytes. GRegex compiles for UTF-8, where
+ * `?` and a class take one character, and PCRE2 leaves matching a name that
+ * is not valid UTF-8 undefined - in practice no wildcard crosses a stray byte,
+ * so `*.iso` did not exclude a Latin-1 `caf\xe9.iso` (#283). Such a name is
+ * matched with the same patterns compiled G_REGEX_RAW, where a byte is a
+ * character - which is what it is in the Latin-1 names that produce them.
+ */
+static bool raw_path(const char *path)
+{
+	return !g_utf8_validate(path, -1, NULL);
+}
+
 int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 {
 	struct glob_pat *gp;
@@ -244,14 +288,14 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 
 	gp = pat_new(gs, pattern);
 	gp->dir_only = dir_only;
-	/*
-	 * G_REGEX_OPTIMIZE turns on PCRE2's JIT. It is not optional here: this
-	 * runs once per directory entry on every walker thread, and matching
-	 * measured ~12x slower without it.
-	 */
-	gp->re = g_regex_new(frag, G_REGEX_OPTIMIZE, 0, &gerr);
+	/* A pattern that is not UTF-8 has only the byte form. */
+	if (g_utf8_validate(frag, -1, NULL))
+		gp->re = g_regex_new(frag, GLOB_REGEX_FLAGS, 0, &gerr);
+	if (!gerr)
+		gp->re_raw = g_regex_new(frag, GLOB_REGEX_FLAGS | G_REGEX_RAW,
+					 0, &gerr);
 	g_free(frag);
-	if (!gp->re) {
+	if (gerr) {
 		*err = g_strdup_printf("bad exclude pattern \"%s\": %s",
 				       pattern, gerr->message);
 		g_error_free(gerr);
@@ -260,29 +304,30 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 	return 0;
 }
 
-int glob_set_compile(struct glob_set *gs, char **err)
+/* Join every pattern's regex of one form into one alternation. */
+static int compile_one(struct glob_set *gs, bool raw, GRegex **out, char **err)
 {
 	GString *all = g_string_new(NULL);
 	GError *gerr = NULL;
 	unsigned int n = 0;
 	int ret = 0;
 
-	g_clear_pointer(&gs->re, g_regex_unref);
-
 	for (unsigned int i = 0; i < gs->pats->len; i++) {
 		struct glob_pat *gp = g_ptr_array_index(gs->pats, i);
+		GRegex *re = raw ? gp->re_raw : gp->re;
 
-		if (!gp->re)
+		if (!re)
 			continue;
 		if (n++)
 			g_string_append_c(all, '|');
-		g_string_append_printf(all, "(?:%s)",
-				       g_regex_get_pattern(gp->re));
+		g_string_append_printf(all, "(?:%s)", g_regex_get_pattern(re));
 	}
 
 	if (n) {
-		gs->re = g_regex_new(all->str, G_REGEX_OPTIMIZE, 0, &gerr);
-		if (!gs->re) {
+		*out = g_regex_new(all->str,
+				   GLOB_REGEX_FLAGS | (raw ? G_REGEX_RAW : 0),
+				   0, &gerr);
+		if (!*out) {
 			*err = g_strdup_printf("combining exclude patterns: %s",
 					       gerr->message);
 			g_error_free(gerr);
@@ -293,6 +338,15 @@ int glob_set_compile(struct glob_set *gs, char **err)
 	return ret;
 }
 
+int glob_set_compile(struct glob_set *gs, char **err)
+{
+	g_clear_pointer(&gs->re, g_regex_unref);
+	g_clear_pointer(&gs->re_raw, g_regex_unref);
+
+	return compile_one(gs, false, &gs->re, err) ||
+	       compile_one(gs, true, &gs->re_raw, err);
+}
+
 /*
  * Which pattern matched? Only reached once the combined regex has already said
  * yes, so this linear scan runs at most once per excluded path - and it is
@@ -300,14 +354,15 @@ int glob_set_compile(struct glob_set *gs, char **err)
  * not distinguish.
  */
 static struct glob_pat *attribute(struct glob_set *gs, const char *path,
-				  bool is_dir)
+				  bool is_dir, bool raw)
 {
 	for (unsigned int i = 0; i < gs->pats->len; i++) {
 		struct glob_pat *gp = g_ptr_array_index(gs->pats, i);
+		GRegex *re = raw ? gp->re_raw : gp->re;
 
-		if (!gp->re || (gp->dir_only && !is_dir))
+		if (!re || (gp->dir_only && !is_dir))
 			continue;
-		if (g_regex_match(gp->re, path, 0, NULL))
+		if (g_regex_match(re, path, 0, NULL))
 			return gp;
 	}
 	return NULL;
@@ -319,11 +374,14 @@ bool glob_set_match(struct glob_set *gs, const char *path, bool is_dir,
 	struct glob_pat *gp = g_hash_table_lookup(gs->literals, path);
 
 	if (!gp) {
-		if (!gs->re || !g_regex_match(gs->re, path, 0, NULL))
+		bool raw = raw_path(path);
+		GRegex *re = raw ? gs->re_raw : gs->re;
+
+		if (!re || !g_regex_match(re, path, 0, NULL))
 			return false;
 		/* A directory-only pattern can match the combined regex on a
 		 * plain file; attribute() is what rejects it. */
-		gp = attribute(gs, path, is_dir);
+		gp = attribute(gs, path, is_dir, raw);
 		if (!gp)
 			return false;
 	}

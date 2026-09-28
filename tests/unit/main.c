@@ -80,6 +80,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_glob_double_star_without_a_separator);
 	MU_RUN(test_glob_backslash_escapes);
 	MU_RUN(test_glob_character_classes);
+	MU_RUN(test_glob_a_class_is_one_name_character);
+	MU_RUN(test_glob_a_name_that_is_not_utf8_is_matched);
+	MU_RUN(test_glob_a_newline_in_a_name_is_just_a_character);
 	MU_RUN(test_glob_directory_only);
 	MU_RUN(test_glob_literal_paths_are_not_globs);
 	MU_RUN(test_glob_reports_matching_pattern_and_counts);

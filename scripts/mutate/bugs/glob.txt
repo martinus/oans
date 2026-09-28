@@ -84,9 +84,9 @@
 # `cache/` would then exclude every *file* called cache as well, which is the
 # opposite of what the user wrote and looks like it worked.
 <<<
-		if (!gp->re || (gp->dir_only && !is_dir))
+		if (!re || (gp->dir_only && !is_dir))
 ===
-		if (!gp->re)
+		if (!re)
 >>>
 
 # the trailing '/' is left on the pattern instead of being stripped
@@ -118,3 +118,45 @@ void glob_set_add_literal(struct glob_set *gs, const char *path)
 		return;
 	g_free(ignored);
 >>>
+
+# ---------------------------------------------------------------- #283
+
+# a name that is not UTF-8 is matched with the UTF-8 regex
+# PCRE2 leaves that undefined, and in practice no wildcard crosses the byte:
+# `*.iso` did not exclude a Latin-1 `caf\xe9.iso`.
+<<<
+	return !g_utf8_validate(path, -1, NULL);
+===
+	return false;
+>>>
+
+# `.` stops at a newline again
+# `**` and the any-depth prefix then stop at a newline in a name, so a crafted
+# name steps out from under an exclude.
+<<<
+	(G_REGEX_OPTIMIZE | G_REGEX_DOTALL | G_REGEX_DOLLAR_ENDONLY)
+===
+	(G_REGEX_OPTIMIZE | G_REGEX_DOLLAR_ENDONLY)
+>>>
+
+# `$` matches before a trailing newline again
+<<<
+	(G_REGEX_OPTIMIZE | G_REGEX_DOTALL | G_REGEX_DOLLAR_ENDONLY)
+===
+	(G_REGEX_OPTIMIZE | G_REGEX_DOTALL)
+>>>
+
+# a negated class matches the separator
+<<<
+	g_string_append(out, negated ? "[^/" : "(?!/)[");
+===
+	g_string_append(out, negated ? "[^" : "(?!/)[");
+>>>
+
+# a POSIX class is escaped into a class of its letters
+<<<
+		if (pat[j] == '[' && j + 1 < len && pat[j + 1] == ':') {
+===
+		if (0) {
+>>>
+

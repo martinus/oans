@@ -235,8 +235,11 @@ so \f[CR]\-\-exclude \(aqcache/\(aq\f[R] skips directories named
 .IP \(bu 2
 \f[CR]*\f[R] matches any run of characters \f[B]except
 \f[CB]/\f[B]\f[R], \f[CR]?\f[R] matches one non\-\f[CR]/\f[R] character,
-\f[CR][a\-z]\f[R] and \f[CR][!a\-z]\f[R] are character classes, and
+\f[CR][a\-z]\f[R], \f[CR][!a\-z]\f[R] and POSIX classes such as
+\f[CR][[:digit:]]\f[R] match one non\-\f[CR]/\f[R] character, and
 \f[CR]**\f[R] crosses directory boundaries.
+A name that is not valid UTF\-8 (an old Latin\-1 name, say) is matched
+byte by byte, so there \f[CR]?\f[R] matches one byte.
 .PP
 Excluding a directory prunes the walk there, so naming a directory also
 skips everything inside it \(em there is no need to add a wildcard for
