@@ -1307,7 +1307,7 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
 	struct extent_csum ext, whole[2];
 	struct dupe_extents *d;
-	int64_t id[3], w;
+	int64_t id[3];
 
 	free_all_filerecs();
 	init_results_tree(&res);
@@ -1319,8 +1319,9 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 	whole[1] = (struct extent_csum){ .loff = 4096, .poff = 24576, .len = 4096 };
 	memcpy(whole[1].digest, later, DIGEST_LEN);
 	for (unsigned int i = 0; i < 2; i++) {
-		w = put_dupe(db, i ? "/span/whole2" : "/span/whole1", 68 + i, 68,
-			     65536, 1, 0, 2);
+		int64_t w = put_dupe(db, i ? "/span/whole2" : "/span/whole1",
+				     68 + i, 68, 65536, 1, 0, 2);
+
 		mu_check(dbfile_store_extent_hashes(db, w, 2, whole) == 0);
 	}
 	span_fixture(db, id);

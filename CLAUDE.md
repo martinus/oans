@@ -937,21 +937,14 @@ counterexample. No dependencies, one header, minunit-compatible.
     extents 10.3 → 0.14 s, syn blocks 0.54 → 0.25 s, snapshot extents
     0.79 → 0.34 s. The sorter can write up to 2× more temp data, but in
     sequential runs.
-  - **The row order is part of the contract.** Per group the anchor comes
-    first, then the window's rows by file id and rowid. Extent dedupe takes the
-    first member as its target, so a new member with a lower id (a resumed
-    file keeps its row, #159) must not come first. The new SQL gave the same
-    member sequence in every group as the old SQL, pass by pass, on four
-    synthetic hashfiles. Pinned by
-    `test_extent_groups_spanning_passes_load_with_their_older_member`.
-  - **The anchor probe must skip whole-file duplicates itself.** The old query
-    also filtered them from every loaded row; now the probe is the only place
-    that keeps a whole-file member from becoming the anchor.
-  - **No `AS MATERIALIZED`.** SQLite 3.35 and later computes a CTE that is
-    used twice only once, which is what the loaders need. The keyword itself
-    needs 3.35, and the rest of the code needs only 3.25 (window functions),
-    so adding it would make the statement fail to prepare on Debian 11,
-    Ubuntu 20.04 and RHEL 8. Measured: the same plan and times without it.
+  - **The row order is part of the contract** (the loader comments say why).
+    The new SQL gave the same member sequence in every group as the old SQL,
+    pass by pass, on four synthetic hashfiles and on a real 192k-file tree.
+    Pinned by `test_extent_groups_spanning_passes_load_with_their_older_member`,
+    whose new member has the lower id, as a resumed file (#159) does.
+  - **No `AS MATERIALIZED`**: it would fail to prepare on Debian 11, Ubuntu
+    20.04 and RHEL 8 (SQLite < 3.35). Measured: the same plan and times
+    without it.
   - **The pre-analysis keeps its scoped `IN` form for incremental runs** —
     6-9 s there against ~20 s for both rewrites tried. At `seq_lo == 0` it
     drops the predicate instead (`COUNT_*_WORK("1")`), which is exact since
@@ -1535,7 +1528,8 @@ Scan assigns `seq = config+1`, bumped every `--batchsize`/`-B` files (default
 1024). `process_duplicates` loops `for i=dedupe_seq; i<max` over generations;
 each group is deduped exactly once (a no-change rerun nets 0). The
 `GET_DUPLICATE_*` loaders load only the members new in a pass plus one stable
-representative (min id) as the target, marked `de_anchored` to pin it — this
+member from an earlier pass as the target, loaded first (the anchor; see #265
+in "Hashfile / SQLite gotchas" and #197/#237 for whole files) — this
 fixed both wasted per-pass re-load/re-fiemap of already-deduped members and
 per-pass target drift (a group spanning passes used to converge to one cluster
 *per pass* instead of a single extent). Exercise with `DUPEREMOVE_FILES_PER_PASS`
