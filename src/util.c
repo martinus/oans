@@ -347,6 +347,36 @@ void sanitize_ctrl(const char *in, char *out, size_t out_sz)
 	out[o] = '\0';
 }
 
+char *absolute_path(const char *path)
+{
+	/* longpath-ok: an argument the user typed, never a walked name. */
+	char *out = realpath(path, NULL);
+	gchar *dir, *base, *lexical;
+	char *rdir;
+
+	if (out)
+		return out;
+
+	dir = g_path_get_dirname(path);
+	base = g_path_get_basename(path);
+	rdir = realpath(dir, NULL);	/* longpath-ok: as above. */
+	if (rdir) {
+		size_t n = strlen(rdir);
+
+		if (asprintf(&out, "%s%s%s", rdir,
+			     n && rdir[n - 1] == '/' ? "" : "/", base) < 0)
+			out = NULL;
+	} else {
+		lexical = g_canonicalize_filename(path, NULL);
+		out = strdup(lexical);
+		g_free(lexical);
+	}
+	free(rdir);
+	g_free(dir);
+	g_free(base);
+	return out;
+}
+
 char *path_for_display(const char *path)
 {
 	size_t sz;

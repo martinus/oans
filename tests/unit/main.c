@@ -47,6 +47,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_block_len);
 	MU_RUN(test_is_file_renamed);
 	MU_RUN(test_seen_inode);
+	MU_RUN(test_a_file_that_became_a_directory_is_skipped);
 	MU_RUN(test_get_extent);
 	MU_RUN(test_fiemap_layout_key);
 	MU_RUN(test_fiemap_maps_share);
@@ -66,6 +67,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_scan_eta);
 	MU_RUN(test_group_u64);
 	MU_RUN(test_parse_size);
+	MU_RUN(test_absolute_path);
 	MU_RUN(test_human_size);
 	MU_RUN(test_human_duration);
 	MU_RUN(test_num_digits);

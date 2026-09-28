@@ -29,6 +29,51 @@ static bool wrote_prefix_within(const struct fenced *f, size_t sz, const char *f
 }
 
 /* One fiemap record: {logical, physical, length, flags}. */
+/*
+ * A relative --hashfile or -R argument must come out as the string the walk
+ * stores (#282): absolute, symlinks resolved - including for a path that is
+ * no longer on disk, which is exactly what -R is for.
+ */
+MU_TEST(test_absolute_path) {
+	char dir[] = "/tmp/oans-abs.XXXXXX", link[64], old[PATH_MAX];
+	_cleanup_(freep) char *real = NULL, *gone = NULL, *lexical = NULL,
+			      *via = NULL;
+	char want[128];
+
+	if (!mkdtemp(dir) || !getcwd(old, sizeof(old)) || chdir(dir))
+		abort();
+	snprintf(link, sizeof(link), "%s.link", dir);
+	if (symlink(dir, link) || close(open("f", O_CREAT | O_WRONLY, 0600)))
+		abort();
+
+	real = absolute_path("f");
+	snprintf(want, sizeof(want), "%s/f", dir);
+	mu_assert_string_eq(want, real);
+
+	gone = absolute_path("./gone");		/* not on disk */
+	snprintf(want, sizeof(want), "%s/gone", dir);
+	mu_assert_string_eq(want, gone);
+
+	snprintf(want, sizeof(want), "%s/f", link);
+	via = absolute_path(want);		/* through the symlink */
+	snprintf(want, sizeof(want), "%s/f", dir);
+	mu_assert_string_eq(want, via);
+
+	/* Gone, and through the symlink: only the directory resolves it. */
+	free(gone);
+	snprintf(want, sizeof(want), "%s/gone", link);
+	gone = absolute_path(want);
+	snprintf(want, sizeof(want), "%s/gone", dir);
+	mu_assert_string_eq(want, gone);
+
+	lexical = absolute_path("no/such/../dir/x");	/* no directory either */
+	snprintf(want, sizeof(want), "%s/no/dir/x", dir);
+	mu_assert_string_eq(want, lexical);
+
+	if (unlink("f") || chdir(old) || unlink(link) || rmdir(dir))
+		abort();
+}
+
 MU_TEST(test_sanitize_ctrl) {
 	char out[64];
 

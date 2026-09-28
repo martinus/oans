@@ -692,9 +692,35 @@ static int for_each_stdin_line(int (*cb)(char *line, void *arg), void *arg)
 	return ret;
 }
 
+/*
+ * Remove one path from the hashfile, spelled the way the walk stores it:
+ * absolute, with symlinks resolved. Answers 0 when a row went, 1 when the
+ * hashfile had none (#282: a relative path used to say "Removed" and remove
+ * nothing), and -1 on a database error.
+ */
+static int rm_one(struct dbhandle *db, const char *name)
+{
+	_cleanup_(freep) char *abs = absolute_path(name);
+	declare_display_path(disp, abs);
+
+	if (dbfile_remove_file(db, abs))
+		return -1;
+	if (sqlite3_changes(db->db) == 0) {
+		eprintf("\"%s\" is not in the hashfile\n", disp);
+		return 1;
+	}
+	vprintf("Removed \"%s\" from hashfile.\n", disp);
+	return 0;
+}
+
+static int rm_status;
+
 static int rm_one_path(char *path, void *db)
 {
-	dbfile_remove_file(db, path);
+	int ret = rm_one(db, path);
+
+	if (ret && !rm_status)
+		rm_status = ret < 0 ? -1 : 1;
 	return 0;
 }
 
@@ -708,22 +734,12 @@ static int rm_db_files(int numfiles, char **files)
 	}
 
 	for (i = 0; i < numfiles; i++) {
-		const char *name = files[i];
-
-		if (strcmp(name, "-") == 0) {
+		if (strcmp(files[i], "-") == 0)
 			for_each_stdin_line(rm_one_path, db);
-			continue;
-		}
-
-		if (dbfile_remove_file(db, name)) {
-			ret = -1;
-		} else if (verbose) {
-			declare_display_path(disp, name);
-
-			vprintf("Removed \"%s\" from hashfile.\n",
-				disp);
-		}
+		else
+			rm_one_path(files[i], db);
 	}
+	ret = rm_status;
 	return ret;
 }
 
@@ -1099,11 +1115,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	 * this would be confusing for the user.
 	 */
 	if (options.hashfile != NULL) {
-		char tmp[PATH_MAX + 10 ] = {0,};
-		add_exclude_path(options.hashfile);
-		snprintf(tmp, PATH_MAX + 9, "%s-wal", options.hashfile);
+		_cleanup_(freep) char *abs = absolute_path(options.hashfile);
+		char tmp[PATH_MAX + 10] = {0,};
+
+		add_exclude_path(abs);
+		snprintf(tmp, PATH_MAX + 9, "%s-wal", abs);
 		add_exclude_path(tmp);
-		snprintf(tmp, PATH_MAX + 9, "%s-shm", options.hashfile);
+		snprintf(tmp, PATH_MAX + 9, "%s-shm", abs);
 		add_exclude_path(tmp);
 	}
 

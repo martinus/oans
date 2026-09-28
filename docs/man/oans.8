@@ -381,6 +381,9 @@ rebuild them.
 Remove the named paths from the hashfile and exit; a single \f[B]\-\f[R]
 reads the list from standard input.
 Requires \f[B]\-\-hashfile\f[R].
+A relative path is resolved against the current directory first.
+A path the hashfile does not hold is reported, and the exit status is
+then 1.
 (Deleted files are also pruned automatically on the next scan;
 \f[B]\-R\f[R] is for removing paths that still exist.)
 .SS Output and information
@@ -681,8 +684,9 @@ The next run hashes those files again.
 .TP
 \f[B]2\f[R]
 The run completed, but covered \f[B]less than it was asked to\f[R]: a
-path named on the command line could not be resolved or stat\(cqed, or a
-replayed configuration had lost one of its stored roots.
+path named on the command line could not be resolved or stat\(cqed, lies
+on another filesystem than the first one (one run scans one filesystem),
+or a replayed configuration had lost one of its stored roots.
 Everything else was still scanned and deduplicated.
 Typical causes are a typo, an unmounted path, a renamed share, or a
 shell glob that was quoted by accident.

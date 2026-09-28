@@ -33,6 +33,16 @@
  * btrfs-progs/util.c and modified locally to suit my purposes.
  */
 uint64_t parse_size(char *s);
+
+/*
+ * `path` spelled the way the walk stores paths: absolute, with symlinks
+ * resolved. realpath() when it exists; otherwise its resolved directory plus
+ * the last component (a file already gone from disk); otherwise the path made
+ * absolute against the current directory, lexically. So a relative --hashfile
+ * or `-R` argument names the same string the hashfile holds (#282). Free with
+ * free(); NULL only when out of memory.
+ */
+char *absolute_path(const char *path);
 int pretty_size_snprintf(uint64_t size, char *str, size_t str_bytes);
 #define pretty_size(size) 						\
 	({								\

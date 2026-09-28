@@ -21,7 +21,7 @@ Read the section for the code you are about to touch before you edit it.
 
 | Touching | Read |
 | --- | --- |
-| `src/file_scan.c`: the walk | Scan parallelism; What oans will scan (#224); File names are untrusted input (#202); --exclude matching |
+| `src/file_scan.c`: the walk | Scan parallelism; What oans will scan (#224); One run, one filesystem (#282); File names are untrusted input (#202); --exclude matching |
 | `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Preallocated extents (#273); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201); Hashfile / SQLite gotchas (#274, the scan writer) |
 | `src/dbfile.c`: schema, config, history | Hashfile identity & schema version; Hashfile / SQLite gotchas; Self-describing hashfile |
 | `src/dbfile.c`: `GET_DUPLICATE_*`, `COUNT_*` | Hashfile / SQLite gotchas (#260, #265, #270); dedupe_seq; The dedupe-phase loaders |
@@ -1077,6 +1077,13 @@ walkers.**
     single `__scan_file` consumer, so past ~4 they're never the bottleneck — the
     csum pool (`--io-threads`) is. `DUPEREMOVE_WALK_THREADS` exists solely as a
     `bench.py --walk-threads` experiment hook; default (unset) is unchanged.
+- **Walkers decide from their own `statx`, not from `d_type` (#278).** An
+  entry replaced between `readdir()` and the `statx()` - a file by a
+  directory, or by a symlink to one - was pushed as a file, and the consumer's
+  `abort_on(!S_ISREG)` then killed the run with the open batch. The `statx`
+  uses `AT_SYMLINK_NOFOLLOW`, the queue is chosen from `stx_mode`, the consumer
+  skips and counts a non-regular file, and the hashing open adds `O_NOFOLLOW`
+  for a swap after all that.
 - Cold-walk cost is fundamental btrfs metadata I/O (`statx→btrfs_iget→btree`);
   SQLite is <2%, so parallelizing the consumer wouldn't help.
 
@@ -1505,6 +1512,22 @@ names the two; `dedupe_probe_fd()` asks everything else.
   having been seen to say *yes* and not just *no*.
 - The refusal paths are testable anywhere: ext4 and tmpfs answer `EOPNOTSUPP`,
   and an `overlay` mount over either reproduces the stacking case.
+
+## One run, one filesystem; paths as the walk spells them (#282)
+
+- **A root on another filesystem is a root the run did not cover.**
+  `check_file()` returned false for it with no message and no counter, so
+  `oans -r A B` with B elsewhere exited 0 having scanned A, and every replay
+  of the stored roots did it again. `other_fs()` now warns and counts it in
+  `nr_roots_unusable`, so the run exits 2 like a missing root. A filesystem
+  mounted *below* a root stays out as before, under a `-v` message only.
+- **A path oans compares with stored ones goes through `absolute_path()`**
+  (`src/util.c`): `realpath()`, else the resolved directory plus the last
+  component (for `-R` of a file already gone), else lexical. A relative
+  `--hashfile` inside the tree was added to the excludes as typed, never
+  matched the walk's absolute paths, and got hashed with its `-wal`/`-shm`
+  every run; a relative `-R` said "Removed" and removed nothing. `-R` now
+  checks `sqlite3_changes()` and exits 1 when a path removed nothing.
 
 ## Snapshot-aware scan: copy hashes for an identical layout (#206)
 
