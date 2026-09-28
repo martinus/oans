@@ -27,6 +27,7 @@ static void intr_reset(void)
 	atomic_store(&caught_signal, 0);
 	atomic_store(&reported, false);
 	atomic_store(&tick_files, 0);
+	atomic_store(&file_raise_done, false);
 	tick_batches = 0;
 	limit_files = 0;
 	limit_batches = 0;

@@ -4,6 +4,7 @@
  * Signal handling for a graceful, durable shutdown. See interrupt.h.
  */
 
+#include <sched.h>
 #include <signal.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -99,6 +100,7 @@ void interrupt_report(void)
  * them.
  */
 static _Atomic unsigned long tick_files;
+static _Atomic bool file_raise_done;
 static unsigned long tick_batches;
 static unsigned long limit_files, limit_batches;
 static int test_signal = SIGINT;
@@ -119,6 +121,8 @@ static void read_hooks(void)
 
 void interrupt_test_file_tick(void)
 {
+	unsigned long n;
+
 	if (!limit_files || interrupted())
 		return;
 	/*
@@ -129,9 +133,21 @@ void interrupt_test_file_tick(void)
 	 * >=: with SA_RESETHAND the disposition is back to the default by the
 	 * time a second raise() lands, so two workers crossing together would
 	 * kill the process outright - the very thing being tested against.
+	 *
+	 * A worker past the limit waits until that raise() has returned, which
+	 * is after the handler has set the flag. Without the wait, a runner
+	 * that pauses the raising thread between the increment and raise()
+	 * lets the other workers hash every file that is left, and the run is
+	 * not cut short at all (seen once in CI on #266).
 	 */
-	if (atomic_fetch_add(&tick_files, 1) + 1 == limit_files)
+	n = atomic_fetch_add(&tick_files, 1) + 1;
+	if (n == limit_files) {
 		raise(test_signal);
+		atomic_store(&file_raise_done, true);
+	} else if (n > limit_files) {
+		while (!atomic_load(&file_raise_done))
+			sched_yield();
+	}
 }
 
 void interrupt_test_batch_tick(void)
