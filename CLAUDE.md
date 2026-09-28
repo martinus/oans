@@ -862,6 +862,16 @@ counterexample. No dependencies, one header, minunit-compatible.
     --source ~/git/linux --cap 4G --rounds 10 --verify` (`build:897a222` builds the
     fork's pure-upstream base in a cached worktree — the only valid duperemove
     baseline; `../duperemove` and `../dm-backports` already carry fork commits).
+  - **SQL has its own harness: `scripts/bench-queries.py`** — the second
+    sanctioned exception, because neither tool above can isolate one query.
+    It builds large synthetic hashfiles (profiles `blocks`, `fragmented`,
+    `snapshots`, `manyfiles`, cached in `--workdir`), takes each dedupe-phase
+    query from `src/dbfile.c` of `--base` (default `origin/master`) and of the
+    working tree through `cc -E`, and prints time and temp writes for both,
+    plus whether the results are the same (exit 1 if not). Run it for any change
+    to a `GET_DUPLICATE_*` or `COUNT_*` statement: `scripts/bench-queries.py -q
+    count-extents -p fragmented`. The temp-write column is the one that found
+    #260, #265 and #270; on a fast disk the time alone hides it.
   - **Cold runs work now:** the dev box enables `sudo tee /proc/sys/vm/drop_caches`
     via sudoers, so `bench.py` drops the page cache (metadata + data) before every
     timed run (default; `--warm` opts out). Plain `sudo -n true` still needs a
@@ -950,12 +960,22 @@ counterexample. No dependencies, one header, minunit-compatible.
   - **No `AS MATERIALIZED`**: it would fail to prepare on Debian 11, Ubuntu
     20.04 and RHEL 8 (SQLite < 3.35). Measured: the same plan and times
     without it.
-  - **The pre-analysis keeps its scoped `IN` form for incremental runs** —
-    6-9 s there against ~20 s for both rewrites tried. At `seq_lo == 0` it
-    drops the predicate instead (`COUNT_*_WORK("1")`), which is exact since
-    every generation is >= 1: on the fragmented tree's first scan, 33 s and
-    10.8 GiB of temp writes -> 19 s and none. Between the two, a large
-    increment still churns in proportion to how much is new.
+  - **The pre-analysis has the same shape since #270.** It used the scoped
+    `IN` form and churned temp pages the same way, and it asked "is there an
+    older member" once per extent row. Now `COUNT_*_WORK_SINCE` groups the new
+    rows and probes once per group; `_ALL` (at `seq_lo == 0`) has no window and
+    no probe. Measured with `scripts/bench-queries.py` (below), same results in
+    every case: fragmented extents 19.8 s / 5.6 GiB temp -> 7.8 s / 0,
+    snapshot extents 29.7 s / 7.2 GiB -> 12.7 s / 40 MiB, a 2M-file hashfile's
+    whole-file count 5.0 s / 3.1 GiB -> 3.4 s / 0.
+    - **`group by +f.digest` in `_SINCE`, and it matters.** Without the `+`,
+      SQLite reads the whole digest index in group order and filters the
+      window after: on 2M files a one-generation run took 3 s instead of 0.
+    - **`count(w), sum(w)` over a `case` that gives NULL**, not a `where`
+      on the group: SQLite pushes that `where` into the subquery and then runs
+      the probe twice per group.
+    - `?1` must appear in every form, since the C code always binds it; `_ALL`
+      spells its "no older member" as `?1 > 0`.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`
@@ -1710,17 +1730,15 @@ count, so it moves smoothly 0→100% (like hashing) even through one giant group
 - `--progress=json` emits `work_done_bytes`/`work_total_bytes` **raw** (no
   monotone clamp — machine consumers want truth); `pdedupe_end()` emits one
   final dedupe record so the last line shows the settled `done == total`.
-- **The pre-analysis scales with the new work, not the hashfile (#184).** Both
-  figures come from one `dbfile_count_dupe_work()` call — one query per pass
-  yielding count *and* sum, since they group over the identical row set — and
-  `FILES_GROUP_IS_NEW`/`EXTENTS_GROUP_IS_NEW` restrict each to groups with a
-  member newer than `first_seq`, as a `WHERE` on the **group key** (index seek)
-  rather than a `having` verdict reachable only after grouping everything. On
-  2M files/2M extents: 1% new 8.95 s → 0.10 s. **The trade:** the scoped form
-  loses the index-ordered group-by, so at ~100% new (a first scan, or any run
-  without `--hashfile`) it is *slower* — 8.98 s → 12.5 s, crossing over near
-  50% new. Right side of the trade: a first scan spends far longer hashing,
-  while the incremental case is every scheduled run.
+- **The pre-analysis scales with the new work, not the hashfile (#184, #270).**
+  Both figures come from one `dbfile_count_dupe_work()` call — one query per
+  pass yielding count *and* sum, since they group over the identical row set.
+  Each query groups only the rows newer than `first_seq` and asks once per
+  group whether an older member exists (the #265 loader shape; details and
+  numbers under "Hashfile / SQLite gotchas"). A first scan (`seq_lo == 0`)
+  uses a form with no window and no probe, so it no longer pays for the
+  incremental case. The #184 form (a `WHERE` on the group key) was 8.95 s ->
+  0.10 s at 1% new, but 12.5 s at 100% new and it churned temp pages between.
 - The group estimate is therefore **per-run**, not lifetime, which it always
   should have been — `pdd.done` counts groups deduped *this* run, so
   `max(estimate, queued)` was comparing a lifetime figure to a per-run one and
