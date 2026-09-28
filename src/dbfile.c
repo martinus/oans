@@ -765,11 +765,14 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 
 /*
  * The extent rows that can be the older member of the group of extent W: same
- * (digest, len), from a generation before this dedupe phase (?1), and not in
- * a whole-file group. The loader takes the first of them as the group's
- * anchor (GET_DUPLICATE_EXTENTS); the work estimate asks only whether one
- * exists (dbfile_count_dupe_work). Defined once for the same reason as
- * FILEDUP_MEMBER: if the two disagree, the progress total is wrong.
+ * (digest, len), from a generation at or below ?1, and not in a whole-file
+ * group. For the loader (GET_DUPLICATE_EXTENTS) ?1 is the start of the pass,
+ * and it takes the first such row as the group's anchor. For the work estimate
+ * (dbfile_count_dupe_work) ?1 is the start of the whole dedupe phase, and it
+ * asks only whether one exists. Across the passes of one phase the two agree:
+ * a group's first new member is the older member of every later pass. Defined
+ * once for the same reason as FILEDUP_MEMBER: if the rule differs, the
+ * progress total is wrong.
  */
 #define EXTENTS_OLDER_COPY(W)						\
 "from extents o join files wo on o.fileid = wo.id "			\
@@ -2764,13 +2767,21 @@ static void dbfile_query_2u64_arg(sqlite3 *db, const char *sql, uint64_t arg,
 {
 	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
 
+	int ret;
+
 	*a = *b = 0;
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-	    sqlite3_bind_int64(stmt, 1, arg) == SQLITE_OK &&
-	    sqlite3_step(stmt) == SQLITE_ROW) {
-		*a = sqlite3_column_int64(stmt, 0);
-		*b = sqlite3_column_int64(stmt, 1);
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (ret == SQLITE_OK)
+		ret = sqlite3_bind_int64(stmt, 1, arg);
+	if (ret == SQLITE_OK)
+		ret = sqlite3_step(stmt);
+	if (ret != SQLITE_ROW) {
+		/* Only the progress total is lost, so the run goes on. */
+		perror_sqlite(ret, "estimating the dedupe work");
+		return;
 	}
+	*a = sqlite3_column_int64(stmt, 0);
+	*b = sqlite3_column_int64(stmt, 1);
 }
 
 /*
@@ -2791,13 +2802,12 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	uint64_t fgroups, fbytes, egroups = 0, ebytes = 0;
 
 	/*
-	 * Whole-file work. Mirrors GET_DUPLICATE_FILES: a group with an
-	 * already-deduped member (old_cnt > 0) dedupes all its new members
-	 * against that anchor (new_cnt copies); a group with only new members
-	 * promotes one to target and dedupes the rest (new_cnt - 1). Summing
-	 * per-group is exact regardless of how the generations get split into
-	 * passes: across passes the first new member becomes the anchor and
-	 * every later one dedupes against it.
+	 * Whole-file work: a group with an older member counts all its new
+	 * members, and a group with only new members counts all but one (see
+	 * COUNT_FILES_WORK). Summing per group does not depend on how the
+	 * generations are split into passes: across passes the first new member
+	 * becomes the older member of the later ones. One case does not match
+	 * the loader yet: a new member that wins the target election (#272).
 	 */
 	dbfile_query_2u64_arg(db->db, seq_lo ?
 		COUNT_FILES_WORK_SINCE : COUNT_FILES_WORK_ALL,
