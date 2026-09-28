@@ -2004,6 +2004,7 @@ int main(int argc, char **argv)
 	 * before this point has produced work worth saving.
 	 */
 	interrupt_install();
+	pool_push_init();
 
 	/* Allow larger than unusal amount of open files. On linux
 	 * this should bw increase form 1K to 512K open files

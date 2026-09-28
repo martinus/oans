@@ -1759,6 +1759,17 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
   ~5% of memcheck runs). `free_batch()` asserts `extents_search_idle()`, and
   `DUPEREMOVE_SEARCH_DELAY_MS` makes the race deterministic for the regression
   test (`test_partial_search_waits_for_its_workers`).
+- **A failed thread start is not a failed push (#277).** GLib's
+  `g_thread_pool_push()` sets an error only when it could not start a new
+  thread, and queues the item all the same. Both pools read it as "not
+  queued": the search freed the item a worker still held and dropped its
+  outstanding count twice, so a later wait returned early or hung for good,
+  and the dedupe phase aborted. `pool_push()` (`src/threads.c`) is the one
+  place that pushes now: a warning, printed once, and fatal only when the pool
+  has no thread at all to run the item. `DUPEREMOVE_POOL_SPAWN_FAIL` reports
+  the error after every real push; `test_pool_spawn_fail.py` passes `dm(...,
+  timeout=120)`, because the old code's failure is a hang. TasksMax on the
+  `oans@` units and `RLIMIT_NPROC` are the real triggers.
 - **Valgrind is the gate** (`make integration-valgrind`): this is the UAF-prone
   area (see the "Valgrind" section / PR #105). Run it before any PR here — but
   note it did **not** catch the pushed-dext race above (valgrind's serialization

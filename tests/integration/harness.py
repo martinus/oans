@@ -325,7 +325,7 @@ class DuperemoveTest(unittest.TestCase):
     # -- running oans ------------------------------------------------
 
     def dm(self, *args, hashfile=True, stdin=None, env=None, quiet=True,
-           text=True):
+           text=True, timeout=None):
         """Run oans; capture combined output in self.out and code in self.rc.
 
         Pass stdin=<str> to feed the process on standard input (e.g. a "-"
@@ -336,6 +336,9 @@ class DuperemoveTest(unittest.TestCase):
         text=False leaves self.out as raw bytes, for the tests that assert on
         exactly which bytes reached the terminal (#202) - decoding would hide
         the thing under test.
+
+        timeout=<seconds> kills oans and fails the test when it runs longer,
+        for a test whose failure mode is a hang.
         """
         _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
@@ -348,7 +351,8 @@ class DuperemoveTest(unittest.TestCase):
         if env:
             run_env = dict(os.environ, **env)
         proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=text, env=run_env)
+                              stderr=subprocess.STDOUT, text=text, env=run_env,
+                              timeout=timeout)
         self.out = proc.stdout
         self.rc = proc.returncode
         return self.out
