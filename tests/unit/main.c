@@ -108,6 +108,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_block_groups_spanning_passes_load_with_their_older_member);
 	MU_RUN(test_extent_groups_spanning_passes_load_with_their_older_member);
 	MU_RUN(test_the_work_estimate_counts_only_groups_with_a_new_member);
+	MU_RUN(test_the_first_scan_work_estimate_counts_every_group);
 	MU_RUN(test_nondupe_extents_are_the_ones_nothing_else_shares);
 	MU_RUN(test_nondupe_extents_grow_past_the_initial_capacity);
 	MU_RUN(test_an_interrupted_load_publishes_nothing);

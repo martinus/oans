@@ -763,6 +763,22 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 "	where fdup.digest = " F ".digest and fdup.size = " F ".size "	\
 "	and fdup.id <> " F ".id and not (fdup.flags & 1))) "
 
+/*
+ * The extent rows that can be the older member of the group of extent W: same
+ * (digest, len), from a generation at or below ?1, and not in a whole-file
+ * group. For the loader (GET_DUPLICATE_EXTENTS) ?1 is the start of the pass,
+ * and it takes the first such row as the group's anchor. For the work estimate
+ * (dbfile_count_dupe_work) ?1 is the start of the whole dedupe phase, and it
+ * asks only whether one exists. Across the passes of one phase the two agree:
+ * a group's first new member is the older member of every later pass. Defined
+ * once for the same reason as FILEDUP_MEMBER: if the rule differs, the
+ * progress total is wrong.
+ */
+#define EXTENTS_OLDER_COPY(W)						\
+"from extents o join files wo on o.fileid = wo.id "			\
+"where o.digest = " W ".digest and o.len = " W ".len "			\
+"and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")
+
 static struct dbhandle *open_handle(char *filename, bool readonly)
 {
 	struct dbhandle *result = calloc(1, sizeof(struct dbhandle));
@@ -891,10 +907,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 #define GET_DUPLICATE_EXTENTS						\
 "with g0(digest, len, cnt, anchor) as ( "				\
 "	select w.digest, w.len, count(*), case when ?1 > 0 then ( "	\
-"		select o.rowid from extents o "				\
-"		join files wo on o.fileid = wo.id "			\
-"		where o.digest = w.digest and o.len = w.len "		\
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+"		select o.rowid " EXTENTS_OLDER_COPY("w")			\
 "		order by o.rowid limit 1) end "				\
 "	from extents w join files wf on w.fileid = wf.id "		\
 "	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
@@ -2681,82 +2694,72 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 }
 
 /*
- * Restrict a dup-group aggregate to the groups this run can actually touch:
- * those with at least one member newer than the phase-start watermark ?1.
+ * The two queries of dbfile_count_dupe_work(): how many duplicate groups this
+ * dedupe phase touches, and how many bytes it will byte-compare.
  *
- * Written as a WHERE on the *group key* rather than the `having ... new_cnt > 0`
- * it replaces, because a HAVING verdict is only reachable after grouping the
- * entire hashfile - every run, however little changed. As a WHERE it drives an
- * index loop instead (idx_files_dedupeseq for the new rows, then
- * idx_files_digest_size / idx_extents_digest_len to pull their groups), so the
- * cost tracks the new work. Neither macro ever filters individual rows, only the
- * group key, so count(*)/new_cnt/old_cnt within a surviving group are unchanged.
+ * Same shape as the pass loaders (#265): group only this run's new rows
+ * (dedupe_seq > ?1) through the sorter, and ask once per group whether it has
+ * an older member, through the digest index (#270). Before, a group was
+ * admitted by an IN (...) set of the new rows, which SQLite fills in random
+ * key order and so rewrites about one temp page per row (#260) - gigabytes
+ * when much of the hashfile is new - and the extent query ran FILEDUP_MEMBER
+ * once per extent row instead of once per file.
  *
- * The two are not equally strong, and the difference is load-bearing:
+ * Each group yields its work as w, or NULL when it is no group: count(w) and
+ * sum(w) then skip it, with no WHERE for SQLite to push back into the grouping
+ * and evaluate the probe a second time. The work mirrors the loaders: with an
+ * older member, every new one is deduped against it (new copies); without,
+ * one new member becomes the target (new copies - 1), and a single new member
+ * with no older one is no group at all.
  *
- *   FILES_GROUP_IS_NEW repeats the outer query's own filters, so its witness row
- *   is necessarily inside the group -> new_cnt >= 1. `having new_cnt > 0` is
- *   implied and kept only for symmetry.
+ * Two forms of each, chosen by the caller:
  *
- *   EXTENTS_GROUP_IS_NEW deliberately does NOT repeat FILEDUP_MEMBER: pushing
- *   that correlated probe into the subquery costs more than the outer seeks it
- *   saves (7.99 s vs 7.41 s at 100% new). So a group can be admitted by a new
- *   extent whose file *is* a whole-file dup member and then have every outer row
- *   filtered away - `having new_cnt > 0` is what drops it. Do not "simplify" it
- *   away.
+ *   *_SINCE (seq_lo > 0) reads only the new rows, through idx_files_dedupeseq.
+ *   The files query groups by `+f.digest` for that: with the bare column,
+ *   SQLite reads the whole (digest, size) index in group order to save a sort,
+ *   which on 2M files took 3 s for one new generation instead of 0.
  *
- * The trade, measured on a 2M-file / 2M-extent hashfile: the scoped form loses
- * the index-ordered group-by and needs a temp b-tree, so it wins hugely when
- * little is new (1% new: 8.95 s -> 0.10 s) and loses when nearly everything is
- * (100% new: 8.98 s -> 12.5 s), crossing over around 50%. That is the right side
- * of the trade to be on: 100%-new is a first scan, which spends far longer
- * hashing than analysing, while the incremental case is every scheduled run.
+ *   *_ALL (seq_lo == 0, a first scan or a run without --hashfile) has no
+ *   window, since every generation is at least 1, and no older member to ask
+ *   for. The files query then reads the (digest, size) index in order. `?1 > 0`
+ *   stands in for the probe: it is false here, and it keeps ?1 in the
+ *   statement for the caller to bind.
  *
- * At seq_lo == 0 the trade is not needed: every generation is at least 1, so
- * both predicates hold for every row and are left out, which is exact. That is
- * the first scan and every run without --hashfile - the case where the scoped
- * form's temp B-tree also churns (#260: measured 30 s and 11.3 GiB of temp
- * writes -> 15 s and none, on 100k files x 30 extents).
+ * The extent query takes the window's files first (cross join) and reads
+ * their extents by fileid, so FILEDUP_MEMBER runs once per file.
  */
-#define FILES_GROUP_IS_NEW						\
-"(digest, size) in (select fnew.digest, fnew.size from files fnew "	\
-"	where fnew.dedupe_seq > ?1 "					\
-"	and fnew.digest is not null and not (fnew.flags & 1)) "
+#define FILES_OLD_MEMBER						\
+"exists (select 1 from files o "					\
+"	where o.digest = f.digest and o.size = f.size "			\
+"	and o.dedupe_seq <= ?1 and not (o.flags & 1))"
 
-#define EXTENTS_GROUP_IS_NEW						\
-"(e.digest, e.len) in (select e2.digest, e2.len from extents e2 "	\
-"	join files f2 on e2.fileid = f2.id "				\
-"	where f2.dedupe_seq > ?1) "
+#define EXTENTS_OLD_MEMBER						\
+"exists (select 1 " EXTENTS_OLDER_COPY("e") ")"
 
-/* The two queries of dbfile_count_dupe_work(), with the group predicate as a
- * parameter: IS_NEW is one of the two above, or "1" at seq_lo == 0. */
-#define COUNT_FILES_WORK(IS_NEW)					\
-"select count(*), "							\
-"       coalesce(sum(size * (case when old_cnt > 0 then new_cnt "	\
-"                                 else new_cnt - 1 end)), 0) "		\
-"from ( "								\
-"  select size, "							\
-"         sum(dedupe_seq >  ?1) as new_cnt, "			\
-"         sum(dedupe_seq <= ?1) as old_cnt "				\
-"  from files "								\
-"  where digest is not null and not (flags & 1) "			\
-"  and " IS_NEW								\
-"  group by digest, size "						\
-"  having count(*) > 1 and new_cnt > 0)"
+#define COUNT_FILES_WORK(OLD, WINDOW, KEY)				\
+"select count(w), coalesce(sum(w), 0) from ( "				\
+"  select case when " OLD " then size * count(*) "			\
+"              when count(*) > 1 then size * (count(*) - 1) end as w "	\
+"  from files f "							\
+"  where f.digest is not null and not (f.flags & 1) " WINDOW		\
+"  group by " KEY ", f.size)"
 
-#define COUNT_EXTENTS_WORK(IS_NEW)					\
-"select count(*), "							\
-"       coalesce(sum(len * (case when old_cnt > 0 then new_cnt "	\
-"                                else new_cnt - 1 end)), 0) "		\
-"from ( "								\
-"  select e.len as len, "						\
-"         sum(f.dedupe_seq >  ?1) as new_cnt, "			\
-"         sum(f.dedupe_seq <= ?1) as old_cnt "			\
-"  from extents e join files f on e.fileid = f.id "			\
-"  where not " FILEDUP_MEMBER("f")					\
-"  and " IS_NEW								\
-"  group by e.digest, e.len "						\
-"  having count(*) > 1 and new_cnt > 0)"
+#define COUNT_EXTENTS_WORK(OLD, WINDOW)					\
+"select count(w), coalesce(sum(w), 0) from ( "				\
+"  select case when " OLD " then e.len * count(*) "			\
+"              when count(*) > 1 then e.len * (count(*) - 1) end as w "	\
+"  from files f cross join extents e on e.fileid = f.id "		\
+"  where not " FILEDUP_MEMBER("f") WINDOW				\
+"  group by e.digest, e.len)"
+
+#define COUNT_FILES_WORK_SINCE						\
+	COUNT_FILES_WORK(FILES_OLD_MEMBER, "and f.dedupe_seq > ?1 ", "+f.digest")
+#define COUNT_FILES_WORK_ALL						\
+	COUNT_FILES_WORK("?1 > 0", "", "f.digest")
+#define COUNT_EXTENTS_WORK_SINCE					\
+	COUNT_EXTENTS_WORK(EXTENTS_OLD_MEMBER, "and f.dedupe_seq > ?1 ")
+#define COUNT_EXTENTS_WORK_ALL						\
+	COUNT_EXTENTS_WORK("?1 > 0", "")
 
 /* Run `sql` with seq_lo bound to ?1 and read the first two columns. */
 static void dbfile_query_2u64_arg(sqlite3 *db, const char *sql, uint64_t arg,
@@ -2764,13 +2767,21 @@ static void dbfile_query_2u64_arg(sqlite3 *db, const char *sql, uint64_t arg,
 {
 	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
 
+	int ret;
+
 	*a = *b = 0;
-	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-	    sqlite3_bind_int64(stmt, 1, arg) == SQLITE_OK &&
-	    sqlite3_step(stmt) == SQLITE_ROW) {
-		*a = sqlite3_column_int64(stmt, 0);
-		*b = sqlite3_column_int64(stmt, 1);
+	ret = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (ret == SQLITE_OK)
+		ret = sqlite3_bind_int64(stmt, 1, arg);
+	if (ret == SQLITE_OK)
+		ret = sqlite3_step(stmt);
+	if (ret != SQLITE_ROW) {
+		/* Only the progress total is lost, so the run goes on. */
+		perror_sqlite(ret, "estimating the dedupe work");
+		return;
 	}
+	*a = sqlite3_column_int64(stmt, 0);
+	*b = sqlite3_column_int64(stmt, 1);
 }
 
 /*
@@ -2791,16 +2802,15 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	uint64_t fgroups, fbytes, egroups = 0, ebytes = 0;
 
 	/*
-	 * Whole-file work. Mirrors GET_DUPLICATE_FILES: a group with an
-	 * already-deduped member (old_cnt > 0) dedupes all its new members
-	 * against that anchor (new_cnt copies); a group with only new members
-	 * promotes one to target and dedupes the rest (new_cnt - 1). Summing
-	 * per-group is exact regardless of how the generations get split into
-	 * passes: across passes the first new member becomes the anchor and
-	 * every later one dedupes against it.
+	 * Whole-file work: a group with an older member counts all its new
+	 * members, and a group with only new members counts all but one (see
+	 * COUNT_FILES_WORK). Summing per group does not depend on how the
+	 * generations are split into passes: across passes the first new member
+	 * becomes the older member of the later ones. One case does not match
+	 * the loader yet: a new member that wins the target election (#272).
 	 */
 	dbfile_query_2u64_arg(db->db, seq_lo ?
-		COUNT_FILES_WORK(FILES_GROUP_IS_NEW) : COUNT_FILES_WORK("1"),
+		COUNT_FILES_WORK_SINCE : COUNT_FILES_WORK_ALL,
 		seq_lo, &fgroups, &fbytes);
 
 	/*
@@ -2814,8 +2824,7 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	 */
 	if (!whole_file_only)
 		dbfile_query_2u64_arg(db->db, seq_lo ?
-			COUNT_EXTENTS_WORK(EXTENTS_GROUP_IS_NEW) :
-			COUNT_EXTENTS_WORK("1"),
+			COUNT_EXTENTS_WORK_SINCE : COUNT_EXTENTS_WORK_ALL,
 			seq_lo, &egroups, &ebytes);
 
 	/*

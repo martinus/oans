@@ -363,9 +363,9 @@
 # a later pass has not reached yet: a new extent whose only twin comes later
 # loads as a group of one, which the worker can only throw away.
 <<<
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+"and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")
 ===
-"		and wo.dedupe_seq > 0 and not " FILEDUP_MEMBER("wo")	\
+"and wo.dedupe_seq > 0 and not " FILEDUP_MEMBER("wo")
 >>>
 
 # ---------------------------------------------------------------- #265
@@ -385,9 +385,53 @@
 # a whole-file duplicate can be an extent group's older member
 # The whole-file pass deletes the extent rows of those files, and it can run at
 # the same time as this load. Then an extent group can load a row that is being
-# deleted, and use it as its target.
+# deleted, and use it as its target. The work estimate shares this probe
+# (EXTENTS_OLDER_COPY), so it then also counts one copy too many (#270).
 <<<
-"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")	\
+"and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo")
 ===
-"		and wo.dedupe_seq <= ?1 "					\
+"and wo.dedupe_seq <= ?1 "
+>>>
+
+# ---------------------------------------------------------------- #270
+
+# the estimate stops asking for an older member of a whole-file group
+# Every group then looks new, and a group of one old and n new members counts
+# n - 1 copies instead of n. The bar then reaches 100% before the dedupe ends.
+<<<
+#define COUNT_FILES_WORK_SINCE						\
+	COUNT_FILES_WORK(FILES_OLD_MEMBER, "and f.dedupe_seq > ?1 ", "+f.digest")
+===
+#define COUNT_FILES_WORK_SINCE						\
+	COUNT_FILES_WORK("?1 < 0", "and f.dedupe_seq > ?1 ", "+f.digest")
+>>>
+
+# the estimate stops asking for an older member of an extent group
+# The same mistake on the extent side, which is where most of the work is.
+<<<
+#define COUNT_EXTENTS_WORK_SINCE					\
+	COUNT_EXTENTS_WORK(EXTENTS_OLD_MEMBER, "and f.dedupe_seq > ?1 ")
+===
+#define COUNT_EXTENTS_WORK_SINCE					\
+	COUNT_EXTENTS_WORK("?1 < 0", "and f.dedupe_seq > ?1 ")
+>>>
+
+# an inlined file counts as the older member of a whole-file group
+# The loader never loads an inlined file, so the dedupe does one copy less than
+# the estimate says.
+<<<
+"	and o.dedupe_seq <= ?1 and not (o.flags & 1))"
+===
+"	and o.dedupe_seq <= ?1)"
+>>>
+
+# the estimate counts the members of a whole-file group in its extents too
+# Those extent rows are deleted before the extent pass loads, so each such
+# group is counted twice.
+<<<
+"  from files f cross join extents e on e.fileid = f.id "		\
+"  where not " FILEDUP_MEMBER("f") WINDOW				\
+===
+"  from files f cross join extents e on e.fileid = f.id "		\
+"  where 1 " WINDOW							\
 >>>

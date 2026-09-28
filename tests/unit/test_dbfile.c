@@ -1356,49 +1356,133 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 }
 
 /*
- * The progress pre-analysis counts only groups with a member newer than
- * seq_lo, and their bytes as the dedupe will do them: every new member against
- * an older one, or all but one when every member is new. (Its group predicate
- * only narrows the work - `having new_cnt > 0` decides which groups count - so
- * leaving the predicate out at seq_lo == 0, #260, changes no figure here.)
+ * The progress pre-analysis (dbfile_count_dupe_work) counts the groups this run
+ * touches and the bytes it will compare, the way the dedupe does them: with an
+ * older member, every new member is deduped against it; without, one new
+ * member becomes the target and the rest are deduped.
  *
- * Generation 90 holds an already-deduped file pair and extent pair,
- * generation 91 one new pair of each. Other tests' rows sit in lower
- * generations, so with seq_lo = 90 only this fixture can be counted.
+ * Every group in the fixture has its own size or length, so the byte total says
+ * which groups were counted and how. Generation 90 is old, 91 is new; other
+ * tests' rows sit in lower generations, so with seq_lo = 90 only this fixture
+ * can be counted.
+ *
+ *   whole files                                         counted as
+ *   W1  one old, one new                     1000 B     1 copy
+ *   W2  two new, plus an inlined new one    20000 B     1 copy
+ *   W3  two old                            300000 B     -
+ *   W4  one old, two new                  4000000 B     2 copies
+ *   W5  one new, alone                   50000000 B     -
+ *   W6  an inlined old one, one new     600000000 B     -
+ *
+ *   extents (the files below are not whole-file duplicates, except where said)
+ *   E1  one old, one new                     4096 B     1 copy
+ *   E2  two new                              8192 B     1 copy
+ *   E3  old one in W3, one new              16384 B     - (W3 is a whole-file group)
+ *   E4  one old, new one in W2              32768 B     - (W2 is a whole-file group)
+ *   E5  one old, two new                   131072 B     2 copies
+ *
+ * W4 and E5 are what separate "has an older member" from "does not": the same
+ * group without the older member would count one copy fewer. W6 and E3/E4 are
+ * the members that must not count as members at all.
  */
+struct work_file {
+	const char *name;
+	unsigned int dg, seq, flags;
+	uint64_t size;
+	unsigned int ext_dg;	/* 0: no extent row */
+	uint64_t ext_len;
+};
+
+static const struct work_file work_fixture[] = {
+	{ "/work/w1a", 301, 90, 0, 1000,      0, 0 },
+	{ "/work/w1b", 301, 91, 0, 1000,      0, 0 },
+	{ "/work/w2a", 302, 91, 0, 20000,     0, 0 },
+	{ "/work/w2b", 302, 91, 0, 20000,     314, 32768 },	/* E4, new side */
+	{ "/work/w2c", 302, 91, FILE_INLINED, 20000, 0, 0 },
+	{ "/work/w3a", 303, 90, 0, 300000,    313, 16384 },	/* E3, old side */
+	{ "/work/w3b", 303, 90, 0, 300000,    0, 0 },
+	{ "/work/w4a", 304, 90, 0, 4000000,   0, 0 },
+	{ "/work/w4b", 304, 91, 0, 4000000,   0, 0 },
+	{ "/work/w4c", 304, 91, 0, 4000000,   0, 0 },
+	{ "/work/w5",  305, 91, 0, 50000000,  0, 0 },
+	{ "/work/w6a", 306, 90, FILE_INLINED, 600000000, 0, 0 },
+	{ "/work/w6b", 306, 91, 0, 600000000, 0, 0 },
+	/* Extent-only files, each with a whole-file digest of its own. */
+	{ "/work/e1a", 321, 90, 0, 65536, 311, 4096 },
+	{ "/work/e1b", 322, 91, 0, 65536, 311, 4096 },
+	{ "/work/e2a", 323, 91, 0, 65536, 312, 8192 },
+	{ "/work/e2b", 324, 91, 0, 65536, 312, 8192 },
+	{ "/work/e3",  325, 91, 0, 65536, 313, 16384 },
+	{ "/work/e4",  326, 90, 0, 65536, 314, 32768 },
+	{ "/work/e5a", 327, 90, 0, 65536, 315, 131072 },
+	{ "/work/e5b", 328, 91, 0, 65536, 315, 131072 },
+	{ "/work/e5c", 329, 91, 0, 65536, 315, 131072 },
+};
+
+static void work_put(struct dbhandle *db)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(work_fixture); i++) {
+		const struct work_file *w = &work_fixture[i];
+		int64_t id = put_dupe(db, w->name, 300 + i, w->dg, w->size,
+				      w->seq, w->flags, 1);
+		struct extent_csum ext = { .loff = 0, .poff = 4096 * (i + 1),
+					   .len = w->ext_len };
+
+		if (!w->ext_dg)
+			continue;
+		digest_of(ext.digest, w->ext_dg);
+		if (dbfile_store_extent_hashes(db, id, 1, &ext))
+			abort();
+	}
+}
+
+static void work_cleanup(struct dbhandle *db)
+{
+	exec(db, "delete from files where filename like '/work/%'"); /* hashes cascade */
+}
+
 MU_TEST(test_the_work_estimate_counts_only_groups_with_a_new_member) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
-	struct extent_csum ext = { .loff = 0, .poff = 4096, .len = 4096 };
-	int64_t id[4];
 	uint64_t groups, bytes;
 
-	/* Whole-file pairs: old (a, b) and new (c, d). */
-	put_dupe(db, "/work/a", 70, 70, 65536, 90, 0, 1);
-	put_dupe(db, "/work/b", 71, 70, 65536, 90, 0, 1);
-	put_dupe(db, "/work/c", 72, 71, 65536, 91, 0, 1);
-	put_dupe(db, "/work/d", 73, 71, 65536, 91, 0, 1);
-
-	/* Extent pairs in files that are not whole-file duplicates. */
-	id[0] = put_dupe(db, "/work/e", 74, 72, 65536, 90, 0, 1);
-	id[1] = put_dupe(db, "/work/f", 75, 73, 65536, 90, 0, 1);
-	id[2] = put_dupe(db, "/work/g", 76, 74, 65536, 91, 0, 1);
-	id[3] = put_dupe(db, "/work/h", 77, 75, 65536, 91, 0, 1);
-	digest_of(ext.digest, 78);
-	for (unsigned int i = 0; i < 2; i++)
-		mu_check(dbfile_store_extent_hashes(db, id[i], 1, &ext) == 0);
-	digest_of(ext.digest, 79);
-	for (unsigned int i = 2; i < 4; i++)
-		mu_check(dbfile_store_extent_hashes(db, id[i], 1, &ext) == 0);
+	work_put(db);
 
 	dbfile_count_dupe_work(db, 90, true, &groups, &bytes);
-	mu_check(groups == 1);
-	mu_check(bytes == 65536);
+	mu_check(groups == 3);				/* W1, W2, W4 */
+	mu_check(bytes == 1000 + 20000 + 2 * 4000000);
 
 	dbfile_count_dupe_work(db, 90, false, &groups, &bytes);
-	mu_check(groups == 1);			/* the larger of 1 and 1 */
-	mu_check(bytes == 65536 + 4096);
+	mu_check(groups == 3);				/* the larger of 3 and 3 */
+	mu_check(bytes == 1000 + 20000 + 2 * 4000000	/* whole files */
+			  + 4096 + 8192 + 2 * 131072);	/* E1, E2, E5 */
 
-	exec(db, "delete from files where filename like '/work/%'"); /* hashes cascade */
+	work_cleanup(db);
+}
+
+/*
+ * The first scan (seq_lo = 0) counts every group, with its own form of the
+ * query (#270): no window, no older member to ask for. Everything is new, so a
+ * group of n members is n - 1 copies.
+ *
+ * Other tests' rows count here too, so this measures what the fixture adds:
+ * its digests are its own, so it forms no group with them.
+ */
+MU_TEST(test_the_first_scan_work_estimate_counts_every_group) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	uint64_t fg0, fb0, g0, b0, fg1, fb1, g1, b1;
+
+	dbfile_count_dupe_work(db, 0, true, &fg0, &fb0);
+	dbfile_count_dupe_work(db, 0, false, &g0, &b0);
+	work_put(db);
+	dbfile_count_dupe_work(db, 0, true, &fg1, &fb1);
+	dbfile_count_dupe_work(db, 0, false, &g1, &b1);
+	work_cleanup(db);
+
+	/* W1, W2, W3 and W4 (W5 is alone, W6 has one member that counts). */
+	mu_check(fg1 - fg0 == 4);
+	mu_check(fb1 - fb0 == 1000 + 20000 + 300000 + 2 * 4000000);
+	/* E1, E2 and E5; E3 and E4 each lose their whole-file member. */
+	mu_check((b1 - fb1) - (b0 - fb0) == 4096 + 8192 + 2 * 131072);
 }
 
 /*
