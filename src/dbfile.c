@@ -817,10 +817,9 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * The group key set is built from this pass's rows with GROUP BY, never as an
  * IN (...) list of them (#260). An IN list over the window's rows is a temp
  * B-tree filled in random digest order, and SQLite gives it a tiny page cache,
- * so almost every insert rewrites a page: measured 20.6 GiB of temp writes for
- * the two passes over a 450 MiB hashfile (100k files, 6M blocks), where
- * GROUP BY sorts through the sorter and wrote 129 MiB. The time went 64.8 s ->
- * 34.0 s, and the rows and their order are identical.
+ * so almost every insert rewrites a page - GiB of temp writes per pass. GROUP BY
+ * goes through the sorter, which writes sequential runs. Measurements are in
+ * CLAUDE.md ("Hashfile / SQLite gotchas").
  *
  * A group qualifies with two members in the window, or one plus an older one
  * (dedupe_seq <= ?1) - the same as "more than one member up to ?2". No older
@@ -873,10 +872,8 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * load no longer depends on the whole-file pass finishing, which is what lets
  * the two passes pipeline.
  *
- * The group key set is built with GROUP BY over the window, not as an IN list
- * of it, for the reason given at GET_DUPLICATE_BLOCKS (#260). Measured on a
- * fragmented tree (64k files x 60 extents, 334 MiB hashfile): 8.7 GiB -> 66 MiB
- * of temp writes and 36.7 s -> 13.0 s, with identical rows and order.
+ * grp is built with GROUP BY over the window, not as an IN list of it, for the
+ * reason given at GET_DUPLICATE_BLOCKS (#260).
  */
 #define GET_DUPLICATE_EXTENTS						\
 "with grp(digest, len) as ( "						\

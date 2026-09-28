@@ -1216,10 +1216,8 @@ MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
 
 /*
  * A pass loads a group when it has two members in the pass, or one member in
- * the pass and one from an earlier pass (#260). The loaders now build their
- * groups from the pass's own rows and look for older members separately, so
- * the second case is a branch of its own - drop it and every group that spans
- * two passes stops loading, with no error.
+ * the pass and one from an earlier pass (#260). The loaders look for the older
+ * member in a separate probe, so the second case is a branch of its own.
  *
  * The fixture spans three generations and loads the window (1, 2]:
  *   - `span`: an older member (generation 1) and a new one (generation 2).
@@ -1241,11 +1239,7 @@ static void span_fixture(struct dbhandle *db, int64_t id[3])
 
 static void span_cleanup(struct dbhandle *db)
 {
-	exec(db, "delete from blocks where fileid in "
-		 "(select id from files where filename like '/span/%')");
-	exec(db, "delete from extents where fileid in "
-		 "(select id from files where filename like '/span/%')");
-	exec(db, "delete from files where filename like '/span/%'");
+	exec(db, "delete from files where filename like '/span/%'"); /* hashes cascade */
 }
 
 MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
@@ -1298,10 +1292,7 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 	struct results_tree res;
 	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
 	struct extent_csum ext;
-	struct dupe_extents *found = NULL;
-	struct extent *e;
-	struct rb_node *n;
-	bool saw_old = false, saw_new = false;
+	struct dupe_extents *d;
 	int64_t id[3];
 
 	free_all_filerecs();
@@ -1327,20 +1318,12 @@ MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
 
 	mu_check(dbfile_load_extent_hashes(db, &res, 1, 2) == 0);
 
-	for (n = rb_first(&res.root); n; n = rb_next(n)) {
-		struct dupe_extents *d = rb_entry(n, struct dupe_extents, de_node);
-
-		mu_check(memcmp(d->de_hash, later, DIGEST_LEN) != 0);
-		if (!memcmp(d->de_hash, span, DIGEST_LEN))
-			found = d;
-	}
-	mu_check(found != NULL);
-	mu_check(found->de_num_dupes == 2);
-	list_for_each_entry(e, &found->de_extents, e_list) {
-		saw_old |= strcmp(e->e_file->filename, "/span/old") == 0;
-		saw_new |= strcmp(e->e_file->filename, "/span/new") == 0;
-	}
-	mu_check(saw_old && saw_new);
+	mu_check(find_dupe_extents(&res, later, 4096) == NULL);
+	d = find_dupe_extents(&res, span, 4096);
+	mu_check(d != NULL);
+	mu_check(d->de_num_dupes == 2);
+	/* The older member is loaded first, so it is the target. */
+	mu_assert_string_eq("/span/old", target_of(d));
 
 	free_results_tree(&res);
 	free_all_filerecs();

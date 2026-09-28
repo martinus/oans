@@ -925,8 +925,6 @@ counterexample. No dependencies, one header, minunit-compatible.
     shape on purpose: incrementally it is 6-9 s against ~20 s for both fixes
     tried, and it churns only when most rows are new (10.8 GiB on a first scan
     of the fragmented tree). A fix there must beat it on both.
-  - The block load used to run under the label "loading duplicate extents",
-    which is why #260 blamed the extent query. It has its own label now.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`

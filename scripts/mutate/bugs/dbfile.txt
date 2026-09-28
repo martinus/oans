@@ -349,11 +349,9 @@
 # ---------------------------------------------------------------- #260
 
 # a pass stops loading block groups whose other member is from an earlier pass
-# The loaders build their groups from the pass's own rows and look for older
-# members separately, so that look-up is a branch of its own. Without it a group
-# loads only when two of its members are new in the same pass: every duplicate
-# that spans two passes - a file scanned today matching one from last week -
-# is never deduplicated, and the run still exits 0.
+# A group then loads only when two of its members are new in the same pass:
+# a duplicate that spans two passes - a file scanned today matching one from
+# last week - is never deduplicated, and the run still exits 0.
 <<<
 "	having count(*) > 1 or (?1 > 0 and exists ( "			\
 "		select 1 from blocks o join files wo on o.fileid = wo.id " \
