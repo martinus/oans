@@ -225,6 +225,7 @@ static int print_hashfile_stats(char *filename)
 
 	db = dbfile_open_handle_ro(filename);
 	if (!db) {
+		/* escape-ok: oans's own --hashfile argument. */
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
@@ -246,6 +247,7 @@ static int print_hashfile_stats(char *filename)
 	page_count = dbfile_query_u64(sq, "PRAGMA page_count");
 	freelist = dbfile_query_u64(sq, "PRAGMA freelist_count");
 
+	/* escape-ok: oans's own --hashfile argument. */
 	printf("%s%soans hashfile%s  %s", col_bold, col_blue, col_reset, filename);
 	/* longpath-ok: the hashfile, named by the user, never scanned. */
 	if (stat(filename, &sb) == 0)
@@ -441,12 +443,14 @@ static int print_hashfile_history(char *filename)
 
 	db = dbfile_open_handle_ro(filename);
 	if (!db) {
+		/* escape-ok: oans's own --hashfile argument. */
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
 	if (dbfile_get_run_summary(db, &sum))
 		return -1;
 
+	/* escape-ok: oans's own --hashfile argument. */
 	printf("%s%soans history%s  %s\n", col_bold, col_blue, col_reset, filename);
 	if (sum.runs == 0) {
 		printf("  %sno runs recorded yet%s\n", col_dim, col_reset);
@@ -504,6 +508,7 @@ static int print_metrics_json(char *filename)
 
 	db = dbfile_open_handle_ro(filename);
 	if (!db) {
+		/* escape-ok: oans's own --hashfile argument. */
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
@@ -590,6 +595,7 @@ static int prune_block_hashes(char *filename)
 
 	db = dbfile_open_handle(filename);
 	if (!db) {
+		/* escape-ok: oans's own --hashfile argument. */
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
@@ -651,6 +657,7 @@ static int list_db_files(char *filename)
 
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle_ro(filename);
 	if (!db) {
+		/* escape-ok: oans's own --hashfile argument. */
 		eprintf("Error: Could not open \"%s\"\n", filename);
 		return -1;
 	}
@@ -828,6 +835,7 @@ static int scan_files_from_cmdline(int numfiles, char **files, struct dbhandle *
 		char *name = files[i];
 
 		if (scan_file(name, db)) {
+			/* escape-ok: a command-line argument, typed by whoever runs oans. */
 			eprintf("Error: cannot scan %s\n", name);
 			return 1;
 		}

@@ -508,8 +508,12 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			 * other per-file dedupe notices (vprintf), and the bar
 			 * is disabled under -v anyway, so it prints cleanly.
 			 */
-			vprintf("%s: Skipping dedupe.\n",
-				extent->e_file->filename);
+			if (verbose) {
+				declare_display_path(disp,
+						     extent->e_file->filename);
+
+				vprintf("%s: Skipping dedupe.\n", disp);
+			}
 			/*
 			 * If this was our last duplicate extent in
 			 * the list, and we added dupes from a
@@ -659,9 +663,14 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 			if (shared) {
 				atomic_fetch_add(&dedupe_dest_already_shared, 1);
 				group_tick(gp, len); /* skipped, but credit its work */
-				vprintf("[%p] %s already shares the target's "
-					"extents; skipping.\n", g_thread_self(),
-					extent->e_file->filename);
+				if (verbose) {
+					declare_display_path(disp,
+						extent->e_file->filename);
+
+					vprintf("[%p] %s already shares the "
+						"target's extents; skipping.\n",
+						g_thread_self(), disp);
+				}
 				if (ctxt && last)
 					goto run_dedupe;
 				continue;
@@ -673,8 +682,10 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 		if (rc) {
 			if (rc < 0) {
 				/* This can only be ENOMEM. */
-				eprintf("%s: Request not queued.\n",
-					extent->e_file->filename);
+				declare_display_path(disp,
+						     extent->e_file->filename);
+
+				eprintf("%s: Request not queued.\n", disp);
 				ret = ENOMEM;
 				goto out;
 			}
@@ -724,8 +735,11 @@ close_files:
 			ret = filerec_open_once(tgt_extent->e_file,
 						&open_files);
 			if (ret) {
+				declare_display_path(disp,
+						     extent->e_file->filename);
+
 				eprintf("%s: Could not re-open as target.\n",
-					extent->e_file->filename);
+					disp);
 				break;
 			}
 		}
