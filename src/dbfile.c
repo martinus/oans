@@ -1217,6 +1217,16 @@ bind_error:
 	return ret;
 }
 
+/* Run one statement that returns no rows; print why it failed. */
+int dbfile_exec(sqlite3 *db, const char *sql)
+{
+	int ret = sqlite3_exec(db, sql, NULL, NULL, NULL);
+
+	if (ret)
+		perror_sqlite(ret, sql);
+	return ret;
+}
+
 int dbfile_commit_trans(sqlite3 *db)
 {
 	int ret;

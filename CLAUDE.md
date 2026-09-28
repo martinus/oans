@@ -22,7 +22,7 @@ Read the section for the code you are about to touch before you edit it.
 | Touching | Read |
 | --- | --- |
 | `src/file_scan.c`: the walk | Scan parallelism; What oans will scan (#224); File names are untrusted input (#202); --exclude matching |
-| `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Preallocated extents (#273); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201) |
+| `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Preallocated extents (#273); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201); Hashfile / SQLite gotchas (#274, the scan writer) |
 | `src/dbfile.c`: schema, config, history | Hashfile identity & schema version; Hashfile / SQLite gotchas; Self-describing hashfile |
 | `src/dbfile.c`: `GET_DUPLICATE_*`, `COUNT_*` | Hashfile / SQLite gotchas (#260, #265, #270); dedupe_seq; The dedupe-phase loaders |
 | `src/run_dedupe.c`, `src/dedupe.c` | Streaming dedupe pipeline; Dedupe must converge (#186); Correctness invariants; Valgrind |
@@ -931,6 +931,25 @@ counterexample. No dependencies, one header, minunit-compatible.
   (283k on a 141k rescan) to ~800, ~24% faster. The writer batches on the same
   cadence. Reader and writer must be **separate connections** (`db` listing
   handle vs `wdb`/`scan_writer`).
+- **A failed write drops one unit, never the batch (#274).** Every
+  `scan_write_begin()` .. `end`/`flush`/`abort` pair is one unit (a file's
+  row, a block flush, a checkpoint, the final digest) inside a `SAVEPOINT`,
+  and the write lock is held for all of it, so units never interleave. The
+  batch used to be rolled back whole: every row id already queued for hashing
+  was then gone, and `files.id` is a plain `INTEGER PRIMARY KEY`, so the next
+  insert reused one. Injected once on 8,001 files: 7,145 constraint failures,
+  0-996 files kept, and in 2 of 25 runs one file's digest on another's row,
+  all with exit 0.
+  - **When SQLite drops the transaction itself** (a failed `COMMIT`, or
+    `SQLITE_FULL`/`SQLITE_IOERR` mid-statement; `sqlite3_get_autocommit()`
+    says so), the queued ids are stale and nothing makes them right:
+    `batch_lost()` stops the walk, the listing and the csum workers, and the
+    run exits 1. The next run rehashes those files.
+  - **Every path after a begin must end the unit.** `scan_write_begin()`
+    aborts on a unit left open; `store_file_row()`'s rename failure was one.
+  - Pinned by `test_write_failure.py`, through `DUPEREMOVE_WRITE_FAIL_AT=N`
+    (fail the Nth file's final write) and `DUPEREMOVE_WRITE_FAIL_LOSES_BATCH`.
+    The unit suite never opens the scan writer, so there is no bug block.
 - **An open read transaction stops WAL checkpoints (#261).** A checkpoint
   cannot copy a frame that is newer than the snapshot of an open reader. If the
   snapshot saw a fully checkpointed WAL, the checkpoint copies nothing. And the

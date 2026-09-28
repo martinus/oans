@@ -574,9 +574,11 @@ See `docs/nas-quickstart.md` in the source tree for the full walkthrough.
   ~ Success.
 
 **1**
-  ~ A fatal error: invalid options, a hashfile that could not be opened, or a
+  ~ A fatal error: invalid options, a hashfile that could not be opened, a
     replay in which *none* of the stored paths still exist (`oans` refuses that
-    rather than let the prune empty the hashfile).
+    rather than let the prune empty the hashfile), or a write to the hashfile
+    that failed during the scan and took the files hashed in the last few
+    seconds with it. The next run hashes those files again.
 
 **2**
   ~ The run completed, but covered **less than it was asked to**: a path named

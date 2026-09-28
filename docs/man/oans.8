@@ -669,10 +669,12 @@ walkthrough.
 Success.
 .TP
 \f[B]1\f[R]
-A fatal error: invalid options, a hashfile that could not be opened, or
-a replay in which \f[I]none\f[R] of the stored paths still exist
+A fatal error: invalid options, a hashfile that could not be opened, a
+replay in which \f[I]none\f[R] of the stored paths still exist
 (\f[CR]oans\f[R] refuses that rather than let the prune empty the
-hashfile).
+hashfile), or a write to the hashfile that failed during the scan and
+took the files hashed in the last few seconds with it.
+The next run hashes those files again.
 .TP
 \f[B]2\f[R]
 The run completed, but covered \f[B]less than it was asked to\f[R]: a

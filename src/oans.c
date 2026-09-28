@@ -1662,6 +1662,8 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 	/* Run the parallel walk + scan over everything seeded above. */
 	if (!ret)
 		ret = filescan_walk_run(db);
+	if (filescan_batch_lost())
+		ret = 1;
 
 	/*
 	 * Nothing could be locked onto a usable filesystem, so the walk saw no
@@ -1692,6 +1694,9 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 
 	pscan_finish_listing();
 	filescan_free();
+	/* The csum workers write until filescan_free() has drained them (#274). */
+	if (filescan_batch_lost())
+		ret = 1;
 	if (want_progress) {
 		/*
 		 * A live dedupe phase (the only one that keeps drawing the block)

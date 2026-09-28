@@ -257,10 +257,26 @@ static void scan_workq_drain(void);
  *
  * scan_write_{begin,end,abort}() must be called with the write lock held.
  * scan_writer_{open,close}() bracket the scan while no worker is running.
+ *
+ * Each begin..end/abort pair is one *unit* - one file's row, one flush of its
+ * block hashes, one checkpoint - and runs inside a SAVEPOINT (#274). A failed
+ * unit rolls back only itself: the transaction holds every file written in the
+ * last ~10 s, and the ids of those rows are already queued for hashing, so
+ * rolling the whole batch back used to leave workers writing hashes against
+ * ids that were gone, or that the next insert reused for another file. The
+ * write lock is held for the whole unit, so units never interleave and the
+ * savepoint stack is at most one deep.
+ *
+ * Sometimes the batch is lost anyway: a failed COMMIT, or an error such as
+ * SQLITE_FULL or SQLITE_IOERR, after which SQLite may roll back the whole
+ * transaction by itself. The queued ids are then stale and nothing can make
+ * them right, so the scan stops (batch_lost()) and the run fails.
  */
 #define COMMIT_INTERVAL_SEC	10.0
 static struct dbhandle *scan_writer;
 static bool scan_trans_open;
+static bool scan_unit_open;
+static _Atomic bool scan_batch_lost;
 static double scan_write_start;
 static struct dbhandle *scan_read_db;	/* listing handle whose reads we batch */
 static bool scan_read_open;
@@ -272,52 +288,122 @@ static int scan_writer_open(void)
 	return scan_writer ? 0 : -1;
 }
 
-/* Ensure a batch transaction is open. Call with the write lock held. */
+/*
+ * The open batch is gone. Stop the walk, the listing and the hashing: every
+ * file they hold was handed an id from that batch. Write lock held.
+ */
+static void batch_lost(void)
+{
+	if (sqlite3_get_autocommit(scan_writer->db) == 0)
+		dbfile_abort_trans(scan_writer->db);
+	scan_trans_open = false;
+	scan_unit_open = false;
+
+	if (atomic_exchange_explicit(&scan_batch_lost, true,
+				     memory_order_relaxed))
+		return;
+	eprintf("Error: a write to the hashfile failed and took the files "
+		"hashed in the last %.0f seconds with it. Stopping the scan; "
+		"the next run hashes them again.\n", COMMIT_INTERVAL_SEC);
+}
+
+bool filescan_batch_lost(void)
+{
+	return atomic_load_explicit(&scan_batch_lost, memory_order_relaxed);
+}
+
+static int scan_exec(const char *sql)
+{
+	return dbfile_exec(scan_writer->db, sql);
+}
+
+/*
+ * Open a write unit, and the batch transaction under it if none is open. Call
+ * with the write lock held, and end it with scan_write_end(),
+ * scan_write_flush() or scan_write_abort().
+ */
 static int scan_write_begin(void)
 {
 	int ret;
 
-	if (scan_trans_open)
-		return 0;
+	if (filescan_batch_lost())
+		return -1;
+	abort_on(scan_unit_open);
 
-	ret = dbfile_begin_trans(scan_writer->db);
+	if (!scan_trans_open) {
+		ret = dbfile_begin_trans(scan_writer->db);
+		if (ret)
+			return ret;
+		scan_trans_open = true;
+		scan_write_start = elapsed_seconds();
+	}
+
+	ret = scan_exec("savepoint scan_unit");
 	if (ret)
 		return ret;
-
-	scan_trans_open = true;
-	scan_write_start = elapsed_seconds();
+	scan_unit_open = true;
 	return 0;
 }
 
-/* Commit any open batch. Call with the write lock held. */
-static int scan_write_flush(void)
+/* Keep the open unit's writes. Write lock held. */
+static int scan_unit_release(void)
 {
 	int ret;
 
-	if (!scan_trans_open)
+	if (!scan_unit_open)
 		return 0;
-
-	ret = dbfile_commit_trans(scan_writer->db);
-	scan_trans_open = false;
+	scan_unit_open = false;
+	ret = scan_exec("release scan_unit");
+	if (ret)
+		batch_lost();
 	return ret;
 }
 
-/* Commit the write batch once it has been open COMMIT_INTERVAL_SEC. */
+/* Close the open unit and commit the batch. Call with the write lock held. */
+static int scan_write_flush(void)
+{
+	int ret = scan_unit_release();
+
+	if (ret || !scan_trans_open)
+		return ret;
+
+	ret = dbfile_commit_trans(scan_writer->db);
+	scan_trans_open = false;
+	if (ret)
+		batch_lost();
+	return ret;
+}
+
+/*
+ * Close the open unit, and commit the batch once it has been open
+ * COMMIT_INTERVAL_SEC. Call with the write lock held.
+ */
 static int scan_write_end(void)
 {
+	int ret = scan_unit_release();
+
+	if (ret)
+		return ret;
 	if (scan_trans_open && elapsed_seconds() - scan_write_start >= COMMIT_INTERVAL_SEC)
 		return scan_write_flush();
 	return 0;
 }
 
-/* Roll back the current batch. Call with the write lock held. */
+/*
+ * Drop the open unit's writes and keep the rest of the batch. If SQLite has
+ * rolled the whole transaction back by itself, the batch is lost. Call with
+ * the write lock held.
+ */
 static void scan_write_abort(void)
 {
-	if (!scan_trans_open)
+	if (!scan_unit_open)
 		return;
+	scan_unit_open = false;
 
-	dbfile_abort_trans(scan_writer->db);
-	scan_trans_open = false;
+	if (scan_exec("rollback to scan_unit") ||
+	    scan_exec("release scan_unit") ||
+	    sqlite3_get_autocommit(scan_writer->db))
+		batch_lost();
 }
 
 /*
@@ -476,6 +562,27 @@ static unsigned int block_batch_max = BLOCK_BATCH_MAX;
 static uint64_t checkpoint_interval = CHECKPOINT_INTERVAL_BYTES;
 static unsigned int checkpoint_stop_after;
 static unsigned int checkpoint_pause_at;
+
+/*
+ * DUPEREMOVE_WRITE_FAIL_AT=N fails the final write of the Nth file to finish
+ * hashing, as a full disk or an I/O error would (#274). With
+ * DUPEREMOVE_WRITE_FAIL_LOSES_BATCH set, the failure also rolls back the whole
+ * transaction, which is what SQLite may do by itself on SQLITE_FULL or
+ * SQLITE_IOERR. Counted under the write lock.
+ */
+static unsigned int write_fail_at;
+static bool write_fail_loses_batch;
+static unsigned int write_fail_count;
+
+static int write_fault(struct dbhandle *db)
+{
+	if (!write_fail_at || ++write_fail_count != write_fail_at)
+		return 0;
+	if (write_fail_loses_batch)
+		sqlite3_exec(db->db, "rollback", NULL, NULL, NULL);
+	eprintf("test hook: failing a hashfile write\n");
+	return SQLITE_FULL;
+}
 static atomic_bool walk_listed;	/* set once the consumer is done listing */
 
 struct hashes {
@@ -1375,7 +1482,8 @@ static _Atomic bool walk_abort;
 
 static bool walk_aborted(void)
 {
-	return atomic_load_explicit(&walk_abort, memory_order_relaxed);
+	return atomic_load_explicit(&walk_abort, memory_order_relaxed) ||
+	       filescan_batch_lost();
 }
 
 static int get_dirent_type(struct dirent *entry, int fd, const char *path)
@@ -1742,7 +1850,7 @@ int filescan_walk_run(struct dbhandle *db)
 
 		if (it == WALK_STOP)
 			break;
-		if (!ret && !interrupted()) {
+		if (!ret && !interrupted() && !filescan_batch_lost()) {
 			/*
 			 * On a filesystem oans does not know by name, the first
 			 * files settle whether it can be deduplicated at all,
@@ -1821,6 +1929,7 @@ static int64_t store_file_row(struct file *dbfile, char *path, bool file_renamed
 
 	if (file_renamed && dbfile_rename_file(wdb, dbfile->id, path)) {
 		vprintf("dbfile_rename_file failed\n");
+		scan_write_abort();
 		dbfile_unlock();
 		return 0;
 	}
@@ -3344,7 +3453,7 @@ static gpointer scan_worker(gpointer arg)
 		pscan_slot_waiting(slot, false);
 		if (!file)
 			break;
-		if (interrupted()) {
+		if (interrupted() || filescan_batch_lost()) {
 			free_file_to_scan(&file);
 			continue;
 		}
@@ -3754,6 +3863,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	ret = inlined ? 0 : store_block_batch(&hashes);
 	if (!ret)
 		ret = store_extent_batch(&hashes);
+	if (!ret)
+		ret = write_fault(db);
 	if (ret) {
 		scan_write_abort();
 		dbfile_unlock();
@@ -4115,6 +4226,8 @@ void filescan_init(void)
 	env_uint("DUPEREMOVE_BLOCK_BATCH", BLOCK_BATCH_MAX, &block_batch_max);
 	env_uint("DUPEREMOVE_CHECKPOINT_STOP", UINT_MAX, &checkpoint_stop_after);
 	env_uint("DUPEREMOVE_CHECKPOINT_PAUSE", UINT_MAX, &checkpoint_pause_at);
+	env_uint("DUPEREMOVE_WRITE_FAIL_AT", UINT_MAX, &write_fail_at);
+	write_fail_loses_batch = getenv("DUPEREMOVE_WRITE_FAIL_LOSES_BATCH");
 
 	if (ckpt_env) {
 		unsigned long long v = strtoull(ckpt_env, NULL, 10);
