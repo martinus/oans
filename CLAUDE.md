@@ -909,6 +909,24 @@ counterexample. No dependencies, one header, minunit-compatible.
     `g_async_queue_timeout_pop()` was not among them, so every item handed from
     a walker to the consumer read as a race (exit 66 in the sanitizer leg).
     Wrap any new GLib hand-off call the same way.
+- **Never build an `IN (...)` or `DISTINCT` set from an unsorted stream of
+  rows whose count grows with the tree (#260).** SQLite stores that set in a
+  temp B-tree with a tiny page cache, fills it in random key order, and so
+  rewrites almost one page per inserted row. `PRAGMA temp.cache_size` does not
+  reach it; `temp_store=memory` does, but then RAM grows with the window, and a
+  single 8 TB file is one window. Measured on the pass loaders: 20.6 GiB of
+  temp writes for a 450 MiB hashfile (blocks) and 8.7 GiB for a 334 MiB one
+  (fragmented extents). Group the new rows with `GROUP BY` instead — that goes
+  through the sorter, which writes sequential runs (129 MiB and 66 MiB) — and
+  probe for older members per group through the digest index.
+  - The two loaders (`GET_DUPLICATE_BLOCKS`/`_EXTENTS`) are rewritten that way,
+    with identical rows and order, verified pass by pass on synthetic
+    hashfiles. The pre-analysis (`EXTENTS_GROUP_IS_NEW`) still has the old
+    shape on purpose: incrementally it is 6-9 s against ~20 s for both fixes
+    tried, and it churns only when most rows are new (10.8 GiB on a first scan
+    of the fragmented tree). A fix there must beat it on both.
+  - The block load used to run under the label "loading duplicate extents",
+    which is why #260 blamed the extent query. It has its own label now.
 - `.hashfile-wal` / `.hashfile-shm` are SQLite WAL sidecars — don't hand-delete.
 - **Hardlink hazard:** `INSERT OR REPLACE` on `UNIQUE(ino, subvol)` can
   cascade-delete rows for other links to the inode; an in-memory `seen_inodes`

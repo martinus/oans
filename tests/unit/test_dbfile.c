@@ -1215,6 +1215,139 @@ MU_TEST(test_extent_hashes_load_as_groups_carrying_their_offsets) {
 }
 
 /*
+ * A pass loads a group when it has two members in the pass, or one member in
+ * the pass and one from an earlier pass (#260). The loaders now build their
+ * groups from the pass's own rows and look for older members separately, so
+ * the second case is a branch of its own - drop it and every group that spans
+ * two passes stops loading, with no error.
+ *
+ * The fixture spans three generations and loads the window (1, 2]:
+ *   - `span`: an older member (generation 1) and a new one (generation 2).
+ *     It must load, as the new member plus the older one as its target.
+ *   - `later`: one new member (generation 2) and one from generation 3, after
+ *     the window. It must not load: a member the pass has not reached yet is
+ *     not a member, and counting it would load a group of one.
+ *
+ * Rows use their own inodes and digests and are deleted at the end: every
+ * memdb() handle is the same database, so they would otherwise be seen by the
+ * tests that run after this one.
+ */
+static void span_fixture(struct dbhandle *db, int64_t id[3])
+{
+	id[0] = put_dupe(db, "/span/old", 61, 61, 65536, 1, 0, 2);
+	id[1] = put_dupe(db, "/span/new", 62, 62, 65536, 2, 0, 2);
+	id[2] = put_dupe(db, "/span/later", 63, 63, 65536, 3, 0, 1);
+}
+
+static void span_cleanup(struct dbhandle *db)
+{
+	exec(db, "delete from blocks where fileid in "
+		 "(select id from files where filename like '/span/%')");
+	exec(db, "delete from extents where fileid in "
+		 "(select id from files where filename like '/span/%')");
+	exec(db, "delete from files where filename like '/span/%'");
+}
+
+MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct hash_tree tree;
+	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
+	struct block_csum blk;
+	struct dupe_blocks_list *dl;
+	struct rb_node *n;
+	bool saw_old = false, saw_new = false;
+	int64_t id[3];
+
+	free_all_filerecs();
+	init_hash_tree(&tree);
+	digest_of(span, 64);
+	digest_of(later, 65);
+	span_fixture(db, id);
+
+	blk.loff = 0;
+	memcpy(blk.digest, span, DIGEST_LEN);
+	mu_check(dbfile_store_block_hashes(db, id[0], 1, &blk) == 0);
+	mu_check(dbfile_store_block_hashes(db, id[1], 1, &blk) == 0);
+	blk.loff = 4096;
+	memcpy(blk.digest, later, DIGEST_LEN);
+	mu_check(dbfile_store_block_hashes(db, id[1], 1, &blk) == 0);
+	mu_check(dbfile_store_block_hashes(db, id[2], 1, &blk) == 0);
+
+	mu_check(dbfile_load_block_hashes(db, &tree, 1, 2) == 0);
+
+	dl = find_block_list(&tree, span);
+	mu_check(dl != NULL);
+	mu_check(dl->dl_num_elem == 2);
+	for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
+		struct file_hash_head *h =
+			rb_entry(n, struct file_hash_head, h_node);
+
+		saw_old |= strcmp(h->h_file->filename, "/span/old") == 0;
+		saw_new |= strcmp(h->h_file->filename, "/span/new") == 0;
+	}
+	mu_check(saw_old && saw_new);
+	mu_check(find_block_list(&tree, later) == NULL);
+
+	free_hash_tree(&tree);
+	free_all_filerecs();
+	span_cleanup(db);
+}
+
+MU_TEST(test_extent_groups_spanning_passes_load_with_their_older_member) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct results_tree res;
+	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
+	struct extent_csum ext;
+	struct dupe_extents *found = NULL;
+	struct extent *e;
+	struct rb_node *n;
+	bool saw_old = false, saw_new = false;
+	int64_t id[3];
+
+	free_all_filerecs();
+	init_results_tree(&res);
+	digest_of(span, 66);
+	digest_of(later, 67);
+	span_fixture(db, id);
+
+	ext.loff = 0;
+	ext.poff = 4096;
+	ext.len = 4096;
+	memcpy(ext.digest, span, DIGEST_LEN);
+	mu_check(dbfile_store_extent_hashes(db, id[0], 1, &ext) == 0);
+	ext.poff = 8192;
+	mu_check(dbfile_store_extent_hashes(db, id[1], 1, &ext) == 0);
+	ext.loff = 4096;
+	ext.poff = 12288;
+	memcpy(ext.digest, later, DIGEST_LEN);
+	mu_check(dbfile_store_extent_hashes(db, id[1], 1, &ext) == 0);
+	ext.loff = 0;
+	ext.poff = 16384;
+	mu_check(dbfile_store_extent_hashes(db, id[2], 1, &ext) == 0);
+
+	mu_check(dbfile_load_extent_hashes(db, &res, 1, 2) == 0);
+
+	for (n = rb_first(&res.root); n; n = rb_next(n)) {
+		struct dupe_extents *d = rb_entry(n, struct dupe_extents, de_node);
+
+		mu_check(memcmp(d->de_hash, later, DIGEST_LEN) != 0);
+		if (!memcmp(d->de_hash, span, DIGEST_LEN))
+			found = d;
+	}
+	mu_check(found != NULL);
+	mu_check(found->de_num_dupes == 2);
+	list_for_each_entry(e, &found->de_extents, e_list) {
+		saw_old |= strcmp(e->e_file->filename, "/span/old") == 0;
+		saw_new |= strcmp(e->e_file->filename, "/span/new") == 0;
+	}
+	mu_check(saw_old && saw_new);
+
+	free_results_tree(&res);
+	free_all_filerecs();
+	span_cleanup(db);
+}
+
+/*
  * The extents of one file that nothing else in the hashfile shares.
  *
  * `--dedupe-options=partial` asks this for each file, then searches those

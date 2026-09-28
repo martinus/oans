@@ -813,16 +813,31 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "select filename, size from files where id = ?1;"
 	dbfile_prepare_stmt(load_filerec, LOAD_FILEREC);
 
-/* Same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed on digest. */
+/*
+ * The group key set is built from this pass's rows with GROUP BY, never as an
+ * IN (...) list of them (#260). An IN list over the window's rows is a temp
+ * B-tree filled in random digest order, and SQLite gives it a tiny page cache,
+ * so almost every insert rewrites a page: measured 20.6 GiB of temp writes for
+ * the two passes over a 450 MiB hashfile (100k files, 6M blocks), where
+ * GROUP BY sorts through the sorter and wrote 129 MiB. The time went 64.8 s ->
+ * 34.0 s, and the rows and their order are identical.
+ *
+ * A group qualifies with two members in the window, or one plus an older one
+ * (dedupe_seq <= ?1) - the same as "more than one member up to ?2". No older
+ * generation exists when ?1 = 0, so the probe is skipped there.
+ *
+ * Otherwise the same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed
+ * on digest.
+ */
 #define GET_DUPLICATE_BLOCKS						\
 "with grp(digest) as ( "						\
-"	select blocks.digest from blocks "				\
-"	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 and blocks.digest in ( "			\
-"		select blocks.digest from blocks "			\
-"		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
-"	group by blocks.digest having count(*) > 1) "			\
+"	select w.digest from blocks w "					\
+"	join files wf on w.fileid = wf.id "				\
+"	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
+"	group by w.digest "						\
+"	having count(*) > 1 or (?1 > 0 and exists ( "			\
+"		select 1 from blocks o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
 "select blocks.digest, fileid, loff from blocks "			\
 "join files on fileid = id "						\
 "where blocks.digest in (select digest from grp) and ( "		\
@@ -857,19 +872,23 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * deletion having happened first - but the static exclusion means the extent
  * load no longer depends on the whole-file pass finishing, which is what lets
  * the two passes pipeline.
+ *
+ * The group key set is built with GROUP BY over the window, not as an IN list
+ * of it, for the reason given at GET_DUPLICATE_BLOCKS (#260). Measured on a
+ * fragmented tree (64k files x 60 extents, 334 MiB hashfile): 8.7 GiB -> 66 MiB
+ * of temp writes and 36.7 s -> 13.0 s, with identical rows and order.
  */
 #define GET_DUPLICATE_EXTENTS						\
 "with grp(digest, len) as ( "						\
-"	select extents.digest, len from extents "			\
-"	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 "					\
-"	and not " FILEDUP_MEMBER("files")				\
-"	and (extents.digest, len) in ( "				\
-"		select extents.digest, len from extents "		\
-"		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2 "		\
-"		and not " FILEDUP_MEMBER("files") ") "			\
-"	group by extents.digest, len having count(*) > 1) "		\
+"	select w.digest, w.len from extents w "				\
+"	join files wf on w.fileid = wf.id "				\
+"	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
+"	and not " FILEDUP_MEMBER("wf")					\
+"	group by w.digest, w.len "					\
+"	having count(*) > 1 or (?1 > 0 and exists ( "			\
+"		select 1 from extents o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and o.len = w.len "		\
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") "))) " \
 "select extents.digest, fileid, loff, len, poff from extents "		\
 "join files on fileid = id "						\
 "where not " FILEDUP_MEMBER("files")					\
