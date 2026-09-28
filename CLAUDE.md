@@ -24,6 +24,11 @@ normal machine with the README's deps needs none of it.
 - **GitHub is a fork:** every `gh` command needs `--repo martinus/oans`.
 - **Never merge a PR without the user explicitly saying "merge it".** Rhythm:
   branch → PR → wait. The user often asks for a `/simplify` pass first.
+- **No Claude attribution anywhere.** Do not add a `Co-Authored-By` or
+  `Claude-Session` trailer to a commit. Do not add a "Generated with Claude
+  Code" line or a session link to a PR, an issue, a comment, a review or
+  release notes. `.claude/settings.json` turns off the trailers and PR lines
+  that Claude Code adds itself. This rule covers the text you write yourself.
 - **`scripts/verify.sh`** is the pre-PR gate: build (warnings = failure),
   `make check`, and a valgrind scan+dedupe+replay smoke.
 - **`make doc`** regenerates the man page from `docs/man/oans.md` and needs
