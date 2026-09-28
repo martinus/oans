@@ -15,6 +15,29 @@ vars and the `DuperemoveTest` python base class.
 install` the `-devel` packages, hence the `/tmp/devroot` pkg-config shim; a
 normal machine with the README's deps needs none of it.
 
+## Where to look
+
+Read the section for the code you are about to touch before you edit it.
+
+| Touching | Read |
+| --- | --- |
+| `src/file_scan.c`: the walk | Scan parallelism; What oans will scan (#224); File names are untrusted input (#202); --exclude matching |
+| `src/file_scan.c`, `src/csum.c`: hashing | Hash resume (#159); Snapshot-aware scan (#206); SIGINT/SIGTERM flush the batch (#201) |
+| `src/dbfile.c`: schema, config, history | Hashfile identity & schema version; Hashfile / SQLite gotchas; Self-describing hashfile |
+| `src/dbfile.c`: `GET_DUPLICATE_*`, `COUNT_*` | Hashfile / SQLite gotchas (#260, #265, #270); dedupe_seq; The dedupe-phase loaders |
+| `src/run_dedupe.c`, `src/dedupe.c` | Streaming dedupe pipeline; Dedupe must converge (#186); Correctness invariants; Valgrind |
+| `src/fiemap.c` | Dedupe must converge (#186); fiemap and the storage heuristic; Snapshot-aware scan (#206) |
+| `src/find_dupes.c` | The extent search, and the bug testing it found; Streaming dedupe pipeline (partial mode) |
+| `src/progress.c` | Nothing prints past the live block (#179); Dedupe progress is byte-weighted |
+| `src/oans.c`: options, replay, reports | Self-describing hashfile, history & scheduling; io-threads default |
+| `src/glob.c` | --exclude matching |
+| `src/interrupt.c` | SIGINT/SIGTERM flush the batch (#201) |
+| `src/storage.c`, `src/btrfs-util.c` | io-threads default; fiemap and the storage heuristic |
+| `tests/unit/` | The C unit suite's layout; Mutation & property testing |
+| `tests/integration/` | Build & test |
+| `Makefile`, CI flags | WERROR=1 was silently disabling -O2 |
+| Anything slow | Profiling & measurement; Measured dead-ends |
+
 ## Repo layout & workflow (read first)
 
 - **This checkout is a git *worktree*.** `master` is checked out in a sibling
@@ -24,6 +47,12 @@ normal machine with the README's deps needs none of it.
 - **GitHub is a fork:** every `gh` command needs `--repo martinus/oans`.
 - **Never merge a PR without the user explicitly saying "merge it".** Rhythm:
   branch → PR → wait. The user often asks for a `/simplify` pass first.
+  - **The one exception is the issues loop.** "Do the issues" (or `/issues`)
+    starts `.claude/skills/issues/SKILL.md`, and that request is the
+    permission to merge the loop's own PRs, each one only when CI is green.
+    It ends when the loop ends; nothing else is relaxed. The skill is the
+    order of the work, this file is the rules, so a rule goes here and not
+    there.
 - **No Claude attribution anywhere.** Do not add a `Co-Authored-By` or
   `Claude-Session` trailer to a commit. Do not add a "Generated with Claude
   Code" line or a session link to a PR, an issue, a comment, a review or
