@@ -813,16 +813,30 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "select filename, size from files where id = ?1;"
 	dbfile_prepare_stmt(load_filerec, LOAD_FILEREC);
 
-/* Same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed on digest. */
+/*
+ * The group key set is built from this pass's rows with GROUP BY, never as an
+ * IN (...) list of them (#260). An IN list over the window's rows is a temp
+ * B-tree filled in random digest order, and SQLite gives it a tiny page cache,
+ * so almost every insert rewrites a page - GiB of temp writes per pass. GROUP BY
+ * goes through the sorter, which writes sequential runs. Measurements are in
+ * CLAUDE.md ("Hashfile / SQLite gotchas").
+ *
+ * A group qualifies with two members in the window, or one plus an older one
+ * (dedupe_seq <= ?1) - the same as "more than one member up to ?2". No older
+ * generation exists when ?1 = 0, so the probe is skipped there.
+ *
+ * Otherwise the same generation-pass reduction as GET_DUPLICATE_EXTENTS, keyed
+ * on digest.
+ */
 #define GET_DUPLICATE_BLOCKS						\
 "with grp(digest) as ( "						\
-"	select blocks.digest from blocks "				\
-"	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 and blocks.digest in ( "			\
-"		select blocks.digest from blocks "			\
-"		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2) "		\
-"	group by blocks.digest having count(*) > 1) "			\
+"	select w.digest from blocks w "					\
+"	join files wf on w.fileid = wf.id "				\
+"	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
+"	group by w.digest "						\
+"	having count(*) > 1 or (?1 > 0 and exists ( "			\
+"		select 1 from blocks o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
 "select blocks.digest, fileid, loff from blocks "			\
 "join files on fileid = id "						\
 "where blocks.digest in (select digest from grp) and ( "		\
@@ -832,7 +846,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "		join files f on b.fileid = f.id "			\
 "		where f.dedupe_seq <= ?1 "				\
 "		and b.digest in (select digest from grp) "		\
-"		group by b.digest)) "					\
+"		group by b.digest order by 1)) "			\
 "order by (dedupe_seq > ?1), fileid;"
 	dbfile_prepare_stmt(get_duplicate_blocks, GET_DUPLICATE_BLOCKS);
 
@@ -857,19 +871,23 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * deletion having happened first - but the static exclusion means the extent
  * load no longer depends on the whole-file pass finishing, which is what lets
  * the two passes pipeline.
+ *
+ * grp is built with GROUP BY over the window, not as an IN list of it, for the
+ * reason given at GET_DUPLICATE_BLOCKS (#260). The same goes for the list of
+ * representatives' rowids: GROUP BY emits them in digest order, which is a
+ * random rowid order, so `order by 1` sorts them before they fill the list.
  */
 #define GET_DUPLICATE_EXTENTS						\
 "with grp(digest, len) as ( "						\
-"	select extents.digest, len from extents "			\
-"	join files on fileid = id "					\
-"	where dedupe_seq <= ?2 "					\
-"	and not " FILEDUP_MEMBER("files")				\
-"	and (extents.digest, len) in ( "				\
-"		select extents.digest, len from extents "		\
-"		join files on fileid = id "				\
-"		where dedupe_seq > ?1 and dedupe_seq <= ?2 "		\
-"		and not " FILEDUP_MEMBER("files") ") "			\
-"	group by extents.digest, len having count(*) > 1) "		\
+"	select w.digest, w.len from extents w "				\
+"	join files wf on w.fileid = wf.id "				\
+"	where wf.dedupe_seq > ?1 and wf.dedupe_seq <= ?2 "		\
+"	and not " FILEDUP_MEMBER("wf")					\
+"	group by w.digest, w.len "					\
+"	having count(*) > 1 or (?1 > 0 and exists ( "			\
+"		select 1 from extents o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and o.len = w.len "		\
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") "))) " \
 "select extents.digest, fileid, loff, len, poff from extents "		\
 "join files on fileid = id "						\
 "where not " FILEDUP_MEMBER("files")					\
@@ -881,7 +899,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "		where f.dedupe_seq <= ?1 "				\
 "		and not " FILEDUP_MEMBER("f")				\
 "		and (e.digest, e.len) in (select digest, len from grp) "\
-"		group by e.digest, e.len)) "				\
+"		group by e.digest, e.len order by 1)) "		\
 "order by (dedupe_seq > ?1), fileid;"
 	dbfile_prepare_stmt(get_duplicate_extents, GET_DUPLICATE_EXTENTS);
 
@@ -2680,6 +2698,12 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
  * (100% new: 8.98 s -> 12.5 s), crossing over around 50%. That is the right side
  * of the trade to be on: 100%-new is a first scan, which spends far longer
  * hashing than analysing, while the incremental case is every scheduled run.
+ *
+ * At seq_lo == 0 the trade is not needed: every generation is at least 1, so
+ * both predicates hold for every row and are left out, which is exact. That is
+ * the first scan and every run without --hashfile - the case where the scoped
+ * form's temp B-tree also churns (#260: measured 30 s and 11.3 GiB of temp
+ * writes -> 15 s and none, on 100k files x 30 extents).
  */
 #define FILES_GROUP_IS_NEW						\
 "(digest, size) in (select fnew.digest, fnew.size from files fnew "	\
@@ -2690,6 +2714,36 @@ unsigned int get_max_dedupe_seq(struct dbhandle *db)
 "(e.digest, e.len) in (select e2.digest, e2.len from extents e2 "	\
 "	join files f2 on e2.fileid = f2.id "				\
 "	where f2.dedupe_seq > ?1) "
+
+/* The two queries of dbfile_count_dupe_work(), with the group predicate as a
+ * parameter: IS_NEW is one of the two above, or "1" at seq_lo == 0. */
+#define COUNT_FILES_WORK(IS_NEW)					\
+"select count(*), "							\
+"       coalesce(sum(size * (case when old_cnt > 0 then new_cnt "	\
+"                                 else new_cnt - 1 end)), 0) "		\
+"from ( "								\
+"  select size, "							\
+"         sum(dedupe_seq >  ?1) as new_cnt, "			\
+"         sum(dedupe_seq <= ?1) as old_cnt "				\
+"  from files "								\
+"  where digest is not null and not (flags & 1) "			\
+"  and " IS_NEW								\
+"  group by digest, size "						\
+"  having count(*) > 1 and new_cnt > 0)"
+
+#define COUNT_EXTENTS_WORK(IS_NEW)					\
+"select count(*), "							\
+"       coalesce(sum(len * (case when old_cnt > 0 then new_cnt "	\
+"                                else new_cnt - 1 end)), 0) "		\
+"from ( "								\
+"  select e.len as len, "						\
+"         sum(f.dedupe_seq >  ?1) as new_cnt, "			\
+"         sum(f.dedupe_seq <= ?1) as old_cnt "			\
+"  from extents e join files f on e.fileid = f.id "			\
+"  where not " FILEDUP_MEMBER("f")					\
+"  and " IS_NEW								\
+"  group by e.digest, e.len "						\
+"  having count(*) > 1 and new_cnt > 0)"
 
 /* Run `sql` with seq_lo bound to ?1 and read the first two columns. */
 static void dbfile_query_2u64_arg(sqlite3 *db, const char *sql, uint64_t arg,
@@ -2732,20 +2786,9 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	 * passes: across passes the first new member becomes the anchor and
 	 * every later one dedupes against it.
 	 */
-	dbfile_query_2u64_arg(db->db,
-		"select count(*), "
-		"       coalesce(sum(size * (case when old_cnt > 0 then new_cnt "
-		"                                 else new_cnt - 1 end)), 0) "
-		"from ( "
-		"  select size, "
-		"         sum(dedupe_seq >  ?1) as new_cnt, "
-		"         sum(dedupe_seq <= ?1) as old_cnt "
-		"  from files "
-		"  where digest is not null and not (flags & 1) "
-		"  and " FILES_GROUP_IS_NEW
-		"  group by digest, size "
-		"  having count(*) > 1 and new_cnt > 0)", seq_lo,
-		&fgroups, &fbytes);
+	dbfile_query_2u64_arg(db->db, seq_lo ?
+		COUNT_FILES_WORK(FILES_GROUP_IS_NEW) : COUNT_FILES_WORK("1"),
+		seq_lo, &fgroups, &fbytes);
 
 	/*
 	 * Extent work, excluding extents whose file is a whole-file dup-group
@@ -2757,20 +2800,10 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	 * 200k groups on a 2M-extent hashfile).
 	 */
 	if (!whole_file_only)
-		dbfile_query_2u64_arg(db->db,
-			"select count(*), "
-			"       coalesce(sum(len * (case when old_cnt > 0 then new_cnt "
-			"                                else new_cnt - 1 end)), 0) "
-			"from ( "
-			"  select e.len as len, "
-			"         sum(f.dedupe_seq >  ?1) as new_cnt, "
-			"         sum(f.dedupe_seq <= ?1) as old_cnt "
-			"  from extents e join files f on e.fileid = f.id "
-			"  where not " FILEDUP_MEMBER("f")
-			"  and " EXTENTS_GROUP_IS_NEW
-			"  group by e.digest, e.len "
-			"  having count(*) > 1 and new_cnt > 0)", seq_lo,
-			&egroups, &ebytes);
+		dbfile_query_2u64_arg(db->db, seq_lo ?
+			COUNT_EXTENTS_WORK(EXTENTS_GROUP_IS_NEW) :
+			COUNT_EXTENTS_WORK("1"),
+			seq_lo, &egroups, &ebytes);
 
 	/*
 	 * The whole-file and extent groups overlap heavily (a duplicate file is

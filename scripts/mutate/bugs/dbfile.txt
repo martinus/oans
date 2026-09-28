@@ -345,3 +345,33 @@
 	if (ret && extents)
 		free(extents);
 >>>
+
+# ---------------------------------------------------------------- #260
+
+# a pass stops loading block groups whose other member is from an earlier pass
+# A group then loads only when two of its members are new in the same pass:
+# a duplicate that spans two passes - a file scanned today matching one from
+# last week - is never deduplicated, and the run still exits 0.
+<<<
+"	having count(*) > 1 or (?1 > 0 and exists ( "			\
+"		select 1 from blocks o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
+===
+"	having count(*) > 1 or (0 and exists ( "			\
+"		select 1 from blocks o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and wo.dedupe_seq <= ?1))) "	\
+>>>
+
+# the older-member probe counts members from generations after the pass
+# Then a new extent whose only twin is not scanned into this pass yet makes a
+# "group" of one member, which the worker can only throw away - and in the
+# case the bound exists for, it also loads groups a later pass will load again.
+<<<
+"		select 1 from extents o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and o.len = w.len "		\
+"		and wo.dedupe_seq <= ?1 and not " FILEDUP_MEMBER("wo") "))) " \
+===
+"		select 1 from extents o join files wo on o.fileid = wo.id " \
+"		where o.digest = w.digest and o.len = w.len "		\
+"		and wo.dedupe_seq > 0 and not " FILEDUP_MEMBER("wo") "))) " \
+>>>

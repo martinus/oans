@@ -1284,6 +1284,7 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 		 * list holds only this window's files.
 		 */
 		init_hash_tree(&dups_tree);
+		pdedupe_set_activity("loading duplicate blocks");
 		load_lock(inmem);
 		ret = dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
 		load_unlock(inmem);

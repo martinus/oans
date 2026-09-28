@@ -105,6 +105,9 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_loading_one_filerec_treats_a_missing_id_as_success);
 	MU_RUN(test_block_hashes_load_into_the_tree_in_offset_order);
 	MU_RUN(test_extent_hashes_load_as_groups_carrying_their_offsets);
+	MU_RUN(test_block_groups_spanning_passes_load_with_their_older_member);
+	MU_RUN(test_extent_groups_spanning_passes_load_with_their_older_member);
+	MU_RUN(test_the_work_estimate_counts_only_groups_with_a_new_member);
 	MU_RUN(test_nondupe_extents_are_the_ones_nothing_else_shares);
 	MU_RUN(test_nondupe_extents_grow_past_the_initial_capacity);
 	MU_RUN(test_an_interrupted_load_publishes_nothing);
