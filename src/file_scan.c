@@ -313,9 +313,42 @@ bool filescan_batch_lost(void)
 	return atomic_load_explicit(&scan_batch_lost, memory_order_relaxed);
 }
 
-static int scan_exec(const char *sql)
+/*
+ * The unit statements, prepared once per writer. Every file runs two units, so
+ * sqlite3_exec() parsing four statement texts per file - under the write lock -
+ * cost the scan 8% wall and 18% CPU on a 96k-file tree, all of #274's price.
+ */
+enum { SP_BEGIN, SP_RELEASE, SP_ROLLBACK, SP_COUNT };
+static const char *const sp_sql[SP_COUNT] = {
+	"savepoint scan_unit", "release scan_unit", "rollback to scan_unit",
+};
+static sqlite3_stmt *sp_stmt[SP_COUNT];
+
+static int scan_exec(unsigned int which)
 {
-	return dbfile_exec(scan_writer->db, sql);
+	int ret;
+
+	if (!sp_stmt[which]) {
+		ret = sqlite3_prepare_v2(scan_writer->db, sp_sql[which], -1,
+					 &sp_stmt[which], NULL);
+		if (ret)
+			return dbfile_exec(scan_writer->db, sp_sql[which]);
+	}
+	ret = sqlite3_step(sp_stmt[which]);
+	sqlite3_reset(sp_stmt[which]);
+	if (ret == SQLITE_DONE)
+		return 0;
+	eprintf("Database error %d while running \"%s\": %s\n", ret,
+		sp_sql[which], sqlite3_errstr(ret));
+	return ret;
+}
+
+static void scan_exec_free(void)
+{
+	for (unsigned int i = 0; i < SP_COUNT; i++) {
+		sqlite3_finalize(sp_stmt[i]);
+		sp_stmt[i] = NULL;
+	}
 }
 
 /*
@@ -339,7 +372,7 @@ static int scan_write_begin(void)
 		scan_write_start = elapsed_seconds();
 	}
 
-	ret = scan_exec("savepoint scan_unit");
+	ret = scan_exec(SP_BEGIN);
 	if (ret)
 		return ret;
 	scan_unit_open = true;
@@ -354,7 +387,7 @@ static int scan_unit_release(void)
 	if (!scan_unit_open)
 		return 0;
 	scan_unit_open = false;
-	ret = scan_exec("release scan_unit");
+	ret = scan_exec(SP_RELEASE);
 	if (ret)
 		batch_lost();
 	return ret;
@@ -401,8 +434,8 @@ static void scan_write_abort(void)
 		return;
 	scan_unit_open = false;
 
-	if (scan_exec("rollback to scan_unit") ||
-	    scan_exec("release scan_unit") ||
+	if (scan_exec(SP_ROLLBACK) ||
+	    scan_exec(SP_RELEASE) ||
 	    sqlite3_get_autocommit(scan_writer->db))
 		batch_lost();
 }
@@ -465,6 +498,7 @@ static void scan_writer_close(void)
 	scan_write_flush();
 	dbfile_unlock();
 
+	scan_exec_free();	/* before the close, or it fails as busy */
 	dbfile_close_handle(scan_writer);
 	scan_writer = NULL;
 }
