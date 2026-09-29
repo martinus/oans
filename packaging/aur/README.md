@@ -22,7 +22,7 @@ One-off, and it needs a human: an AUR account with an SSH key uploaded at
 git clone ssh://aur@aur.archlinux.org/oans.git aur-oans   # empty on first use
 cp packaging/aur/oans/{PKGBUILD,.SRCINFO} aur-oans/
 cd aur-oans && git add PKGBUILD .SRCINFO
-git commit -m "Initial import: oans 1.12.2" && git push origin master
+git commit -m "Initial import: oans 1.13.0" && git push origin master
 ```
 
 Repeat with `oans-git`. The push is what creates the package; there is no
