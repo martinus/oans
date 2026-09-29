@@ -13,6 +13,7 @@
  */
 
 #include "threads.h"
+#include "test_hooks.h"
 #include "debug.h"
 #include "tsan.h"
 
@@ -75,7 +76,7 @@ static bool spawn_fail_hook;
 
 void pool_push_init(void)
 {
-	spawn_fail_hook = getenv("DUPEREMOVE_POOL_SPAWN_FAIL") != NULL;
+	spawn_fail_hook = test_hook_env("DUPEREMOVE_POOL_SPAWN_FAIL") != NULL;
 }
 
 bool pool_push(GThreadPool *pool, void *item)

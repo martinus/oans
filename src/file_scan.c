@@ -46,6 +46,7 @@
 #include <glib.h>
 
 #include "csum.h"
+#include "test_hooks.h"
 #include "filerec.h"
 #include "hash-tree.h"
 #include "btrfs-util.h"
@@ -560,8 +561,13 @@ static unsigned int block_batch_max = BLOCK_BATCH_MAX;
  * done, so a test can look at the hashfile as the run leaves it there (#261).
  */
 static uint64_t checkpoint_interval = CHECKPOINT_INTERVAL_BYTES;
+#if OANS_TEST_HOOKS
 static unsigned int checkpoint_stop_after;
 static unsigned int checkpoint_pause_at;
+#else
+/* Constants, so the code only they reach is compiled out (#295). */
+enum { checkpoint_stop_after = 0, checkpoint_pause_at = 0 };
+#endif
 
 /*
  * DUPEREMOVE_WRITE_FAIL_AT=N fails the final write of the Nth file to finish
@@ -570,8 +576,12 @@ static unsigned int checkpoint_pause_at;
  * transaction, which is what SQLite may do by itself on SQLITE_FULL or
  * SQLITE_IOERR. Counted under the write lock.
  */
+#if OANS_TEST_HOOKS
 static unsigned int write_fail_at;
 static bool write_fail_loses_batch;
+#else
+enum { write_fail_at = 0, write_fail_loses_batch = 0 };
+#endif
 static unsigned int write_fail_count;
 
 static int write_fault(struct dbhandle *db)
@@ -1838,7 +1848,7 @@ void filescan_walk_begin(void)
 	 * walk concurrency (deeper block-layer I/O queue) speeds the cold btrfs
 	 * metadata walk, without also inflating the hashing pool.
 	 */
-	walk_override = getenv("DUPEREMOVE_WALK_THREADS");
+	walk_override = test_hook_env("DUPEREMOVE_WALK_THREADS");
 	if (walk_override) {
 		unsigned long n = strtoul(walk_override, NULL, 10);
 		if (n >= 1)
@@ -3932,14 +3942,14 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 		checkpoints++;
 
 		/* Test hook: hold the run here, mid-file, for a test to look. */
-		if (checkpoints == checkpoint_pause_at) {
+		if (checkpoint_pause_at && checkpoints == checkpoint_pause_at) {
 			while (!atomic_load(&walk_listed))
 				g_usleep(1000);
 			raise(SIGSTOP);
 		}
 
 		/* Test hook: stand in for the kill this exists to survive. */
-		if (checkpoints == checkpoint_stop_after) {
+		if (checkpoint_stop_after && checkpoints == checkpoint_stop_after) {
 			declare_display_path(disp, file->path);
 
 			vprintf("%s: stopping after %u checkpoints at %"PRIu64
@@ -4364,7 +4374,7 @@ void filescan_get_workq_stats(uint64_t *pops, uint64_t *empty_waits)
 /* Set *out from a test-hook variable, if it holds a number in [1, max]. */
 static void env_uint(const char *name, unsigned long max, unsigned int *out)
 {
-	const char *env = getenv(name);
+	const char *env = test_hook_env(name);
 	unsigned long v;
 
 	if (!env)
@@ -4376,15 +4386,17 @@ static void env_uint(const char *name, unsigned long max, unsigned int *out)
 
 void filescan_init(void)
 {
-	const char *ckpt_env = getenv("DUPEREMOVE_CHECKPOINT_BYTES");
+	const char *ckpt_env = test_hook_env("DUPEREMOVE_CHECKPOINT_BYTES");
 
-	force_fs_probe = getenv("DUPEREMOVE_FORCE_FS_PROBE") != NULL;
+	force_fs_probe = test_hook_env("DUPEREMOVE_FORCE_FS_PROBE") != NULL;
 
 	env_uint("DUPEREMOVE_BLOCK_BATCH", BLOCK_BATCH_MAX, &block_batch_max);
+#if OANS_TEST_HOOKS
 	env_uint("DUPEREMOVE_CHECKPOINT_STOP", UINT_MAX, &checkpoint_stop_after);
 	env_uint("DUPEREMOVE_CHECKPOINT_PAUSE", UINT_MAX, &checkpoint_pause_at);
 	env_uint("DUPEREMOVE_WRITE_FAIL_AT", UINT_MAX, &write_fail_at);
-	write_fail_loses_batch = getenv("DUPEREMOVE_WRITE_FAIL_LOSES_BATCH");
+	write_fail_loses_batch = test_hook_env("DUPEREMOVE_WRITE_FAIL_LOSES_BATCH");
+#endif
 
 	if (ckpt_env) {
 		unsigned long long v = strtoull(ckpt_env, NULL, 10);

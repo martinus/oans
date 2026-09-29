@@ -31,6 +31,7 @@
 #include <glib.h>
 
 #include "rbtree.h"
+#include "test_hooks.h"
 #include "list.h"
 #include "csum.h"
 #include "filerec.h"
@@ -1190,7 +1191,7 @@ void dedupe_seal_batch(struct dedupe_batch *b)
 void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 {
 	GError *err = NULL;
-	const char *delay = getenv("DUPEREMOVE_DEDUPE_DELAY_MS");
+	const char *delay = test_hook_env("DUPEREMOVE_DEDUPE_DELAY_MS");
 
 	batch_complete_cb = on_complete;
 	/* Kept in step with the print condition in dedupe_phase_end(): this

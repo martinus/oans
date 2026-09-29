@@ -13,6 +13,7 @@ test
 __pycache__/
 version
 .version-stamp
+.test-hooks-stamp
 .pandoc/
 
 # Core dumps: oans aborts (abort_on) leave these next to the binary.

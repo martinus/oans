@@ -84,6 +84,9 @@ identification is unprivileged on Linux 6.4+; on older kernels run oans as root
 make && sudo make install
 ```
 
+`make TEST_HOOKS=0` builds without the `DUPEREMOVE_*` environment hooks the test
+suite uses to steer a run; `oans --version` then says so.
+
 > **Arch Linux:** `PKGBUILD`s live in [`packaging/aur/`](packaging/aur) (`oans`
 > for releases, `oans-git` for `master`).
 

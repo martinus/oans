@@ -24,7 +24,8 @@ import shutil
 import sqlite3
 import unittest
 
-from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
+from harness import (DUPEREMOVE, DuperemoveTest, requires_reflink,
+                     skip_without_hooks)
 
 COLS, ROWS = 100, 30
 
@@ -41,6 +42,7 @@ def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS):
     With `stderr_path`, the child's stderr is redirected to that file while
     stdout stays on the pty - the `2>errors.log` case of #203.
     """
+    skip_without_hooks(env)
     pid, fd = pty.fork()
     if pid == 0:                                  # child
         try:

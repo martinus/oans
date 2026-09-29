@@ -149,6 +149,17 @@ all: oans
 
 src/oans.o: .version-stamp
 
+# Test hooks (#295, src/test_hooks.h): the DUPEREMOVE_* variables the test
+# suites steer a run with. On by default; `make TEST_HOOKS=0` builds oans
+# without them. Only oans's own objects get the flag: the unit suite #includes
+# the sources and always has them. The stamp rebuilds every object when the
+# value changes, as .version-stamp does for the version.
+TEST_HOOKS ?= 1
+$(OBJECTS): override CPPFLAGS += -DOANS_TEST_HOOKS=$(TEST_HOOKS)
+$(OBJECTS): .test-hooks-stamp
+.test-hooks-stamp: force-version
+	@printf '%s\n' '$(TEST_HOOKS)' | cmp -s - $@ 2>/dev/null || printf '%s\n' '$(TEST_HOOKS)' > $@
+
 # oans is the only program: src/oans.c has main(), the rest is its library.
 oans: $(OBJECTS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBRARY_FLAGS)
@@ -227,6 +238,7 @@ integration-valgrind: oans
 lint:
 	@python3 scripts/lint-longpath.py
 	@python3 scripts/lint-escape.py
+	@python3 scripts/lint-test-hooks.py
 	@python3 scripts/test_lint_escape.py
 	@python3 scripts/lint-build-flags.py
 	@python3 scripts/lint-test-registry.py

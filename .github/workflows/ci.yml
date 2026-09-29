@@ -62,6 +62,20 @@ jobs:
       - name: Unit tests
         run: make test
 
+      # #295: a build without the test hooks must compile under both
+      # compilers, say so in --version (the suite reads it to skip), and keep
+      # none of their names. Then back to the default build the steps below
+      # test; the stamp rebuilds every object each way.
+      - name: Build without test hooks
+        run: |
+          make TEST_HOOKS=0 oans
+          ./oans --version | grep -q 'without test hooks'
+          if strings oans | grep -oE 'DUPEREMOVE_[A-Z_]+' | sort -u |
+             grep -vxE 'DUPEREMOVE_(SCAN_STATS|NO_LAYOUT_COPY)'; then
+            echo "a test hook survived TEST_HOOKS=0"; exit 1
+          fi
+          make oans
+
       # Dedupe integration tests need a reflink-capable filesystem, which the
       # runner's ext4 root is not. Back a small btrfs/XFS with a loopback image
       # and point the suite's scratch dir at it. The XFS leg runs unprivileged,

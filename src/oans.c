@@ -33,6 +33,7 @@
 #include <glib.h>
 
 #include "list.h"
+#include "test_hooks.h"
 #include "csum.h"
 #include "filerec.h"
 #include "hash-tree.h"
@@ -750,7 +751,9 @@ static void print_version(void)
 #ifdef	DEBUG_BUILD
 	s = " (debug build)";
 #endif
-	printf("oans %s%s\n", VERSTRING, s ? s : "");
+	/* The integration suite reads this to skip what needs a hook (#295). */
+	printf("oans %s%s%s\n", VERSTRING, s ? s : "",
+	       OANS_TEST_HOOKS ? "" : " (without test hooks)");
 }
 
 /* adapted from ocfs2-tools */
@@ -1493,7 +1496,7 @@ static int process_duplicates(struct dbhandle *db)
 	unsigned int stride, passes;
 	int ret = 0;
 	/* Tests force many small passes to exercise the cross-generation path. */
-	const char *env = getenv("DUPEREMOVE_FILES_PER_PASS");
+	const char *env = test_hook_env("DUPEREMOVE_FILES_PER_PASS");
 	int env_val = env ? atoi(env) : 0;
 
 	if (env_val > 0)

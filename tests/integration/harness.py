@@ -292,6 +292,42 @@ def _settle_scratch():
         os.close(fd)
 
 
+def _has_test_hooks():
+    """Whether DUPEREMOVE was built with the test hooks (#295): a
+    `make TEST_HOOKS=0` build says "without test hooks" in --version."""
+    try:
+        out = subprocess.run([DUPEREMOVE, "--version"], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return True
+    return "without test hooks" not in out
+
+
+HAS_TEST_HOOKS = _has_test_hooks()
+
+# The variables oans reads only through test_hook_env(). Not the two it reads
+# in every build: DUPEREMOVE_SCAN_STATS and DUPEREMOVE_NO_LAYOUT_COPY.
+TEST_HOOK_VARS = frozenset((
+    "DUPEREMOVE_BLOCK_BATCH", "DUPEREMOVE_CHECKPOINT_BYTES",
+    "DUPEREMOVE_CHECKPOINT_PAUSE", "DUPEREMOVE_CHECKPOINT_STOP",
+    "DUPEREMOVE_DEDUPE_DELAY_MS", "DUPEREMOVE_FILES_PER_PASS",
+    "DUPEREMOVE_FORCE_FS_PROBE", "DUPEREMOVE_INTERRUPT_AFTER",
+    "DUPEREMOVE_INTERRUPT_AFTER_BATCHES", "DUPEREMOVE_INTERRUPT_SIGNAL",
+    "DUPEREMOVE_POOL_SPAWN_FAIL", "DUPEREMOVE_SEARCH_DELAY_MS",
+    "DUPEREMOVE_WALK_THREADS", "DUPEREMOVE_WRITE_FAIL_AT",
+    "DUPEREMOVE_WRITE_FAIL_LOSES_BATCH",
+))
+
+
+def skip_without_hooks(env):
+    """Skip the running test if `env` sets a hook the binary was built
+    without: the run would silently ignore it and test something else.
+    Raising SkipTest from inside a test is what skipTest() does."""
+    if env and not HAS_TEST_HOOKS and TEST_HOOK_VARS & set(env):
+        raise unittest.SkipTest("needs a binary built with test hooks "
+                                "(TEST_HOOKS=1)")
+
+
 class DuperemoveTest(unittest.TestCase):
     """Base class: a fresh scratch dir + hashfile per test, plus helpers."""
 
@@ -340,6 +376,7 @@ class DuperemoveTest(unittest.TestCase):
         timeout=<seconds> kills oans and fails the test when it runs longer,
         for a test whose failure mode is a hang.
         """
+        skip_without_hooks(env)
         _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
         if quiet:

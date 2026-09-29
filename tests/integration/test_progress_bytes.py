@@ -13,7 +13,8 @@ import json
 import os
 import subprocess
 
-from harness import DuperemoveTest, requires_reflink, DUPEREMOVE
+from harness import (DuperemoveTest, requires_reflink, DUPEREMOVE,
+                     skip_without_hooks)
 
 MiB = 1024 * 1024
 
@@ -23,6 +24,7 @@ class ProgressBytesTest(DuperemoveTest):
         """Run oans -rd with --progress=json; return (proc, events)."""
         cmd = [DUPEREMOVE, "-q", "--io-threads=4", "--hashfile", self.hf,
                "--progress=json", *args]
+        skip_without_hooks(env)
         run_env = dict(os.environ, **env) if env else None
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            text=True, env=run_env)

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "debug.h"
+#include "test_hooks.h"
 #include "interrupt.h"
 
 /*
@@ -107,9 +108,9 @@ static int test_signal = SIGINT;
 
 static void read_hooks(void)
 {
-	const char *sig = getenv("DUPEREMOVE_INTERRUPT_SIGNAL");
-	const char *f = getenv("DUPEREMOVE_INTERRUPT_AFTER");
-	const char *b = getenv("DUPEREMOVE_INTERRUPT_AFTER_BATCHES");
+	const char *sig = test_hook_env("DUPEREMOVE_INTERRUPT_SIGNAL");
+	const char *f = test_hook_env("DUPEREMOVE_INTERRUPT_AFTER");
+	const char *b = test_hook_env("DUPEREMOVE_INTERRUPT_AFTER_BATCHES");
 
 	if (f)
 		limit_files = strtoul(f, NULL, 10);
