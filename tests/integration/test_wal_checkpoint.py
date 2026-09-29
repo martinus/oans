@@ -14,6 +14,7 @@ import signal
 import subprocess
 
 from harness import (DUPEREMOVE, DuperemoveTest, _settle_scratch,
+                     skip_without_hooks,
                      requires_real_binary, requires_reflink)
 
 MiB = 1 << 20
@@ -31,6 +32,7 @@ class WalCheckpointTest(DuperemoveTest):
         env = dict(os.environ,
                    DUPEREMOVE_CHECKPOINT_BYTES=str(MiB),
                    DUPEREMOVE_CHECKPOINT_PAUSE="3")
+        skip_without_hooks(env)
         p = subprocess.Popen(
             [DUPEREMOVE, "-q", "--io-threads=1", "-b", "4096",
              "--dedupe-options=partial", "--hashfile", self.hf,

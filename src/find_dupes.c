@@ -27,6 +27,7 @@
 #include <inttypes.h>
 
 #include "csum.h"
+#include "test_hooks.h"
 #include "rbtree.h"
 #include "list.h"
 #include "filerec.h"
@@ -458,7 +459,7 @@ bool extents_search_idle(void)
 
 void extents_search_init(void)
 {
-	const char *delay = getenv("DUPEREMOVE_SEARCH_DELAY_MS");
+	const char *delay = test_hook_env("DUPEREMOVE_SEARCH_DELAY_MS");
 
 	if (delay)
 		search_delay_us = (useconds_t)strtoul(delay, NULL, 10) * 1000;
