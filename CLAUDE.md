@@ -964,6 +964,13 @@ counterexample. No dependencies, one header, minunit-compatible.
     says so), the queued ids are stale and nothing makes them right:
     `batch_lost()` stops the walk, the listing and the csum workers, and the
     run exits 1. The next run rehashes those files.
+  - **The unit statements are prepared once per writer (`scan_exec()`).**
+    Every file runs two units, and `sqlite3_exec()` parsing `SAVEPOINT` and
+    `RELEASE` from text for each, under the write lock, cost the scan 8% wall
+    and 18% CPU on a 96k-file tree (`bench.py -p git`, cold: 2.52 → 2.72 s).
+    Prepared: 2.58 s. A build without the savepoints ran at 2.50 s, so the
+    remaining ~2% is SQLite's savepoint work, which #274 needs. The statements
+    are finalized before the writer closes, or the close fails as busy.
   - **Every path after a begin must end the unit.** `scan_write_begin()`
     aborts on a unit left open; `store_file_row()`'s rename failure was one.
   - Pinned by `test_write_failure.py`, through `DUPEREMOVE_WRITE_FAIL_AT=N`
