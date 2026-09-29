@@ -467,9 +467,15 @@ uint64_t fiemap_unshared_bytes(struct fiemap_phys_set *seen,
 	return unshared;
 }
 
-/* Flags that make a record's physical address meaningless or unstable. */
+/*
+ * Flags that make a record's physical address meaningless or unstable - or,
+ * for ENCODED, not enough to name the bytes (#287): a compressed extent's
+ * address is the extent's, so two files that reference different offsets of
+ * it at the same logical offset report identical records.
+ */
 #define LAYOUT_REJECT_FLAGS	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
-				 FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_DATA_ENCRYPTED)
+				 FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_DATA_ENCRYPTED | \
+				 FIEMAP_EXTENT_ENCODED)
 /* Flags that say nothing about content. */
 #define LAYOUT_IGNORE_FLAGS	(FIEMAP_EXTENT_SHARED | FIEMAP_EXTENT_LAST)
 

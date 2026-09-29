@@ -13,9 +13,13 @@ DUPEREMOVE_NO_LAYOUT_COPY=1, which hashes everything the old way.
 Physical-layout assertions, so serial - see DuperemoveTest.serial.
 """
 
+import fcntl
 import os
+import struct
+import subprocess
 
-from harness import DuperemoveTest, requires_btrfs, requires_reflink
+from harness import (DuperemoveTest, requires_btrfs, requires_reflink,
+                     fiemap_extents)
 
 MiB = 1 << 20
 
@@ -171,3 +175,56 @@ class LayoutCopyTest(DuperemoveTest):
                 env={"DUPEREMOVE_NO_LAYOUT_COPY": "1"})
         self.assertDmOk()
         self.assertEqual(0, self.layout_copies())
+
+    def test_halves_of_one_compressed_extent_are_not_one_layout(self):
+        """#287: a compressed extent reports its own address, whatever offset
+        of it a file references. X holds the first half of each of sixteen
+        128 KiB compressed extents and Y the second half, each by clone: the
+        records are identical, the bytes are not, and Y used to be stored
+        with X's digest."""
+        KiB = 1024
+        FICLONERANGE = (1 << 30) | (32 << 16) | (0x94 << 8) | 13
+        FIEMAP_EXTENT_ENCODED = 0x8
+
+        tree = self.path("tree")
+        os.makedirs(tree, exist_ok=True)
+        subprocess.run(["chattr", "+c", tree])   # compress what goes in
+        c = self.path("tree/C")
+        with open(c, "wb") as f:
+            for i in range(16):
+                f.write((b"first-%02d " % i) * (64 * KiB // 9)
+                        + b"x" * (64 * KiB % 9))
+                f.write((b"SECOND-%02d " % i) * (64 * KiB // 10)
+                        + b"y" * (64 * KiB % 10))
+        self.sync()
+        if not all(fl & FIEMAP_EXTENT_ENCODED
+                   for _l, _p, _n, fl in fiemap_extents(c)):
+            self.skipTest("C was not stored compressed")
+
+        src = os.open(c, os.O_RDONLY)
+        try:
+            for name, half in (("X", 0), ("Y", 1)):
+                fd = os.open(self.path("tree/" + name),
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                try:
+                    for i in range(16):
+                        fcntl.ioctl(fd, FICLONERANGE, struct.pack(
+                            "qQQQ", src, i * 128 * KiB + half * 64 * KiB,
+                            64 * KiB, i * 64 * KiB))
+                finally:
+                    os.close(fd)
+        finally:
+            os.close(src)
+        self.sync()
+        x, y = self.path("tree/X"), self.path("tree/Y")
+        self.assertEqual([r[:3] for r in fiemap_extents(x)],
+                         [r[:3] for r in fiemap_extents(y)],
+                         "setup: identical records")
+
+        self.scan(tree, "--io-threads=1")
+        self.assertDmOk()
+        dx, dy = (self.hf_scalar("select hex(digest) from files where "
+                                 "filename like ?", ("%/" + n,))
+                  for n in ("X", "Y"))
+        self.assertNotEqual(dx, dy, "Y was stored with X's digest")
+

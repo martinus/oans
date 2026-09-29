@@ -1601,8 +1601,17 @@ medians, same RSS.
     described with different record boundaries (#186) must read as a *miss*.
   - SHARED and LAST are masked out of the key: the first changes when an
     unrelated file is deduped, the second is positional. Neither says anything
-    about content. COMPRESSED/ENCODED is fine — this only ever compares
-    `fe_physical` for equality, never does arithmetic on it.
+    about content.
+  - **ENCODED refuses the key (#287).** This file used to say compressed
+    extents were fine because only `fe_physical` equality is compared. It is
+    not enough: a compressed extent reports the *extent's* address whatever
+    offset of it a file references. Measured on btrfs, kernel 7.1: clone the
+    first half of sixteen 128 KiB compressed extents into X and the second
+    half into Y, and X and Y report identical records, hold different bytes,
+    and Y was stored with X's digest. The offset is visible only to root, so
+    compressed data gets no layout copy; snapshots of compressed trees are
+    hashed like everything else. `test_layout_copy.py` builds that layout
+    with `FICLONERANGE`.
 - **The re-check needs no extra state: the donor's `extents` rows *are* its
   fiemap record array.** So the in-memory map holds only a key and a file id,
   and a donor whose rows vanished (aborted batch, hardlink cascade, only_whole_
