@@ -165,6 +165,8 @@ void progress_printf(FILE *stream, const char *fmt, ...)
  */
 void pdedupe_begin(unsigned int batches);
 void pdedupe_end(void);
+/* End a block that no phase will end, and show the cursor again. Idempotent. */
+void progress_abandon(void);
 
 /*
  * Update the fuzzy group-count estimate after pdedupe_begin(). Lets the phase

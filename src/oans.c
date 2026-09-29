@@ -1792,7 +1792,7 @@ static int scan_files(char **roots, int nroots, struct dbhandle *db,
 		 */
 		bool dedupe_live = options.run_dedupe && !verbose &&
 				   !options.progress_json && !interrupted() &&
-				   isatty(STDOUT_FILENO);
+				   !ret && isatty(STDOUT_FILENO);
 
 		pscan_join(dedupe_live);
 	}
@@ -2289,6 +2289,10 @@ int main(int argc, char **argv)
 		ret = EXIT_INCOMPLETE;
 
 out:
+	/* Whatever block a phase did not end - a failed scan, a signal in the
+	 * gap before the dedupe phase - goes, and the cursor comes back (#286). */
+	progress_abandon();
+
 	/*
 	 * What a shell reports for a signalled child, so a wrapper sees
 	 * "interrupted" rather than a distinct oans failure. Last, and only over

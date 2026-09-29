@@ -2000,7 +2000,38 @@ what belongs here is when it bites:
   before the redraw — otherwise the two streams' buffers interleave and the
   message lands inside the block. Don't drop those flushes.
   - Consequence for `--progress=json`: the JSON stream is **stderr**, so
-    diagnostics share it. That was already true for anything printed outside the
+    diagnostics share it. A record is formatted into one buffer and written
+    once (#286): made of several `fprintf()`s on unbuffered stderr, a
+    worker's `eprintf()` could land in the middle of it.
+- **Redraw only a block that is on screen (#286).** `print_above_block()`
+  redrew after every routed message, so into a file or a pipe every `-v`
+  message was followed by a block dump (163 lines for 30 files), and while the
+  partial-mode search printer ran it redrew the long-gone scan block, which then
+  sat under every later message. It redraws only when `block_live()` held
+  before the message.
+- **Every row is cut to the terminal, and the block to its height (#286).**
+  Only worker rows were fitted; the dedupe detail line runs to ~96 columns
+  between batches and the bar line with an ETA to ~66, and a wrapped row, like
+  a block taller than the terminal, makes `drawn_lines` count too few and
+  strands one row per redraw. `print_progress()` renders into a buffer and
+  `put_fitted()` cuts every line by visible columns (escape sequences are free,
+  a UTF-8 glyph is one); workers past the height fold into "… N more".
+  `test_a_narrow_short_terminal_strands_nothing` runs two geometries because
+  each hides the other's bug.
+  - **Render into `R`, never into a swapped `stdout`.** The first version set
+    the global `stdout` to the buffer for the render: other threads print to
+    `stdout` without the mutex, so ThreadSanitizer flagged every `-v` message
+    as a race, and a message could have landed in the block buffer.
+  - **`progress_printf()` preserves `errno`.** Callers print an error and
+    then count it by `errno` (`filescan_count_errno_skip(errno)` after an
+    `eprintf()`, in a dozen places); the redraw's `open_memstream()`/`free()`
+    changed it, and under TSan a permission error was counted as
+    "unreadable". Saving it in the one routing function covers every caller.
+- **Whoever hides the cursor, `progress_abandon()` shows it (#286).** The scan
+  leaves its block and the hidden cursor for the dedupe phase, and a failed
+  scan or a signal in the gap never got there, so the shell was left without
+  a cursor. `main()` calls `progress_abandon()` on the way out; after a phase
+  that ended its block it writes nothing. That was already true for anything printed outside the
     printer's lifetime; a consumer must skip lines that don't parse.
 
 ## Valgrind
