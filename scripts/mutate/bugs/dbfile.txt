@@ -528,3 +528,22 @@
 "  from files f cross join extents e on e.fileid = f.id "		\
 "  where 1 " WINDOW							\
 >>>
+
+# ---------------------------------------------------------------- #288
+
+# the last run is the one with the latest timestamp, not the last recorded
+# One-second resolution, and a clock that steps back: --json's skip buckets
+# then describe an older run.
+<<<
+		"from run_history order by rowid desc limit 1",
+===
+		"from run_history order by ts desc limit 1",
+>>>
+
+# a short config value is copied at the field's full length
+<<<
+		memset(val, 0, len);
+		memcpy(val, local ? (const void *)local : "", have < len ? have : len);
+===
+		memcpy(val, local ? (const void *)local : "", len);
+>>>

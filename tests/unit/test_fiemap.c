@@ -803,6 +803,26 @@ MU_TEST(test_fiemap_maps_a_real_file) {
  * fiemap_count_shared() can treat NULL as zero shared bytes rather than as a
  * failure - a distinction that would otherwise turn every hole into an error.
  */
+/*
+ * #288: asked with no slots - the count pass found none, or failed - the
+ * kernel only counts, and reports the real number in fm_mapped_extents with
+ * nothing copied. Every reader walks that number, so it read past the buffer.
+ */
+MU_TEST(test_fiemap_map_never_claims_more_than_it_holds) {
+	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 1, false);
+	_cleanup_(freep) struct fiemap *none = NULL;
+	_cleanup_(freep) struct fiemap *one = NULL;
+
+	if (f.fd < 0)
+		return;
+	none = fiemap_map(f.fd, 0, ~0ULL, 0);
+	mu_check(none != NULL);
+	mu_check(none->fm_mapped_extents == 0);
+	one = fiemap_map(f.fd, 0, ~0ULL, 1);
+	mu_check(one != NULL);
+	mu_check(one->fm_mapped_extents <= 1);
+}
+
 MU_TEST(test_fiemap_range_answers_for_the_range_asked_for) {
 	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 2, true);
 	_cleanup_(freep) struct fiemap *first = NULL;

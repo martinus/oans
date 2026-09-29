@@ -279,6 +279,15 @@ int insert_hashed_block(struct hash_tree *tree,	unsigned char *digest,
 
 	if (add_file_hash_head(d, e)) {
 		free_file_block(e);
+		/*
+		 * A list inserted above for this block alone would stay in the
+		 * tree empty, and free_hash_tree() never finishes one (#288).
+		 */
+		if (d->dl_num_elem == 0) {
+			rb_erase(&d->dl_node, &tree->root);
+			tree->num_hashes--;
+			free_dupe_blocks_list(d);
+		}
 		return ENOMEM;
 	}
 

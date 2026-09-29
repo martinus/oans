@@ -123,3 +123,14 @@
 ===
 	set->n = n;
 >>>
+
+# ---------------------------------------------------------------- #288
+
+# a map claims more records than it holds
+# With fewer slots than extents the kernel only counts; every reader walks
+# fm_mapped_extents, so it read past the buffer.
+<<<
+		if (fiemap->fm_mapped_extents > count)
+			fiemap->fm_mapped_extents = count;
+===
+>>>
