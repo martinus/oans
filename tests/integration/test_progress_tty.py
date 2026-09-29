@@ -19,6 +19,9 @@ import re
 import select
 import struct
 import termios
+import tempfile
+import shutil
+import sqlite3
 import unittest
 
 from harness import DUPEREMOVE, DuperemoveTest, requires_reflink
@@ -32,7 +35,7 @@ _CSI = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
 _ANSI_TEXT = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def _run_in_pty(argv, env=None, stderr_path=None):
+def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS):
     """Run argv on a COLS x ROWS pty; return its raw output bytes.
 
     With `stderr_path`, the child's stderr is redirected to that file while
@@ -49,7 +52,7 @@ def _run_in_pty(argv, env=None, stderr_path=None):
             os.execvpe(argv[0], argv, os.environ if env is None else env)
         finally:                                  # execvp raises, never returns
             os._exit(127)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     chunks = []
     while True:
         if not select.select([fd], [], [], 60)[0]:
@@ -85,13 +88,14 @@ def _worker_rows(data, name, status="hashing"):
     return rows
 
 
-def _render(data):
+def _render(data, cols=COLS, rows=ROWS):
     """Replay an ANSI stream and return every line the user saw, scrollback first.
 
     Handles exactly what oans emits: CR, LF, cursor-up (``ESC[nA``),
     erase-below (``ESC[J``), erase-in-line (``ESC[K``) and line wrapping. Cursor
     show/hide and SGR colors are matched and ignored, as is any other CSI.
     """
+    COLS, ROWS = cols, rows
     grid = [[" "] * COLS for _ in range(ROWS)]
     scrollback = []
     cy = cx = 0
@@ -304,9 +308,27 @@ class ProgressTtyTest(DuperemoveTest):
         stopped_at = self.hf_scalar("select loff from scan_checkpoints")
         self.assertEqual(self.RESUME_CKPT, stopped_at, "unexpected resume point")
 
-        rows = _worker_rows(_run_in_pty(
-            [DUPEREMOVE, "-r", "--hashfile", self.hf, tree] + opts,
-            env=dict(os.environ, **env)), "movie.bin")
+        # The printer redraws every ~100 ms, and a fast runner can hash the
+        # remaining 192 MiB in about that: then no frame shows the row at all
+        # (seen twice on the xfs/clang leg). What this pins is what the row
+        # says when it is drawn, so a run that drew none is repeated, from
+        # the same checkpoint.
+        con = sqlite3.connect(self.hf)       # all of it in the main file
+        con.execute("pragma wal_checkpoint(truncate)")
+        con.close()
+        with open(self.hf, "rb") as f:
+            snapshot = f.read()
+        for _ in range(5):
+            for side in ("-wal", "-shm"):
+                if os.path.exists(self.hf + side):
+                    os.unlink(self.hf + side)
+            with open(self.hf, "wb") as f:
+                f.write(snapshot)
+            rows = _worker_rows(_run_in_pty(
+                [DUPEREMOVE, "-r", "--hashfile", self.hf, tree] + opts,
+                env=dict(os.environ, **env)), "movie.bin")
+            if rows:
+                break
         self.assertTrue(rows, "the resumed file never appeared in the block; "
                               "see RESUME_SIZE above")
 
@@ -322,6 +344,75 @@ class ProgressTtyTest(DuperemoveTest):
         self.assertGreaterEqual(
             float(pct.group(1)), 100.0 * stopped_at / self.RESUME_SIZE,
             f"the resumed row restarted below its checkpoint:\n  {rows[0]}")
+
+
+    def test_a_failed_scan_gives_the_cursor_back(self):
+        """#286: the scan hides the cursor and leaves its block for the dedupe
+        phase. A scan that fails - here on a filesystem that cannot dedupe -
+        never reaches that phase, and the shell was left with no cursor and
+        the block still on screen."""
+        other = "/dev/shm"
+        if not os.path.isdir(other) or \
+           os.stat(other).st_dev == os.stat(self.work).st_dev:
+            self.skipTest("no second filesystem at /dev/shm")
+        tree = tempfile.mkdtemp(prefix="oans-tty.", dir=other)
+        self.addCleanup(shutil.rmtree, tree, True)
+        for i in range(4):
+            with open(os.path.join(tree, f"f{i}"), "wb") as f:
+                f.write(os.urandom(64 * 1024))
+
+        data = _run_in_pty([DUPEREMOVE, "-dr", "--hashfile", self.hf, tree])
+        self.assertGreater(data.rfind(b"\x1b[?25h"), data.rfind(b"\x1b[?25l"),
+                           "the cursor was left hidden")
+        stranded = [ln for ln in _render(data) if WORKER_ROW.match(ln)]
+        self.assertEqual([], stranded)
+
+    def test_a_narrow_short_terminal_strands_nothing(self):
+        """#286: only the worker rows were fitted to the width. The dedupe
+        detail line runs past 80 columns between batches, and a block taller
+        than the terminal scrolls; either way the redraw homes too few rows
+        and leaves a stale one behind each time."""
+        for i in range(8):
+            self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 256 * 1024)
+        tree = os.path.join(self.work, "tree")
+        env = dict(os.environ, DUPEREMOVE_FILES_PER_PASS="2",
+                   DUPEREMOVE_DEDUPE_DELAY_MS="50")
+        # Narrow and tall, where only the width can go wrong (the bar line
+        # alone is ~66 columns); then short, where the height can.
+        for cols, rows in ((50, 40), (60, 10)):
+            self.drop_hashfile()
+            data = _run_in_pty([DUPEREMOVE, "-dr", "--io-threads=8",
+                                "--hashfile", self.hf, tree], env=env,
+                               cols=cols, rows=rows)
+            screen = _render(data, cols=cols, rows=rows)
+            stranded = [ln for ln in screen if WORKER_ROW.match(ln)]
+            self.assertEqual([], stranded,
+                             f"{cols}x{rows}:\n" + "\n".join(screen))
+
+
+class ProgressPipeTest(DuperemoveTest):
+    def test_a_message_into_a_file_is_not_followed_by_the_block(self):
+        """#286: every routed message redrew the whole block, even with no
+        terminal to draw it on: 163 lines for a 30-file -v run."""
+        for i in range(30):
+            self.mkrand(f"tree/f{i}.tmp", 8000)
+        self.mkrand("tree/keep", 8000)
+        out = self.dm("-rv", "--exclude", "*.tmp", self.path("tree"),
+                      quiet=False)
+        self.assertEqual(0, self.rc, out)
+        stage_lines = [ln for ln in out.splitlines()
+                       if re.match(r"^\W*scanning\b", ln)]
+        self.assertLess(len(stage_lines), 5, out)
+
+    def test_the_search_bar_stays_off_a_pipe(self):
+        """#286: the partial-mode search bar is redrawn with '\\r', and it was
+        written into pipes, and under -q."""
+        for i in range(4):
+            self.mkdup(f"tree/a{i}", f"tree/b{i}", 64 * 1024)
+        out = self.dm("-r", "--dedupe-options=partial", self.path("tree"),
+                      text=False)
+        self.assertEqual(0, self.rc, out)
+        self.assertNotIn(b"\r[", out)
 
 
 if __name__ == "__main__":

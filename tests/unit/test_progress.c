@@ -144,3 +144,23 @@ MU_TEST(test_scan_eta) {
 	/* Done >= total -> 0, never negative or a fallback signal. */
 	mu_check(near(scan_eta_seconds(4 * GiB, 4, 4 * GiB, 4, W, 10.0), 0.0, 1e-6));
 }
+
+/*
+ * #286: a narrow terminal asks for fewer than eight columns, where the tail of a
+ * path shorter than eight started before the path; and a cut inside a UTF-8
+ * character put half of it on screen.
+ */
+MU_TEST(test_ellipsize_path_stays_inside_the_path) {
+	char out[64];
+
+	ellipsize_path("abc", out, sizeof(out), 2);
+	mu_assert_string_eq("abc", out);
+
+	/* Ten two-byte characters in 20 bytes, cut to 12 columns. */
+	ellipsize_path("\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+		       "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9",
+		       out, sizeof(out), 12);
+	mu_check(g_utf8_validate(out, -1, NULL));
+	mu_check(strstr(out, "\xe2\x80\xa6") != NULL);	/* the ellipsis */
+}
+

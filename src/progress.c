@@ -96,6 +96,27 @@ bool tty;
  * cosmetic, not worth the critical section, but a plain int here is a race.
  */
 _Atomic unsigned int w_col;
+/* Terminal height, refreshed and read the same way. */
+static _Atomic unsigned int w_row;
+
+/*
+ * Whether this run hid the cursor. Every path that ends a block shows it again,
+ * and progress_abandon() is the one that runs when no phase ended it (#286).
+ */
+static bool cursor_hidden;
+
+static void cursor_hide(void)
+{
+	printf("\33[?25l");
+	cursor_hidden = true;
+}
+
+static void cursor_show(void)
+{
+	if (cursor_hidden)
+		printf("\33[?25h");
+	cursor_hidden = false;
+}
 
 /*
  * When set (--progress=json), the progress thread streams newline-delimited
@@ -246,7 +267,8 @@ static struct {
 	_Atomic uint64_t	work_total_bytes;
 	_Atomic uint64_t	pushed_bytes;	/* sum of W0 pushed so far */
 	uint64_t		shown_pct;	/* printer thread only */
-	unsigned int		batch, batches;
+	/* The producer writes these while the printer reads them (#286). */
+	_Atomic unsigned int	batch, batches;
 	const char *_Atomic	activity;	/* static string */
 	/* reclaimed: honest disk freed (kernel-deduped bytes). net_shared: fiemap
 	 * "net change in shared extents", a diagnostic for the machine-readable
@@ -266,7 +288,16 @@ static uint64_t work_total_clamped(void)
 	return pushed > total ? pushed : total;
 }
 
-#define s_printf(args...) do { if (tty) printf("\33[K"); printf(args); } while (0)
+/*
+ * Where the block is rendered: print_progress()'s buffer while it renders, else
+ * stdout. Never reassign stdout itself for this - other threads print to it
+ * without the mutex, and a swapped global both races and swallows their lines.
+ * Only touched under pscan.mutex.
+ */
+static FILE *rout;
+#define R (rout ? rout : stdout)
+
+#define s_printf(args...) do { if (tty) fprintf(R, "\33[K"); fprintf(R, args); } while (0)
 
 /* Move the cursor to the top-left of the block drawn in the previous render. */
 static void progress_home(void)
@@ -323,15 +354,25 @@ static void ellipsize_path(const char *path, char *out, size_t out_len,
 	int len = strlen(path);
 	int head, tail;
 
+	/*
+	 * Clamp before comparing (#286): a narrow terminal asks for fewer than
+	 * eight columns, and a path shorter than eight then made the tail start
+	 * before the path.
+	 */
+	if (cols < 8)
+		cols = 8;
 	if (cols >= len) {
 		snprintf(out, out_len, "%s", path);
 		return;
 	}
-	if (cols < 8)
-		cols = 8;
 
 	head = (cols - 1) * 2 / 5;
 	tail = cols - 1 - head;
+	/* Cut between characters, not inside a UTF-8 one. */
+	while (head > 0 && ((unsigned char)path[head] & 0xc0) == 0x80)
+		head--;
+	while (tail > 0 && ((unsigned char)path[len - tail] & 0xc0) == 0x80)
+		tail--;
 	snprintf(out, out_len, "%.*s…%s", head, path, path + len - tail);
 }
 
@@ -438,7 +479,7 @@ static const char *const BAR_SUB[] = {
 /* The dim " · " separator between fields on the bar and detail lines. */
 static void detail_sep(void)
 {
-	printf(" %s·%s ", col_dim, col_reset);
+	fprintf(R, " %s·%s ", col_dim, col_reset);
 }
 
 /* Worker status word (no colon) and its color. thread_scanning is "hashing". */
@@ -568,30 +609,30 @@ static void print_thread_progress(struct pscan_thread *t, unsigned int slot)
 static unsigned int print_stage_line(void)
 {
 	if (tty)
-		fputs("\033[K", stdout);
+		fputs("\033[K", R);
 
 	for (enum stage s = 0; s < STAGE_COUNT; s++) {
 		const char *acc = stage_color(s);
 
 		if (s)
-			fputs("   ", stdout);
+			fputs("   ", R);
 
 		switch (stages[s]) {
 		case ST_DONE:
-			printf("%s%s%s %s%s%s", col_green, tty ? "✔" : "x",
+			fprintf(R, "%s%s%s %s%s%s", col_green, tty ? "✔" : "x",
 			       col_reset, col_green, stage_name[s], col_reset);
 			break;
 		case ST_RUNNING:
-			printf("%s%s%s %s%s%s%s", acc, spinner_glyph(), col_reset,
+			fprintf(R, "%s%s%s %s%s%s%s", acc, spinner_glyph(), col_reset,
 			       col_bold, acc, stage_name[s], col_reset);
 			break;
 		default:	/* ST_PENDING */
-			printf("%s%s %s%s", col_dim, tty ? "·" : "-",
+			fprintf(R, "%s%s %s%s", col_dim, tty ? "·" : "-",
 			       stage_name[s], col_reset);
 			break;
 		}
 	}
-	putchar('\n');
+	fputc('\n', R);
 	return 1;
 }
 
@@ -602,14 +643,14 @@ static unsigned int print_stage_line(void)
  */
 static void render_bar(double frac, bool indet, const char *acc)
 {
-	putchar('[');
+	fputc('[', R);
 
 	if (!tty) {	/* plain ASCII for logs / non-tty */
 		int f = indet ? 0 : (int)(frac * BAR_WIDTH + 0.5);
 
 		for (int i = 0; i < BAR_WIDTH; i++)
-			putchar(i < f ? '#' : '-');
-		putchar(']');
+			fputc(i < f ? '#' : '-', R);
+		fputc(']', R);
 		return;
 	}
 
@@ -622,9 +663,9 @@ static void render_bar(double frac, bool indet, const char *acc)
 			bool lit = i >= pos && i < pos + win;
 
 			if (lit)
-				printf("%s%s%s", acc, BAR_FULL, col_reset);
+				fprintf(R, "%s%s%s", acc, BAR_FULL, col_reset);
 			else
-				printf("%s%s%s", col_dim, BAR_EMPTY, col_reset);
+				fprintf(R, "%s%s%s", col_dim, BAR_EMPTY, col_reset);
 		}
 	} else {
 		int eighths, full, rem, printed = 0;
@@ -637,19 +678,19 @@ static void render_bar(double frac, bool indet, const char *acc)
 		full = eighths / 8;
 		rem = eighths % 8;
 
-		printf("%s", acc);
+		fprintf(R, "%s", acc);
 		for (; printed < full && printed < BAR_WIDTH; printed++)
-			fputs(BAR_FULL, stdout);
+			fputs(BAR_FULL, R);
 		if (rem && printed < BAR_WIDTH) {
-			fputs(BAR_SUB[rem], stdout);
+			fputs(BAR_SUB[rem], R);
 			printed++;
 		}
-		printf("%s%s", col_reset, col_dim);
+		fprintf(R, "%s%s", col_reset, col_dim);
 		for (; printed < BAR_WIDTH; printed++)
-			fputs(BAR_EMPTY, stdout);
-		printf("%s", col_reset);
+			fputs(BAR_EMPTY, R);
+		fprintf(R, "%s", col_reset);
 	}
-	putchar(']');
+	fputc(']', R);
 }
 
 /* The current live-edge stage: dedupe once that phase is running, else hashing. */
@@ -711,7 +752,7 @@ static unsigned int print_bar_line(void)
 	s_printf("%s%-*s%s  ", acc, STAGE_PREFIX_W, stage_name[cs], col_reset);
 	render_bar(frac, indet, acc);
 	if (!indet) {
-		printf("  %s%u%%%s", col_bold, pct, col_reset);
+		fprintf(R, "  %s%u%%%s", col_bold, pct, col_reset);
 		/*
 		 * An ETA beyond a year means the inputs are off (a stalled
 		 * rate sample or a corrupt total), not a real forecast; the
@@ -720,10 +761,10 @@ static unsigned int print_bar_line(void)
 		 */
 		if (eta > 0.0 && eta < 365.0 * 86400) {
 			detail_sep();
-			printf("ETA ~%s", human_duration(eta));
+			fprintf(R, "ETA ~%s", human_duration(eta));
 		}
 	}
-	putchar('\n');
+	fputc('\n', R);
 	return 1;
 }
 
@@ -739,7 +780,7 @@ static void print_hash_rate(void)
 
 	if (bytes_scanned && elapsed > 1.0) {
 		detail_sep();
-		printf("%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
+		fprintf(R, "%s/s", human_size((uint64_t)(bytes_scanned / elapsed)));
 	}
 }
 
@@ -776,30 +817,30 @@ static unsigned int print_detail_line(void)
 		 * identical files, ...) here under the bar instead of "0 / ~0".
 		 */
 		if (done == 0 && pdd.activity) {
-			printf("%s", pdd.activity);
+			fprintf(R, "%s", pdd.activity);
 			if (st) {
 				detail_sep();
-				printf("%s/%s files", group_u64(sd), group_u64(st));
+				fprintf(R, "%s/%s files", group_u64(sd), group_u64(st));
 			}
-			putchar('\n');
+			fputc('\n', R);
 			return 1;
 		}
 
-		printf("%s%s%s / ~%s groups",
+		fprintf(R, "%s%s%s / ~%s groups",
 		       col_bold, group_u64(done), col_reset, group_u64(total));
 		if (pdd.batches > 1) {
 			detail_sep();
-			printf("batch %u/%u", pdd.batch, pdd.batches);
+			fprintf(R, "batch %u/%u", pdd.batch, pdd.batches);
 		}
 		if (st) {
 			detail_sep();
-			printf("searching extents %s/%s", group_u64(sd), group_u64(st));
+			fprintf(R, "searching extents %s/%s", group_u64(sd), group_u64(st));
 		} else if (pool_idle && pdd.activity) {
 			detail_sep();
-			printf("%s", pdd.activity);
+			fprintf(R, "%s", pdd.activity);
 		}
 		detail_sep();
-		printf("reclaimed %s%s%s\n", col_green,
+		fprintf(R, "reclaimed %s%s%s\n", col_green,
 		       human_size(pdd.reclaimed), col_reset);
 		return 1;
 	}
@@ -810,25 +851,25 @@ static unsigned int print_detail_line(void)
 		 * visited (reset once at pscan_run); total_files_count is how many
 		 * of them need (re)hashing. Both climb monotonically during listing.
 		 */
-		printf("%s%s%s files", col_bold,
+		fprintf(R, "%s%s%s files", col_bold,
 		       group_u64(pscan.files_examined), col_reset);
 		detail_sep();
-		printf("%s%s%s need hashing", col_bold,
+		fprintf(R, "%s%s%s need hashing", col_bold,
 		       group_u64(pscan.total_files_count), col_reset);
 		print_hash_rate();	/* hashing overlaps the walk */
-		putchar('\n');
+		fputc('\n', R);
 		return 1;
 	}
 
 	{
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 
-		printf("%s%s%s / %s files", col_bold,
+		fprintf(R, "%s%s%s / %s files", col_bold,
 		       group_u64(files_scanned), col_reset, group_u64(tf));
 		detail_sep();
-		printf("%s / %s", human_size(bytes_scanned), human_size(tb));
+		fprintf(R, "%s / %s", human_size(bytes_scanned), human_size(tb));
 		print_hash_rate();
-		putchar('\n');
+		fputc('\n', R);
 		return 1;
 	}
 }
@@ -864,17 +905,78 @@ static void sum_scanned(void)
 	}
 }
 
+/*
+ * Copy `line` (one row, without its newline) to stdout, cut to `cols` visible
+ * columns. Escape sequences take no column, and a UTF-8 character takes one -
+ * every glyph the block draws is one column wide.
+ */
+static void put_fitted(const char *line, size_t len, unsigned int cols)
+{
+	unsigned int used = 0;
+	size_t i = 0;
+
+	while (i < len) {
+		size_t n = 1;
+
+		if (line[i] == '\33') {		/* CSI: ESC [ params final */
+			n = 2;
+			while (i + n < len && !(line[i + n] >= 0x40 &&
+						line[i + n] <= 0x7e))
+				n++;
+			n++;
+		} else {
+			if (used == cols)
+				break;
+			used++;
+			while (i + n < len &&
+			       ((unsigned char)line[i + n] & 0xc0) == 0x80)
+				n++;
+		}
+		fwrite(line + i, 1, n > len - i ? len - i : n, stdout);
+		i += n;
+	}
+	/* Whatever was cut may have held the SGR reset. */
+	if (i < len)
+		fputs(col_reset, stdout);
+}
+
+/*
+ * The block as rows of at most the terminal's width, and no taller than it
+ * (#286). Only the worker rows were fitted, so at 80 columns the dedupe detail
+ * line wrapped, drawn_lines counted one row too few, and each redraw left a
+ * stale row behind; a block taller than the terminal did the same. Rendered
+ * into a buffer so every line can be cut the same way.
+ */
 static void *print_progress(void)
 {
-	unsigned int lines = 0;
+	unsigned int lines = 0, rows = w_row, workers = pscan.thread_count;
+	unsigned int cols = w_col;
+	char *buf = NULL;
+	size_t size = 0;
+	FILE *mem;
 
 	sum_scanned();
 
 	progress_home();	/* back to the top of the block we drew last time */
 
+	/*
+	 * Four rows below the workers (spacer, stage, bar, detail) and one for
+	 * the cursor: the rest is what the workers get.
+	 */
+	if (tty && rows && rows != UINT_MAX && workers + 5 > rows)
+		workers = rows > 6 ? rows - 6 : 1;
+
+	mem = open_memstream(&buf, &size);
+	rout = mem;
+
 	/* Worker lines on top, numbered 1..N (the slot index, not the pid). */
-	for (unsigned int i = 0; i < pscan.thread_count; i++) {
+	for (unsigned int i = 0; i < workers; i++) {
 		print_thread_progress(pscan.threads[i], i + 1);
+		lines++;
+	}
+	if (workers < pscan.thread_count) {
+		s_printf("%s  … %u more%s\n", col_dim,
+			 pscan.thread_count - workers, col_reset);
 		lines++;
 	}
 
@@ -883,6 +985,24 @@ static void *print_progress(void)
 	lines++;
 
 	lines += print_total_progress();
+
+	if (mem) {
+		fclose(mem);
+		rout = NULL;
+		for (char *p = buf; p < buf + size;) {
+			char *nl = memchr(p, '\n', buf + size - p);
+			size_t len = nl ? (size_t)(nl - p) : (size_t)(buf + size - p);
+
+			if (tty && cols != UINT_MAX)
+				put_fitted(p, len, cols);
+			else
+				fwrite(p, 1, len, stdout);
+			if (nl)
+				putchar('\n');
+			p += len + (nl ? 1 : 0);
+		}
+		free(buf);
+	}
 
 	progress_wipe();	/* drop any rows a taller previous render left */
 	drawn_lines = lines;
@@ -911,6 +1031,18 @@ static enum jphase json_phase(void)
 static void emit_json_progress(enum jphase phase)
 {
 	double elapsed = elapsed_seconds();
+	/*
+	 * Built in memory and written once (#286): a record made of several
+	 * fprintf()s on unbuffered stderr could have an eprintf() from a worker
+	 * land between them, and the consumer then got two lines that do not
+	 * parse.
+	 */
+	char *buf = NULL;
+	size_t size = 0;
+	FILE *out = open_memstream(&buf, &size);
+
+	if (!out)
+		return;
 
 	switch (phase) {
 	case JP_DEDUPE: {
@@ -925,30 +1057,30 @@ static void emit_json_progress(enum jphase phase)
 				    : dedupe_eta_seconds(done, total, de);
 
 		/* Raw values (no monotone clamp): consumers want truth. */
-		fprintf(stderr, "{\"phase\":\"dedupe\",\"elapsed_sec\":%.2f,"
+		fprintf(out, "{\"phase\":\"dedupe\",\"elapsed_sec\":%.2f,"
 			"\"groups\":%" PRIu64 ",\"groups_total\":%" PRIu64 ","
 			"\"work_done_bytes\":%" PRIu64 ","
 			"\"work_total_bytes\":%" PRIu64 ","
 			"\"reclaimed_bytes\":%" PRIu64, elapsed, done, total,
 			wdone, wtotal, (uint64_t)pdd.reclaimed);
 		if (pdd.activity)
-			fprintf(stderr, ",\"activity\":\"%s\"", pdd.activity);
+			fprintf(out, ",\"activity\":\"%s\"", pdd.activity);
 		if (st)
-			fprintf(stderr, ",\"search_files\":%" PRIu64 ","
+			fprintf(out, ",\"search_files\":%" PRIu64 ","
 				"\"search_files_total\":%" PRIu64, sd, st);
 		if (eta > 0.0)
-			fprintf(stderr, ",\"eta_sec\":%.1f", eta);
+			fprintf(out, ",\"eta_sec\":%.1f", eta);
 		break;
 	}
 	case JP_SCAN:
-		fprintf(stderr, "{\"phase\":\"scanning\",\"elapsed_sec\":%.2f,"
+		fprintf(out, "{\"phase\":\"scanning\",\"elapsed_sec\":%.2f,"
 			"\"files_examined\":%" PRIu64 ",\"files_to_hash\":%" PRIu64,
 			elapsed, pscan.files_examined, pscan.total_files_count);
 		break;
 	case JP_HASH: {
 		uint64_t tf = pscan.total_files_count, tb = pscan.total_bytes_count;
 
-		fprintf(stderr, "{\"phase\":\"hashing\",\"elapsed_sec\":%.2f,"
+		fprintf(out, "{\"phase\":\"hashing\",\"elapsed_sec\":%.2f,"
 			"\"files\":%" PRIu64 ",\"files_total\":%" PRIu64 ","
 			"\"bytes\":%" PRIu64 ",\"bytes_total\":%" PRIu64,
 			elapsed, files_scanned, tf, bytes_scanned, tb);
@@ -956,16 +1088,19 @@ static void emit_json_progress(enum jphase phase)
 			double eta = scan_eta_seconds(bytes_scanned, files_scanned,
 						      tb, tf, eta_file_weight, elapsed);
 
-			fprintf(stderr, ",\"bytes_per_sec\":%.0f",
+			fprintf(out, ",\"bytes_per_sec\":%.0f",
 				bytes_scanned / elapsed);
 			if (eta > 0.0)
-				fprintf(stderr, ",\"eta_sec\":%.1f", eta);
+				fprintf(out, ",\"eta_sec\":%.1f", eta);
 		}
 		break;
 	}
 	}
-	fprintf(stderr, "}\n");
+	fprintf(out, "}\n");
+	fclose(out);
+	fwrite(buf, 1, size, stderr);
 	fflush(stderr);
+	free(buf);
 }
 
 /* Emitted once at the end of a run when --progress=json is set. */
@@ -1013,11 +1148,11 @@ static void *pscan_progress_thread(void * p)
 
 		/* Refresh the tty properties. Some ttys (e.g. bare ptys)
 		 * report a zero width; treat that as "don't truncate". */
-		if (tty) {
-			ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+		if (tty && ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
 			w_col = w.ws_col ? w.ws_col : UINT_MAX;
+			w_row = w.ws_row ? w.ws_row : UINT_MAX;
 		} else {
-			w_col = UINT_MAX;
+			w_col = w_row = UINT_MAX;
 		}
 
 		g_mutex_lock(&pscan.mutex);
@@ -1077,9 +1212,7 @@ void pscan_run(void)
 	pscan.files_examined = 0;	/* cumulative walk count, climbs to the total */
 
 	if (tty && !progress_json) {
-		/* hide the cursor */
-		printf("\33[?25l");
-
+		cursor_hide();
 		prepare_screen_area();
 	}
 
@@ -1122,11 +1255,33 @@ void pscan_join(bool continues)
 	 * clean so the report or the next output starts on a fresh line. No
 	 * summary is left behind.
 	 */
-	if (tty)
-		printf("\33[?25h");	/* show the cursor again */
+	cursor_show();
 	progress_home();
 	progress_wipe();
 	drawn_lines = 0;
+	pscan_free_threads();
+}
+
+/*
+ * End a block that no phase is going to end (#286). The scan leaves its block
+ * and the hidden cursor for the dedupe phase to take over, and a scan that
+ * failed, or a signal landing before that phase began, broke the promise: the
+ * block stayed on screen and the user's shell was left without a cursor.
+ * main() calls this on the way out; after a phase that ended its block it has
+ * nothing to do.
+ */
+void progress_abandon(void)
+{
+	printer_stop();
+	if (!progress_json) {
+		if (block_live()) {
+			progress_home();
+			progress_wipe();
+			drawn_lines = 0;
+		}
+		cursor_show();
+		fflush(stdout);
+	}
 	pscan_free_threads();
 }
 
@@ -1234,9 +1389,20 @@ static void print_above_block(FILE *stream, const char *fmt, va_list args)
 
 	g_mutex_lock(&pscan.mutex);
 
-	progress_home();
-	progress_wipe();
-	drawn_lines = 0;
+	/*
+	 * Redraw only a block that is on screen (#286). Into a file or a pipe
+	 * there is none, and every message used to be followed by a full block
+	 * dump - 163 lines for a 30-file -v run. And while the search's own
+	 * printer runs, the scan block is long gone: redrawing it put a stale
+	 * "hashing 0%" block under the next message, for the rest of the run.
+	 */
+	bool live = block_live();
+
+	if (live) {
+		progress_home();
+		progress_wipe();
+		drawn_lines = 0;
+	}
 
 	/*
 	 * The block lives on stdout; `stream` may be another descriptor pointing
@@ -1249,7 +1415,8 @@ static void print_above_block(FILE *stream, const char *fmt, va_list args)
 	vfprintf(stream, fmt, args);
 	fflush(stream);
 
-	print_progress();
+	if (live)
+		print_progress();
 	g_mutex_unlock(&pscan.mutex);
 }
 
@@ -1274,6 +1441,13 @@ static void print_above_block(FILE *stream, const char *fmt, va_list args)
 void progress_printf(FILE *stream, const char *fmt, ...)
 {
 	va_list args;
+	/*
+	 * Callers print an error and then count it by errno - `eprintf(...,
+	 * strerror(errno)); filescan_count_errno_skip(errno);` is the idiom in
+	 * two dozen places - and stdio, the redraw's buffer and free() are all
+	 * free to change errno. A permission error then counted as "unreadable".
+	 */
+	int saved_errno = errno;
 
 	va_start(args, fmt);
 	if (printer || block_live())
@@ -1281,6 +1455,7 @@ void progress_printf(FILE *stream, const char *fmt, ...)
 	else
 		vfprintf(stream, fmt, args);
 	va_end(args);
+	errno = saved_errno;
 }
 
 /*
@@ -1353,7 +1528,7 @@ void pdedupe_begin(unsigned int batches)
 
 	if (!progress_json) {
 		tty = true;
-		printf("\33[?25l");	/* hide the cursor (a no-op if scan already did) */
+		cursor_hide();	/* a no-op if the scan already did */
 		/*
 		 * Do NOT reset drawn_lines here: the scan left its block in place
 		 * (see pscan_join with continues=true), so the first dedupe render
@@ -1377,7 +1552,7 @@ void pdedupe_end(void)
 		 * fully-ticked stage line in place; the caller prints the final
 		 * summary below it. (JSON mode drew no block.) */
 		if (!progress_json) {
-			printf("\33[?25h");
+			cursor_show();
 			progress_home();
 			progress_wipe();
 			drawn_lines = 0;
@@ -1456,9 +1631,11 @@ void pdedupe_counters(uint64_t *groups, uint64_t *reclaimed, uint64_t *net_share
 		*net_shared = pdd.net_shared;
 }
 
+static int search_last_pos;
+
 static void *psearch_progress_thread(void * p)
 {
-	static int last_pos = -1;
+	int last_pos = search_last_pos;
 
 	do {
 		int pos;
@@ -1505,6 +1682,15 @@ void psearch_run(uint64_t num_filerecs)
 		pdedupe_set_activity("searching block-level matches");
 		return;
 	}
+	/*
+	 * A bar redrawn with '\r' is for a terminal (#286): into a pipe it wrote
+	 * "\r[%    ]" lines, and -q asked for nothing at all. And each search
+	 * starts from an empty bar; the position used to be a static that only
+	 * the first pass ever saw below the end.
+	 */
+	if (quiet || progress_json || !isatty(STDOUT_FILENO))
+		return;
+	search_last_pos = -1;
 	printer_start(psearch_progress_thread);
 }
 

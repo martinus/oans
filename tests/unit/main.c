@@ -56,6 +56,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_fiemap_phys_set_grows);
 	MU_RUN(test_sanitize_ctrl);
 	MU_RUN(test_progress_copy_path);
+	MU_RUN(test_ellipsize_path_stays_inside_the_path);
 	MU_RUN(test_progress_path_two_stage_render);
 	MU_RUN(test_storage_recommend_io_threads);
 	MU_RUN(test_storage_describe);
