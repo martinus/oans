@@ -69,9 +69,19 @@ class SelfDescribingConfigTest(DuperemoveTest):
         self.assertEqual(self._opt("opt_max_filesize"), 1024 * 1024)
 
     def test_bare_run_without_stored_config_errors(self):
-        # Fresh hashfile, no arguments: nothing to replay.
+        # No hashfile at all: nothing to replay, and nothing created (#284).
         self.dm()
-        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(1, self.rc, self.out)
+        self.assertIn("there is no hashfile", self.out)
+        self.assertFalse(os.path.exists(self.hf))
+
+        # A hashfile, but one a stdin-list scan wrote, which stores no
+        # configuration.
+        self.mkrand("tree/a", 8000)
+        self.dm("-", stdin=self.path("tree/a") + "\n")
+        self.assertDmOk()
+        self.dm()
+        self.assertEqual(1, self.rc, self.out)
         self.assertIn("no stored scan configuration", self.out)
 
     def test_all_roots_missing_refuses_and_keeps_rows(self):

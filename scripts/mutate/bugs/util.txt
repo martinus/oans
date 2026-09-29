@@ -98,3 +98,15 @@
 ===
 	rdir = NULL;
 >>>
+
+# ---------------------------------------------------------------- #284
+
+# a size that does not fit in 64 bits wraps instead of being refused
+# `--max-filesize=16E` came out as 0 and `20E` as 4 EiB, and the run went on
+# with a limit nobody asked for.
+<<<
+	if (errno == ERANGE || v > UINT64_MAX / mult) {
+===
+	if (errno == ERANGE) {
+>>>
+

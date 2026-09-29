@@ -246,10 +246,19 @@ MU_TEST(test_prop_group_u64_truncates_to_a_prefix) {
  */
 static uint64_t size_of(const char *s)
 {
-	char buf[32];
+	uint64_t v;
 
-	snprintf(buf, sizeof(buf), "%s", s);
-	return parse_size(buf);
+	if (parse_size(s, &v))
+		abort();		/* a valid size in the table below */
+	return v;
+}
+
+/* Whether parse_size() refuses `s`, leaving the output alone. */
+static bool size_refused(const char *s)
+{
+	uint64_t v = 12345;
+
+	return parse_size(s, &v) != 0 && v == 12345;
 }
 
 MU_TEST(test_parse_size) {
@@ -282,11 +291,20 @@ MU_TEST(test_parse_size) {
 	mu_check(size_of("1024k") == size_of("1m"));
 
 	/*
-	 * The error paths - an empty value, an unknown descriptor, a suffix
-	 * longer than one character - are not exercised here: parse_size()
-	 * calls exit() on each, which would take the whole suite with it.
-	 * They are covered end-to-end in tests/integration/test_min_filesize.py.
+	 * The error paths return now rather than exit() (#284), which took the
+	 * whole suite with it and so was only ever tested end to end.
 	 */
+	mu_check(size_refused(""));
+	mu_check(size_refused("k"));
+	mu_check(size_refused("10KB"));
+	mu_check(size_refused("10x"));
+
+	/* Nothing wraps: 16E is 2^64 and used to come out as 0. */
+	mu_check(size_of("15e") == 15ULL << 60);
+	mu_check(size_refused("16e"));
+	mu_check(size_refused("20e"));
+	mu_check(size_of("18446744073709551615") == UINT64_MAX);
+	mu_check(size_refused("18446744073709551616"));
 }
 
 /*
@@ -310,12 +328,14 @@ MU_TEST(test_prop_parse_size_scales_by_the_suffix) {
 		for (unsigned int i = 0; i < level; i++)
 			expect *= 1024;
 
+		uint64_t got;
+
 		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n, rungs[level]);
-		prop_check(&p, parse_size(buf) == expect);
+		prop_check(&p, parse_size(buf, &got) == 0 && got == expect);
 
 		snprintf(buf, sizeof(buf), "%" PRIu64 "%c", n,
 			 (char)toupper(rungs[level]));
-		prop_check(&p, parse_size(buf) == expect);
+		prop_check(&p, parse_size(buf, &got) == 0 && got == expect);
 	}
 }
 

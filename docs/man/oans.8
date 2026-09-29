@@ -141,8 +141,15 @@ stored.
 Because the hashfile also records the run\(cqs options, paths, and
 \f[B]\-\-exclude\f[R] patterns, you need not repeat them:
 \f[B]\f[CB]oans \-\-hashfile=FILE\f[B]\f[R] with no \f[I]file\f[R]
-arguments \f[B]replays the last run\f[R] (any other options on that
-command line are ignored).
+arguments \f[B]replays the last run\f[R].
+The stored settings \- \f[B]\-r\f[R], \f[B]\-d\f[R], the size limits,
+\f[B]\-\-skip\-zeroes\f[R], \f[B]\-\-skip\-readonly\-subvols\f[R],
+\f[B]\-\-dedupe\-options\f[R] and the excludes \- win over the command
+line.
+Options that shape only this run (\f[B]\-\-io\-threads\f[R],
+\f[B]\-\-cpu\-threads\f[R], \f[B]\-B\f[R], \f[B]\-q\f[R], \f[B]\-v\f[R])
+still apply, and an extra \f[B]\-\-exclude\f[R] applies to this run
+without being stored; the block size is always the hashfile\(cqs.
 That includes \f[B]\-d\f[R]: a hashfile seeded by a read\-only preview
 run replays as read\-only forever, so \f[CR]oans\f[R] warns on such a
 replay and prints the command to update it.
@@ -165,13 +172,14 @@ more CPU and a larger hashfile; larger blocks fragment less.
 Most users never need to change this.
 .TP
 \f[B]\-B\f[R] \f[I]N\f[R], \f[B]\-\-batchsize\f[R]=\f[I]N\f[R]
-Run the dedupe phase after every \f[I]N\f[R] newly scanned files instead
-of once at the end.
-This caps memory use on large data sets and when partial matching is
-enabled, at a small cost to multithreading efficiency.
-Default \f[B]1024\f[R], a good value for extent\-based dedupe; drop it
-toward \f[B]1\f[R] when working on very large files (VM images,
-backups).
+Group newly scanned files into \f[I]generations\f[R] of \f[I]N\f[R]
+files.
+Default \f[B]1024\f[R]; \f[I]N\f[R] is from 1 to 2\(ha31.
+The dedupe phase always runs once the scan is over, and works through
+the generations in passes of about 65,536 files, so up to that number
+\f[B]\-B\f[R] changes neither the passes nor the memory they use.
+Above it, each pass is one generation of \f[I]N\f[R] files, which takes
+more memory.
 .TP
 \f[B]\-m\f[R] \f[I]SIZE\f[R], \f[B]\-\-min\-filesize\f[R]=\f[I]SIZE\f[R]
 Skip regular files smaller than \f[I]SIZE\f[R] bytes (suffixes
@@ -271,8 +279,7 @@ Default \f[B]on\f[R].
 \f[B][no]partial\f[R]
 Also compare \f[I]portions\f[R] of extents (block\-level matching),
 finding dedupe that pure extent matching misses.
-Powerful but CPU\-intensive and larger on disk; pair it with
-\f[B]\-\-batchsize\f[R] to bound memory.
+Powerful but CPU\-intensive and larger on disk.
 Default \f[B]off\f[R].
 (This path is under active development and its semantics may change.)
 .TP
@@ -701,7 +708,8 @@ See \f[I]EXAMPLES\f[R] for an \f[CR]OnFailure=\f[R] setup.
 .RE
 .TP
 \f[B]130\f[R], \f[B]143\f[R]
-Interrupted by \f[B]SIGINT\f[R] (Ctrl\-C) or \f[B]SIGTERM\f[R].
+Interrupted by \f[B]SIGINT\f[R] (Ctrl\-C) or \f[B]SIGTERM\f[R], also
+when the run had lost a root and would otherwise exit \f[B]2\f[R].
 Work already done was committed to the hashfile; re\-run to continue
 where it stopped.
 .PP

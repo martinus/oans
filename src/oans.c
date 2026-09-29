@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -890,7 +891,7 @@ static void help(void)
 "\n"
 "Scan tuning:\n"
 "  -b SIZE                     hashing block size, 4K-1M (default 128K)\n"
-"  -B, --batchsize=N           dedupe every N scanned files (default 1024)\n"
+"  -B, --batchsize=N           files per scan generation (default 1024)\n"
 "  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
 "      --max-filesize=SIZE     skip files larger than SIZE (default: no limit)\n"
 "      --skip-zeroes           detect and skip all-zero blocks\n"
@@ -929,6 +930,45 @@ static void help(void)
 /*
  * Ok this is doing more than just parsing options.
  */
+/*
+ * A whole number in [1, max] for option `opt`, or an error (#284). strtoul()
+ * alone took `8x` as 8 and `-1` as 4294967295 threads, which then tripped an
+ * abort_on() in the scan.
+ */
+static int parse_count(const char *opt, const char *arg, unsigned long max,
+		       unsigned int *out)
+{
+	char *end;
+	unsigned long v;
+
+	errno = 0;
+	v = strtoul(arg, &end, 10);
+	if (!isdigit((unsigned char)arg[0]) || *end || errno || v < 1 ||
+	    v > max) {
+		eprintf("Error: %s takes a whole number from 1 to %lu, "
+			"\"%s\" found\n", opt, max, arg);
+		return -1;
+	}
+	*out = (unsigned int)v;
+	return 0;
+}
+
+/* A size option into *out, or an error when it is not in [1, max]. */
+static int parse_size_opt(const char *opt, const char *arg, uint64_t max,
+			  uint64_t *out)
+{
+	if (parse_size(arg, out))
+		return -1;
+	if (*out < 1 || *out > max) {
+		eprintf("Error: %s must be from 1 to %" PRIu64 ", \"%s\" "
+			"found\n", opt, max, arg);
+		return -1;
+	}
+	return 0;
+}
+
+#define MAX_THREADS	1024
+
 static int parse_options(int argc, char **argv, int *filelist_idx)
 {
 	int c, numfiles;
@@ -966,15 +1006,22 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	while ((c = getopt_long(argc, argv, "b:vdrh?LRqB:m:", long_ops, NULL))
 	       != -1) {
 		switch (c) {
-		case 'b':
-			blocksize = parse_size(optarg);
-			if (blocksize < MIN_BLOCKSIZE ||
-			    blocksize > MAX_BLOCKSIZE){
-				eprintf("Error: Blocksize is bounded by %u and %u, %u found\n",
-					MIN_BLOCKSIZE, MAX_BLOCKSIZE, blocksize);
+		case 'b': {
+			uint64_t bs;
+
+			/* Checked before narrowing: 2^32 + 4K used to pass as
+			 * 4K (#284). */
+			if (parse_size(optarg, &bs))
+				return EINVAL;
+			if (bs < MIN_BLOCKSIZE || bs > MAX_BLOCKSIZE) {
+				eprintf("Error: Blocksize is bounded by %u and %u, "
+					"%s found\n", MIN_BLOCKSIZE, MAX_BLOCKSIZE,
+					optarg);
 				return EINVAL;
 			}
+			blocksize = (unsigned int)bs;
 			break;
+		}
 		case 'd':
 			options.run_dedupe = 1;
 			break;
@@ -998,20 +1045,14 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			options.hashfile = strdup(optarg);
 			break;
 		case IO_THREADS_OPTION:
-			options.io_threads = strtoul(optarg, NULL, 10);
-			if (!options.io_threads){
-				eprintf("Error: --io-threads must be "
-					"an integer, %s found\n", optarg);
+			if (parse_count("--io-threads", optarg, MAX_THREADS,
+					&options.io_threads))
 				return EINVAL;
-			}
 			break;
 		case CPU_THREADS_OPTION:
-			options.cpu_threads = strtoul(optarg, NULL, 10);
-			if (!options.cpu_threads){
-				eprintf("Error: --cpu-threads must be "
-					"an integer, %s found\n", optarg);
+			if (parse_count("--cpu-threads", optarg, MAX_THREADS,
+					&options.cpu_threads))
 				return EINVAL;
-			}
 			break;
 		case SKIP_ZEROES_OPTION:
 			options.skip_zeroes = true;
@@ -1061,18 +1102,14 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case MIN_FILESIZE_OPTION:
 		case 'm':
-			options.min_filesize = parse_size(optarg);
-			if (options.min_filesize == 0) {
-				eprintf("Error: --min-filesize must be greater than zero\n");
+			if (parse_size_opt("--min-filesize", optarg, UINT64_MAX,
+					   &options.min_filesize))
 				return EINVAL;
-			}
 			break;
 		case MAX_FILESIZE_OPTION:
-			options.max_filesize = parse_size(optarg);
-			if (options.max_filesize == 0) {
-				eprintf("Error: --max-filesize must be greater than zero\n");
+			if (parse_size_opt("--max-filesize", optarg, UINT64_MAX,
+					   &options.max_filesize))
 				return EINVAL;
-			}
 			break;
 		case EXCLUDE_OPTION:
 			/*
@@ -1089,9 +1126,16 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			user_excludes[n_user_excludes++] = strdup(optarg);
 			break;
 		case BATCH_SIZE_OPTION:
-		case 'B':
-			options.batch_size = parse_size(optarg);
+		case 'B': {
+			uint64_t n;
+
+			/* 0, or anything that narrowed to 0 like 4G, divided by
+			 * zero after the scan (#284). */
+			if (parse_size_opt("-B", optarg, 1ULL << 31, &n))
+				return EINVAL;
+			options.batch_size = (unsigned int)n;
 			break;
+		}
 		case HELP_OPTION:
 			help();
 			break;
@@ -1333,16 +1377,22 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
  * the whole-file and extent passes. dedupe_seq advances in generation order as
  * batches complete (see dedupe_advance_seq), preserving the Ctrl+C invariant.
  */
-static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
-			      unsigned int max, unsigned int stride)
+static int stream_duplicates(struct dbhandle *db, unsigned int first_seq,
+			     unsigned int max, unsigned int stride)
 {
 	bool inmem = !options.hashfile;
 	struct dbhandle *pdb = inmem ? db : dbfile_open_handle(options.hashfile);
 	unsigned int pass = 0;
 
+	/*
+	 * Nothing is deduped without it, so the run fails (#284); and the
+	 * progress block process_duplicates() started is ended here, since the
+	 * dedupe phase that would end it never begins (#286).
+	 */
 	if (!pdb) {
 		eprintf("Unable to open a read handle for the dedupe phase\n");
-		return;
+		pdedupe_end();
+		return -1;
 	}
 
 	g_dedupe_write_db = dbfile_get_handle();
@@ -1395,6 +1445,7 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 
 	if (!inmem)
 		dbfile_close_handle(pdb);
+	return 0;
 }
 
 /*
@@ -1407,12 +1458,13 @@ static void stream_duplicates(struct dbhandle *db, unsigned int first_seq,
  */
 #define DEDUPE_FILES_PER_PASS	(64 * 1024)
 
-static void process_duplicates(struct dbhandle *db)
+static int process_duplicates(struct dbhandle *db)
 {
 	unsigned int max = get_max_dedupe_seq(db);
 	unsigned int first_seq = dedupe_seq;	/* bumped inside the loop */
 	unsigned int files_per_pass = DEDUPE_FILES_PER_PASS;
 	unsigned int stride, passes;
+	int ret = 0;
 	/* Tests force many small passes to exercise the cross-generation path. */
 	const char *env = getenv("DUPEREMOVE_FILES_PER_PASS");
 	int env_val = env ? atoi(env) : 0;
@@ -1453,7 +1505,7 @@ static void process_duplicates(struct dbhandle *db)
 	 * "Nothing to deduplicate" when it had simply stopped looking.
 	 */
 	if (interrupted())
-		return;
+		return 0;
 
 	if (options.run_dedupe)
 		pdedupe_begin(passes);
@@ -1498,7 +1550,7 @@ static void process_duplicates(struct dbhandle *db)
 		 * prints the summary. Filerecs are held per batch and released
 		 * at batch completion - no free_all_filerecs() between batches.
 		 */
-		stream_duplicates(db, first_seq, max, stride);
+		ret = stream_duplicates(db, first_seq, max, stride);
 	} else {
 		for (unsigned int i = first_seq; i < max; i += stride) {
 			unsigned int hi = i + stride < max ? i + stride : max;
@@ -1515,6 +1567,7 @@ static void process_duplicates(struct dbhandle *db)
 
 	if (options.do_block_hash)
 		extents_search_free();
+	return ret;
 }
 
 /*
@@ -1826,19 +1879,43 @@ static int apply_scan_config(const struct scan_config *sc)
 	 * the whole point of a replay is that the user no longer remembers the
 	 * arguments. On stderr, so -q (what the shipped unit runs) still shows it.
 	 */
+	/*
+	 * The command has to carry every stored setting, not only -r and the
+	 * roots (#285): it is a normal run, so it stores its own configuration,
+	 * and one without the stored excludes and size limits would from then
+	 * on scan - and deduplicate - exactly what the job was set up to skip.
+	 */
 	if (!sc->run_dedupe) {
+		struct scan_config with_d = *sc;
+		_cleanup_(freep) char *opts = NULL;
+		GString *cmd;
+
+		with_d.run_dedupe = 1;
+		opts = scan_config_options_str(&with_d);
+		cmd = g_string_new(NULL);
+		/* escape-ok: oans's own --hashfile argument. */
+		g_string_append_printf(cmd, "oans %s --hashfile=%s", opts,
+				       options.hashfile);
+		for (i = 0; i < sc->nexcludes; i++) {
+			gchar *q = g_shell_quote(sc->excludes[i]);
+
+			g_string_append_printf(cmd, " --exclude=%s", q);
+			g_free(q);
+		}
+		for (i = 0; i < sc->nroots; i++) {
+			declare_display_path(root, sc->roots[i]);
+			gchar *q = g_shell_quote(root);
+
+			g_string_append_printf(cmd, " %s", q);
+			g_free(q);
+		}
 		eprintf("WARNING: the stored configuration for %s has no -d, so "
 			"this run will hash but not deduplicate.\n",
 			options.hashfile);
+		/* escape-ok: the stored roots were escaped above. */
 		eprintf("         Re-run once with -d and the paths to update "
-			"it:\n           oans -%sd --hashfile=%s",
-			sc->recurse ? "r" : "", options.hashfile);
-		for (i = 0; i < sc->nroots; i++) {
-			declare_display_path(root, sc->roots[i]);
-
-			eprintf(" %s", root);
-		}
-		eprintf("\n");
+			"it:\n           %s\n", cmd->str);
+		g_string_free(cmd, TRUE);
 	}
 
 	return 0;
@@ -2054,6 +2131,21 @@ int main(int argc, char **argv)
 		return ret < 0 ? 1 : ret;
 	ret = 0;
 
+	/*
+	 * A bare replay reads a stored configuration, so there must be a
+	 * hashfile to read it from: opening one creates it, and a typo in the
+	 * path then left an empty hashfile behind (#284).
+	 */
+	if (argc == filelist_idx && !stdin_filelist &&
+	    /* longpath-ok: the hashfile itself. */
+	    access(options.hashfile, F_OK) != 0) {
+		/* escape-ok: oans's own --hashfile argument. */
+		eprintf("Error: no files given, and there is no hashfile %s to "
+			"replay: %s\n", options.hashfile, strerror(errno));
+		ret = 1;
+		goto out;
+	}
+
 	db = dbfile_open_handle(options.hashfile);
 	if (!db) {
 		ret = 1;	/* EXIT STATUS in the man page (#284) */
@@ -2135,7 +2227,8 @@ int main(int argc, char **argv)
 	 * build the find-dupes indexes, count groups) under the live dedupe
 	 * block, so those seconds animate instead of freezing the display.
 	 */
-	process_duplicates(db);
+	if (process_duplicates(db))
+		ret = 1;
 
 	{
 		uint64_t groups = 0, reclaimed = 0;
@@ -2199,10 +2292,11 @@ out:
 	/*
 	 * What a shell reports for a signalled child, so a wrapper sees
 	 * "interrupted" rather than a distinct oans failure. Last, and only over
-	 * a success: a real error found on the way out is the more useful
-	 * status, and it is not the signal's doing.
+	 * a success or an incomplete run (#284: a replay that had lost a root
+	 * exited 2 when interrupted): a real error found on the way out is the
+	 * more useful status, and it is not the signal's doing.
 	 */
-	if (interrupted() && !ret)
+	if (interrupted() && (!ret || ret == EXIT_INCOMPLETE))
 		ret = 128 + interrupt_signo();
 
 	scan_config_free(&replay);

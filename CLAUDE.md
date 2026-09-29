@@ -468,8 +468,9 @@ scripts/mutate/mutate.py --file src/util.c --dry-run    # how many, and how long
     which left `g`/`t`/`p`/`e` unexercised anywhere.
 - **Triage the residue rather than reporting it.** What was left at 94 is
   ~61 mutants in `setrlimit`/`sysconf`/`clock_gettime`/`backtrace` code no unit
-  test can reach, 14 on `parse_size`'s `exit()` paths (a test that reaches them
-  takes the suite with it), and a handful that are provably equivalent —
+  test can reach, 14 on `parse_size`'s `exit()` paths (a test that reached them
+  took the suite with it; since #284 it returns an error and they are tested),
+  and a handful that are provably equivalent —
   `memcpy(buf, "\\t", 3)` copies the literal's own NUL into a scratch buffer
   whose third byte is never read; `u < ARRAY_SIZE(units) - 1` cannot differ
   from `<=` because `v >= 1024.0` fails first, UINT64_MAX being 16 EiB. Check
@@ -1346,10 +1347,26 @@ roots are known (`apply_storage_defaults()` in `oans.c`).
   (`scan_roots`/`scan_excludes` tables) via
   `dbfile_store_scan_config`/`load_scan_config`. A bare `oans --hashfile=FILE`
   **replays** the last run (`apply_scan_config`+`drop_missing_roots`):
-  last-run-wins, other options ignored, a missing root skipped with a warning —
-  but if *all* roots are gone oans refuses (so the stat prune can't wipe the
-  hashfile, e.g. an unmounted drive); a replay doesn't re-persist. Pinned by
-  `test_self_describing.py`.
+  last-run-wins for the stored settings, while `--io-threads`, `-B`, `-q`,
+  `-v` and an extra (unstored) `--exclude` still apply; a missing root skipped
+  with a warning — but if *all* roots are gone oans refuses (so the stat prune
+  can't wipe the hashfile, e.g. an unmounted drive); a replay doesn't
+  re-persist. Pinned by `test_self_describing.py`.
+  - **A bare replay needs the hashfile to exist (#284).** Opening one creates
+    it, so a typo in the path used to leave an empty hashfile behind.
+  - **The "has no -d" hint prints every stored setting (#285)**, through
+    `scan_config_options_str()` plus the stored excludes. The command it
+    offers is a normal run, which stores its own configuration: naming only
+    `-r`, `-d` and the roots, it erased the excludes and size limits, and the
+    timer then scanned and deduplicated what the job was set up to skip.
+    `test_the_command_it_prints_keeps_every_stored_setting` runs the printed
+    command and compares the stored settings.
+- **`-B` sizes scan generations, nothing else below 65,536 (#285).** The
+  dedupe phase always runs after the whole scan, in passes of
+  `DEDUPE_FILES_PER_PASS` files, so `-B 1` and `-B 1024` give the same passes
+  and the same memory. The docs said it ran the dedupe every N files and
+  capped memory. It is 1..2^31 now: 0, or a value that narrowed to 0 like
+  `4G`, divided by zero after the scan.
 - **Run history & metrics.** Each run appends to `run_history`
   (`dbfile_record_run`, from `main()` after `process_duplicates`). `--history` =
   human timeline + lifetime totals (`dbfile_get_run_summary`); `--json` = a flat
