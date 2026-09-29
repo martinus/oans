@@ -77,6 +77,32 @@ static enum hashfile_kind identify(const char *sql, int64_t *app_id)
 	return kind;
 }
 
+/*
+ * #288: a config value shorter than the field it is read into - only a foreign
+ * or damaged hashfile has one - was copied at the field's full length, past the
+ * end of the value. It comes back zero-padded now, and a NULL as all zeros.
+ */
+MU_TEST(test_dbfile_a_short_config_value_is_not_overread) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	struct dbfile_config cfg;
+	static const char want[8] = { 'a', 'b' };
+	static const char none[8] = { 0 };
+
+	exec(db, "create temp table saved as select * from config "
+		 "where keyname = 'hash_type'");
+	exec(db, "update config set keyval = 'ab' where keyname = 'hash_type'");
+	mu_check(dbfile_get_config(db->db, &cfg) == 0);
+	mu_check(memcmp(cfg.hash_type, want, 8) == 0);
+
+	exec(db, "update config set keyval = NULL where keyname = 'hash_type'");
+	mu_check(dbfile_get_config(db->db, &cfg) == 0);
+	mu_check(memcmp(cfg.hash_type, none, 8) == 0);
+
+	exec(db, "update config set keyval = (select keyval from saved) "
+		 "where keyname = 'hash_type'");
+	exec(db, "drop table saved");
+}
+
 MU_TEST(test_dbfile_identify_touches_only_what_is_ours) {
 	int64_t id;
 
@@ -410,6 +436,21 @@ MU_TEST(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run) {
 	mu_check(s.last_skip_unsupported_fs == 0 && s.last_readonly_subvols == 0);
 	mu_check(s.total_skip_errors == 3 + 1 + 11 + 22 + 33 + 44);
 
+	/*
+	 * The last run is the one recorded last (#288). `ts` has one-second
+	 * resolution and a clock can step back, so ordering by it picked an
+	 * older run's buckets.
+	 */
+	{
+		struct run_record stepped_back = {
+			.ts = 2500, .duration_ms = 100, .files_scanned = 1,
+			.skip_permission = 7,
+		};
+
+		mu_check(dbfile_record_run(db, &stepped_back) == 0);
+		mu_check(dbfile_get_run_summary(db, &s) == 0);
+		mu_check(s.last_skip_permission == 7);
+	}
 }
 
 /*

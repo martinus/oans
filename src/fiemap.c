@@ -118,8 +118,18 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 		return NULL;
 	}
 
-	if (fiemap->fm_mapped_extents != count)
+	/*
+	 * With fewer slots than extents - none at all, if the counting call
+	 * found none or failed - the kernel only counts: fm_mapped_extents is
+	 * the real number, and only fm_extent_count records were copied (#288).
+	 * Every reader walks fm_mapped_extents, so it must not exceed the
+	 * buffer. The file changed between the two calls; a later check sees it.
+	 */
+	if (fiemap->fm_mapped_extents != count) {
 		dprintf("fiemap: file changed between fiemap calls\n");
+		if (fiemap->fm_mapped_extents > count)
+			fiemap->fm_mapped_extents = count;
+	}
 
 	return fiemap;
 }

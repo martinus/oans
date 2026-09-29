@@ -176,3 +176,24 @@ class SelfDescribingReplayDedupeTest(DuperemoveTest):
         self.dm()                 # bare: replays -r -d <tree>
         self.assertDmOk()
         self.assertShared(c, e)   # proves the stored root was re-scanned + deduped
+
+    def test_a_tree_that_is_gone_is_pruned_with_a_note(self):
+        """#288: the prune is by existence, so the rows of a tree that is not
+        mounted right now go while another tree is scanned into the same
+        hashfile, and are hashed again once it is back. That is right - a
+        stat cannot tell unmounted from deleted - but it should not be
+        silent."""
+        for i in range(3):
+            self.mkrand(f"a/f{i}", 8000)
+            self.mkrand(f"b/sub/f{i}", 8000)
+        self.dm("-r", self.path("a"))
+        self.dm("-r", self.path("b"))
+        self.assertDmOk()
+        os.rename(self.path("b"), self.path("b-unmounted"))
+
+        self.dm("-r", self.path("a"), quiet=True)
+        self.assertDmOk()
+        self.assertIn("3 of them were in directories that are gone too",
+                      self.out)
+        self.assertIn("b/sub", self.out)
+

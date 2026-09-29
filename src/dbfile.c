@@ -340,7 +340,9 @@ static int shadow_run_history(sqlite3 *db)
 	if (ret)
 		return ret;
 
+	/* The reports order by rowid (#288), which a view does not have. */
 	sql = g_string_new("create temp view run_history as select ");
+	g_string_append(sql, table ? "rowid as rowid, " : "0 as rowid, ");
 	for (unsigned int i = 0; i < ARRAY_SIZE(cols); i++) {
 		char *q = sqlite3_mprintf("select count(*) from "
 			"pragma_table_info('run_history') where name = %Q;",
@@ -373,7 +375,9 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 	char path[PATH_MAX + 1];
 	int app_id = 0;
 
-	dbfile_get_dbpath(db, path);
+	/* An error message below prints it (#288: it was left uninitialised). */
+	if (dbfile_get_dbpath(db, path))
+		snprintf(path, sizeof(path), "(unknown path)");
 
 	/*
 	 * oans requires its brand. A brand-new file was stamped before this
@@ -1864,7 +1868,7 @@ int dbfile_get_run_summary(struct dbhandle *dbh, struct run_summary *s)
 	ret = sqlite3_prepare_v2(dbh->db,
 		"select skip_permission, skip_unreadable, skip_path_too_long, "
 		"skip_unsupported_fs, readonly_subvols "
-		"from run_history order by ts desc limit 1",
+		"from run_history order by rowid desc limit 1",
 		-1, &stmt, NULL);
 	if (ret) {
 		perror_sqlite(ret, "reading last run skips");
@@ -2044,8 +2048,14 @@ static int get_config_text(sqlite3_stmt *stmt, const char *name, char *val, int 
 	}
 
 	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		int have;
+
+		/* A foreign or damaged config can hold a shorter value, or NULL
+		 * (#288): copy only what is there. */
 		local = sqlite3_column_text(stmt, 0);
-		memcpy(val, local, len);
+		have = local ? sqlite3_column_bytes(stmt, 0) : 0;
+		memset(val, 0, len);
+		memcpy(val, local ? (const void *)local : "", have < len ? have : len);
 	}
 
 	if (ret != SQLITE_DONE) {
@@ -3151,6 +3161,15 @@ int dbfile_prune_unscanned_files(struct dbhandle *db)
  */
 int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 {
+	return dbfile_prune_missing_files_report(db, seen, NULL);
+}
+
+int64_t dbfile_prune_missing_files_report(struct dbhandle *db,
+					  bool (*seen)(int64_t),
+					  struct prune_report *report)
+{
+	_cleanup_(freep) char *last_dir = NULL;
+	bool last_gone = false;
 	sqlite3_stmt *sel = NULL;
 	sqlite3_stmt *del = db->stmts.delete_file_by_id;
 	int64_t *gone = NULL;
@@ -3181,6 +3200,27 @@ int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 		/* Only ENOENT/ENOTDIR mean "gone"; keep rows on EACCES, EIO, etc. */
 		if (errno != ENOENT && errno != ENOTDIR)
 			continue;
+
+		if (report) {
+			/* Rows come roughly in walk order, so one directory's
+			 * files are mostly adjacent: stat it once per run. */
+			gchar *dir = g_path_get_dirname(fn);
+
+			if (!last_dir || strcmp(dir, last_dir) != 0) {
+				struct stat dst;
+
+				free(last_dir);
+				last_dir = strdup(dir);
+				last_gone = longpath_stat(dir, &dst) != 0 &&
+					    (errno == ENOENT || errno == ENOTDIR);
+			}
+			if (last_gone) {
+				report->in_gone_dirs++;
+				if (!report->gone_dir)
+					report->gone_dir = strdup(dir);
+			}
+			g_free(dir);
+		}
 
 		if (n == cap) {
 			size_t ncap = cap ? cap * 2 : 512;
@@ -3214,13 +3254,18 @@ int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t))
 		ret = sqlite3_step(del);
 		if (ret != SQLITE_DONE) {
 			perror_sqlite(ret, "deleting missing file");
-			dbfile_commit_trans(db->db);
+			/* Keep what went, and never leave the transaction open
+			 * (#288). */
+			if (dbfile_commit_trans(db->db))
+				dbfile_abort_trans(db->db);
 			goto out;
 		}
 	}
 	sqlite3_reset(del);
-	if (dbfile_commit_trans(db->db))
+	if (dbfile_commit_trans(db->db)) {
+		dbfile_abort_trans(db->db);
 		goto out;
+	}
 
 	removed = (int64_t)n;
 out:

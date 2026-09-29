@@ -132,6 +132,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_a_worker_past_the_limit_waits_for_the_raise);
 	MU_RUN(test_the_wind_down_notice_is_said_once);
 	MU_RUN(test_fiemap_maps_a_real_file);
+	MU_RUN(test_fiemap_map_never_claims_more_than_it_holds);
 	MU_RUN(test_fiemap_range_answers_for_the_range_asked_for);
 	MU_RUN(test_fiemap_counts_nothing_shared_in_a_fresh_file);
 	MU_RUN(test_a_refused_ioctl_is_an_error_not_a_zero_answer);
@@ -141,6 +142,7 @@ MU_TEST_SUITE(test_suite) {
 	/* The hashfile, against an in-memory SQLite - the same path a run
 	 * without --hashfile takes, so none of this is a test-only seam. */
 	MU_RUN(test_dbfile_identify_touches_only_what_is_ours);
+	MU_RUN(test_dbfile_a_short_config_value_is_not_overread);
 	MU_RUN(test_dbfile_files_are_unique_on_the_inode_pair);
 	MU_RUN(test_dbfile_pruning_a_deleted_file_takes_its_hashes);
 	MU_RUN(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint);

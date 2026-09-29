@@ -198,6 +198,8 @@ static struct dupe_extents *find_alloc_dext(struct results_tree *res,
 	g_mutex_unlock(&res->tree_mutex);
 	if (!dext) {
 		new = dupe_extents_new(digest, len);
+		if (!new)
+			return NULL;	/* #288: this was dereferenced */
 
 		g_mutex_lock(&res->tree_mutex);
 		dext = find_dupe_extents(res, digest, len);
@@ -231,8 +233,10 @@ int insert_one_result(struct results_tree *res, unsigned char *digest,
 	extent_plen(extent) = len;
 	extent_shared_bytes(extent) = 0;
 	dext = find_alloc_dext(res, digest, len);
-	if (!dext)
+	if (!dext) {
+		free_extent(extent);	/* #288: leaked */
 		return ENOMEM;
+	}
 
 	abort_on(dext->de_len != len);
 
@@ -259,12 +263,14 @@ int insert_result(struct results_tree *res, unsigned char *digest,
 	struct dupe_extents *dext;
 	uint64_t len = endoff[0] - startoff[0] + 1;
 
-	if (!e0 || !e1)
+	/* Either may have been allocated when the other was not (#288). */
+	if (!e0 || !e1 || !(dext = find_alloc_dext(res, digest, len))) {
+		if (e0)
+			free_extent(e0);
+		if (e1)
+			free_extent(e1);
 		return ENOMEM;
-
-	dext = find_alloc_dext(res, digest, len);
-	if (!dext)
-		return ENOMEM;
+	}
 
 	abort_on(dext->de_len != len);
 

@@ -75,7 +75,14 @@ int btrfs_get_fsuuid(int fd, uuid_t *uuid)
 	if (ret)
 		return errno;
 
-	uuid_copy(*uuid, args.metadata_uuid);
+	/*
+	 * A kernel older than the flag (about 5.10) clears it and leaves
+	 * metadata_uuid zero, which gave every btrfs one null UUID (#288). The
+	 * fsid is the same thing there: metadata_uuid only differs from it
+	 * after `btrfstune -m`, which needs the newer kernel anyway.
+	 */
+	uuid_copy(*uuid, (args.flags & BTRFS_FS_INFO_FLAG_METADATA_UUID) ?
+			 args.metadata_uuid : args.fsid);
 	return 0;
 }
 

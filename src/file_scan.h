@@ -34,7 +34,8 @@ int filescan_walk_run(struct dbhandle *db);
  * files it already confirmed, so call this after scan_files() returns. Returns
  * the number of rows pruned, or -1 on error.
  */
-int64_t filescan_prune_deleted(struct dbhandle *db);
+int64_t filescan_prune_deleted(struct dbhandle *db,
+			       struct prune_report *report);
 
 void fs_get_locked_uuid(uuid_t *uuid);
 

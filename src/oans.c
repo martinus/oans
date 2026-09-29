@@ -472,7 +472,7 @@ static int print_hashfile_history(char *filename)
 		"select ts, reclaimed, duration_ms, files_scanned, deduped, "
 		"skip_permission + skip_unreadable + skip_path_too_long "
 		"+ skip_unsupported_fs "
-		"from run_history order by ts desc limit 20", -1, &stmt, NULL) == SQLITE_OK) {
+		"from run_history order by rowid desc limit 20", -1, &stmt, NULL) == SQLITE_OK) {
 		while (sqlite3_step(stmt) == SQLITE_ROW) {
 			char when[32];
 			int64_t skipped = sqlite3_column_int64(stmt, 5);
@@ -1297,8 +1297,22 @@ static struct dbhandle *g_dedupe_write_db;	/* global handle, for the watermark *
 /* Reaped-batch callback (producer thread): advance the durable dedupe_seq once a
  * batch and all earlier generations are done. Serialized against worker writes
  * on the shared write handle via dbfile_lock(). */
+/*
+ * The lower bound of the first generation window whose load failed, or 0. A
+ * batch whose loader stopped partway still reaps, and moving the watermark
+ * past it would leave its groups unloaded until their files change (#288):
+ * the watermark stops at the failed window, and the next run loads it again.
+ * Producer thread only, like the callback.
+ */
+static bool load_failed_any;
+static unsigned int load_failed_at;
+
 static void dedupe_advance_seq(unsigned int seq_hi)
 {
+	if (load_failed_any && seq_hi > load_failed_at)
+		seq_hi = load_failed_at;
+	if (seq_hi <= dedupe_seq)
+		return;
 	dedupe_seq = seq_hi;
 	dbfile_cfg.dedupe_seq = dedupe_seq;
 	dbfile_cfg.blocksize = blocksize;
@@ -1316,6 +1330,13 @@ static void dedupe_advance_seq(unsigned int seq_hi)
 static void load_lock(bool inmem)   { if (inmem) dbfile_lock(); }
 static void load_unlock(bool inmem) { if (inmem) dbfile_unlock(); }
 
+static void load_failed(unsigned int seq_lo)
+{
+	if (!load_failed_any || seq_lo < load_failed_at)
+		load_failed_at = seq_lo;
+	load_failed_any = true;
+}
+
 /* Load one generation window's groups into a batch and submit them. */
 static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 			      struct dedupe_batch *batch,
@@ -1329,9 +1350,11 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 	ret = dbfile_load_same_files(pdb, dedupe_batch_files(batch),
 				     seq_lo, seq_hi, first_seq);
 	load_unlock(inmem);
-	if (ret)
+	if (ret) {
 		eprintf("Error loading whole-file duplicates for generations "
 			"(%u, %u]; deduping what was loaded\n", seq_lo, seq_hi);
+		load_failed(seq_lo);
+	}
 	dedupe_push(batch, true);
 
 	if (options.only_whole_files)
@@ -1342,9 +1365,11 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 	ret = dbfile_load_extent_hashes(pdb, dedupe_batch_extents(batch),
 					seq_lo, seq_hi);
 	load_unlock(inmem);
-	if (ret)
+	if (ret) {
 		eprintf("Error loading duplicate extents for generations "
 			"(%u, %u]; deduping what was loaded\n", seq_lo, seq_hi);
+		load_failed(seq_lo);
+	}
 
 	if (options.do_block_hash) {
 		struct hash_tree dups_tree;
@@ -1359,11 +1384,12 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 		load_lock(inmem);
 		ret = dbfile_load_block_hashes(pdb, &dups_tree, seq_lo, seq_hi);
 		load_unlock(inmem);
-		if (ret)
+		if (ret) {
 			eprintf("Error loading block hashes for generations "
 				"(%u, %u]; partial dedupe may be incomplete\n",
 				seq_lo, seq_hi);
-		else
+			load_failed(seq_lo);
+		} else
 			find_additional_dedupe(dedupe_batch_extents(batch));
 		free_hash_tree(&dups_tree);
 	}
@@ -1445,7 +1471,8 @@ static int stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 
 	if (!inmem)
 		dbfile_close_handle(pdb);
-	return 0;
+	/* A database error while loading is a failed run (#288). */
+	return load_failed_any ? -1 : 0;
 }
 
 /*
@@ -1512,11 +1539,27 @@ static int process_duplicates(struct dbhandle *db)
 
 	pdedupe_set_activity("checking for deleted files");
 	{
-		int64_t pruned = filescan_prune_deleted(db);
+		struct prune_report pr = {0};
+		int64_t pruned = filescan_prune_deleted(db, &pr);
 
 		if (pruned > 0)
 			qprintf("Pruned %lld deleted file%s from the hashfile\n",
 				(long long)pruned, pruned == 1 ? "" : "s");
+		/*
+		 * Not only -v: the prune is by existence, so a filesystem that
+		 * is not mounted right now loses its rows, and they are hashed
+		 * again once it is back (#288).
+		 */
+		if (pr.in_gone_dirs && pr.gone_dir) {
+			declare_display_path(dir, pr.gone_dir);
+
+			eprintf("Note: %lld of them were in directories that are "
+				"gone too, such as %s. If that is a filesystem "
+				"that is not mounted right now, its files are "
+				"hashed again once it is back.\n",
+				(long long)pr.in_gone_dirs, dir);
+		}
+		free(pr.gone_dir);
 	}
 
 	pdedupe_set_activity("building search indexes");

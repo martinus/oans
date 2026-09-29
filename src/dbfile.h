@@ -461,6 +461,20 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 int dbfile_prune_unscanned_files(struct dbhandle *db);
 int64_t dbfile_prune_missing_files(struct dbhandle *db, bool (*seen)(int64_t));
 
+/*
+ * What a prune removed whose directory is gone as well (#288): the shape an
+ * unmounted filesystem leaves in a hashfile shared between trees. Its rows go
+ * like any deleted file's, which costs a rehash once it is back, so the run
+ * says so. `gone_dir` is one such directory; free it.
+ */
+struct prune_report {
+	int64_t	in_gone_dirs;
+	char	*gone_dir;
+};
+int64_t dbfile_prune_missing_files_report(struct dbhandle *db,
+					  bool (*seen)(int64_t),
+					  struct prune_report *report);
+
 /* Build the find-dupes-phase indexes (deferred past the scan). See dbfile.c. */
 int dbfile_create_search_indexes(struct dbhandle *db);
 #endif	/* __DBFILE_H__ */

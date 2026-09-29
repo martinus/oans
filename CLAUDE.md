@@ -709,6 +709,10 @@ first tests for it found a real bug.
 functions were the last untested pure code in the tree. Both are small, and both
 taught the same thing from opposite directions.
 
+- **`fm_mapped_extents` never exceeds the buffer (#288).** With fewer slots
+  than extents - none, when the count pass found none or failed - the kernel
+  only counts and reports the real number, so every reader walked past the
+  allocation. `fiemap_map()` clamps it; the file changed between the calls.
 - **A synthetic record array cannot reach `do_fiemap()` itself.** Every fiemap
   test until now built `struct fm_rec` fixtures and called the map walkers
   directly, which is right for `fiemap_maps_share()` and the layout key — but
@@ -1773,6 +1777,11 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
 `stream_duplicates()` in `oans.c`. The report path (no `-d`) stays sequential
 (`report_duplicates()`).
 
+- **A batch whose load failed does not move the watermark (#288).** It still
+  reaps and dedupes what was loaded, but the groups a failed loader never
+  returned would otherwise wait until their files change: `load_failed()`
+  caps `dedupe_advance_seq()` at the window's lower bound, and the run exits
+  1. On a first scan that bound is 0, so the cap is a flag plus a value.
 - **At most `DEDUPE_MAX_INFLIGHT` (2) batches in flight** — the RAM double
   buffer. `dedupe_await_slot()` blocks the producer until a slot frees.
 - **Generation-ordered watermark.** Batches are reaped strictly in FIFO

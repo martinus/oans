@@ -1622,6 +1622,16 @@ static void dirq_stop_walkers(void)
 /* Queue a directory for the walkers. Takes ownership of path. */
 static void dirq_push(char *path)
 {
+	/*
+	 * Callers pass strdup()'s result. GLib refuses a NULL item, and with
+	 * the pending count already raised the walk would then never end
+	 * (#288).
+	 */
+	if (!path) {
+		eprintf("Out of memory queueing a directory; skipping it\n");
+		filescan_count_skip(SCAN_SKIP_UNREADABLE);
+		return;
+	}
 	g_atomic_int_inc(&walk_dir_pending);
 	g_async_queue_push(walk_dirq, path);
 }
@@ -3272,6 +3282,13 @@ struct layout_donor {
 static struct layout_donor	*donor_slots;
 static uint64_t			*donor_used;	/* 1 bit per slot */
 static size_t			donor_cap;	/* power of two, 0 == off */
+/*
+ * Whether the table is in use, for layout_copy_wanted() on the csum workers.
+ * Set before any worker starts and cleared after they stop, where donor_cap
+ * is rewritten under donor_lock by donor_grow() - reading it unlocked was a
+ * race (#288).
+ */
+static bool			donors_on;
 static size_t			donor_count;
 static GMutex			donor_lock;
 static _Atomic uint64_t		layout_copied_files;
@@ -3355,10 +3372,12 @@ static void layout_donors_init(void)
 		donor_used = NULL;
 		donor_cap = 0;		/* an optimisation, not state: run on */
 	}
+	donors_on = donor_cap != 0;
 }
 
 static void layout_donors_free(void)
 {
+	donors_on = false;
 	free(donor_slots);
 	donor_slots = NULL;
 	free(donor_used);
@@ -3375,7 +3394,7 @@ static void layout_donors_free(void)
  */
 static inline bool layout_copy_wanted(uint64_t filesize)
 {
-	return donor_cap && filesize >= LAYOUT_COPY_MIN_SIZE;
+	return donors_on && filesize >= LAYOUT_COPY_MIN_SIZE;
 }
 
 /* Offer a freshly hashed file as a donor for the rest of this run. */
@@ -3475,7 +3494,8 @@ static bool try_layout_copy(struct scan_ctxt *ctxt, struct file_to_scan *file,
 	tprogress->file_scanned_bytes = ctxt->filesize;
 	atomic_fetch_add(&layout_copied_files, 1);
 	atomic_fetch_add(&layout_copied_bytes, ctxt->filesize);
-	atomic_fetch_add(&scan_hashed_files, 1);
+	/* Not counted as hashed: it took no hash time, and the rate
+	 * DUPEREMOVE_SCAN_STATS derives would be skewed (#288). */
 	return true;
 
 decline:
@@ -3701,6 +3721,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	bool has_layout_key = false;
 
 	uint64_t t_start = mono_ns(), t_hash = 0, t_done = 0;	/* calibration */
+	uint64_t hashed_from = 0;
 
 	if (!(buffer->buf)) {
 		ret = prepare_buffer(buffer);
@@ -3778,6 +3799,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * until we reach the expected EOF, based on the expected filesize
 	 */
 	t_hash = mono_ns();	/* calibration: setup done, read+hash begins */
+	hashed_from = ctxt.off;	/* past a resumed file's head */
 	tprogress->status = thread_scanning;	/* first byte imminent: show % */
 
 	while (ctxt.off < ctxt.filesize) {
@@ -4055,7 +4077,8 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			 (t_hash - t_start) + (mono_ns() - t_done));
 	atomic_fetch_add(&scan_hash_ns, t_done - t_hash);
 	atomic_fetch_add(&scan_hashed_files, 1);
-	atomic_fetch_add(&scan_hashed_bytes, ctxt.off);
+	/* The bytes this run read: a resumed file's head was hashed before. */
+	atomic_fetch_add(&scan_hashed_bytes, ctxt.off - hashed_from);
 
 	/* Test hook, last: this file's rows are in the batch now, so an
 	 * interrupt raised here is one the flush is meant to save. */
@@ -4217,9 +4240,11 @@ static bool file_was_seen(int64_t id)
  * after scan_files() has returned (the scan writer must be committed first).
  * Returns the number pruned, or -1 on error. Frees the seen-set.
  */
-int64_t filescan_prune_deleted(struct dbhandle *db)
+int64_t filescan_prune_deleted(struct dbhandle *db,
+			       struct prune_report *report)
 {
-	int64_t pruned = dbfile_prune_missing_files(db, file_was_seen);
+	int64_t pruned = dbfile_prune_missing_files_report(db, file_was_seen,
+							   report);
 
 	free(seen_files);
 	seen_files = NULL;
