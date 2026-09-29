@@ -116,13 +116,15 @@ unsigned int fiemap_count_extents(int fd, uint64_t start, uint64_t length);
  *   - no extents at all (a hole-only file has no layout to speak of),
  *   - any record the kernel says it cannot pin down: UNKNOWN, DELALLOC (still
  *     in page cache, no stable address), DATA_INLINE (lives in the metadata, so
- *     `fe_physical` names nothing), or DATA_ENCRYPTED (equal ciphertext
- *     addresses need not mean equal plaintext).
+ *     `fe_physical` names nothing), DATA_ENCRYPTED (equal ciphertext
+ *     addresses need not mean equal plaintext), or ENCODED.
  *
- * COMPRESSED/ENCODED extents are fine, because this only ever compares
- * `fe_physical` for equality and never does arithmetic on it - on a compressed
- * extent the address names the extent as a whole, so equality is meaningful
- * where an offset into it is not (see fiemap_maps_share()).
+ * ENCODED because on a compressed extent `fe_physical` names the extent as a
+ * whole, not the offset a file references (#287). Measured on btrfs, kernel
+ * 7.1: two files built by cloning the first and the second half of the same
+ * compressed extents report identical records, hold different bytes, and the
+ * second was stored with the first's digest. The offset is only visible to
+ * root (BTRFS_IOC_TREE_SEARCH), so a compressed layout is a miss.
  *
  * SHARED and LAST are masked out of the key: the first is a refcount property
  * that changes when an unrelated file is deduped, the second is positional.

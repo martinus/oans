@@ -99,10 +99,15 @@ MU_TEST(test_fiemap_layout_key) {
 
 	mu_check(!share(at_start, 1, 4096, offset_in, 1, 4096, 4096));
 
-	/* Compressed extents are fine: the address is only ever compared. */
+	/*
+	 * Compressed extents are refused (#287). This said they were fine
+	 * because the address is only compared - but it is the extent's
+	 * address, whatever offset of it the file references, so two files
+	 * with different bytes can report identical records.
+	 */
 	struct fm_rec enc[] = {{0, 4096, 8192, ENC}};
 
-	mu_check(key_of(enc, 1, 8192, b));
+	mu_check(!key_of(enc, 1, 8192, b));
 
 	/*
 	 * More extents than the stack buffer holds, so the heap path runs.
