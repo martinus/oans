@@ -130,8 +130,24 @@ static bool append_class(GString *out, const char *pat, size_t len, size_t *i)
 				continue;
 			}
 		}
-		/* '-' and ranges pass through; only these two would change
-		 * meaning inside a PCRE2 class. */
+		/*
+		 * A backslash takes the next character literally, as in
+		 * gitignore: `[a\-z]` is three characters, `[\]]` a ']'. PCRE2
+		 * reads a backslashed letter or digit as an escape of its own
+		 * (`\d`), so those, and UTF-8 bytes, go in bare; anything else
+		 * keeps the backslash. A trailing one leaves the class
+		 * unterminated.
+		 */
+		if (pat[j] == '\\' && j + 1 < len) {
+			unsigned char c = pat[++j];
+
+			if (!g_ascii_isalnum(c) && c < 0x80)
+				g_string_append_c(out, '\\');
+			g_string_append_c(out, c);
+			continue;
+		}
+		/* '-' and ranges pass through; only '[' (and a lone '\')
+		 * would change meaning inside a PCRE2 class. */
 		if (pat[j] == '\\' || pat[j] == '[')
 			g_string_append_c(out, '\\');
 		g_string_append_c(out, pat[j]);
@@ -222,6 +238,31 @@ static bool is_plain_path(const char *pat)
 	       !g_str_has_suffix(pat, "/");
 }
 
+/* An entry with no regex is an exact path, matched by hash lookup. */
+static bool is_literal(const struct glob_pat *gp)
+{
+	return !gp->re && !gp->re_raw;
+}
+
+/*
+ * The entry already added under this spelling, of the same kind. The same
+ * pattern twice - replayed from the hashfile and repeated on the command line,
+ * or naming the hashfile oans excludes anyway - is one pattern: as two, only
+ * the first could ever be credited with a match, and the second was reported
+ * as having matched nothing.
+ */
+static struct glob_pat *pat_find(struct glob_set *gs, const char *pattern,
+				 bool literal)
+{
+	for (unsigned int i = 0; i < gs->pats->len; i++) {
+		struct glob_pat *gp = g_ptr_array_index(gs->pats, i);
+
+		if (is_literal(gp) == literal && !strcmp(gp->pattern, pattern))
+			return gp;
+	}
+	return NULL;
+}
+
 static struct glob_pat *pat_new(struct glob_set *gs, const char *pattern)
 {
 	struct glob_pat *gp = g_malloc0(sizeof(*gp));
@@ -233,8 +274,14 @@ static struct glob_pat *pat_new(struct glob_set *gs, const char *pattern)
 
 static void add_literal(struct glob_set *gs, const char *path, bool internal)
 {
-	struct glob_pat *gp = pat_new(gs, path);
+	struct glob_pat *gp = pat_find(gs, path, true);
 
+	/* The user's spelling wins, so the warning still covers it. */
+	if (gp) {
+		gp->internal = gp->internal && internal;
+		return;
+	}
+	gp = pat_new(gs, path);
 	gp->internal = internal;
 	g_hash_table_insert(gs->literals, gp->pattern, gp);
 }
@@ -281,6 +328,8 @@ int glob_set_add(struct glob_set *gs, const char *pattern, char **err)
 		add_literal(gs, pattern, false);
 		return 0;
 	}
+	if (pat_find(gs, pattern, false))
+		return 0;
 
 	frag = glob_to_regex(pattern, &dir_only, err);
 	if (!frag)

@@ -87,6 +87,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_glob_directory_only);
 	MU_RUN(test_glob_literal_paths_are_not_globs);
 	MU_RUN(test_glob_reports_matching_pattern_and_counts);
+	MU_RUN(test_glob_a_backslash_in_a_class_escapes);
+	MU_RUN(test_glob_a_repeated_pattern_is_one_pattern);
 	MU_RUN(test_glob_rejects_malformed);
 	MU_RUN(test_glob_empty_set_matches_nothing);
 	MU_RUN(test_prop_a_layout_matches_only_itself);

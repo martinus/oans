@@ -222,6 +222,68 @@ MU_TEST(test_glob_reports_matching_pattern_and_counts) {
 	glob_set_free(gs);
 }
 
+/*
+ * Inside a class a backslash escapes the next character, as gitignore has it.
+ * It used to be a literal backslash, so `[a\-z]` was the range `\`..`z` and
+ * `[\]]` a backslash followed by a stray ']'.
+ */
+MU_TEST(test_glob_a_backslash_in_a_class_escapes) {
+	mu_check(gs_hit("f[a\\-z]", "/x/f-", false));
+	mu_check(gs_hit("f[a\\-z]", "/x/fz", false));
+	mu_check(!gs_hit("f[a\\-z]", "/x/fb", false));
+	mu_check(!gs_hit("f[a\\-z]", "/x/f_", false));	/* in \..z */
+
+	mu_check(gs_hit("f[\\]]", "/x/f]", false));
+	mu_check(!gs_hit("f[\\]]", "/x/f\\]", false));
+	mu_check(gs_hit("f[!\\]]", "/x/fa", false));
+	mu_check(!gs_hit("f[!\\]]", "/x/f]", false));
+
+	/* An escaped backslash is one; an escaped letter is just the letter,
+	 * not a PCRE2 escape such as \d. */
+	mu_check(gs_hit("f[\\\\]", "/x/f\\", false));
+	mu_check(gs_hit("f[\\d]", "/x/fd", false));
+	mu_check(!gs_hit("f[\\d]", "/x/f5", false));
+	mu_check(gs_hit("f[\\[]", "/x/f[", false));
+}
+
+/*
+ * The same pattern given twice is one pattern: replayed from the hashfile and
+ * repeated on the command line, or naming the hashfile oans already excludes.
+ * As two, only the first was credited with a match and the second drew a
+ * "matched nothing" warning.
+ */
+MU_TEST(test_glob_a_repeated_pattern_is_one_pattern) {
+	char *err = NULL;
+	const char *pat = NULL;
+	bool matched = false;
+	struct glob_set *gs = glob_set_new();
+
+	mu_check(glob_set_add(gs, "*.log", &err) == 0);
+	mu_check(glob_set_add(gs, "*.log", &err) == 0);
+	mu_check(glob_set_compile(gs, &err) == 0);
+	mu_check(glob_set_match(gs, "/a/x.log", false, NULL));
+	mu_check(glob_set_stat(gs, 0, &pat, &matched) && matched);
+	mu_check(!glob_set_stat(gs, 1, &pat, &matched));
+	glob_set_free(gs);
+
+	/* A user pattern naming an internal literal, in either order. */
+	for (int user_first = 0; user_first < 2; user_first++) {
+		gs = glob_set_new();
+		if (user_first)
+			mu_check(glob_set_add(gs, "/d/h.db", &err) == 0);
+		glob_set_add_literal(gs, "/d/h.db");
+		if (!user_first)
+			mu_check(glob_set_add(gs, "/d/h.db", &err) == 0);
+		mu_check(glob_set_compile(gs, &err) == 0);
+		mu_check(glob_set_match(gs, "/d/h.db", false, NULL));
+		mu_check(glob_set_stat(gs, 0, &pat, &matched));
+		mu_assert_string_eq("/d/h.db", pat);
+		mu_check(matched);
+		mu_check(!glob_set_stat(gs, 1, &pat, &matched));
+		glob_set_free(gs);
+	}
+}
+
 MU_TEST(test_glob_rejects_malformed) {
 	char *err = NULL;
 	struct glob_set *gs = glob_set_new();
@@ -254,10 +316,13 @@ static void gen_glob_segment(struct prop *p, char *buf, size_t sz)
 	size_t len = (size_t)prop_range(p, 1, sz - 1);
 
 	for (size_t i = 0; i < len; i++) {
-		switch (prop_below(p, 8)) {
+		switch (prop_below(p, 10)) {
 		case 0: buf[i] = '*'; break;
 		case 1: buf[i] = '?'; break;
 		case 2: buf[i] = '.'; break;
+		/* An escape, and a range, both inside a class and out. */
+		case 5: buf[i] = '\\'; break;
+		case 6: buf[i] = '-'; break;
 		/* '[' and ']' reach append_class(), and an unmatched '[' is the
 		 * one way a pattern can fail to compile - which is what makes
 		 * gs_of()'s rejection path live. Without them it was dead:

@@ -201,7 +201,9 @@ file is recorded once.
       non-`/` character, `[a-z]`, `[!a-z]` and POSIX classes such as
       `[[:digit:]]` match one non-`/` character, and `**` crosses directory
       boundaries. A name that is not valid UTF-8 (an old Latin-1 name, say) is
-      matched byte by byte, so there `?` matches one byte.
+      matched byte by byte, so there `?` matches one byte. A `\` makes the
+      next character literal, inside a class too: `[a\-z]` matches `a`, `-`
+      or `z`.
 
     <!-- -->
 

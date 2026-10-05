@@ -248,6 +248,9 @@ so \f[CR]\-\-exclude \(aqcache/\(aq\f[R] skips directories named
 \f[CR]**\f[R] crosses directory boundaries.
 A name that is not valid UTF\-8 (an old Latin\-1 name, say) is matched
 byte by byte, so there \f[CR]?\f[R] matches one byte.
+A \f[CR]\(rs\f[R] makes the next character literal, inside a class too:
+\f[CR][a\(rs\-z]\f[R] matches \f[CR]a\f[R], \f[CR]\-\f[R] or
+\f[CR]z\f[R].
 .PP
 Excluding a directory prunes the walk there, so naming a directory also
 skips everything inside it \(em there is no need to add a wildcard for
