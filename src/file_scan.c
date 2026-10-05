@@ -2495,16 +2495,22 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 /*
  * Whether an up-to-date row can stand, for a row an older binary hashed. An
  * unchanged file is never hashed again, so whatever such a binary got wrong
- * would stay for good. Two things, both only possible next to a preallocated
- * extent:
+ * would stay for good. Three things, each only possible next to a
+ * preallocated extent or a hole:
  *
  * - #273: a whole read buffer was filled with zeroes whenever it touched an
  *   UNWRITTEN extent, so the digest may be wrong (FILE_UNWRITTEN_CHECKED);
  * - the extent holding EOF, running past the file size and followed by a
- *   preallocated extent, got no row (FILE_EOF_EXTENT_CHECKED).
+ *   preallocated extent, got no row (FILE_EOF_EXTENT_CHECKED);
+ * - a hole the scan read rather than skipped was hashed into the next data
+ *   extent's digest (FILE_HOLE_EXTENT_CHECKED). The scan skips only whole
+ *   hash blocks of hole, and only when it reaches one from a data extent or
+ *   from the start of the file, so a hole after one of those that starts and
+ *   ends on a block boundary is the case that was always right; any other
+ *   gap before a data extent is rehashed. Erring wide costs one rehash.
  *
- * One fiemap per such row, once: a file that has neither gets the bits and is
- * not asked again, and one that has either is rehashed, which sets them too.
+ * One fiemap per such row, once: a file that has none gets the bits and is
+ * not asked again, and one that has any is rehashed, which sets them too.
  *
  * A file that cannot be opened or mapped keeps its row and is asked again
  * next run: hashing would fail on it the same way.
@@ -2522,8 +2528,22 @@ static bool scan_row_ok(const char *path, int64_t fileid, uint64_t size,
 	if (!fiemap)
 		return true;
 
+	uint64_t prev_end = 0;
+	bool prev_skip = false;
+
 	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
 		struct fiemap_extent *e = &fiemap->fm_extents[i];
+		bool skip = e->fe_flags & FIEMAP_SKIP_FLAGS;
+		bool gap = e->fe_logical > prev_end;
+		bool hashed_gap = gap && (prev_skip ||
+					  prev_end % blocksize ||
+					  e->fe_logical % blocksize);
+
+		if (!(flags & FILE_HOLE_EXTENT_CHECKED) && !skip &&
+		    hashed_gap && e->fe_logical < size)
+			return false;
+		prev_end = e->fe_logical + e->fe_length;
+		prev_skip = skip;
 
 		if (e->fe_flags & FIEMAP_EXTENT_UNWRITTEN) {
 			if (!(flags & FILE_UNWRITTEN_CHECKED))
@@ -3041,6 +3061,15 @@ static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		    e->fe_length != r->ext_len)
 			return decline_resume(ctxt, file, tprogress, db,
 				"extent layout changed since the checkpoint");
+		/*
+		 * An extent digest in progress has hashed part of its extent,
+		 * so the offset lies inside it. One that has not reached the
+		 * extent yet was started in the hole before it by an older
+		 * binary, and holds that hole's zeroes.
+		 */
+		if (e->fe_logical >= r->off)
+			return decline_resume(ctxt, file, tprogress, db,
+				"the checkpoint's extent state covers a hole");
 	} else if (!options.only_whole_files && e &&
 		   e->fe_logical < r->off &&
 		   !(e->fe_flags & FIEMAP_SKIP_FLAGS)) {
@@ -3315,6 +3344,25 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 				finish_running_checksum(ctxt->extent_csum, NULL);
 			ctxt->extent_csum = NULL;
 			return 0;
+		}
+
+		/*
+		 * file_off is in a hole and get_extent() handed back the next
+		 * extent. The buffer holds the hole as zeroes - a hole that does
+		 * not fill whole blocks is read, see hole_run_length() - and
+		 * those are no part of the extent: its row says it starts at
+		 * fe_logical and runs fe_length. Hashing them in gave the same
+		 * extent a different digest behind every hole size, and the
+		 * extent pass never matched it. Step over the gap.
+		 */
+		if (file_off < extent->fe_logical) {
+			size_t gap = extent->fe_logical - file_off;
+
+			if (gap > bytes - buf_off)
+				gap = bytes - buf_off;
+			buf_off += gap;
+			file_off += gap;
+			continue;
 		}
 
 		ext_end_off = extent->fe_logical + extent->fe_length;

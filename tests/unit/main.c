@@ -44,6 +44,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_running_checksum_rejects_foreign_state);
 	MU_RUN(test_is_block_zeroed);
 	MU_RUN(test_is_area_ignored);
+	MU_RUN(test_an_extent_digest_leaves_out_the_hole_before_it);
 	MU_RUN(test_block_len);
 	MU_RUN(test_is_file_renamed);
 	MU_RUN(test_seen_inode);

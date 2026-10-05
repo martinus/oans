@@ -1301,6 +1301,18 @@ databases all have that layout.
   harness `syncfs()`es before every `dm()` run, which hid this from the suite:
   the regression test passes `settle=False`, and is `serial` because another
   test's `syncfs()` flushes its file just as well.
+- **An extent's digest leaves out the hole before it.** The scan skips only
+  whole hash blocks of hole, so a hole that does not fill them is read as
+  zeroes, and `get_extent()` answers the *next* extent for an offset in it.
+  `process_extents()` hashed those zeroes into that extent, whose row still
+  said `fe_logical`/`fe_length`: one 64 KiB extent behind 32K, 64K and 128K
+  holes got three digests and was never extent-deduped. It steps over the gap
+  now; file digest and block hashes are unchanged (checked byte-identical).
+  Repaired per row by `FILE_HOLE_EXTENT_CHECKED` (`flags & 16`): rehashed when
+  a data extent follows a gap that is unaligned to the hash block or follows a
+  preallocated extent - wider than the exact cases, on purpose. A checkpoint
+  an older binary wrote in such a hole carries extent state that started
+  before its extent (`ext_loff >= loff`), and `adopt_resume()` refuses it.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 

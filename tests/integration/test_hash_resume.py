@@ -19,7 +19,7 @@ racing a signal against a read.
 """
 
 import os
-from harness import DuperemoveTest, requires_reflink
+from harness import DuperemoveTest, fiemap_extents, requires_reflink
 
 KiB = 1 << 10
 MiB = 1 << 20
@@ -208,6 +208,74 @@ class HashResumeTest(DuperemoveTest):
         self.dm("-rv", tree, quiet=False)
         self.assertDmOk()
         self.assertIn("extent layout changed", self.out)
+        self.assertEqual(0, self.hf_count("scan_checkpoints"))
+        self.assertEqual(expected, self.fingerprints(),
+                         "the file was not re-hashed from the start")
+
+    # A read buffer that ends inside a hole: data up to GAP_START, which is
+    # not a hash-block boundary, so the scan reads the hole up to the next
+    # one - exactly where the first checkpoint lands, one buffer in. The hole
+    # runs on to GAP_END, also unaligned, and the tail extent starts there.
+    GAP_START = 960 * KiB
+    GAP_END = 1184 * KiB
+
+    def build_gap_tree(self):
+        tail = os.urandom(3 * MiB)
+        self.make_sparse("tree/gap", os.urandom(self.GAP_START),
+                         self.GAP_END - self.GAP_START, tail)
+        self.write("tree/ref", tail)      # the tail's bytes, as its own extent
+        self.sync()
+        recs = [(l, n) for l, _p, n, _fl in
+                fiemap_extents(self.path("tree/gap")) if l == self.GAP_END]
+        if not recs:
+            self.skipTest("the tail does not start an extent here")
+        return self.path("tree"), recs[0]
+
+    def tail_digest(self, name, loff):
+        return self.hf_scalar(
+            "select hex(e.digest) from extents e join files f on "
+            "f.id = e.fileid where f.filename like ? and e.loff = ?",
+            ("%/" + name, loff))
+
+    def test_a_checkpoint_in_a_hole_resumes_to_the_same_digests(self):
+        """The hole's zeroes are no part of the extent after it, whether the
+        scan crosses the hole in one run or stops in the middle of it."""
+        tree, (loff, length) = self.build_gap_tree()
+        expected = self.scan_straight_through(tree)
+        self.assertEqual(self.tail_digest("ref", 0),
+                         self.tail_digest("gap", loff),
+                         "the extent after the hole hashed its zeroes")
+
+        self.drop_hashfile()
+        self.interrupt_after_one_checkpoint(tree)
+        self.assertEqual([(MiB, None)], self.hf_query(
+            "select c.loff, c.ext_state from scan_checkpoints c join files f "
+            "on f.id = c.fileid where f.filename like '%/gap'"),
+            "a checkpoint in the hole carries no extent state")
+
+        runs = self.scan_with_interruptions(tree)
+        self.assertEqual(expected, self.fingerprints(),
+                         f"hashing across {runs} interruptions did not produce "
+                         "what one straight run produces")
+
+    def test_a_checkpoint_whose_extent_state_covers_a_hole_is_refused(self):
+        """What an older binary leaves behind in a hole: extent state started
+        before its extent, holding the hole's zeroes. Resumed, the extent's
+        digest would carry them for good."""
+        tree, (loff, length) = self.build_gap_tree()
+        expected = self.scan_straight_through(tree)
+        self.drop_hashfile()
+        self.interrupt_after_one_checkpoint(tree)
+
+        # Any state this build can restore will do: it must not be adopted.
+        self.hf_exec("update scan_checkpoints set ext_state = state, "
+                     "ext_loff = ?, ext_len = ? where loff = ? and fileid = "
+                     "(select id from files where filename like '%/gap')",
+                     (loff, length, MiB))
+
+        self.dm("-rv", tree, quiet=False)
+        self.assertDmOk()
+        self.assertIn("extent state covers a hole", self.out)
         self.assertEqual(0, self.hf_count("scan_checkpoints"))
         self.assertEqual(expected, self.fingerprints(),
                          "the file was not re-hashed from the start")
