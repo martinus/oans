@@ -1589,6 +1589,14 @@ names the two; `dedupe_probe_fd()` asks everything else.
   the error is already on screen: measured on a 20k-file tree, 402 `getdents64`
   became 16. An UNKNOWN file is hashed normally, so an unrecognised filesystem
   costs at most `FS_PROBE_MAX_TRIES` files before it is refused.
+- **A file that cannot host the probe is not asked, and costs no try.** One
+  under two blocks, or one that will not open read-write, said nothing about
+  the filesystem but spent `FS_PROBE_MAX_TRIES`, so a supported tree whose
+  first sixteen files were small or 0444 was refused. A file we own is asked
+  through a read-only fd, as the dedupe phase opens it (an UNKNOWN that way is
+  not counted either: older kernels refuse owner dedupe). `EROFS` still counts,
+  since no file of a read-only mount gets past it. The cost: a tree where no
+  file can host it is walked whole before the refusal.
 - **Three ways to end up refusing, and they say different things.** A definite
   no; `FS_PROBE_MAX_TRIES` files that all declined; and a walk that ended with
   the question never asked (`filescan_fs_probe_unsettled()` — an empty tree, or

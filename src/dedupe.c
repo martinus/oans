@@ -650,15 +650,11 @@ enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status)
 	return DEDUPE_SUPPORT_UNKNOWN;
 }
 
-enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
+uint64_t dedupe_probe_len(int fd, uint64_t size)
 {
-	char buf[sizeof(struct file_dedupe_range) +
-		 sizeof(struct file_dedupe_range_info)] = {0,};
-	struct file_dedupe_range *same = (struct file_dedupe_range *)buf;
 	unsigned int bs = cached_blocksize(fd);
 	uint64_t cap = bs > DEDUPE_PROBE_LEN_MAX ? bs : DEDUPE_PROBE_LEN_MAX;
 	uint64_t len = size / 2;
-	int rc;
 
 	/*
 	 * Two disjoint ranges of one file: [0, len) against [len, 2 * len).
@@ -675,7 +671,18 @@ enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
 	if (len > cap)
 		len = cap;
 	len = dedupe_shareable_len(fd, len);
-	if (len < bs)
+	return len < bs ? 0 : len;
+}
+
+enum dedupe_support dedupe_probe_fd(int fd, uint64_t size)
+{
+	char buf[sizeof(struct file_dedupe_range) +
+		 sizeof(struct file_dedupe_range_info)] = {0,};
+	struct file_dedupe_range *same = (struct file_dedupe_range *)buf;
+	uint64_t len = dedupe_probe_len(fd, size);
+	int rc;
+
+	if (!len)
 		return DEDUPE_SUPPORT_UNKNOWN;
 
 	same->src_offset = 0;

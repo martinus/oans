@@ -684,15 +684,17 @@ struct locked_fs {
 	 */
 	enum dedupe_support dedupe;
 	unsigned int dedupe_probe_tries;
+	unsigned int dedupe_probe_unasked;	/* could not host it */
 };
 struct locked_fs locked_fs = {0,};
 
 /*
  * How many files may be asked before giving up on a filesystem oans does not
- * recognise. A file can fail to answer for reasons of its own -- unreadable,
- * unwritable, empty -- so one inconclusive result must not condemn the tree;
- * but a filesystem that never answers must not read the whole tree first
- * either.
+ * recognise. A file can fail to answer for reasons of its own, so one
+ * inconclusive result must not condemn the tree; but a filesystem that never
+ * answers must not read the whole tree first either. Files that cannot host
+ * the probe at all -- too small, not writable -- are not asked and do not
+ * count (fs_dedupe_probe_settled).
  */
 #define FS_PROBE_MAX_TRIES	16
 
@@ -1532,6 +1534,11 @@ static void report_fs_unusable(void)
 			"none could answer. A stacking filesystem such as "
 			"overlayfs reports its lower filesystem's refusal this "
 			"way.\n", locked_fs.dedupe_probe_tries);
+	else if (locked_fs.dedupe_probe_unasked)
+		eprintf("Error: no file could test whether this filesystem "
+			"supports FIDEDUPERANGE - %u file(s) were too small "
+			"(under two blocks) or not writable.\n",
+			locked_fs.dedupe_probe_unasked);
 	else
 		eprintf("Error: no file was available to test whether this "
 			"filesystem supports FIDEDUPERANGE.\n");
@@ -2298,6 +2305,19 @@ static void seed_checkpointed_files(struct dbhandle *db)
 	free(paths);
 }
 
+/* A file that cannot host the probe: the walk offers the next one. */
+static bool fs_probe_not_asked(const char *path, const char *why)
+{
+	locked_fs.dedupe_probe_unasked++;
+	if (verbose) {
+		declare_display_path(disp, path);
+
+		vprintf("Not asking %s about FIDEDUPERANGE support: %s\n",
+			disp, why);
+	}
+	return true;
+}
+
 /*
  * Open for reading a file the walk listed as regular. Anything may have been
  * put at that name since the walker's statx, and opening a FIFO without
@@ -2352,16 +2372,41 @@ fail:
 static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 {
 	/*
-	 * The ioctl's destination must be writable, so this opens O_RDWR. It
-	 * issues a real dedupe request, which cannot change anything anyone can
-	 * observe about the file (see dedupe_probe_fd). A file that cannot be
-	 * opened that way -- read-only file, read-only mount -- or that is too
-	 * small to hold the two ranges the probe compares simply cannot answer;
-	 * those are the inconclusive cases.
+	 * The ioctl's destination must be writable or the caller's own, so
+	 * this opens O_RDWR, and O_RDONLY for a file we own but may not write
+	 * (the dedupe phase opens every file that way, and the kernel accepts
+	 * it). It issues a real dedupe request, which cannot change anything
+	 * anyone can observe about the file (see dedupe_probe_fd).
+	 *
+	 * A file that cannot host the probe - too small to hold the two
+	 * ranges it compares, or not one we may write - is not asked, and
+	 * does not count toward FS_PROBE_MAX_TRIES: it says nothing about the
+	 * filesystem, and a tree whose first files are small or read-only
+	 * would otherwise be refused on a filesystem that supports the ioctl.
+	 * Only a read-only mount, which no file of it can get past, still
+	 * counts.
 	 */
+	bool owned_fallback = false;
 	_cleanup_(closefd) int fd = longpath_open(path, O_RDWR);
-	enum dedupe_support support = fd == -1
-		? DEDUPE_SUPPORT_UNKNOWN : dedupe_probe_fd(fd, st->stx_size);
+	enum dedupe_support support;
+
+	if (fd == -1 && errno != EROFS && st->stx_uid == geteuid()) {
+		fd = longpath_open(path, O_RDONLY);
+		owned_fallback = true;
+	}
+	if (fd == -1 && errno != EROFS)
+		return fs_probe_not_asked(path, "it cannot be opened for it");
+	if (fd != -1 && !dedupe_probe_len(fd, st->stx_size))
+		return fs_probe_not_asked(path, "it is too small");
+
+	support = fd == -1 ? DEDUPE_SUPPORT_UNKNOWN
+			   : dedupe_probe_fd(fd, st->stx_size);
+	/*
+	 * Through a read-only fd, a kernel that predates owner dedupe answers
+	 * EINVAL for the file, not the filesystem.
+	 */
+	if (owned_fallback && support == DEDUPE_SUPPORT_UNKNOWN)
+		return fs_probe_not_asked(path, "it is not writable");
 
 	switch (support) {
 	case DEDUPE_SUPPORT_YES:
