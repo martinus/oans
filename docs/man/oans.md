@@ -137,8 +137,8 @@ file is recorded once.
 
 **-b** *SIZE*
   ~ Block size used when reading and hashing file data. Default **128K**;
-    accepted range **4K**–**1M** (suffixes `K`/`M` accepted). Smaller blocks can
-    surface more sub-extent matches when partial matching is enabled
+    a power of two from **4K** to **1M** (suffixes `K`/`M` accepted). Smaller
+    blocks can surface more sub-extent matches when partial matching is enabled
     (**\--dedupe-options=partial**) but cost more CPU and a larger hashfile;
     larger blocks fragment less. Most users never need to change this.
 
@@ -289,7 +289,12 @@ file is recorded once.
     `scan_configured_dedupe` is `false` when the stored scan configuration has
     no **-d** — a job in that state hashes but never deduplicates, and reports
     `0 B` reclaimed forever, which is also what a healthy job on a clean tree
-    reports. This is what tells them apart.
+    reports. This is what tells them apart. It is `null` when no run has stored
+    a scan configuration yet.
+
+    Strings are UTF-8. A byte of a path that is not valid UTF-8 (an old Latin-1
+    name, say) is written as `\u00NN` of that byte, so such a name does not
+    read back byte for byte.
 
     `scan_skipped_last_run` reports what the most recent scan could **not**
     read, bucketed by cause (`permission`, `unreadable`, `path_too_long`,
@@ -305,7 +310,7 @@ file is recorded once.
 **\--prune-block-hashes**
 
   ~ Delete every stored **block** hash from the hashfile, compact it, and exit.
-    Requires **\--hashfile**.
+    Requires **\--hashfile**, which must exist.
 
     Block hashes exist only to serve **\--dedupe-options=partial**, which is
     off by default — an ordinary scan stores none, whatever **-b** is set to.
@@ -323,8 +328,9 @@ file is recorded once.
 
 **-R** *file*...
   ~ Remove the named paths from the hashfile and exit; a single **-** reads the
-    list from standard input. Requires **\--hashfile**. A relative path is
-    resolved against the current directory first. A path the hashfile does not
+    list from standard input. Requires **\--hashfile**, which must exist, and
+    at least one path. A relative path is resolved against the current
+    directory first. A path the hashfile does not
     hold is reported, and the exit status is then 1. (Deleted files are also
     pruned automatically on the next scan; **-R** is for removing paths that
     still exist.)

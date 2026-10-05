@@ -165,6 +165,63 @@ MU_TEST(test_sanitize_ctrl) {
 	free(dup);
 }
 
+MU_TEST(test_utf8_seq_len) {
+	static const struct { const char *s; size_t want; } cases[] = {
+		{ "a", 1 },
+		{ "\xc3\xa9", 2 },		/* U+00E9 */
+		{ "\xc2\x80", 2 },		/* U+0080, lowest two-byte */
+		{ "\xdf\xbf", 2 },		/* U+07FF */
+		{ "\xe0\xa0\x80", 3 },		/* U+0800, lowest three-byte */
+		{ "\xed\x9f\xbf", 3 },		/* U+D7FF, below the surrogates */
+		{ "\xee\x80\x80", 3 },		/* U+E000, above them */
+		{ "\xef\xbf\xbf", 3 },
+		{ "\xf0\x90\x80\x80", 4 },	/* U+10000 */
+		{ "\xf4\x8f\xbf\xbf", 4 },	/* U+10FFFF, the last */
+		{ "\xe9", 0 },			/* Latin-1 e-acute, then the NUL */
+		{ "\xe9t", 0 },
+		{ "\x80", 0 },			/* stray continuation */
+		{ "\xbf", 0 },
+		{ "\xc0\xaf", 0 },		/* overlong '/' */
+		{ "\xc1\xbf", 0 },
+		{ "\xc3", 0 },			/* truncated by the NUL */
+		{ "\xc3(", 0 },
+		{ "\xe0\x9f\xbf", 0 },		/* overlong U+07FF */
+		{ "\xed\xa0\x80", 0 },		/* surrogate U+D800 */
+		{ "\xe2\x82", 0 },
+		{ "\xe2\x82(", 0 },
+		{ "\xf0\x8f\xbf\xbf", 0 },	/* overlong U+FFFF */
+		{ "\xf4\x90\x80\x80", 0 },	/* U+110000 */
+		{ "\xf5\x80\x80\x80", 0 },
+		{ "\xf0\x90\x80(", 0 },
+		{ "\xff", 0 },
+	};
+
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		size_t got = utf8_seq_len((const unsigned char *)cases[i].s);
+
+		if (got != cases[i].want)
+			printf("utf8_seq_len case %zu: %zu, want %zu\n", i,
+			       got, cases[i].want);
+		mu_check(got == cases[i].want);
+	}
+}
+
+/*
+ * The print macros are statements. As a bare `if`, the `else` below bound to
+ * the macro's own test, so it ran exactly when it should not have.
+ */
+MU_TEST(test_print_macros_take_an_else) {
+	int saved = verbose, hit = 0;
+
+	verbose = 0;
+	if (hit)
+		vprintf("never\n");
+	else
+		hit = 1;
+	verbose = saved;
+	mu_check(hit == 1);
+}
+
 MU_TEST(test_group_u64) {
 	char b[28];
 

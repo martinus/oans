@@ -300,6 +300,37 @@ size_t ctrl_seq_len(const unsigned char *p, unsigned char *cp)
 	return 0;
 }
 
+size_t utf8_seq_len(const unsigned char *p)
+{
+	unsigned char lo = 0x80, hi = 0xbf;
+	size_t n, i;
+
+	if (p[0] < 0x80)
+		return 1;
+	if (p[0] >= 0xc2 && p[0] <= 0xdf)
+		n = 2;
+	else if (p[0] >= 0xe0 && p[0] <= 0xef)
+		n = 3;
+	else if (p[0] >= 0xf0 && p[0] <= 0xf4)
+		n = 4;
+	else
+		return 0;	/* continuation, overlong lead C0/C1, or F5+ */
+
+	/* The lead bytes whose second byte has a narrower range. */
+	switch (p[0]) {
+	case 0xe0: lo = 0xa0; break;	/* overlong below U+0800 */
+	case 0xed: hi = 0x9f; break;	/* UTF-16 surrogates */
+	case 0xf0: lo = 0x90; break;	/* overlong below U+10000 */
+	case 0xf4: hi = 0x8f; break;	/* past U+10FFFF */
+	}
+	if (p[1] < lo || p[1] > hi)
+		return 0;
+	for (i = 2; i < n; i++)
+		if (p[i] < 0x80 || p[i] > 0xbf)
+			return 0;
+	return n;
+}
+
 bool has_ctrl(const char *s)
 {
 	const unsigned char *p = (const unsigned char *)s;

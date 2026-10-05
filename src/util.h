@@ -150,6 +150,16 @@ void debug_print_uuid(uuid_t uuid);
  */
 size_t ctrl_seq_len(const unsigned char *p, unsigned char *cp);
 
+/*
+ * Length of the well-formed UTF-8 sequence at p (RFC 3629: no overlong forms,
+ * no surrogates, nothing past U+10FFFF): 1 for ASCII, 2-4 otherwise, 0 when p
+ * starts no valid sequence - a stray continuation byte, a truncated sequence,
+ * or a byte that is Latin-1 rather than UTF-8. Says nothing about controls;
+ * that is ctrl_seq_len()'s question. Safe on a NUL-terminated string: the
+ * terminator is never a continuation byte, so the walk stops there.
+ */
+size_t utf8_seq_len(const unsigned char *p);
+
 /* True if `s` holds anything ctrl_seq_len() would flag - which no ordinary
  * name does, so this is the fast path out of every escaper below. */
 bool has_ctrl(const char *s);
