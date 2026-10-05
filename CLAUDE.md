@@ -1276,6 +1276,17 @@ databases all have that layout.
   got no row and was never extent-deduped. Repaired the same way, per row:
   `FILE_EOF_EXTENT_CHECKED` (`flags & 8`), checked in the same fiemap as the
   bit above (`scan_row_ok()`); `FILE_SCAN_CHECKED` is both.
+- **UNWRITTEN is only zeroes once the data is flushed.** Data written but not
+  yet on disk can sit over an UNWRITTEN extent: XFS allocates delalloc as
+  unwritten at writeback and converts it when the I/O completes, and a write
+  into a fallocated range stays unwritten until flushed. The scan faked that
+  data as zeroes, so two identical files scanned mid-writeback got different
+  digests (the xfs-only flake of `test_a_crafted_name_...`). `do_fiemap()`
+  counts with `FIEMAP_FLAG_SYNC`, which flushes and waits for the conversion;
+  free on a clean file (250k tiny files, warm: 10.56 s vs 10.45 s). The
+  harness `syncfs()`es before every `dm()` run, which hid this from the suite:
+  the regression test passes `settle=False`, and is `serial` because another
+  test's `syncfs()` flushes its file just as well.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 

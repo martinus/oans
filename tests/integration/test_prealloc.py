@@ -187,3 +187,31 @@ class PreallocPastEofTest(DuperemoveTest):
     def eof_physical(self, p, size):
         return [ph for l, ph, n, _fl in fiemap_extents(p)
                 if l < size <= l + n]
+
+
+class UnflushedTest(DuperemoveTest):
+    # Any other test's run syncfs()es the whole scratch (_settle_scratch),
+    # which would flush this file before the scan and pass it vacuously.
+    serial = True
+    digest = PreallocTest.digest
+
+    def test_unflushed_data_over_a_preallocated_extent_is_hashed(self):
+        """Data written into a preallocated range is not on disk until it is
+        flushed, and until then the extent can still read as UNWRITTEN to an
+        unsynced fiemap - while a read() returns the data. On XFS the same
+        state also comes from writeback in flight. The scan used to fake that
+        data as zeroes (the flaky crafted-name test on the xfs leg)."""
+        a = os.urandom(MiB)
+        p = self.path("tree/a")
+        with open(p, "wb") as f:
+            os.posix_fallocate(f.fileno(), 0, len(a))
+            f.write(a)
+        if not any(flags & FIEMAP_EXTENT_UNWRITTEN for _l, _p, _n, flags
+                   in fiemap_extents(p, sync=False)):
+            self.skipTest("the unflushed data does not map as UNWRITTEN "
+                          "here (btrfs reports it DELALLOC)")
+        self.write("tree/c", a)
+        self.dm("-r", self.path("tree"), settle=False)
+        self.assertDmOk()
+        self.assertEqual(self.digest("c"), self.digest("a"),
+                         "the digest describes the bytes, not zeroes")

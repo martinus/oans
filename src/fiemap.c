@@ -27,14 +27,15 @@
  * Empty fiemap ioctl to count the extents overlapping [start, start+length).
  * Pass start=0, length=~0ULL for the whole file. Returns 0 on error.
  */
-unsigned int fiemap_count_extents(int fd, uint64_t start,
-				  uint64_t length)
+static unsigned int count_extents(int fd, uint64_t start, uint64_t length,
+				  uint32_t flags)
 {
 	struct fiemap fiemap = {0,};
 	int err;
 
 	fiemap.fm_start = start;
 	fiemap.fm_length = length;
+	fiemap.fm_flags = flags;
 
 	err = ioctl(fd, FS_IOC_FIEMAP, &fiemap);
 	if (err < 0) {
@@ -43,6 +44,11 @@ unsigned int fiemap_count_extents(int fd, uint64_t start,
 	}
 
 	return fiemap.fm_mapped_extents;
+}
+
+unsigned int fiemap_count_extents(int fd, uint64_t start, uint64_t length)
+{
+	return count_extents(fd, start, length, 0);
 }
 
 /*
@@ -134,9 +140,20 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 	return fiemap;
 }
 
+/*
+ * FIEMAP_FLAG_SYNC on the counting call: the scan decides from this map which
+ * bytes it may skip reading, so the map must describe data, not writeback in
+ * progress. Data written but not yet flushed can sit over an UNWRITTEN extent:
+ * XFS converts delalloc to unwritten before the write, and to written only
+ * when the I/O completes, and a write into a preallocated range stays
+ * unwritten until it is flushed. Mapped then, that data was faked as zeroes
+ * and the file stored a digest of bytes it never held. The flush makes the
+ * kernel finish all of that first, and costs nothing on a clean file.
+ */
 struct fiemap *do_fiemap(int fd)
 {
-	return fiemap_map(fd, 0, ~0ULL, fiemap_count_extents(fd, 0, ~0ULL));
+	return fiemap_map(fd, 0, ~0ULL,
+			  count_extents(fd, 0, ~0ULL, FIEMAP_FLAG_SYNC));
 }
 
 /*

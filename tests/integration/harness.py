@@ -94,23 +94,23 @@ _FIEMAP_EXTENT_DATA_INLINE = 0x0200
 _NO_PHYS = _FIEMAP_EXTENT_UNKNOWN | _FIEMAP_EXTENT_DELALLOC | _FIEMAP_EXTENT_DATA_INLINE
 
 
-def fiemap_extents_fd(fd):
+def fiemap_extents_fd(fd, sync=True):
     """Like fiemap_extents(), but on an already-open fd. Lets callers reach a
-    file whose absolute path exceeds PATH_MAX (opened via a dir_fd), #117."""
+    file whose absolute path exceeds PATH_MAX (opened via a dir_fd), #117.
+    `sync=False` maps the file as it is, unflushed data included."""
+    req = _FIEMAP_FLAG_SYNC if sync else 0
     # extent_count=0 makes the kernel report only the total extent count
     # (it never fills more than fm_extent_count, so a single sized guess can
     # silently truncate). Count first, then fetch exactly that many.
     buf = bytearray(_FIEMAP_HDR.size)
-    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                          _FIEMAP_FLAG_SYNC, 0, 0, 0)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF, req, 0, 0, 0)
     fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
     count = _FIEMAP_HDR.unpack_from(buf, 0)[3]
     if count == 0:
         return []
 
     buf = bytearray(_FIEMAP_HDR.size + count * _FIEMAP_EXT.size)
-    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF,
-                          _FIEMAP_FLAG_SYNC, 0, count, 0)
+    _FIEMAP_HDR.pack_into(buf, 0, 0, 0xFFFFFFFFFFFFFFFF, req, 0, count, 0)
     fcntl.ioctl(fd, _FS_IOC_FIEMAP, buf, True)
     mapped = _FIEMAP_HDR.unpack_from(buf, 0)[3]
 
@@ -122,7 +122,7 @@ def fiemap_extents_fd(fd):
     return out
 
 
-def fiemap_extents(path, dir_fd=None):
+def fiemap_extents(path, dir_fd=None, sync=True):
     """Return [(logical, physical, length, flags), ...] for path's data extents.
 
     Holes are not returned by FIEMAP, so every entry is real data. Uses
@@ -132,7 +132,7 @@ def fiemap_extents(path, dir_fd=None):
     """
     fd = os.open(path, os.O_RDONLY, dir_fd=dir_fd)
     try:
-        return fiemap_extents_fd(fd)
+        return fiemap_extents_fd(fd, sync)
     finally:
         os.close(fd)
 
@@ -392,7 +392,7 @@ class DuperemoveTest(unittest.TestCase):
     # -- running oans ------------------------------------------------
 
     def dm(self, *args, hashfile=True, stdin=None, env=None, quiet=True,
-           text=True, timeout=None):
+           text=True, timeout=None, settle=True):
         """Run oans; capture combined output in self.out and code in self.rc.
 
         Pass stdin=<str> to feed the process on standard input (e.g. a "-"
@@ -406,9 +406,13 @@ class DuperemoveTest(unittest.TestCase):
 
         timeout=<seconds> kills oans and fails the test when it runs longer,
         for a test whose failure mode is a hang.
+
+        settle=False skips the syncfs() below, for a test about what oans
+        does with data that is not on disk yet.
         """
         skip_without_hooks(env)
-        _settle_scratch()   # the tree must be on disk before oans maps it
+        if settle:
+            _settle_scratch()   # the tree must be on disk before oans maps it
         cmd = [DUPEREMOVE, "--io-threads=4"]
         if quiet:
             cmd.insert(1, "-q")

@@ -18,7 +18,8 @@ struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 				 unsigned int *index);
 
 /*
- * Extract the extents mapping of a file.
+ * Extract the extents mapping of a file, after flushing its dirty data so the
+ * map describes what a read returns (see the definition).
  * May not return all extents if the file changed while this function is
  * running.
  */
