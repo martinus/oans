@@ -135,8 +135,6 @@ static inline void closefd(int *fd)
 		close(*fd);
 }
 
-void debug_print_uuid(uuid_t uuid);
-
 /*
  * Which bytes must never reach a terminal - the single definition of that
  * policy, so it cannot drift between output formats. Returns how many input

@@ -1011,6 +1011,21 @@ void filescan_free_late(void)
 	g_clear_pointer(&ro_subvols, g_hash_table_destroy);
 }
 
+/* The cached answer for `dev`, if it has one. */
+static bool ro_subvol_cached(dev_t dev, bool *rdonly)
+{
+	gpointer key = GSIZE_TO_POINTER((gsize)dev), val;
+	bool found;
+
+	g_mutex_lock(&ro_subvol_lock);
+	found = ro_subvols &&
+		g_hash_table_lookup_extended(ro_subvols, key, NULL, &val);
+	if (found)
+		*rdonly = GPOINTER_TO_INT(val);
+	g_mutex_unlock(&ro_subvol_lock);
+	return found;
+}
+
 /*
  * Core lookup: is `fd`'s subvolume read-only? `fd` must be open on a file or
  * directory inside it, and `dev` is its device, used as the cache key.
@@ -1025,13 +1040,8 @@ static bool ro_subvol_lookup(int fd, dev_t dev, bool count_skip)
 	gpointer key = GSIZE_TO_POINTER((gsize)dev), val;
 	bool rdonly = false;
 
-	g_mutex_lock(&ro_subvol_lock);
-	if (ro_subvols &&
-	    g_hash_table_lookup_extended(ro_subvols, key, NULL, &val)) {
-		g_mutex_unlock(&ro_subvol_lock);
-		return GPOINTER_TO_INT(val);
-	}
-	g_mutex_unlock(&ro_subvol_lock);
+	if (ro_subvol_cached(dev, &rdonly))
+		return rdonly;
 
 	/*
 	 * Probe outside the lock: the ioctl is the slow part, and a duplicate
@@ -1086,7 +1096,12 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 	bool rdonly;
 	int fd;
 
-	fd = longpath_open(path, O_RDONLY | O_NONBLOCK);	/* a FIFO: #281 */
+	/* Every entry comes through here: open only for a device not yet asked. */
+	if (ro_subvol_cached(dev, &rdonly))
+		return rdonly;
+
+	/* O_NONBLOCK for a FIFO (#281); O_NOFOLLOW, as the walk's statx. */
+	fd = longpath_open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
 	if (fd == -1)
 		return false;	/* unreadable is someone else's error to report */
 	rdonly = ro_subvol_lookup(fd, dev, true);
@@ -1193,9 +1208,14 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		 * (Linux 6.4+). This is unprivileged and works on XFS without
 		 * root, unlike the libblkid device probe below. Older kernels
 		 * return ENOTTY, so fall through to mountinfo + libblkid.
+		 *
+		 * A null UUID is no answer either: a null locked UUID reads as
+		 * "not locked yet" on every walker (#282), so libblkid is asked
+		 * instead, and it refuses one too.
 		 */
 		if (ioctl(fd, FS_IOC_GETFSUUID, &fsuuid) == 0 &&
-		    fsuuid.len == sizeof(uuid_t)) {
+		    fsuuid.len == sizeof(uuid_t) &&
+		    !uuid_is_null(fsuuid.uuid)) {
 			uuid_copy(probe->uuid, fsuuid.uuid);
 			return 0;
 		}
@@ -1448,12 +1468,13 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 		if (uuid_compare(probe.uuid, locked_fs.uuid) != 0) {
 			declare_display_path(disp, path);
+			char found[UUID_STR_LEN], locked[UUID_STR_LEN];
 
-			eprintf("%s lives on fs ", disp);
-			debug_print_uuid(probe.uuid);
-			eprintf(" while the hashfile is locked on fs ");
-			debug_print_uuid(locked_fs.uuid);
-			eprintf(".\n");
+			/* One call: a line in pieces breaks the live block (#179). */
+			uuid_unparse(probe.uuid, found);
+			uuid_unparse(locked_fs.uuid, locked);
+			eprintf("%s lives on fs %s while the hashfile is locked "
+				"on fs %s.\n", disp, found, locked);
 			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			if (!parent_checked)
 				nr_roots_unusable++;
@@ -1574,47 +1595,19 @@ static bool walk_aborted(void)
 	       filescan_batch_lost();
 }
 
-static int get_dirent_type(struct dirent *entry, int fd, const char *path)
+/*
+ * Whether the walk takes an entry of this type: a regular file, or a directory
+ * under --recurse. Counts only what is genuinely neither (symlinks, sockets,
+ * devices - see #126); a directory passed over because --recurse was not given
+ * is the user's own choice, not a skip worth reporting.
+ */
+static bool walk_takes(bool reg, bool dir)
 {
-	int ret;
-	struct statx st;
-
-	if (entry->d_type != DT_UNKNOWN)
-		return entry->d_type;
-
-	/*
-	 * FS doesn't support file type in dirent, do this the old
-	 * fashioned way. We translate mode to DT_* for the
-	 * convenience of the caller.
-	 */
-	ret = statx(fd, entry->d_name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &st);
-	if (ret || !(st.stx_mask & STATX_BASIC_STATS)) {
-		declare_display_path(disp, path);
-		declare_display_path(dname, entry->d_name);
-
-		eprintf("Error %d: %s while getting type of file %s/%s. "
-			"Skipping.\n", errno, strerror(errno),
-			disp, dname);
-		filescan_count_errno_skip(errno);
-		return DT_UNKNOWN;
-	}
-
-	if (S_ISREG(st.stx_mode))
-		return DT_REG;
-	if (S_ISDIR(st.stx_mode))
-		return DT_DIR;
-	if (S_ISBLK(st.stx_mode))
-		return DT_BLK;
-	if (S_ISCHR(st.stx_mode))
-		return DT_CHR;
-	if (S_ISFIFO(st.stx_mode))
-		return DT_FIFO;
-	if (S_ISLNK(st.stx_mode))
-		return DT_LNK;
-	if (S_ISSOCK(st.stx_mode))
-		return DT_SOCK;
-
-	return DT_UNKNOWN;
+	if (reg || (dir && options.recurse_dirs))
+		return true;
+	if (!dir)
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+	return false;
 }
 
 /*
@@ -1776,23 +1769,16 @@ static void process_dir(const char *path, struct dbhandle *db)
 		    || strcmp(entry->d_name, "..") == 0)
 			continue;
 
-		entry->d_type = get_dirent_type(entry, dirfd(dirp), path);
-
-		if (entry->d_type != DT_REG &&
-		    !(options.recurse_dirs && entry->d_type == DT_DIR)) {
-			/*
-			 * Count only entries that are genuinely neither a file
-			 * nor a directory (symlinks, sockets, devices - see
-			 * #126). A directory passed over because --recurse was
-			 * not given is the user's own choice, not a skip worth
-			 * reporting, and DT_UNKNOWN was already counted by
-			 * get_dirent_type() as the errno that produced it.
-			 */
-			if (entry->d_type != DT_DIR &&
-			    entry->d_type != DT_UNKNOWN)
-				filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+		/*
+		 * A filesystem that leaves d_type DT_UNKNOWN is answered by
+		 * the statx below, which every entry the walk takes gets
+		 * anyway; asking a statx of its own here cost such an entry
+		 * two.
+		 */
+		if (entry->d_type != DT_UNKNOWN &&
+		    !walk_takes(entry->d_type == DT_REG,
+				entry->d_type == DT_DIR))
 			continue;
-		}
 
 		/* A component is bounded by NAME_MAX; guard defensively so the
 		 * child buffer can never overflow. */
@@ -1817,8 +1803,8 @@ static void process_dir(const char *path, struct dbhandle *db)
 		 * kernel would reject with ENAMETOOLONG (#117).
 		 */
 		/*
-		 * AT_SYMLINK_NOFOLLOW: d_type already left symlinks out, and
-		 * what goes where is decided from this statx, not from d_type.
+		 * AT_SYMLINK_NOFOLLOW: d_type, where known, already left
+		 * symlinks out, and what goes where is decided from this statx.
 		 * An entry replaced between readdir() and here - a file by a
 		 * directory, or by a symlink to one - used to be pushed as a
 		 * file and abort the run in the consumer (#278).
@@ -1833,6 +1819,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 			filescan_count_errno_skip(errno);
 			continue;
 		}
+
+		if (entry->d_type == DT_UNKNOWN &&
+		    !walk_takes(S_ISREG(st.stx_mode), S_ISDIR(st.stx_mode)))
+			continue;
 
 		if (!check_file(db, child, &st, true))
 			continue;
@@ -2506,6 +2496,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 			eprintf("Error %d: %s while finding subvol for file "
 				"\"%s\". Skipping.\n", ret, strerror(ret),
 				disp);
+			filescan_count_errno_skip(ret);
 			return 0;
 		}
 
