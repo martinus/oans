@@ -2297,17 +2297,25 @@ static void seed_checkpointed_files(struct dbhandle *db)
  * blocks nor follows a symlink (#278), and what it opened must still be a
  * regular file.
  *
+ * O_NOATIME: a scan reads every byte of every file, and must not stamp every
+ * file as read, which also costs a metadata write per file on a relatime
+ * mount. Only the owner (or CAP_FOWNER) may ask, and that is decided per file,
+ * so an EPERM is retried without it rather than remembered.
+ *
  * Returns the descriptor, back in blocking mode, or -1 with errno set. A name
  * that is no longer a regular file sets *not_regular instead of errno; the
  * caller counts it as SCAN_SKIP_NOT_REGULAR, as __scan_file() does.
  */
 static int open_listed_file(const char *path, bool *not_regular)
 {
-	int fd = longpath_open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	const int flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
+	int fd = longpath_open(path, flags | O_NOATIME);
 	struct stat st;
 	int fl;
 
 	*not_regular = false;
+	if (fd == -1 && errno == EPERM)
+		fd = longpath_open(path, flags);
 	if (fd == -1)
 		return -1;
 	if (fstat(fd, &st) == -1)
