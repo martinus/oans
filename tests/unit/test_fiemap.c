@@ -804,23 +804,81 @@ MU_TEST(test_fiemap_maps_a_real_file) {
  * failure - a distinction that would otherwise turn every hole into an error.
  */
 /*
- * #288: asked with no slots - the count pass found none, or failed - the
- * kernel only counts, and reports the real number in fm_mapped_extents with
- * nothing copied. Every reader walks that number, so it read past the buffer.
+ * Fewer slots than extents is what a file that gained extents between the
+ * count pass and the map looks like. With no slots the kernel only counts and
+ * reports the real number with nothing copied (#288), so every reader walked
+ * past the buffer; with too few it fills them and stops, and the map looked
+ * complete. Readers take running out of records for a hole, so two maps cut
+ * at the same index compared their unknown tails as shared, and a destination
+ * was skipped as already deduped. Either way the map must be redone in full,
+ * never handed back short.
  */
 MU_TEST(test_fiemap_map_never_claims_more_than_it_holds) {
-	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 1, false);
+	_cleanup_(fm_close) struct fm_file f = fm_open(__func__, 3, true);
+	_cleanup_(freep) struct fiemap *full = NULL;
 	_cleanup_(freep) struct fiemap *none = NULL;
 	_cleanup_(freep) struct fiemap *one = NULL;
+	unsigned int counted;
 
 	if (f.fd < 0)
 		return;
+	counted = fiemap_count_extents(f.fd, 0, ~0ULL);
+	mu_assert(counted >= 2,
+		  "the sparse fixture mapped one extent, so no map can be short");
+	full = do_fiemap(f.fd);
+	mu_check(full != NULL);
+
 	none = fiemap_map(f.fd, 0, ~0ULL, 0);
-	mu_check(none != NULL);
-	mu_check(none->fm_mapped_extents == 0);
 	one = fiemap_map(f.fd, 0, ~0ULL, 1);
-	mu_check(one != NULL);
-	mu_check(one->fm_mapped_extents <= 1);
+	mu_assert(none != NULL && one != NULL,
+		  "the file did not change, so the retry should have mapped it");
+	mu_assert_int_eq(counted, none->fm_mapped_extents);
+	mu_assert_int_eq(counted, one->fm_mapped_extents);
+	mu_check(none->fm_mapped_extents <= none->fm_extent_count);
+	mu_check(one->fm_mapped_extents <= one->fm_extent_count);
+	mu_check(memcmp(one->fm_extents, full->fm_extents,
+			counted * sizeof(struct fiemap_extent)) == 0);
+}
+
+/*
+ * The part of that decision the records alone can answer. A full buffer whose
+ * last record is neither the file's last nor reaches the range's end is
+ * "cannot tell", and only then is the kernel asked about the rest.
+ */
+MU_TEST(test_fiemap_map_complete) {
+	const uint32_t LAST = FIEMAP_EXTENT_LAST;
+	struct fm_rec three[] = {
+		{0, 4096, 4096, 0}, {8192, 16384, 4096, 0}, {16384, 32768, 4096, 0}
+	};
+	struct fm_rec three_last[] = {
+		{0, 4096, 4096, 0}, {8192, 16384, 4096, 0}, {16384, 32768, 4096, LAST}
+	};
+	struct fiemap *fm = mkmap(three, 3);
+	struct fiemap *fl = mkmap(three_last, 3);
+
+	/* Full buffer, tail unaccounted for: could be a hole, could be cut. */
+	mu_check(!fiemap_map_complete(fm, 3, 0, 65536));
+	mu_check(!fiemap_map_complete(fm, 3, 0, ~0ULL));
+	/* Saturates rather than wrapping past the end of the address space. */
+	mu_check(!fiemap_map_complete(fm, 3, 4096, ~0ULL));
+	/* The file's last extent: nothing can follow it. */
+	mu_check(fiemap_map_complete(fl, 3, 0, ~0ULL));
+	/* The last record reaches the end of the range asked for. */
+	mu_check(fiemap_map_complete(fm, 3, 0, 20480));
+	mu_check(fiemap_map_complete(fm, 3, 8192, 10000));
+	mu_check(!fiemap_map_complete(fm, 3, 8192, 12289));
+	/* A slot to spare: the kernel ran out of extents before slots. */
+	mu_check(fiemap_map_complete(fm, 4, 0, 65536));
+
+	/* No slots: an empty answer is complete, a counted one is not (#288). */
+	fm->fm_mapped_extents = 0;
+	mu_check(fiemap_map_complete(fm, 0, 0, 65536));
+	fm->fm_mapped_extents = 2;
+	mu_check(!fiemap_map_complete(fm, 0, 0, 65536));
+	mu_check(!fiemap_map_complete(fm, 1, 0, 65536));
+
+	free(fm);
+	free(fl);
 }
 
 MU_TEST(test_fiemap_range_answers_for_the_range_asked_for) {

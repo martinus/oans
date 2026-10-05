@@ -13,8 +13,10 @@
  * General Public License for more details.
  */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
@@ -38,7 +40,7 @@ unsigned int fiemap_count_extents(int fd, uint64_t start,
 
 	err = ioctl(fd, FS_IOC_FIEMAP, &fiemap);
 	if (err < 0) {
-		perror("fiemap_count_extents");
+		eprintf("fiemap_count_extents: %s\n", strerror(errno));
 		return 0;
 	}
 
@@ -87,51 +89,94 @@ struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 }
 
 /*
+ * Does a map that was given `count` slots provably hold every record of
+ * [start, start+length)? The kernel stops copying when the slots run out, and a
+ * full buffer then looks exactly like a range with that many extents: the file
+ * gained some between the count pass and this one. Readers take running out of
+ * records for a hole, so two maps cut off at the same index would compare their
+ * unknown tails as matching holes (fiemap_maps_share()).
+ *
+ * False means "cannot tell from the records": the buffer is full, the last
+ * record is not the file's last, and it ends before the range does. The caller
+ * then asks the kernel about the remainder.
+ */
+static bool fiemap_map_complete(const struct fiemap *fm, unsigned int count,
+				uint64_t start, uint64_t length)
+{
+	const struct fiemap_extent *last;
+	uint64_t end = length > UINT64_MAX - start ? UINT64_MAX : start + length;
+
+	if (fm->fm_mapped_extents > count)
+		return false;	/* no slots: the kernel only counted (#288) */
+	if (fm->fm_mapped_extents < count || count == 0)
+		return true;	/* slots to spare, so the kernel ran out first */
+
+	last = &fm->fm_extents[count - 1];
+	return (last->fe_flags & FIEMAP_EXTENT_LAST) ||
+	       last->fe_logical + last->fe_length >= end;
+}
+
+static bool fiemap_map_truncated(int fd, const struct fiemap *fm,
+				 unsigned int count, uint64_t start,
+				 uint64_t length)
+{
+	const struct fiemap_extent *last;
+	uint64_t from, end;
+
+	if (fiemap_map_complete(fm, count, start, length))
+		return false;
+	if (fm->fm_mapped_extents > count)
+		return true;
+
+	last = &fm->fm_extents[count - 1];
+	from = last->fe_logical + last->fe_length;
+	end = length > UINT64_MAX - start ? UINT64_MAX : start + length;
+	return fiemap_count_extents(fd, from, end - from) > 0;
+}
+
+/*
  * Map `count` extents of [start, start+length) into a freshly allocated fiemap.
  * `count` normally comes from a preceding fiemap_count_extents() pass. Returns
- * NULL on allocation or ioctl error.
+ * NULL on allocation or ioctl error, and when the file keeps gaining extents
+ * between the count and the map: one retry, then a map that cannot vouch for
+ * its tail is no map at all.
  */
 static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 				 unsigned int count)
 {
 	struct fiemap *fiemap;
 
-	/*
-	 * The structure must be large enough to fit one struct fiemap plus
-	 * $count struct fiemap_extent. We over-allocate a pointer per extent to
-	 * match historical behaviour; it is harmless. See
-	 * https://www.kernel.org/doc/Documentation/filesystems/fiemap.txt
-	 */
-	fiemap = calloc(1, sizeof(struct fiemap) +
-			count * (sizeof(struct fiemap_extent) +
-			sizeof(struct fiemap_extent *)));
-	if (!fiemap)
-		return NULL;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		/*
+		 * The structure must be large enough to fit one struct fiemap
+		 * plus $count struct fiemap_extent. We over-allocate a pointer
+		 * per extent to match historical behaviour; it is harmless. See
+		 * https://www.kernel.org/doc/Documentation/filesystems/fiemap.txt
+		 */
+		fiemap = calloc(1, sizeof(struct fiemap) +
+				count * (sizeof(struct fiemap_extent) +
+				sizeof(struct fiemap_extent *)));
+		if (!fiemap)
+			return NULL;
 
-	fiemap->fm_start = start;
-	fiemap->fm_length = length;
-	fiemap->fm_extent_count = count;
+		fiemap->fm_start = start;
+		fiemap->fm_length = length;
+		fiemap->fm_extent_count = count;
 
-	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
-		perror("fiemap");
-		free(fiemap);
-		return NULL;
-	}
+		if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
+			eprintf("fiemap: %s\n", strerror(errno));
+			free(fiemap);
+			return NULL;
+		}
 
-	/*
-	 * With fewer slots than extents - none at all, if the counting call
-	 * found none or failed - the kernel only counts: fm_mapped_extents is
-	 * the real number, and only fm_extent_count records were copied (#288).
-	 * Every reader walks fm_mapped_extents, so it must not exceed the
-	 * buffer. The file changed between the two calls; a later check sees it.
-	 */
-	if (fiemap->fm_mapped_extents != count) {
+		if (!fiemap_map_truncated(fd, fiemap, count, start, length))
+			return fiemap;
+
 		dprintf("fiemap: file changed between fiemap calls\n");
-		if (fiemap->fm_mapped_extents > count)
-			fiemap->fm_mapped_extents = count;
+		free(fiemap);
+		count = fiemap_count_extents(fd, start, length);
 	}
-
-	return fiemap;
+	return NULL;
 }
 
 struct fiemap *do_fiemap(int fd)
@@ -175,7 +220,7 @@ int fiemap_first_extent_poff(int fd, uint64_t start, uint64_t length,
 	buf.fiemap.fm_extent_count = 1;
 
 	if (ioctl(fd, FS_IOC_FIEMAP, &buf.fiemap) < 0) {
-		perror("fiemap_first_extent_poff");
+		eprintf("fiemap_first_extent_poff: %s\n", strerror(errno));
 		return -1;
 	}
 
