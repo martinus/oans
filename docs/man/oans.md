@@ -203,7 +203,10 @@ file is recorded once.
       boundaries. A name that is not valid UTF-8 (an old Latin-1 name, say) is
       matched byte by byte, so there `?` matches one byte. A `\` makes the
       next character literal, inside a class too: `[a\-z]` matches `a`, `-`
-      or `z`.
+      or `z`. Older versions took a `\` in a class literally, so a hashfile
+      that stored such a pattern (`[\]`, say) now fails its replay as
+      unterminated; re-run with the paths and options, writing a backslash
+      as `[\\]`.
 
     <!-- -->
 

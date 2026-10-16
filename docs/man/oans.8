@@ -251,6 +251,10 @@ byte by byte, so there \f[CR]?\f[R] matches one byte.
 A \f[CR]\(rs\f[R] makes the next character literal, inside a class too:
 \f[CR][a\(rs\-z]\f[R] matches \f[CR]a\f[R], \f[CR]\-\f[R] or
 \f[CR]z\f[R].
+Older versions took a \f[CR]\(rs\f[R] in a class literally, so a
+hashfile that stored such a pattern (\f[CR][\(rs]\f[R], say) now fails
+its replay as unterminated; re\-run with the paths and options, writing
+a backslash as \f[CR][\(rs\(rs]\f[R].
 .PP
 Excluding a directory prunes the walk there, so naming a directory also
 skips everything inside it \(em there is no need to add a wildcard for

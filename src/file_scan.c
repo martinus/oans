@@ -1468,7 +1468,8 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 		if (uuid_compare(probe.uuid, locked_fs.uuid) != 0) {
 			declare_display_path(disp, path);
-			char found[UUID_STR_LEN], locked[UUID_STR_LEN];
+			/* 36-byte uuid + NUL; not UUID_STR_LEN, which older libuuid lacks */
+			char found[37], locked[37];
 
 			/* One call: a line in pieces breaks the live block (#179). */
 			uuid_unparse(probe.uuid, found);
