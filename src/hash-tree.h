@@ -33,8 +33,6 @@ struct dupe_blocks_list {
 	unsigned long long	dl_num_elem;
 	struct list_head	dl_list;
 
-	struct rb_root		dl_files_root; /* stores file_hash_head nodes */
-
 	unsigned char		dl_hash[DIGEST_LEN];
 };
 
@@ -49,8 +47,7 @@ struct file_block {
 	 */
 	struct list_head	b_list;
 
-	struct rb_node		b_file_next; /* filerec->block_tree */
-	struct list_head	b_head_list; /* file_hash_head->h_blocks */
+	struct rb_node		b_file_next; /* filerec->block_tree, by b_loff */
 };
 
 struct dupe_blocks_list *find_block_list(struct hash_tree *tree,
@@ -61,37 +58,6 @@ int insert_hashed_block(struct hash_tree *tree, unsigned char *digest,
 int remove_hashed_block(struct hash_tree *tree, struct file_block *block);
 struct file_block *find_filerec_block(struct filerec *file,
 				      uint64_t loff);
-
-/*
- * We must call sort_file_hash_heads after inserting blocks into our
- * hash_tree. The scan in find_dupes requires them to be in order of
- * increasing offset.
- *
- * NOTE: Using an rbtree instead of doing the list sort winds up in a
- * large performance loss. The item walk in lookup_walk_file_hash_head()
- * is highly cpu bound so the extra instructions to do a linear tree walk
- * really shows up during benchmarking.
- */
-void sort_file_hash_heads(struct hash_tree *tree);
-
-/*
- * Stores a list of blocks with the same hash / filerec
- * combination. Each dupe_blocks_list keeps a tree of these (sorted by
- * file).
- *
- * This speeds up the extent search by allowing us to skip blocks that
- * don't belong to the file we are 'walking'. Blocks are inserted into
- * h_blocks in the same order they are given to insert_hashed_block()
- * (that is, in order of increasing offset).
- */
-struct file_hash_head {
-	struct filerec *h_file;
-	struct rb_node h_node;
-	struct list_head h_blocks;
-};
-
-struct file_hash_head *find_file_hash_head(struct dupe_blocks_list *dups,
-					   struct filerec *file);
 
 void init_hash_tree(struct hash_tree *tree);
 void free_hash_tree(struct hash_tree *tree);

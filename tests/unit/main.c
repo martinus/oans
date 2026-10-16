@@ -97,7 +97,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_prop_every_filerec_is_findable_by_its_own_id);
 	MU_RUN(test_prop_the_hash_tree_counts_what_it_holds);
 	MU_RUN(test_prop_removing_every_block_empties_the_hash_tree);
-	MU_RUN(test_prop_sorting_puts_every_hash_head_in_offset_order);
+	MU_RUN(test_prop_a_files_blocks_walk_in_offset_order);
 	MU_RUN(test_prop_a_dup_group_counts_its_own_members);
 	MU_RUN(test_removing_an_extent_collapses_a_group_of_one);
 	MU_RUN(test_a_group_is_keyed_on_digest_and_length_together);

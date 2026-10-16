@@ -2630,8 +2630,6 @@ int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 		return ret;
 	}
 
-	sort_file_hash_heads(hash_tree);
-
 	return 0;
 }
 

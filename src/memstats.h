@@ -104,7 +104,6 @@ declare_alloc_tracking_header(dupe_extents);
 declare_alloc_tracking_header(extent);
 declare_alloc_tracking_header(filerec);
 declare_alloc_tracking_header(filerec_token);
-declare_alloc_tracking_header(file_hash_head);
 /* Can be called anywhere we want to dump the above statistics */
 void print_mem_stats(void);
 

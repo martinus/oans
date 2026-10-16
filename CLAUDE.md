@@ -545,8 +545,8 @@ survivors) on nineteen tests, with `bugs/{filerec,hash-tree,results-tree}.txt`
 putting nine of the invariants back.
 
 - **They are the only callers of the vendored kernel rbtree**, which is why
-  `src/rbtree.c` and `src/list_sort.c` get no tests of their own: they are
-  verbatim `linux/lib` code with no oans-specific API, so sweeping them would
+  `src/rbtree.c` gets no tests of its own: it is
+  verbatim `linux/lib` code with no oans-specific API, so sweeping it would
   measure upstream's design. Generated insert *and erase* orders here are what
   make that copy rebalance - an ascending sweep only ever unlinks a spine.
 - **`free_all_filerecs()` ignores `refs`.** So "a filerec survives until its
@@ -561,11 +561,15 @@ putting nine of the invariants back.
   from a *pair* takes both extents and answers 0 where a decrement would say 1.
   And `remove_hashed_block()` answers 1 only when it freed the whole list,
   which is how `find_dupes` knows not to keep walking it.
-- **Several files, or the test sees nothing.** A `file_hash_head` is freed when
-  *that file's* sublist drains; with one file that always coincides with the
-  block list being freed, so the leak is invisible. Likewise
-  `sort_file_hash_heads()` is two nested walks, so one digest leaves the outer
-  one unobservable.
+- **Several files, or the test sees nothing.** A block list holds every
+  file's blocks under one digest, so a single-file fixture cannot tell "this
+  file's share drained" from "the list was freed".
+- **No per-(digest, file) index, and none is needed.** `find_dupes` walks a
+  file's blocks through `filerec->block_tree`, an rbtree keyed on the offset,
+  so offset order holds by construction; a digest's other copies come from
+  `dl_list`. The `file_hash_head` tree and its per-window `list_sort` were
+  upstream leftovers nothing read, a malloc and an rbtree insert per (digest,
+  file) pair in partial mode; they were removed.
 - **The fd refcount needs a read, not a counter.** `filerec_open()` hands back
   the descriptor already open; what separates that from close-every-time is
   that the fd stays *usable* across an inner close, so the test reads a byte

@@ -12,7 +12,7 @@ endif
 
 CC ?= gcc
 CFLAGS ?= -Wall -Wextra -Wno-unused-parameter -ggdb -std=gnu11 \
-	-Werror=strict-prototypes -MMD
+	-Werror=strict-prototypes -MMD -MP
 PKG_CONFIG ?= pkg-config
 
 # Extra warnings the tree is already clean under. Not every compiler knows every

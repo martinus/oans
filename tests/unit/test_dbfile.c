@@ -1168,14 +1168,13 @@ MU_TEST(test_loading_one_filerec_treats_a_missing_id_as_success) {
 }
 
 /*
- * Block hashes load into a hash tree, and come out of it sorted.
+ * Block hashes load into a hash tree, and each file's blocks walk out of it
+ * in offset order.
  *
- * The loader ends with sort_file_hash_heads() because find_dupes walks each
- * file's blocks under a hash expecting increasing offsets. GET_DUPLICATE_BLOCKS
- * orders a file's rows by rowid, which is the order they were stored in, not
- * by offset, and add_file_hash_head() appends in arrival order - so rows
- * genuinely arrive jumbled and this is the one place that ordering is
- * established for the dedupe phase.
+ * find_dupes steps through a file's blocks with rb_next() on its block_tree
+ * expecting increasing offsets. GET_DUPLICATE_BLOCKS orders a file's rows by
+ * rowid, which is the order they were stored in, not by offset - so rows
+ * genuinely arrive jumbled, and the offset-keyed tree is what orders them.
  */
 MU_TEST(test_block_hashes_load_into_the_tree_in_offset_order) {
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
@@ -1183,8 +1182,9 @@ MU_TEST(test_block_hashes_load_into_the_tree_in_offset_order) {
 	unsigned char dg[DIGEST_LEN];
 	struct block_csum blocks[3];
 	struct dupe_blocks_list *dl;
-	struct rb_node *n;
-	unsigned int heads = 0;
+	struct file_block *blk;
+	struct filerec *seen[2] = {NULL, NULL};
+	unsigned int nfiles = 0;
 	int64_t a, b;
 
 	free_all_filerecs();
@@ -1211,21 +1211,27 @@ MU_TEST(test_block_hashes_load_into_the_tree_in_offset_order) {
 	mu_check(dl != NULL);
 	mu_check(dl->dl_num_elem == 6);
 
+	list_for_each_entry(blk, &dl->dl_list, b_list) {
+		if (blk->b_file == seen[0] || blk->b_file == seen[1])
+			continue;
+		mu_check(nfiles < 2);
+		seen[nfiles++] = blk->b_file;
+	}
+	mu_check(nfiles == 2);
+
 	/* Both files present, each holding exactly 0, 4096, 8192 in order. */
-	for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
-		struct file_hash_head *h =
-			rb_entry(n, struct file_hash_head, h_node);
-		struct file_block *blk;
+	for (unsigned int f = 0; f < 2; f++) {
+		struct rb_node *n;
 		unsigned int i = 0;
 
-		heads++;
-		list_for_each_entry(blk, &h->h_blocks, b_head_list) {
+		for (n = rb_first(&seen[f]->block_tree); n; n = rb_next(n)) {
+			blk = rb_entry(n, struct file_block, b_file_next);
 			mu_check(blk->b_loff == i * 4096);
+			mu_check(blk->b_parent == dl);
 			i++;
 		}
 		mu_check(i == 3);
 	}
-	mu_check(heads == 2);
 
 	free_hash_tree(&tree);
 	free_all_filerecs();
@@ -1339,7 +1345,7 @@ MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
 	unsigned char span[DIGEST_LEN], later[DIGEST_LEN];
 	struct block_csum blk;
 	struct dupe_blocks_list *dl;
-	struct rb_node *n;
+	struct file_block *blk_in;
 	bool saw_old = false, saw_new = false;
 	int64_t id[3];
 
@@ -1363,12 +1369,9 @@ MU_TEST(test_block_groups_spanning_passes_load_with_their_older_member) {
 	dl = find_block_list(&tree, span);
 	mu_check(dl != NULL);
 	mu_check(dl->dl_num_elem == 2);
-	for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
-		struct file_hash_head *h =
-			rb_entry(n, struct file_hash_head, h_node);
-
-		saw_old |= strcmp(h->h_file->filename, "/span/old") == 0;
-		saw_new |= strcmp(h->h_file->filename, "/span/new") == 0;
+	list_for_each_entry(blk_in, &dl->dl_list, b_list) {
+		saw_old |= strcmp(blk_in->b_file->filename, "/span/old") == 0;
+		saw_new |= strcmp(blk_in->b_file->filename, "/span/new") == 0;
 	}
 	mu_check(saw_old && saw_new);
 	mu_check(find_block_list(&tree, later) == NULL);

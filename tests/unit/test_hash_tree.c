@@ -86,10 +86,10 @@ MU_TEST(test_prop_the_hash_tree_counts_what_it_holds) {
  * 1 exactly when it removed the *last* block carrying that digest and freed
  * the list - find_dupes uses that to know the group is gone, so an answer
  * right about the tree and wrong about the verdict leaves a caller holding a
- * freed list. And a file_hash_head is freed when *that file's* sublist drains,
- * which with a single file would always coincide with the list itself being
- * freed; several files make the two instants different, so dropping the head
- * free leaks it somewhere a counter can still notice.
+ * freed list. And a list holds every file's blocks under its digest, so with
+ * a single file "that file's share drained" would always coincide with the
+ * list itself being freed; several files make the two instants different, and
+ * the surviving list must then hold exactly the other files' blocks.
  *
  * The removal order is generated, which is also the only thing in these tests
  * that makes the vendored rbtree rebalance on erase rather than unlink a
@@ -157,12 +157,18 @@ MU_TEST(test_prop_removing_every_block_empties_the_hash_tree) {
 			ret = remove_hashed_block(&tree, b);
 			prop_check(&p, ret == (last_of_digest ? 1 : 0));
 
-			/* That file's head is gone once its share drains, while
-			 * the list itself lives on for the other files. */
-			if (!last_of_digest)
-				prop_check(&p,
-					   (find_file_hash_head(dl, files[f])
-					    == NULL) == last_of_pair);
+			/* The list lives on for the other files, holding exactly
+			 * what is left of each file's share. */
+			if (!last_of_digest) {
+				unsigned int left = 0;
+				struct file_block *o;
+
+				list_for_each_entry(o, &dl->dl_list, b_list)
+					if (o->b_file == files[f])
+						left++;
+				prop_check(&p, (left == 0) == last_of_pair);
+				prop_check(&p, left == per_pair[d][f]);
+			}
 
 			if (last_of_digest)
 				distinct--;
@@ -180,17 +186,16 @@ MU_TEST(test_prop_removing_every_block_empties_the_hash_tree) {
 }
 
 /*
- * find_dupes walks each file's blocks under a hash expecting increasing
- * offsets, and says so where sort_file_hash_heads is declared. The blocks
- * arrive that way only because the scan happens to produce them so, which is
- * why the sort exists - and why a fixture that inserts in order cannot tell a
- * working sort from no sort at all. Hence a shuffled insertion order.
+ * find_dupes walks a file's blocks in increasing offset order, stepping with
+ * rb_next() through filerec->block_tree (next_block() and its callers), and
+ * reads a block's digest from b_parent. The blocks reach the tree in whatever
+ * order GET_DUPLICATE_BLOCKS yields them, which is rowid and not offset, so a
+ * fixture that inserts in order cannot tell an ordered tree from an
+ * append-only list. Hence a shuffled insertion order.
  *
- * Two digests, not one: the sort is two nested walks, and with a single block
- * list the outer one runs exactly once for the life of the property, so a
- * mutant that stops after the first list would be invisible.
+ * Two digests, so that a block filed under the wrong list is visible.
  */
-MU_TEST(test_prop_sorting_puts_every_hash_head_in_offset_order) {
+MU_TEST(test_prop_a_files_blocks_walk_in_offset_order) {
 	declare_prop(p, 120);
 	struct filerec *files[PROP_FILES];
 	unsigned char digests[2][DIGEST_LEN];
@@ -204,9 +209,9 @@ MU_TEST(test_prop_sorting_puts_every_hash_head_in_offset_order) {
 	while (prop_next(&p)) {
 		struct hash_tree tree;
 		uint64_t offs[PROP_BLOCKS];
+		unsigned int dig[PROP_BLOCKS];
+		unsigned int per_file[PROP_FILES] = {0};
 		unsigned int nb = (unsigned int)prop_range(&p, 2, PROP_BLOCKS);
-		unsigned int heads = 0;
-		struct rb_node *dn;
 
 		init_hash_tree(&tree);
 		for (unsigned int i = 0; i < nb; i++)
@@ -217,36 +222,34 @@ MU_TEST(test_prop_sorting_puts_every_hash_head_in_offset_order) {
 			unsigned int f = (unsigned int)prop_below(&p, PROP_FILES);
 			unsigned int d = (unsigned int)prop_below(&p, 2);
 
+			/* offs[] is a permutation of 0..nb-1 blocks, so the
+			 * offset names the block. */
+			dig[offs[i] / PROP_LEN] = d;
+			per_file[f]++;
 			if (insert_hashed_block(&tree, digests[d], files[f],
 						offs[i]))
 				abort();
 		}
 
-		sort_file_hash_heads(&tree);
-
-		for (dn = rb_first(&tree.root); dn; dn = rb_next(dn)) {
-			struct dupe_blocks_list *dl =
-				rb_entry(dn, struct dupe_blocks_list, dl_node);
+		for (unsigned int f = 0; f < PROP_FILES; f++) {
 			struct rb_node *n;
+			uint64_t prev = 0;
+			unsigned int seen = 0;
 
-			for (n = rb_first(&dl->dl_files_root); n; n = rb_next(n)) {
-				struct file_hash_head *h =
-					rb_entry(n, struct file_hash_head, h_node);
-				struct file_block *b;
-				uint64_t prev = 0;
-				bool first = true;
+			for (n = rb_first(&files[f]->block_tree); n;
+			     n = rb_next(n)) {
+				struct file_block *b =
+					rb_entry(n, struct file_block, b_file_next);
 
-				heads++;
-				list_for_each_entry(b, &h->h_blocks, b_head_list) {
-					prop_check(&p, b->b_file == h->h_file);
-					prop_check(&p, first || b->b_loff > prev);
-					prev = b->b_loff;
-					first = false;
-				}
+				prop_check(&p, b->b_file == files[f]);
+				prop_check(&p, seen == 0 || b->b_loff > prev);
+				prop_check(&p, b->b_parent == find_block_list(
+					&tree, digests[dig[b->b_loff / PROP_LEN]]));
+				prev = b->b_loff;
+				seen++;
 			}
+			prop_check(&p, seen == per_file[f]);
 		}
-		/* Every list reached, not just the first. */
-		prop_check(&p, heads >= tree.num_hashes);
 
 		free_hash_tree(&tree);
 	}

@@ -23,27 +23,20 @@
 		free_dupe_blocks_list(blocklist);
 >>>
 
-# a drained file's hash head is left behind
-# The head is freed when that file's sublist empties, which with one file in
-# the group coincides with the whole list being freed - so this leaks only when
-# several files share a digest, and only a multi-file fixture can see it.
+# a file's blocks walk out of its tree backwards
+# find_dupes steps through a file's blocks with rb_next() and needs increasing
+# offsets; the offset-keyed block_tree is the only thing that provides them,
+# since the loader hands blocks over in rowid order.
 <<<
-	head = find_file_hash_head(blocklist, file);
-	if (head && list_empty(&head->h_blocks))
-		free_one_hash_head(blocklist, head);
+		if (tmp->b_loff > block->b_loff)
+			p = &(*p)->rb_left;
+		else if (tmp->b_loff < block->b_loff)
+			p = &(*p)->rb_right;
 ===
->>>
-
-# only the first block list gets its heads sorted
-# find_dupes requires increasing offsets per file, and the blocks arrive that
-# way only because the scan happens to produce them so. Sorting one list looks
-# right in any fixture that uses a single digest.
-<<<
-	for (dups_node = rb_first(&tree->root); dups_node;
-	     dups_node = rb_next(dups_node)) {
-===
-	for (dups_node = rb_first(&tree->root); dups_node;
-	     dups_node = NULL) {
+		if (tmp->b_loff < block->b_loff)
+			p = &(*p)->rb_left;
+		else if (tmp->b_loff > block->b_loff)
+			p = &(*p)->rb_right;
 >>>
 
 # ---------------------------------------------------------------- filerecs

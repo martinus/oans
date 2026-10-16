@@ -323,16 +323,6 @@
 "order by f.id;"
 >>>
 
-# block hashes reach find_dupes in whatever order the query yielded
-# GET_DUPLICATE_BLOCKS orders by fileid, not by offset, and the hash heads are
-# appended in arrival order - so this is the only place the ordering find_dupes
-# requires is established.
-<<<
-	sort_file_hash_heads(hash_tree);
-
-===
->>>
-
 # a missing fileid is reported as an error rather than as no file
 # The dedupe phase asks about ids from rows that may have been pruned since,
 # so a missing file is ordinary. Returning an error there aborts a whole batch
