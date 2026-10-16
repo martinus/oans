@@ -30,6 +30,11 @@ class UnsupportedFsTest(DuperemoveTest):
         fstype = scratch_fstype(outside)
         if fstype in ("btrfs", "xfs"):
             self.skipTest(f"system temp dir is {fstype}, a supported fs")
+        # A container's /tmp: overlayfs passes FIDEDUPERANGE through to the
+        # filesystem below, so over btrfs it is supported and oans is right
+        # to accept it. Which one is below cannot be told from here.
+        if fstype in ("overlay", "overlayfs"):
+            self.skipTest("system temp dir is overlayfs over an unknown fs")
         return outside
 
     def test_unsupported_fs_fails_loudly(self):

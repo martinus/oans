@@ -20,11 +20,10 @@ class LeastFragmentedTargetTest(DuperemoveTest):
         content = os.urandom(8 * MiB)
         # Several fragmented copies plus one clean, contiguous copy.
         frags = [self.fragment(f"tree/frag{i}", content) for i in range(3)]
-        contig = self.write("tree/contig", content)
+        contig = self.contiguous("tree/contig", content)
         self.sync()
 
         self.assertGreater(len(fiemap_extents(frags[0])), 100, "setup: frag is fragmented")
-        self.assertLessEqual(len(fiemap_extents(contig)), 2, "setup: contig is ~one extent")
 
         self.dedupe(self.path("tree"))
         self.assertDmOk()
@@ -51,10 +50,8 @@ class LeastFragmentedTargetTest(DuperemoveTest):
         self.assertDmOk()
         self.assertShared(frags[0], frags[1], "setup: the first run deduped")
 
-        contig = self.write("tree/contig", content)
+        contig = self.contiguous("tree/contig", content)
         self.sync()
-        self.assertLessEqual(len(fiemap_extents(contig)), 2,
-                             "setup: contig is ~one extent")
         self.dedupe(self.path("tree"))
         self.assertDmOk()
         self.sync()

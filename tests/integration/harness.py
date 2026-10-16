@@ -669,6 +669,30 @@ class DuperemoveTest(unittest.TestCase):
         self._subvols.append(dst)
         return dst
 
+    def contiguous(self, relpath, content, max_extents=2):
+        """Write content as (nearly) one extent, or skip the test.
+
+        A plain write lets writeback allocate in pieces, and while other
+        writers share the filesystem (a parallel suite, a sanitizer or
+        valgrind leg) those pieces interleave with theirs: an 8 MiB file came
+        back as 6 extents and failed a setup assertion. Preallocating
+        reserves the whole range in one allocation first. If free space is
+        too fragmented to give one, that is the box, not oans: skip by name.
+        """
+        p = relpath if os.path.isabs(relpath) else self.path(relpath)
+        for _ in range(3):
+            fd = os.open(p, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+            try:
+                os.posix_fallocate(fd, 0, len(content))
+                os.pwrite(fd, content, 0)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if len(fiemap_extents(p)) <= max_extents:
+                return p
+        self.skipTest(f"free space too fragmented for a contiguous "
+                      f"{len(content)}-byte file")
+
     def fragment(self, relpath, content):
         """Write content, then rewrite alternate 4K blocks in place.
 
