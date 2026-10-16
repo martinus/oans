@@ -42,13 +42,15 @@ class CliEdgeCaseTest(DuperemoveTest):
             self.assertEqual(1, self.rc, f"{args}: {self.out}")
             self.assertIn("there is no hashfile", self.out)
 
-    def test_the_block_size_must_be_a_power_of_two(self):
+    def test_the_block_size_must_be_a_multiple_of_4k(self):
+        """5000 was accepted, and a block that straddles filesystem blocks
+        can never be deduplicated whole."""
         tree = self._tree()
-        for bs in ("5000", "96K", "1000K"):
+        for bs in ("5000", "6K", "1028K"):
             self.dm("-r", "-b", bs, tree)
             self.assertEqual(1, self.rc, f"-b {bs}: {self.out}")
-            self.assertIn("power of two", self.out)
-        for bs in ("4K", "64K", "1M"):
+            self.assertIn("multiple of 4K", self.out)
+        for bs in ("4K", "96K", "1M"):
             self.dm("-r", "-b", bs, tree)
             self.assertDmOk(f"-b {bs}")
 

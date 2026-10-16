@@ -164,8 +164,8 @@ were last deduped are skipped.
 .TP
 \f[B]\-b\f[R] \f[I]SIZE\f[R]
 Block size used when reading and hashing file data.
-Default \f[B]128K\f[R]; a power of two from \f[B]4K\f[R] to \f[B]1M\f[R]
-(suffixes \f[CR]K\f[R]/\f[CR]M\f[R] accepted).
+Default \f[B]128K\f[R]; a multiple of \f[B]4K\f[R] from \f[B]4K\f[R] to
+\f[B]1M\f[R] (suffixes \f[CR]K\f[R]/\f[CR]M\f[R] accepted).
 Smaller blocks can surface more sub\-extent matches when partial
 matching is enabled (\f[B]\-\-dedupe\-options=partial\f[R]) but cost
 more CPU and a larger hashfile; larger blocks fragment less.

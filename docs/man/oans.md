@@ -137,7 +137,7 @@ file is recorded once.
 
 **-b** *SIZE*
   ~ Block size used when reading and hashing file data. Default **128K**;
-    a power of two from **4K** to **1M** (suffixes `K`/`M` accepted). Smaller
+    a multiple of **4K** from **4K** to **1M** (suffixes `K`/`M` accepted). Smaller
     blocks can surface more sub-extent matches when partial matching is enabled
     (**\--dedupe-options=partial**) but cost more CPU and a larger hashfile;
     larger blocks fragment less. Most users never need to change this.

@@ -937,7 +937,7 @@ static void help(void)
 "                              a bare 'oans --hashfile=FILE' replays the last run\n"
 "\n"
 "Scan tuning:\n"
-"  -b SIZE                     hashing block size, a power of two from 4K\n"
+"  -b SIZE                     hashing block size, a multiple of 4K from 4K\n"
 "                              to 1M (default 128K)\n"
 "  -B, --batchsize=N           files per scan generation (default 1024)\n"
 "  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
@@ -1061,15 +1061,16 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			 * 4K (#284). */
 			if (parse_size(optarg, &bs))
 				return EINVAL;
-			/* A power of two, like every filesystem block size:
-			 * blocks are compared at matching offsets, and one
-			 * that straddles fs blocks never lines up with an
-			 * extent (5000 or 96K used to be accepted). */
+			/* A multiple of 4K, the smallest filesystem block: a
+			 * block that ends inside one can never be shared whole
+			 * (5000 used to be accepted). A power of two is not
+			 * needed; fill_buffer() keeps the block grid. */
 			if (bs < MIN_BLOCKSIZE || bs > MAX_BLOCKSIZE ||
-			    (bs & (bs - 1))) {
-				eprintf("Error: Blocksize must be a power of two "
-					"from %u to %u, %s found\n",
-					MIN_BLOCKSIZE, MAX_BLOCKSIZE, optarg);
+			    bs % MIN_BLOCKSIZE) {
+				eprintf("Error: Blocksize must be a multiple of "
+					"%uK from %uK to %uM, %s found\n",
+					MIN_BLOCKSIZE / 1024, MIN_BLOCKSIZE / 1024,
+					MAX_BLOCKSIZE / (1024 * 1024), optarg);
 				return EINVAL;
 			}
 			blocksize = (unsigned int)bs;
