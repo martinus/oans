@@ -1304,10 +1304,15 @@ v1.10.1 persisted **0** files, this persists ~975, in ~70 ms.
   - **Opens that only probe use `O_NONBLOCK`.** A FIFO named as a root made
     `storage_detect()`'s `open()` wait for a writer, and `SA_RESTART`
     restarted it after the first Ctrl-C.
-- **The dedupe phase stops admitting batches and nothing else.** No new drain
-  points: in-flight batches reap normally, `FIDEDUPERANGE` is atomic, and the
-  generation-ordered watermark already guarantees `dedupe_seq` names only
-  fully-processed generations.
+- **The dedupe phase stops admitting batches, and workers skip the groups
+  still queued.** No new drain points: a group already running finishes
+  (`FIDEDUPERANGE` is atomic), and in-flight batches reap normally. Working
+  through the two in-flight batches took minutes on a big tree, past
+  `oans@.service`'s stop timeout, so the unit was SIGKILLed and marked
+  failed. A batch with a skipped group sets `cut_short`, and from its reap on
+  **no batch moves the watermark** - a later one that finished would
+  otherwise jump `dedupe_seq` past the skipped generation. Pinned by
+  `test_signal_flush.py::…_skips_the_queued_groups`.
 - **An interrupt during the *scan* skips the dedupe phase outright**
   (`process_duplicates` returns right after the "Hashfile written" line), and
   the run does not `dbfile_maybe_vacuum()` on the way out. The batch-loop check

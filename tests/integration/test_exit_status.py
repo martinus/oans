@@ -21,7 +21,7 @@ import os
 import stat
 import unittest
 
-from harness import DuperemoveTest
+from harness import REPO_DIR, DuperemoveTest
 
 EXIT_INCOMPLETE = 2
 
@@ -181,6 +181,28 @@ class ExitStatusTest(DuperemoveTest):
         self.assertEqual(1, self.rc)
         self.assertGreater(self.hf_count("files"), 0,
                            "refusing to run must not have pruned the hashfile")
+
+
+
+class UnitExitStatusTest(unittest.TestCase):
+    """The shipped unit must read the statuses above the way they are meant.
+
+    A stop or reboot mid-run exits 128 plus the signal; without those in
+    SuccessExitStatus= systemd marked the unit failed and fired OnFailure= on
+    every `systemctl stop`. Exit 2 must stay out of it, or a lost root would
+    look healthy again.
+    """
+
+    def test_a_stop_is_success_and_a_lost_root_is_not(self):
+        unit = os.path.join(REPO_DIR, "systemd", "oans@.service")
+        codes = set()
+        with open(unit) as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key == "SuccessExitStatus":
+                    codes.update(value.split())
+        self.assertEqual({"130", "143"}, codes)
+        self.assertNotIn(str(EXIT_INCOMPLETE), codes)
 
 
 if __name__ == "__main__":

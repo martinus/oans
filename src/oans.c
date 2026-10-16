@@ -1441,11 +1441,13 @@ static int stream_duplicates(struct dbhandle *db, unsigned int first_seq,
 		struct dedupe_batch *batch;
 
 		/*
-		 * Interrupted: load no further batches. In-flight ones finish
-		 * their groups - FIDEDUPERANGE is atomic, and stopping a worker
-		 * mid-group would buy nothing - and dedupe_phase_end() reaps
-		 * them in generation order, so the durable dedupe_seq still
-		 * names only fully-processed generations.
+		 * Interrupted: load no further batches. Groups already running
+		 * finish - FIDEDUPERANGE is atomic, and stopping a worker
+		 * mid-group would buy nothing - while queued ones are skipped
+		 * and keep their batch from moving the watermark (see
+		 * dedupe_worker_body()). dedupe_phase_end() reaps in generation
+		 * order, so the durable dedupe_seq still names only
+		 * fully-processed generations.
 		 */
 		if (interrupted()) {
 			interrupt_report();

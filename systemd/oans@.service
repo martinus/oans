@@ -37,7 +37,15 @@ ExecStart=/usr/bin/oans --quiet --hashfile=/var/cache/oans/%i.hash
 #     OnFailure=status-email@%i.service
 # (Losing *every* stored root exits 1 and refuses to run, so the stat-based
 # prune can never empty the hashfile.)
-# Deduplication only ever rewrites extent sharing via the byte-verified
-# FIDEDUPERANGE ioctl, so an interrupted run is safe; allow a clean stop.
-TimeoutStopSec=30
+# A stop or a reboot mid-run sends SIGTERM: oans commits what it hashed,
+# finishes only the dedupe requests already running (FIDEDUPERANGE is atomic
+# and byte-verified), leaves the rest for the next run and exits 143 (130 for
+# SIGINT). That is a clean stop, not a failure, so it must not trip an
+# OnFailure= alert.
+SuccessExitStatus=130 143
+# Each dedupe worker finishes the group it is on, and one group can be a large
+# file the kernel has to byte-compare, so allow more than systemd's default
+# 90 s. Past this the run is killed; that is still safe, and costs at most the
+# hashing done since the last commit (every 10 s).
+TimeoutStopSec=5min
 NoNewPrivileges=true

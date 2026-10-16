@@ -127,6 +127,10 @@ the unit fails and an `OnFailure=` of your own fires:
 sudo systemctl edit oans@media.service     # add: [Unit] / OnFailure=...
 ```
 
+Stopping a run (`systemctl stop`, a reboot) is not a failure: oans keeps what
+it hashed, finishes the dedupe requests already running, leaves the rest for
+the next run and exits 143, which the unit lists in `SuccessExitStatus=`.
+
 Exit **1** means it refused to run at all — usually because *every* stored path
 is gone, which oans treats as "the drive is not mounted" rather than "delete
 every hash". Skips you configured (`--exclude`, `--min-filesize`, snapshots)

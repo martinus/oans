@@ -793,10 +793,11 @@ contributes nothing.
 \f[B]Ctrl\-C and \f[CB]systemctl stop\f[B] are handled\f[R], so they do
 not lose that batch.
 On \f[B]SIGINT\f[R] or \f[B]SIGTERM\f[R], \f[CR]oans\f[R] stops taking
-new work, lets what is in flight finish, writes a checkpoint for any
-large file it was in the middle of, commits the batch, and exits
-\f[B]130\f[R] or \f[B]143\f[R] (128 plus the signal, as a shell reports
-for any signalled program).
+new work, lets what is in flight finish (in the dedupe phase, only the
+groups already being deduplicated; queued ones are left for the next
+run), writes a checkpoint for any large file it was in the middle of,
+commits the batch, and exits \f[B]130\f[R] or \f[B]143\f[R] (128 plus
+the signal, as a shell reports for any signalled program).
 A second signal is not trapped and kills at once.
 \f[CR]SIGKILL\f[R] still discards the batch, as it must.
 An interrupted run is deliberately \f[B]not\f[R] added to

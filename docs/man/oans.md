@@ -679,7 +679,8 @@ outright before its first commit contributes nothing.
 
 **Ctrl-C and `systemctl stop` are handled**, so they do not lose that batch.
 On **SIGINT** or **SIGTERM**, `oans` stops taking new work, lets what is in
-flight finish, writes a checkpoint for any large file it was in the middle of,
+flight finish (in the dedupe phase, only the groups already being deduplicated;
+queued ones are left for the next run), writes a checkpoint for any large file it was in the middle of,
 commits the batch, and exits **130** or **143** (128 plus the signal, as a shell
 reports for any signalled program). A second signal is not trapped and kills at
 once. `SIGKILL` still discards the batch, as it must. An interrupted run is

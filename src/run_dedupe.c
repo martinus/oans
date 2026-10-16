@@ -46,6 +46,7 @@
 #include "find_dupes.h"
 #include "file_scan.h"
 #include "tsan.h"
+#include "interrupt.h"
 
 #include "run_dedupe.h"
 
@@ -97,6 +98,7 @@ struct dedupe_batch {
 	unsigned int		seq_hi;		/* generation watermark on completion */
 	_Atomic int		outstanding;	/* work items not yet finished */
 	bool			fully_pushed;	/* producer has pushed every item */
+	bool			cut_short;	/* a group was skipped on a signal */
 	struct list_head	list;		/* in-flight FIFO, generation order */
 };
 
@@ -124,6 +126,13 @@ static unsigned int	inflight_count;
  * only ever read by the assert in free_batch().
  */
 static struct dedupe_batch *open_batch;
+/*
+ * Set when a reaped batch was cut short by a signal: from then on no batch
+ * moves the watermark, not even a later one that did finish, because the
+ * watermark names a prefix of generations and this one has groups left.
+ * Producer thread only.
+ */
+static bool watermark_frozen;
 
 /*
  * Test hook (DUPEREMOVE_DEDUPE_DELAY_MS): hold each dedupe worker back so a
@@ -935,6 +944,25 @@ static void dedupe_worker_body(void *priv)
 		usleep(dedupe_delay_us);	/* test hook, see above */
 
 	/*
+	 * Interrupted (Ctrl-C, systemctl stop): leave this group for the next
+	 * run rather than work through the rest of the batch, which can hold
+	 * thousands of groups - a stop that takes minutes is killed by
+	 * systemd's TimeoutStopSec. The group stays in the results tree, which
+	 * the reap frees, and the batch is marked so its generation is not
+	 * counted as done: the watermark is what makes the next run load it.
+	 * Its work is credited so the bar does not stall below the total.
+	 */
+	if (interrupted()) {
+		pdedupe_add_work_done(w0);
+		g_mutex_lock(&producer_mutex);
+		batch->cut_short = true;
+		batch->outstanding--;
+		batch_maybe_complete_locked(batch);
+		g_mutex_unlock(&producer_mutex);
+		return;
+	}
+
+	/*
 	 * Seed the display line from the group before any work: first member
 	 * as the (provisional) target path, and the data the kernel has to
 	 * byte-verify - group length times the number of copies to dedupe -
@@ -1165,7 +1193,11 @@ static void free_batch(struct dedupe_batch *b)
 	 */
 	abort_on(open_batch != NULL);
 
-	if (batch_complete_cb)
+	/* cut_short was written under producer_mutex before the worker's
+	 * last decrement, which the reap observed under the same lock. */
+	if (b->cut_short)
+		watermark_frozen = true;
+	if (batch_complete_cb && !watermark_frozen)
 		batch_complete_cb(b->seq_hi);
 
 	free_results_tree(&b->res_files);
@@ -1245,6 +1277,7 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	total_dedupe_passes = 0;
 	single_groups_skipped = 0;
 	open_batch = NULL;
+	watermark_frozen = false;
 	inflight_count = 0;
 	INIT_LIST_HEAD(&inflight_batches);
 	if (delay)

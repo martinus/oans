@@ -20,8 +20,8 @@ import signal
 import subprocess
 import time
 
-from harness import (DUPEREMOVE, DuperemoveTest, requires_real_binary,
-                     requires_reflink)
+from harness import (DUPEREMOVE, DuperemoveTest, files_share,
+                     requires_real_binary, requires_reflink)
 
 KiB = 1 << 10
 
@@ -188,6 +188,54 @@ class SignalFlushTest(DuperemoveTest):
         self.dm("-rd", tree, quiet=False)
         self.assertDmOk("convergence run")
         self.assertReclaimedNothing("the tree is already deduped")
+
+    @requires_reflink
+    def test_an_interrupted_dedupe_phase_skips_the_queued_groups(self):
+        """A stop must not work through the batches in flight.
+
+        `systemctl stop` sends SIGTERM and kills the unit TimeoutStopSec
+        later. Workers used to dedupe every group already queued - two whole
+        batches, minutes on a big tree - so the stop timed out. Now a group
+        still queued when the signal lands is skipped, and its batch does not
+        move the watermark: the next run must still find that work.
+        """
+        pairs = 8
+        for i in range(pairs):
+            self.mkdup(f"tree/a{i}.bin", f"tree/b{i}.bin", 128 * KiB)
+        self.sync()
+        tree = self.path("tree")
+
+        # One generation, so one batch; it is sealed (and the signal raised)
+        # while the single worker is still held back on its first group.
+        env = {"DUPEREMOVE_DEDUPE_DELAY_MS": "200",
+               "DUPEREMOVE_INTERRUPT_AFTER_BATCHES": "1",
+               "DUPEREMOVE_INTERRUPT_SIGNAL": "TERM"}
+        self.dm("-rd", "--io-threads=1", tree, env=env)
+        self.assertEqual(143, self.rc, self.out)
+
+        shared = sum(self.path_shares(f"tree/a{i}.bin", f"tree/b{i}.bin")
+                     for i in range(pairs))
+        self.assertLessEqual(shared, 1,
+                             "the queued groups were deduped after the "
+                             "signal instead of being left for the next run")
+        watermark = self.hf_scalar(
+            "select keyval from config where keyname='dedupe_sequence'")
+        top = self.hf_scalar("select max(dedupe_seq) from files")
+        self.assertLess(int(watermark or 0), top,
+                        "a batch with skipped groups moved dedupe_seq")
+
+        # The skipped groups are still pending, and the run after converges.
+        self.dm("-rd", tree)
+        self.assertDmOk("run after an interrupted dedupe phase")
+        for i in range(pairs):
+            self.assertShared(self.path(f"tree/a{i}.bin"),
+                              self.path(f"tree/b{i}.bin"))
+        self.dm("-rd", tree, quiet=False)
+        self.assertDmOk("convergence run")
+        self.assertReclaimedNothing("the tree is already deduped")
+
+    def path_shares(self, a, b):
+        return files_share(self.path(a), self.path(b))
 
     # The hook-driven tests above do run under the valgrind wrapper.
     @requires_real_binary
