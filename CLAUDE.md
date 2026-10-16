@@ -1790,6 +1790,12 @@ per-pass target drift (a group spanning passes used to converge to one cluster
     the group, and an older copy in every later one. The fix first proposed,
     `order by wo.id, o.rowid`, still breaks on a resumed file (#159), which
     keeps its id and gets a later generation; `bugs/dbfile.txt` has it.
+  - **A window that holds only the target loads nothing.** Its copies are
+    in other windows, so loading it alone made a group of one, which
+    `push_results()` skipped with a line at default verbosity: 69,395 of
+    them on `manyfiles`' first scan. `tgt` now keeps such a group only if
+    another member loads with it; the per-group line is `--debug`, with one
+    `-v` count.
   - Pinned by `test_a_new_whole_file_target_takes_the_older_copies_with_it`
     and `test_every_window_takes_the_same_extent_target`, whose fixtures store
     rows in an order that makes every weaker key disagree.

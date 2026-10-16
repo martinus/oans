@@ -1560,8 +1560,12 @@ MU_TEST(test_a_new_whole_file_target_takes_the_older_copies_with_it) {
 
 		t272_put(db, f, 2);
 		mu_assert_string_eq("c,d", t272_load(db, 650, 651, 650));
-		/* d moved already; c alone is a group of one, never deduped. */
-		mu_assert_string_eq("c", t272_load(db, 651, 652, 650));
+		/*
+		 * d moved already, so c's window has nothing to move onto it
+		 * and loads nothing: it used to load c alone, a group of one
+		 * that push_results() skipped with a line on every run.
+		 */
+		mu_assert_string_eq("", t272_load(db, 651, 652, 650));
 		mu_check(t272_work(db, 650) == 1);
 		exec(db, "delete from files where filename like '/t272/%'");
 	}

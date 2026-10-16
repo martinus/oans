@@ -51,9 +51,21 @@
 
 static GMutex mutex;
 static GMutex console_mutex;
-static volatile unsigned long long total_dedupe_passes;
+/*
+ * The producer adds each batch's groups while workers print "(n/total)" under
+ * -v, so both are read across threads: atomic, relaxed - they order nothing,
+ * and a worker seeing the previous batch's total only prints a smaller one.
+ */
+static _Atomic unsigned long long total_dedupe_passes;
+/*
+ * Groups push_results() found with fewer than two members, over the phase.
+ * Producer thread only. One -v line at the end instead of one line per group:
+ * the loaders are not meant to produce them, and when GET_DUPLICATE_FILES did
+ * (a window holding only a group's target) a first scan printed thousands.
+ */
+static unsigned long long single_groups_skipped;
 static volatile unsigned long long curr_dedupe_pass;
-static unsigned int leading_spaces;
+static _Atomic unsigned int leading_spaces;
 /*
  * Whether to measure the fiemap "net change in shared extents". It feeds only
  * the machine-readable line (non-tty or -q; see dedupe_phase_end), so on an
@@ -443,8 +455,12 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 	if (verbose) {
 		g_mutex_lock(&console_mutex);
 		printf("[%p] (%0*llu/%llu) Try to dedupe extents with id ",
-		       g_thread_self(), leading_spaces, passno,
-		       total_dedupe_passes);
+		       g_thread_self(),
+		       (int)atomic_load_explicit(&leading_spaces,
+						 memory_order_relaxed),
+		       passno,
+		       atomic_load_explicit(&total_dedupe_passes,
+					    memory_order_relaxed));
 		debug_print_digest_short(stdout, dext->de_hash);
 		printf("\n");
 		g_mutex_unlock(&console_mutex);
@@ -998,9 +1014,15 @@ static void push_results(struct dedupe_batch *batch, struct results_tree *res,
 			g_ptr_array_add(batch->held, extent->e_file);
 		}
 
+		/*
+		 * Nothing to dedupe, and nothing to settle on the progress bar:
+		 * dext_work() is 0 at one member, and the upfront total counts
+		 * groups, never a window's share of one.
+		 */
 		if (dext->de_num_dupes < 2) {
-			qprintf("Skipping extent - insufficient duplicates (%u)\n",
-				   dext->de_num_dupes);
+			dprintf("Skipping extent - insufficient duplicates (%u)\n",
+				dext->de_num_dupes);
+			single_groups_skipped++;
 			continue;
 		}
 		if (nr < res->num_dupes)	/* nr > num_dupes can't happen */
@@ -1087,8 +1109,11 @@ void dedupe_push(struct dedupe_batch *b, bool whole_file)
 	if (RB_EMPTY_ROOT(&res->root))
 		return;
 
-	total_dedupe_passes += res->num_dupes;
-	leading_spaces = num_digits(total_dedupe_passes);
+	atomic_store_explicit(&leading_spaces,
+			      num_digits(atomic_fetch_add_explicit(
+				      &total_dedupe_passes, res->num_dupes,
+				      memory_order_relaxed) + res->num_dupes),
+			      memory_order_relaxed);
 
 	push_results(b, res, whole_file);
 }
@@ -1200,6 +1225,7 @@ void dedupe_phase_begin(void (*on_complete)(unsigned int seq_hi))
 	report_net_shared = !isatty(STDOUT_FILENO);
 	curr_dedupe_pass = 0;
 	total_dedupe_passes = 0;
+	single_groups_skipped = 0;
 	open_batch = NULL;
 	inflight_count = 0;
 	INIT_LIST_HEAD(&inflight_batches);
@@ -1261,6 +1287,10 @@ void dedupe_phase_end(void)
 
 	pdedupe_end();
 	pdedupe_counters(&groups, &reclaimed, &net_shared);
+
+	if (single_groups_skipped)
+		vprintf("%llu groups skipped: fewer than two members loaded\n",
+			single_groups_skipped);
 
 	/*
 	 * Name only the causes that actually occurred: three numbers where two

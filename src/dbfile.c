@@ -1206,6 +1206,17 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * or below ?3, and they move onto it. Members of earlier windows of this run
  * are not reloaded: every window of the run elected the same target, so they
  * are on it already.
+ *
+ * So a window can hold the target and no copy to move onto it: the target is
+ * this window's only member and the rest sit in later windows, or in earlier
+ * windows of this run. On a first scan that is every group whose target is
+ * alone in its generation: 69,395 of them on bench-queries.py's `manyfiles`,
+ * each printed as a skipped group. `tgt` keeps a group whose target is in the
+ * window only if another member would load with it (in the window, or at or
+ * below ?3), one index probe per such group; when the target is outside the
+ * window, grp's member in the window is not the target. A group of one can do
+ * nothing (dext_work() is 0, and COUNT_FILES_WORK never counted it), and the
+ * election still ranks every member, so no other group or row changes.
  */
 #define GET_DUPLICATE_FILES							\
 "with grp(digest, size) as ( "							\
@@ -1221,8 +1232,14 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
 "			partition by digest, size "			\
 "			order by (flags & 2) desc, nr_extents, id) rn "	\
 "		from files where not (flags & 1) "			\
-"		and (digest, size) in (select digest, size from grp)) "	\
-"	where rn = 1) "							\
+"		and (digest, size) in (select digest, size from grp)) t "	\
+"	where rn = 1 and (t.dedupe_seq <= ?1 or t.dedupe_seq > ?2 "	\
+"	or exists ( "						\
+"		select 1 from files m "					\
+"		where m.digest = t.digest and m.size = t.size "		\
+"		and m.id <> t.id and not (m.flags & 1) "		\
+"		and (m.dedupe_seq <= ?3 "				\
+"		or (m.dedupe_seq > ?1 and m.dedupe_seq <= ?2))))) "	\
 "select f.id, f.size, f.digest, f.filename, f.dedupe_seq, "		\
 "       (f.id = t.fileid) as is_target "					\
 "from files f join tgt t on t.digest = f.digest and t.size = f.size "	\
