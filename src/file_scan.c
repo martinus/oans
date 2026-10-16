@@ -2139,9 +2139,12 @@ static bool resume_scan(struct dbhandle *db, int64_t fileid, uint64_t size,
 	if (cp.size == size && cp.mtime == mtime &&
 	    cp.loff > 0 && cp.loff < size) {
 		resume->csum = running_checksum_restore(cp.file_state, cap);
-		if (cp.has_ext_state)
+		if (cp.has_ext_state) {
 			resume->ext_csum = running_checksum_restore(cp.ext_state,
 								    cap);
+			resume->ext_v1 = running_checksum_state_version(
+					cp.ext_state, cap) == 1;
+		}
 		/* Both or neither: half a checkpoint is no checkpoint. */
 		usable = resume->csum &&
 			 (!cp.has_ext_state || resume->ext_csum);
@@ -2493,6 +2496,30 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 }
 
 /*
+ * Whether a binary older than FILE_HOLE_EXTENT_CHECKED read the gap before
+ * extent i into its digest. The scan skips only whole hash blocks of hole, and
+ * only when it reaches one from a data extent or from the start of the file, so
+ * a hole after one of those that starts and ends on a block boundary is the
+ * case that was always right; any other gap before an extent may have been
+ * read. Erring wide costs one rehash.
+ */
+static bool hole_read_before(const struct fiemap *fiemap, unsigned int i)
+{
+	const struct fiemap_extent *e = &fiemap->fm_extents[i];
+	uint64_t prev_end = 0;
+	bool prev_skip = false;
+
+	if (i > 0) {
+		const struct fiemap_extent *p = &fiemap->fm_extents[i - 1];
+
+		prev_end = p->fe_logical + p->fe_length;
+		prev_skip = p->fe_flags & FIEMAP_SKIP_FLAGS;
+	}
+	return e->fe_logical > prev_end &&
+	       (prev_skip || prev_end % blocksize || e->fe_logical % blocksize);
+}
+
+/*
  * Whether an up-to-date row can stand, for a row an older binary hashed. An
  * unchanged file is never hashed again, so whatever such a binary got wrong
  * would stay for good. Three things, each only possible next to a
@@ -2503,11 +2530,7 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
  * - the extent holding EOF, running past the file size and followed by a
  *   preallocated extent, got no row (FILE_EOF_EXTENT_CHECKED);
  * - a hole the scan read rather than skipped was hashed into the next data
- *   extent's digest (FILE_HOLE_EXTENT_CHECKED). The scan skips only whole
- *   hash blocks of hole, and only when it reaches one from a data extent or
- *   from the start of the file, so a hole after one of those that starts and
- *   ends on a block boundary is the case that was always right; any other
- *   gap before a data extent is rehashed. Erring wide costs one rehash.
+ *   extent's digest (FILE_HOLE_EXTENT_CHECKED, hole_read_before()).
  *
  * One fiemap per such row, once: a file that has none gets the bits and is
  * not asked again, and one that has any is rehashed, which sets them too.
@@ -2528,22 +2551,13 @@ static bool scan_row_ok(const char *path, int64_t fileid, uint64_t size,
 	if (!fiemap)
 		return true;
 
-	uint64_t prev_end = 0;
-	bool prev_skip = false;
-
 	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
 		struct fiemap_extent *e = &fiemap->fm_extents[i];
-		bool skip = e->fe_flags & FIEMAP_SKIP_FLAGS;
-		bool gap = e->fe_logical > prev_end;
-		bool hashed_gap = gap && (prev_skip ||
-					  prev_end % blocksize ||
-					  e->fe_logical % blocksize);
 
-		if (!(flags & FILE_HOLE_EXTENT_CHECKED) && !skip &&
-		    hashed_gap && e->fe_logical < size)
+		if (!(flags & FILE_HOLE_EXTENT_CHECKED) &&
+		    !(e->fe_flags & FIEMAP_SKIP_FLAGS) &&
+		    e->fe_logical < size && hole_read_before(fiemap, i))
 			return false;
-		prev_end = e->fe_logical + e->fe_length;
-		prev_skip = skip;
 
 		if (e->fe_flags & FIEMAP_EXTENT_UNWRITTEN) {
 			if (!(flags & FILE_UNWRITTEN_CHECKED))
@@ -3070,6 +3084,18 @@ static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		if (e->fe_logical >= r->off)
 			return decline_resume(ctxt, file, tprogress, db,
 				"the checkpoint's extent state covers a hole");
+		/*
+		 * Inside the extent, the state is right unless an older binary
+		 * started it in a hole it read: that one holds the hole's
+		 * zeroes, and the row it ends in is marked as hashed by this
+		 * binary, so the digest would stay wrong for good. The state's
+		 * version says who wrote it; one this binary wrote, or adopted
+		 * and saved again after this check, is version 2.
+		 */
+		if (r->ext_v1 &&
+		    hole_read_before(ctxt->fiemap, e - ctxt->fiemap->fm_extents))
+			return decline_resume(ctxt, file, tprogress, db,
+				"the checkpoint's extent state holds a hole an older binary read");
 	} else if (!options.only_whole_files && e &&
 		   e->fe_logical < r->off &&
 		   !(e->fe_flags & FIEMAP_SKIP_FLAGS)) {

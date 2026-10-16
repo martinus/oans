@@ -149,6 +149,72 @@ MU_TEST(test_an_extent_digest_leaves_out_the_hole_before_it) {
 }
 
 /*
+ * Which gaps a binary older than FILE_HOLE_EXTENT_CHECKED read into the next
+ * extent's digest. A row is rehashed for it, and an extent state such a binary
+ * checkpointed after one is refused, so a "no" here is a digest kept for good.
+ */
+MU_TEST(test_hole_read_before) {
+	/* Set, not read: test_is_block_zeroed() leaves it at 100. */
+	const uint64_t B = DEFAULT_BLOCKSIZE, K = 1024;
+	unsigned int saved = blocksize;
+	const uint32_t L = FIEMAP_EXTENT_LAST;
+	/* Contiguous from 0, and a whole-block hole after whole-block data. */
+	const struct fm_rec clean[] = { { 0, 1 * B, B, 0 },
+					{ B, 2 * B, B, 0 },
+					{ 3 * B, 4 * B, B, L } };
+	/* A whole-block hole at the start of the file: skipped, too. */
+	const struct fm_rec lead_aligned[] = { { B, 1 * B, B, L } };
+	/* A hole at the start that ends mid-block. */
+	const struct fm_rec lead_unaligned[] = { { 64 * K, 1 * B, B, L } };
+	/* Data that ends mid-block, then a hole up to a block boundary. */
+	const struct fm_rec after_short[] = { { 0, 1 * B, 16 * K, 0 },
+					      { B, 2 * B, B, L } };
+	/* Whole-block data, then a hole that ends mid-block. */
+	const struct fm_rec into_block[] = { { 0, 1 * B, B, 0 },
+					     { 2 * B + 4 * K, 2 * B, B, L } };
+	/* A whole-block hole after a preallocated extent. */
+	const struct fm_rec after_prealloc[] = {
+		{ 0, 1 * B, B, FIEMAP_EXTENT_UNWRITTEN },
+		{ 2 * B, 2 * B, B, L } };
+	/* Data that ends mid-block, but no gap after it. */
+	const struct fm_rec no_gap[] = { { 0, 1 * B, 16 * K, 0 },
+					 { 16 * K, 2 * B, B, L } };
+	struct fiemap *fm;
+
+	blocksize = B;
+	fm = mkmap(clean, 3);
+	mu_check(!hole_read_before(fm, 0));
+	mu_check(!hole_read_before(fm, 1));
+	mu_check(!hole_read_before(fm, 2));
+	free(fm);
+
+	fm = mkmap(lead_aligned, 1);
+	mu_check(!hole_read_before(fm, 0));
+	free(fm);
+
+	fm = mkmap(lead_unaligned, 1);
+	mu_check(hole_read_before(fm, 0));
+	free(fm);
+
+	fm = mkmap(after_short, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(into_block, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(after_prealloc, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(no_gap, 2);
+	mu_check(!hole_read_before(fm, 1));
+	free(fm);
+	blocksize = saved;
+}
+
+/*
  * A file the walk queued can be something else by the time the consumer gets
  * it. That used to abort the run, losing the open write batch (#278); it is
  * skipped and counted, before anything touches the hashfile.

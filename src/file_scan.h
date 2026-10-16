@@ -162,6 +162,7 @@ struct scan_resume {
 	struct running_checksum *ext_csum;
 	uint64_t ext_loff;
 	uint64_t ext_len;
+	bool ext_v1;		/* ext_csum saved by a binary that hashed holes in */
 };
 
 /* Release checksums nothing has taken ownership of yet. */

@@ -15,18 +15,18 @@
 # legitimate within one build and meaningless across two. A distro upgrade is
 # what actually delivers this bug.
 <<<
-	if (hdr.magic != CSUM_STATE_MAGIC ||
+	if (!state_version(hdr.magic) ||
 	    hdr.xxh_version != XXH_versionNumber() ||
 	    hdr.state_size != sizeof(XXH3_state_t))
 		return NULL;
 ===
-	if (hdr.magic != CSUM_STATE_MAGIC)
+	if (!state_version(hdr.magic))
 		return NULL;
 >>>
 
 # any blob at all is accepted
 <<<
-	if (hdr.magic != CSUM_STATE_MAGIC ||
+	if (!state_version(hdr.magic) ||
 	    hdr.xxh_version != XXH_versionNumber() ||
 	    hdr.state_size != sizeof(XXH3_state_t))
 		return NULL;
@@ -77,4 +77,25 @@
 	if (len < running_checksum_state_size())
 		return -EINVAL;
 ===
+>>>
+
+# a state an older binary saved reads as one this binary saved
+# The version is how the scan tells an extent state that may hold the zeroes
+# of a hole it read from one that cannot; read as current, such a state is
+# resumed and its wrong digest kept for good.
+<<<
+	case CSUM_STATE_MAGIC_V1:
+		return 1;
+===
+	case CSUM_STATE_MAGIC_V1:
+		return 2;
+>>>
+
+# a state is saved with the older binaries' version
+# Every checkpoint this binary writes is then taken for one an older binary
+# wrote, and an interrupted extent behind a hole starts over on every run.
+<<<
+		.magic		= CSUM_STATE_MAGIC,
+===
+		.magic		= CSUM_STATE_MAGIC_V1,
 >>>

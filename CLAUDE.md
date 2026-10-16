@@ -1310,9 +1310,20 @@ databases all have that layout.
   now; file digest and block hashes are unchanged (checked byte-identical).
   Repaired per row by `FILE_HOLE_EXTENT_CHECKED` (`flags & 16`): rehashed when
   a data extent follows a gap that is unaligned to the hash block or follows a
-  preallocated extent - wider than the exact cases, on purpose. A checkpoint
-  an older binary wrote in such a hole carries extent state that started
-  before its extent (`ext_loff >= loff`), and `adopt_resume()` refuses it.
+  preallocated extent - wider than the exact cases, on purpose
+  (`hole_read_before()`, shared with the check below).
+  - **An older binary's checkpoint is refused there too, and only there.** In
+    the hole it carries extent state started before its extent (`ext_loff >=
+    loff`); *inside* the extent the state looks fine and still holds the
+    hole's zeroes, and the row the resumed run finishes gets the bit, so that
+    digest would stay for good. A row flag cannot tell who wrote a checkpoint
+    (a checkpointed row has no flags yet), so the saved checksum state does:
+    its magic is `OANSCSM2` now, `OANSCSM1` before, same layout. Restore takes
+    both; `adopt_resume()` refuses a version 1 extent state only behind a gap
+    `hole_read_before()` names, so an upgrade does not restart every
+    interrupted huge file. Older binaries refuse version 2 and rehash. Pinned
+    by the `test_an_older_binarys_extent_state_*` pair, which rewrite the magic
+    of a real checkpoint.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 

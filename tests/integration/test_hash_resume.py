@@ -280,6 +280,68 @@ class HashResumeTest(DuperemoveTest):
         self.assertEqual(expected, self.fingerprints(),
                          "the file was not re-hashed from the start")
 
+    # The checksum state's magic is "OANSCSM2" since extent digests leave the
+    # hole before their extent out; "OANSCSM1" is what older binaries wrote.
+    # Stored as a little-endian integer, so the version is the first byte.
+    def as_older_binary(self, name):
+        """Mark the checkpoint of `name` as written by an older binary."""
+        rows = self.hf_query(
+            "select c.loff, c.ext_loff, substr(c.ext_state, 1, 8) from "
+            "scan_checkpoints c join files f on f.id = c.fileid "
+            "where f.filename like ?", ("%/" + name,))
+        self.assertEqual(1, len(rows), "one checkpoint for the file")
+        loff, ext_loff, magic = rows[0]
+        self.assertIsNotNone(magic, "the checkpoint carries extent state")
+        self.assertEqual(b"2MSCSNAO", bytes(magic),
+                         "this binary writes version 2")
+        self.hf_exec(
+            "update scan_checkpoints set "
+            "state = X'314d5343534e414f' || substr(state, 9), "
+            "ext_state = X'314d5343534e414f' || substr(ext_state, 9) "
+            "where fileid = (select id from files where filename like ?)",
+            ("%/" + name,))
+        return loff, ext_loff
+
+    def test_an_older_binarys_extent_state_behind_a_hole_is_refused(self):
+        """An older binary started the extent's digest in the hole it read,
+        so its state, saved inside the extent, holds the hole's zeroes - and
+        the row this run finishes says the digest is right."""
+        tree, (loff, length) = self.build_gap_tree()
+        expected = self.scan_straight_through(tree)
+        self.drop_hashfile()
+        # The first checkpoint lands in the hole, the second in the extent.
+        self.dm("-r", tree, env=dict(CKPT, DUPEREMOVE_CHECKPOINT_STOP="2"))
+        self.assertDmOk("interrupted scan")
+        at, ext_loff = self.as_older_binary("gap")
+        self.assertEqual(loff, ext_loff)
+        self.assertGreater(at, loff, "the checkpoint is inside the extent")
+
+        self.dm("-rv", tree, quiet=False)
+        self.assertDmOk()
+        self.assertIn("holds a hole an older binary read", self.out)
+        self.assertEqual(0, self.hf_count("scan_checkpoints"))
+        self.assertEqual(expected, self.fingerprints(),
+                         "the file was not re-hashed from the start")
+
+    def test_an_older_binarys_extent_state_without_a_hole_is_adopted(self):
+        """The control: with no hole in front of the extent there was nothing
+        to get wrong, and an interrupted huge file must not start over just
+        because the binary was upgraded."""
+        self.write("tree/plain", os.urandom(6 * MiB))
+        self.sync()
+        tree = self.path("tree")
+        expected = self.scan_straight_through(tree)
+        self.drop_hashfile()
+        self.interrupt_after_one_checkpoint(tree)
+        at, _ext_loff = self.as_older_binary("plain")
+
+        self.dm("-rv", tree, quiet=False)
+        self.assertDmOk()
+        self.assertIn(f"Resuming {self.path('tree/plain')} at {at} ", self.out)
+        self.assertNotIn("hashing from the start", self.out)
+        self.assertEqual(expected, self.fingerprints(),
+                         "resuming a version 1 state changed the digests")
+
     def test_a_resumed_file_is_deduped_by_the_run_that_finishes_it(self):
         """Its row still carries the generation the interrupted run gave it,
         and the dedupe phase of any run in between moves the watermark past
