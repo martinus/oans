@@ -2299,6 +2299,47 @@ static void seed_checkpointed_files(struct dbhandle *db)
 }
 
 /*
+ * Open for reading a file the walk listed as regular. Anything may have been
+ * put at that name since the walker's statx, and opening a FIFO without
+ * O_NONBLOCK waits for a writer that never comes: on the consumer thread that
+ * stops the whole walk, on a csum worker it stops the run at its end, and
+ * SA_RESTART restarts the open after the first Ctrl-C. So the open neither
+ * blocks nor follows a symlink (#278), and what it opened must still be a
+ * regular file.
+ *
+ * Returns the descriptor, back in blocking mode, or -1 with errno set. A name
+ * that is no longer a regular file sets *not_regular instead of errno; the
+ * caller counts it as SCAN_SKIP_NOT_REGULAR, as __scan_file() does.
+ */
+static int open_listed_file(const char *path, bool *not_regular)
+{
+	int fd = longpath_open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	struct stat st;
+	int fl;
+
+	*not_regular = false;
+	if (fd == -1)
+		return -1;
+	if (fstat(fd, &st) == -1)
+		goto fail;
+	if (!S_ISREG(st.st_mode)) {
+		*not_regular = true;
+		close(fd);
+		return -1;
+	}
+	/* Means nothing on a regular file, but no read should see it. */
+	fl = fcntl(fd, F_GETFL);
+	if (fl == -1 || fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) == -1)
+		goto fail;
+	return fd;
+fail:
+	fl = errno;
+	close(fd);
+	errno = fl;
+	return -1;
+}
+
+/*
  * Settle whether the locked filesystem can be deduplicated, by asking one of
  * its files for FIDEDUPERANGE (#224). Returns false only once the answer is
  * settled as unusable -- a definite no, or enough files having declined that
@@ -2367,7 +2408,8 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
  */
 static bool unwritten_digest_ok(const char *path, int64_t fileid)
 {
-	_cleanup_(closefd) int fd = longpath_open(path, O_RDONLY);
+	bool not_regular;
+	_cleanup_(closefd) int fd = open_listed_file(path, &not_regular);
 	_cleanup_(freep) struct fiemap *fiemap = NULL;
 
 	if (fd == -1)
@@ -2419,7 +2461,13 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	if (locked_fs.is_btrfs && !subvol_cache_get(stx_to_dev(st), &dbfile.subvol)) {
 		_cleanup_(closefd) int fd;
-		fd = longpath_open(path, O_RDONLY);
+		bool not_regular;
+
+		fd = open_listed_file(path, &not_regular);
+		if (fd == -1 && not_regular) {
+			filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+			return 0;
+		}
 		if (fd == -1) {
 			declare_display_path(disp, path);
 
@@ -3694,6 +3742,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			    struct pscan_thread *tprogress)
 {
 	int ret = 0;
+	bool not_regular;
 
 	_cleanup_(free_hashes) struct hashes hashes = {0,};
 	_cleanup_(free_scan_ctxt) struct scan_ctxt ctxt = {0,};
@@ -3789,11 +3838,12 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	if (!ctxt.file_csum)
 		return;
 
-	/*
-	 * O_NOFOLLOW: every path queued here was stat'ed without following its
-	 * last component (#278), so a symlink now is one swapped in since.
-	 */
-	ctxt.fd = longpath_open(file->path, O_RDONLY | O_NOFOLLOW);
+	/* Whatever is at the name now, a FIFO above all (see the helper). */
+	ctxt.fd = open_listed_file(file->path, &not_regular);
+	if (ctxt.fd == -1 && not_regular) {
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+		return;
+	}
 	if (ctxt.fd == -1) {
 		declare_display_path(disp, file->path);
 

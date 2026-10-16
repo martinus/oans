@@ -1116,6 +1116,10 @@ walkers.**
   uses `AT_SYMLINK_NOFOLLOW`, the queue is chosen from `stx_mode`, the consumer
   skips and counts a non-regular file, and the hashing open adds `O_NOFOLLOW`
   for a swap after all that.
+  - **A listed file is opened with `open_listed_file()`**, never a bare
+    `open()`: a FIFO swapped in after the walk blocked the open forever, and
+    on the consumer that stopped the walk. It opens `O_NONBLOCK|O_NOFOLLOW`
+    and refuses anything `fstat` does not call regular.
 - Cold-walk cost is fundamental btrfs metadata I/O (`statx→btrfs_iget→btree`);
   SQLite is <2%, so parallelizing the consumer wouldn't help.
 
