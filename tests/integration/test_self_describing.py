@@ -155,6 +155,33 @@ class SelfDescribingConfigTest(DuperemoveTest):
         names = [r[0] for r in self.hf_query("select filename from files")]
         self.assertTrue(all("/skip/" not in n for n in names), names)
 
+    def test_a_replay_whose_config_cannot_be_read_refuses(self):
+        # A failed read of the stored excludes used to come back as a SQLite
+        # code that callers took for "a config was loaded": the replay then
+        # ran the stored roots with no excludes and exited 0.
+        os.makedirs(self.path("tree/keep"))
+        os.makedirs(self.path("tree/skip"))
+        self.write("tree/keep/a", b"a" * 4096)
+        self.write("tree/skip/b", b"b" * 4096)
+        self.dm("-r", "--exclude", self.path("tree/skip"), self.path("tree"))
+        self.assertDmOk()
+
+        # A view whose column does not exist fails to prepare.
+        self.hf_exec("alter table scan_excludes rename to saved_excludes")
+        self.hf_exec("create view scan_excludes as select nosuch from config")
+
+        self.write("tree/skip/c", b"c" * 4096)
+        self.dm()
+        self.assertEqual(1, self.rc, self.out)
+        self.assertIn("refusing to replay", self.out)
+        names = [r[0] for r in self.hf_query("select filename from files")]
+        self.assertTrue(all("/skip/" not in n for n in names), names)
+
+        # The reports error out too, rather than reading it as "none stored".
+        for mode in ("--stats", "--json"):
+            self.dm(mode)
+            self.assertEqual(1, self.rc, (mode, self.out))
+
 
 @requires_reflink
 class SelfDescribingReplayDedupeTest(DuperemoveTest):

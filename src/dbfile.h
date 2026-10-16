@@ -298,9 +298,12 @@ struct hash_tree;
  * Load hashes into hash_tree only if they have a duplicate in the db.
  * The extent search is later run on the resulting hash_tree.
  *
- * All three loaders process one dedupe pass: the groups with at least one
- * member whose generation is in (seq_lo, seq_hi], plus their partners from
- * any generation <= seq_hi.
+ * Both process one dedupe pass: the groups with at least one member whose
+ * generation is in (seq_lo, seq_hi]. They load those new members plus one
+ * older member per group, the anchor (from a generation <= seq_lo, the same
+ * one in every window, #265/#279), first, so it is the dedupe target; older
+ * members other than the anchor are not reloaded. The whole-file loader is
+ * dbfile_load_same_files(), below.
  */
 int dbfile_load_block_hashes(struct dbhandle *db, struct hash_tree *hash_tree,
 			     unsigned int seq_lo, unsigned int seq_hi);

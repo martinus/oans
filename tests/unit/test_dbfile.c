@@ -356,6 +356,55 @@ MU_TEST(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto) {
 }
 
 /*
+ * A load that fails answers < 0, never a SQLite code. Callers read > 0 as
+ * "a configuration was loaded", so a failed read of scan_excludes used to come
+ * back as SQLITE_ERROR (1): a replay then ran the stored roots with no
+ * excludes, scanning and deduplicating what the job was set up to skip.
+ */
+MU_TEST(test_dbfile_a_failed_scan_config_load_is_an_error_not_a_config) {
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = memdb();
+	char *roots[] = { (char *)"/data" };
+	char *excludes[] = { (char *)"*.iso" };
+	struct scan_config out = {
+		.run_dedupe = 1, .roots = roots, .nroots = 1,
+		.excludes = excludes, .nexcludes = 1,
+	};
+	struct scan_config in;
+	const char *tables[] = { "scan_excludes", "scan_roots" };
+
+	mu_check(dbfile_store_scan_config(db, &out) == 0);
+
+	for (size_t t = 0; t < ARRAY_SIZE(tables); t++) {
+		char sql[256];
+		int ret;
+
+		/* A view whose column does not exist fails to prepare. */
+		snprintf(sql, sizeof(sql), "alter table %s rename to saved_%s; "
+			 "create view %s as select nosuch from config",
+			 tables[t], tables[t], tables[t]);
+		exec(db, sql);
+		memset(&in, 0x5a, sizeof(in));
+		ret = dbfile_load_scan_config(db, &in);
+		snprintf(sql, sizeof(sql), "drop view %s; "
+			 "alter table saved_%s rename to %s",
+			 tables[t], tables[t], tables[t]);
+		exec(db, sql);
+
+		mu_check(ret < 0);
+		/* Nothing half-loaded is handed back: roots read before the
+		 * excludes failed are freed, and the struct reads as empty. */
+		mu_check(in.roots == NULL && in.nroots == 0);
+		mu_check(in.excludes == NULL && in.nexcludes == 0);
+	}
+
+	/* And the tables are back: the next load succeeds. */
+	memset(&in, 0, sizeof(in));
+	mu_check(dbfile_load_scan_config(db, &in) == 1);
+	mu_check(in.nroots == 1 && in.nexcludes == 1);
+	scan_config_free(&in);
+}
+
+/*
  * Run history, which `--history` and `--json` are read straight out of. The
  * lifetime totals accumulate across runs while the error buckets report only
  * the *last* one - a monitoring consumer alarms on the second and trends on

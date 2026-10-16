@@ -148,6 +148,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_dbfile_advancing_the_generation_keeps_hashes_and_checkpoint);
 	MU_RUN(test_dbfile_pruning_unscanned_files_spares_checkpointed_ones);
 	MU_RUN(test_dbfile_scan_config_round_trips_and_coerces_the_old_auto);
+	MU_RUN(test_dbfile_a_failed_scan_config_load_is_an_error_not_a_config);
 	MU_RUN(test_dbfile_run_history_totals_accumulate_but_skips_are_the_last_run);
 	MU_RUN(test_dbfile_layout_matches_compares_every_record);
 	MU_RUN(test_dbfile_copying_a_donor_brings_all_three);

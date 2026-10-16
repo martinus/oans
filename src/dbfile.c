@@ -1719,68 +1719,80 @@ int dbfile_load_scan_config(struct dbhandle *dbh, struct scan_config *sc)
 	sqlite3 *db = dbh->db;
 	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
 	int present = 0, ret;
+	int64_t mfs = 0;
+	const char *what;
 
 	memset(sc, 0, sizeof(*sc));
 
+	/*
+	 * Every failure answers < 0, never a SQLite code: callers read > 0 as
+	 * "a configuration was loaded", and a replay that took a failed read
+	 * of scan_excludes for a stored config with no excludes scanned and
+	 * deduped what the job was set up to skip, exiting 0.
+	 */
 #define SELECT_CONFIG "select keyval from config where keyname=?1;"
+	what = "preparing the config query";
 	ret = sqlite3_prepare_v2(db, SELECT_CONFIG, -1, &stmt, NULL);
 	if (ret)
-		return ret;
+		goto err;
 
-	ret = get_config_int(stmt, "scan_config", &present);
-	if (ret)
-		return ret;
+	/* get_config_int*() report their own errors. */
+	if (get_config_int(stmt, "scan_config", &present))
+		goto fail;
 	if (!present)
 		return 0;	/* no stored configuration */
 
-	get_config_int(stmt, "opt_run_dedupe", &sc->run_dedupe);
-	get_config_int(stmt, "opt_recurse", &sc->recurse);
-	get_config_int(stmt, "opt_skip_zeroes", &sc->skip_zeroes);
-	/*
-	 * Absent in a hashfile written before #156, and written as -1 ("auto")
-	 * by 1.7.x, which resolved it to "skip" under -d. Both mean "the user
-	 * never asked for it", so both must land on the current default rather
-	 * than on 1.7.x's; only an explicit 1 survives a replay (#182).
-	 */
-	get_config_int(stmt, "opt_skip_readonly_subvols",
-		       &sc->skip_readonly_subvols);
+	if (get_config_int(stmt, "opt_run_dedupe", &sc->run_dedupe) ||
+	    get_config_int(stmt, "opt_recurse", &sc->recurse) ||
+	    get_config_int(stmt, "opt_skip_zeroes", &sc->skip_zeroes) ||
+	    /*
+	     * Absent in a hashfile written before #156, and written as -1
+	     * ("auto") by 1.7.x, which resolved it to "skip" under -d. Both
+	     * mean "the user never asked for it", so both must land on the
+	     * current default rather than on 1.7.x's; only an explicit 1
+	     * survives a replay (#182).
+	     */
+	    get_config_int(stmt, "opt_skip_readonly_subvols",
+			   &sc->skip_readonly_subvols) ||
+	    get_config_int(stmt, "opt_only_whole_files", &sc->only_whole_files) ||
+	    get_config_int(stmt, "opt_do_block_hash", &sc->do_block_hash) ||
+	    get_config_int(stmt, "opt_dedupe_same_file", &sc->dedupe_same_file))
+		goto fail;
 	if (sc->skip_readonly_subvols < 0)
 		sc->skip_readonly_subvols = 0;
-	get_config_int(stmt, "opt_only_whole_files", &sc->only_whole_files);
-	get_config_int(stmt, "opt_do_block_hash", &sc->do_block_hash);
-	get_config_int(stmt, "opt_dedupe_same_file", &sc->dedupe_same_file);
-	{
-		int64_t mfs = 0;
 
-		ret = get_config_int64(stmt, "opt_min_filesize", &mfs);
-		if (ret)
-			return ret;
-		sc->min_filesize = (uint64_t)mfs;
+	if (get_config_int64(stmt, "opt_min_filesize", &mfs))
+		goto fail;
+	sc->min_filesize = (uint64_t)mfs;
+	/*
+	 * Additive key: a hashfile written before --max-filesize existed has
+	 * no row, and get_config_int64() then leaves the caller's value
+	 * alone - 0, "no upper bound", which is the behaviour those runs had.
+	 */
+	mfs = 0;
+	if (get_config_int64(stmt, "opt_max_filesize", &mfs))
+		goto fail;
+	sc->max_filesize = (uint64_t)mfs;
 
-		/*
-		 * Additive key: a hashfile written before --max-filesize
-		 * existed has no row, and get_config_int64() then leaves the
-		 * caller's value alone - 0, "no upper bound", which is the
-		 * behaviour those runs had.
-		 */
-		mfs = 0;
-		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
-		if (ret)
-			return ret;
-		sc->max_filesize = (uint64_t)mfs;
-	}
-
+	what = "reading the stored scan roots";
 	ret = load_string_rows(db, "select path from scan_roots order by rowid;",
 			       &sc->roots, &sc->nroots);
 	if (ret)
-		return ret;
+		goto err;
+	what = "reading the stored excludes";
 	ret = load_string_rows(db,
 			       "select pattern from scan_excludes order by rowid;",
 			       &sc->excludes, &sc->nexcludes);
 	if (ret)
-		return ret;
+		goto err;
 
 	return 1;
+
+err:
+	perror_sqlite(ret, what);
+fail:
+	scan_config_free(sc);
+	return -1;
 }
 
 void scan_config_free(struct scan_config *sc)
@@ -3087,8 +3099,9 @@ void dbfile_count_dupe_work(struct dbhandle *db, unsigned int seq_lo,
 	 * members, and a group with only new members counts all but one (see
 	 * COUNT_FILES_WORK). Summing per group does not depend on how the
 	 * generations are split into passes: across passes the first new member
-	 * becomes the older member of the later ones. One case does not match
-	 * the loader yet: a new member that wins the target election (#272).
+	 * becomes the older member of the later ones. A group whose elected
+	 * target is new this run counts its older members too, as the loader
+	 * moves them onto it (FILES_TARGET_IS_NEW, #272).
 	 */
 	dbfile_query_2u64_arg(db->db, seq_lo ?
 		COUNT_FILES_WORK_SINCE : COUNT_FILES_WORK_ALL,

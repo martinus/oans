@@ -269,8 +269,12 @@ static int print_hashfile_stats(char *filename)
 	/* --- stored scan config (self-describing hashfile), if any --- */
 	{
 		struct scan_config sc;
+		int have = dbfile_load_scan_config(db, &sc);
 
-		if (dbfile_load_scan_config(db, &sc) > 0) {
+		/* The load printed why; a report must not read it as "none". */
+		if (have < 0)
+			return -1;
+		if (have > 0) {
 			char *opts = scan_config_options_str(&sc);
 
 			/* escape-ok: the hashfile is oans's own --hashfile
@@ -358,9 +362,12 @@ static int print_hashfile_stats(char *filename)
 	 */
 	if (st.num_b_hashes) {
 		struct scan_config sc = {0};
+		int have = dbfile_load_scan_config(db, &sc);
 
-		/* >0 means a config was loaded; 0 means none is stored. */
-		if (dbfile_load_scan_config(db, &sc) > 0 && !sc.do_block_hash)
+		/* >0 means a config was loaded, 0 that none is stored. */
+		if (have < 0)
+			return -1;
+		if (have > 0 && !sc.do_block_hash)
 			printf("   %s(unused by the stored config; "
 			       "--prune-block-hashes reclaims them)%s",
 			       col_yellow, col_reset);
@@ -505,7 +512,9 @@ static int print_metrics_json(char *filename)
 	struct dbfile_config cfg;
 	struct dbfile_stats st = {0};
 	struct run_summary sum;
+	struct scan_config sc = {0};
 	uint64_t logical, hashed, groups, dupfiles, reclaimable;
+	int have_sc;
 	sqlite3 *sq;
 
 	db = dbfile_open_handle_ro(filename);
@@ -516,6 +525,10 @@ static int print_metrics_json(char *filename)
 	}
 	sq = db->db;
 	if (dbfile_get_config(sq, &cfg) || dbfile_get_run_summary(db, &sum))
+		return -1;
+	/* Before the first byte of output, so a failure leaves no half object. */
+	have_sc = dbfile_load_scan_config(db, &sc);
+	if (have_sc < 0)
 		return -1;
 	dbfile_get_stats(db, &st);
 
@@ -556,14 +569,10 @@ static int print_metrics_json(char *filename)
 	 * reports 0 reclaimed forever, which is also what a healthy job on a
 	 * clean tree reports - this is what tells them apart (#149).
 	 */
-	{
-		struct scan_config sc = {0};
-
-		if (dbfile_load_scan_config(db, &sc) > 0)
-			printf("  \"scan_configured_dedupe\": %s,\n",
-			       sc.run_dedupe ? "true" : "false");
-		scan_config_free(&sc);
-	}
+	if (have_sc > 0)
+		printf("  \"scan_configured_dedupe\": %s,\n",
+		       sc.run_dedupe ? "true" : "false");
+	scan_config_free(&sc);
 	/*
 	 * Deliberately outside the error object: a skipped snapshot is a saving,
 	 * not a fault, but it does mean the run covered less than the tree (#156).
@@ -2109,6 +2118,7 @@ int main(int argc, char **argv)
 	uint64_t files_scanned = 0;
 	uint64_t scan_skips[SCAN_SKIP__COUNT] = {0};
 	int roots_dropped = 0;	/* replayed roots that no longer exist (#146) */
+	bool incomplete = false, signalled = false;
 	struct scan_config replay = {0};
 	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
 
@@ -2158,7 +2168,8 @@ int main(int argc, char **argv)
 
 	/*
 	 * The report modes answer -1 when the hashfile cannot be opened, which a
-	 * shell sees as 255; EXIT STATUS says 1 (#275, #284).
+	 * shell sees as 255, and some pass a SQLite code through; EXIT STATUS
+	 * says 1 for every failure (#275, #284).
 	 */
 	ret = INT_MIN;
 	if (list_only_opt)
@@ -2174,7 +2185,7 @@ int main(int argc, char **argv)
 	else if (prune_blocks_opt)
 		ret = prune_block_hashes(options.hashfile);
 	if (ret != INT_MIN)
-		return ret < 0 ? 1 : ret;
+		return ret ? 1 : 0;
 	ret = 0;
 
 	/*
@@ -2217,7 +2228,9 @@ int main(int argc, char **argv)
 		int have = dbfile_load_scan_config(db, &replay);
 
 		if (have < 0) {
-			ret = have;
+			eprintf("Error: could not read the stored scan "
+				"configuration; refusing to replay it.\n");
+			ret = 1;
 			goto out;
 		}
 		if (!have) {
@@ -2331,8 +2344,10 @@ int main(int argc, char **argv)
 	 * an unmount goes on narrowing every run, exiting 0 each time. Losing
 	 * *every* root already fails hard above, before any pruning.
 	 */
-	if (!ret && (filescan_roots_unusable() || roots_dropped))
+	if (!ret && (filescan_roots_unusable() || roots_dropped)) {
 		ret = EXIT_INCOMPLETE;
+		incomplete = true;
+	}
 
 out:
 	/* Whatever block a phase did not end - a failed scan, a signal in the
@@ -2346,8 +2361,10 @@ out:
 	 * exited 2 when interrupted): a real error found on the way out is the
 	 * more useful status, and it is not the signal's doing.
 	 */
-	if (interrupted() && (!ret || ret == EXIT_INCOMPLETE))
+	if (interrupted() && (!ret || incomplete)) {
 		ret = 128 + interrupt_signo();
+		signalled = true;
+	}
 
 	scan_config_free(&replay);
 	free_all_filerecs();
@@ -2361,5 +2378,12 @@ out:
 		print_mem_stats();
 #endif
 
+	/*
+	 * Every other failure carries whatever its source returned - a SQLite
+	 * code, an errno - and SQLITE_INTERNAL is 2, which reads as
+	 * EXIT_INCOMPLETE. EXIT STATUS says 1 for all of them.
+	 */
+	if (ret && !incomplete && !signalled)
+		ret = 1;
 	return ret;
 }

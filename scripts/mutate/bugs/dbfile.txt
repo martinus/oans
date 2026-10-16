@@ -236,10 +236,10 @@
 # every file above the lower limit stops being scanned, and the run looks
 # exactly like one that had nothing to do.
 <<<
-		mfs = 0;
-		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+	mfs = 0;
+	if (get_config_int64(stmt, "opt_max_filesize", &mfs))
 ===
-		ret = get_config_int64(stmt, "opt_max_filesize", &mfs);
+	if (get_config_int64(stmt, "opt_max_filesize", &mfs))
 >>>
 
 # the last run's error buckets are read one column across
