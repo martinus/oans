@@ -23,6 +23,7 @@
 #include "csum.h"
 #include "debug.h"
 #include "fiemap.h"
+#include "test_hooks.h"
 #include "util.h"
 
 /*
@@ -139,7 +140,11 @@ static bool fiemap_map_truncated(int fd, const struct fiemap *fm,
  * `count` normally comes from a preceding fiemap_count_extents() pass. Returns
  * NULL on allocation or ioctl error, and when the file keeps gaining extents
  * between the count and the map: one retry, then a map that cannot vouch for
- * its tail is no map at all.
+ * its tail is no map at all, and errno says EAGAIN so that the scan can tell
+ * that case from an error and count the file as changed.
+ *
+ * DUPEREMOVE_FIEMAP_UNSTABLE makes every map read as one the file outran: a
+ * file that changes twice between two ioctls cannot be arranged from a test.
  */
 static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 				 unsigned int count)
@@ -169,13 +174,15 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 			return NULL;
 		}
 
-		if (!fiemap_map_truncated(fd, fiemap, count, start, length))
+		if (!fiemap_map_truncated(fd, fiemap, count, start, length) &&
+		    !test_hook_env("DUPEREMOVE_FIEMAP_UNSTABLE"))
 			return fiemap;
 
 		dprintf("fiemap: file changed between fiemap calls\n");
 		free(fiemap);
 		count = fiemap_count_extents(fd, start, length);
 	}
+	errno = EAGAIN;
 	return NULL;
 }
 

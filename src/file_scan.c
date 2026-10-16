@@ -202,6 +202,7 @@ static const struct {
 	[SCAN_SKIP_NOT_REGULAR]	  = { "not_regular",	"not a regular file",	false },
 	[SCAN_SKIP_READONLY_SUBVOL] = { "readonly_subvol",
 					"read-only subvolume",		false },
+	[SCAN_SKIP_CHANGED]	  = { "changed",	"changed while hashing", false },
 };
 
 bool scan_skip_is_error(enum scan_skip_bucket b)
@@ -3874,8 +3875,17 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 	ctxt.fiemap = do_fiemap(ctxt.fd);
-	if (!ctxt.fiemap)
+	if (!ctxt.fiemap) {
+		if (errno == EAGAIN) {
+			declare_display_path(disp, file->path);
+
+			eprintf("%s: extents changed while mapping it. "
+				"Skipped - it is probably still being written; "
+				"the next run will hash it.\n", disp);
+			filescan_count_skip(SCAN_SKIP_CHANGED);
+		}
 		return;
+	}
 
 	/* Take over the interrupted run's state, if the layout still backs it. */
 	if (file->resume &&
@@ -4073,6 +4083,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			"being written; the next run will hash it.\n",
 			disp, (uint64_t)ctxt.off,
 			(uint64_t)ctxt.filesize);
+		filescan_count_skip(SCAN_SKIP_CHANGED);
 		return;
 	}
 
