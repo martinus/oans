@@ -31,4 +31,16 @@
  */
 #define FILE_UNWRITTEN_CHECKED	0x0004
 
+/*
+ * The extents were stored by a binary that keeps the row of the extent holding
+ * EOF when a preallocated extent follows it. Older ones allowed for that
+ * extent running past the file size only when it was FIEMAP_EXTENT_LAST, so it
+ * got no row and the extent pass never deduped it. Rechecked once like
+ * FILE_UNWRITTEN_CHECKED, and set together with it.
+ */
+#define FILE_EOF_EXTENT_CHECKED	0x0008
+
+/* Every recheck bit: a row with all of them needs no fiemap. */
+#define FILE_SCAN_CHECKED	(FILE_UNWRITTEN_CHECKED | FILE_EOF_EXTENT_CHECKED)
+
 #endif

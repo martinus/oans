@@ -2395,18 +2395,24 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 }
 
 /*
- * Whether an up-to-date row's digest can stand, for a row an older binary
- * hashed (#273). Those filled a whole read buffer with zeroes whenever it
- * touched a preallocated extent, so only a file with an UNWRITTEN extent can
- * carry a wrong digest - and an unchanged file is never hashed again, so the
- * wrong one would stay for good. One fiemap per such row, once: a file with no
- * UNWRITTEN extent gets FILE_UNWRITTEN_CHECKED and is not asked again, and one
- * with it is rehashed, which sets the bit too.
+ * Whether an up-to-date row can stand, for a row an older binary hashed. An
+ * unchanged file is never hashed again, so whatever such a binary got wrong
+ * would stay for good. Two things, both only possible next to a preallocated
+ * extent:
  *
- * A file that cannot be opened or mapped keeps its digest and is asked again
+ * - #273: a whole read buffer was filled with zeroes whenever it touched an
+ *   UNWRITTEN extent, so the digest may be wrong (FILE_UNWRITTEN_CHECKED);
+ * - the extent holding EOF, running past the file size and followed by a
+ *   preallocated extent, got no row (FILE_EOF_EXTENT_CHECKED).
+ *
+ * One fiemap per such row, once: a file that has neither gets the bits and is
+ * not asked again, and one that has either is rehashed, which sets them too.
+ *
+ * A file that cannot be opened or mapped keeps its row and is asked again
  * next run: hashing would fail on it the same way.
  */
-static bool unwritten_digest_ok(const char *path, int64_t fileid)
+static bool scan_row_ok(const char *path, int64_t fileid, uint64_t size,
+			unsigned int flags)
 {
 	bool not_regular;
 	_cleanup_(closefd) int fd = open_listed_file(path, &not_regular);
@@ -2418,14 +2424,23 @@ static bool unwritten_digest_ok(const char *path, int64_t fileid)
 	if (!fiemap)
 		return true;
 
-	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++)
-		if (fiemap->fm_extents[i].fe_flags & FIEMAP_EXTENT_UNWRITTEN)
+	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
+		struct fiemap_extent *e = &fiemap->fm_extents[i];
+
+		if (e->fe_flags & FIEMAP_EXTENT_UNWRITTEN) {
+			if (!(flags & FILE_UNWRITTEN_CHECKED))
+				return false;
+		} else if (!(flags & FILE_EOF_EXTENT_CHECKED) &&
+			   !(e->fe_flags & FIEMAP_EXTENT_LAST) &&
+			   e->fe_logical < size &&
+			   e->fe_logical + e->fe_length > size) {
 			return false;
+		}
+	}
 
 	dbfile_lock();
 	if (scan_write_begin() == 0) {
-		dbfile_add_file_flags(scan_writer, fileid,
-				      FILE_UNWRITTEN_CHECKED);
+		dbfile_add_file_flags(scan_writer, fileid, FILE_SCAN_CHECKED);
 		scan_write_end();
 	}
 	dbfile_unlock();
@@ -2521,8 +2536,8 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 
 	/* Database is up-to-date, nothing more to do */
 	if (unchanged && dbfile.digest_valid && !file_renamed &&
-	    ((dbfile.flags & FILE_UNWRITTEN_CHECKED) ||
-	     unwritten_digest_ok(path, dbfile.id))) {
+	    ((dbfile.flags & FILE_SCAN_CHECKED) == FILE_SCAN_CHECKED ||
+	     scan_row_ok(path, dbfile.id, dbfile.size, dbfile.flags))) {
 		mark_file_seen(dbfile.id);	/* still on disk: prune can skip it */
 		return 0;
 	}
@@ -3229,16 +3244,17 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 		 * Unless FIEMAP_EXTENT_NOT_ALIGNED is returned,
 		 * fe_logical, fe_physical, and fe_length will be aligned
 		 * to the block size of the file system.
-		 * So, if we are processing the last extent, then
-		 * ext_end_off may be larger than the filesize. For those extents, add
-		 * the part that will never exist. Only when the extent actually
-		 * runs past EOF though - a last extent that ends before filesize
-		 * (a file with a trailing hole) must not underflow dummy, or the
-		 * store below would never fire and the extent would be lost.
+		 * So the extent holding EOF may end past the filesize. For it,
+		 * add the part that will never be read. That extent need not be
+		 * FIEMAP_EXTENT_LAST: a preallocated extent past EOF
+		 * (fallocate -n) follows it, and keying this on LAST lost the
+		 * data extent's row. Only when the extent actually runs past EOF
+		 * though - one that ends before filesize (a file with a trailing
+		 * hole) must not underflow dummy, or the store below would never
+		 * fire and the extent would be lost.
 		 */
 		size_t dummy = 0;
-		if ((extent->fe_flags & FIEMAP_EXTENT_LAST) &&
-		    ext_end_off > ctxt->filesize)
+		if (ext_end_off > ctxt->filesize)
 			dummy = ext_end_off - ctxt->filesize;
 		if (file_off + dummy == ext_end_off) {
 			ret = store_extent(ctxt, hashes, extent);
@@ -3547,7 +3563,7 @@ static bool try_layout_copy(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		return false;
 
 	/* Where the file lives is this file's business, not the donor's. */
-	flags = FILE_UNWRITTEN_CHECKED |
+	flags = FILE_SCAN_CHECKED |
 		(filescan_fd_is_readonly_subvol(ctxt->fd) ? FILE_RO_SUBVOL : 0);
 
 	tprogress->status = thread_waiting_lock;
@@ -4124,7 +4140,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	 * of needless work: https://github.com/markfasheh/duperemove/issues/316
 	 */
 	ret = dbfile_update_scanned_file(db, file->fileid, file_digest,
-			FILE_UNWRITTEN_CHECKED |
+			FILE_SCAN_CHECKED |
 			(inlined ? FILE_INLINED : 0) |
 			(rdonly_subvol ? FILE_RO_SUBVOL : 0),
 			ctxt.fiemap->fm_mapped_extents);

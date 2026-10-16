@@ -286,6 +286,15 @@ def punch_hole(fd, offset, length):
                       f"punch_hole(offset={offset}, length={length})")
 
 
+def preallocate_past_eof(fd, offset, length):
+    """Preallocate [offset, offset+length) without changing the file size,
+    as `fallocate -n` does. Raises on failure, like punch_hole()."""
+    if _libc.fallocate(fd, _FALLOC_FL_KEEP_SIZE, offset, length):
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err),
+                      f"preallocate_past_eof(offset={offset}, length={length})")
+
+
 def _settle_scratch():
     """syncfs() the scratch filesystem so FIEMAP sees real extents.
 

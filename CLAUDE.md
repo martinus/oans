@@ -1270,6 +1270,12 @@ databases all have that layout.
   trees scanned on different days. Old binaries read `flags` only as `& 1` and
   `& 2`, so the bit is safe for them; one that rewrites the row drops it, which
   costs one more fiemap.
+- **The extent holding EOF runs past the file size, and is not always LAST.**
+  `process_extents()` allowed for the overshoot only on `FIEMAP_EXTENT_LAST`,
+  so a data extent followed by a preallocated one past EOF (`fallocate -n`)
+  got no row and was never extent-deduped. Repaired the same way, per row:
+  `FILE_EOF_EXTENT_CHECKED` (`flags & 8`), checked in the same fiemap as the
+  bit above (`scan_row_ok()`); `FILE_SCAN_CHECKED` is both.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 
