@@ -1595,18 +1595,32 @@ names the two; `dedupe_probe_fd()` asks everything else.
   first sixteen files were small or 0444 was refused. A file we own is asked
   through a read-only fd, as the dedupe phase opens it (an UNKNOWN that way is
   not counted either: older kernels refuse owner dedupe). `EROFS` still counts,
-  since no file of a read-only mount gets past it. The cost: a tree where no
-  file can host it is walked whole before the refusal.
-- **Three ways to end up refusing, and they say different things.** A definite
-  no; `FS_PROBE_MAX_TRIES` files that all declined; and a walk that ended with
-  the question never asked (`filescan_fs_probe_unsettled()` — an empty tree, or
-  everything filtered by `--exclude` or size). The last one matters most: it is
-  the case where exiting 0 would look like a clean run.
+  since no file of a read-only mount gets past it.
+  - **They get a cap of their own, `FS_PROBE_MAX_UNASKED` (1024).** Each one
+    is hashed while the question is open, so uncapped, a user who may not
+    write a tree on ext4 or NFS hashed all of it before the refusal, where
+    the old budget refused after 16 files. Larger than the try budget because
+    such files say nothing: a supported filesystem is refused only if 1024 of
+    them come before any file that can host the probe.
+  - **Both probe opens go through `open_listed()`**, #310's helper with the
+    access mode as a parameter. A 0444 FIFO swapped in after the walker's
+    statx fails the `O_RDWR` open with `EACCES`, and a plain `O_RDONLY`
+    fallback then blocked the whole walk waiting for a writer. A name that is
+    no longer a regular file is neither asked nor counted; `__scan_file()`
+    skips it as before. Pinned by the unit test
+    `test_the_probe_skips_a_fifo_without_blocking`, whose `SIGALRM` without
+    `SA_RESTART` turns the hang into an `EINTR` failure.
+- **Four ways to end up refusing, and they say different things.** A definite
+  no; `FS_PROBE_MAX_TRIES` files that all declined; `FS_PROBE_MAX_UNASKED`
+  files that could not be asked; and a walk that ended with the question
+  never asked (`filescan_fs_probe_unsettled()` — an empty tree, or everything
+  filtered by `--exclude` or size). The last one matters most: it is the case
+  where exiting 0 would look like a clean run.
 - **Not routed through `seed_fs_lock_failed`.** That reports roots which could
   never be locked at all and only fires when *none* was seeded; here a root was
   seeded and the probe has already said precisely what is wrong.
 - **One place words the refusal** (`report_fs_unusable()`), because which of the
-  three cases it is decides the advice, and `file_scan` owns the state — the
+  four cases it is decides the advice, and `file_scan` owns the state — the
   same shape as `filescan_report_excludes()`. It also skips the report on an
   interrupted run, whose exit status belongs to the signal.
 - **`DUPEREMOVE_FORCE_FS_PROBE=1` drops the fast path.** Without it the accept

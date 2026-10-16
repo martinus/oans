@@ -48,6 +48,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_is_file_renamed);
 	MU_RUN(test_seen_inode);
 	MU_RUN(test_a_file_that_became_a_directory_is_skipped);
+	MU_RUN(test_the_probe_skips_a_fifo_without_blocking);
 	MU_RUN(test_get_extent);
 	MU_RUN(test_fiemap_layout_key);
 	MU_RUN(test_fiemap_maps_share);

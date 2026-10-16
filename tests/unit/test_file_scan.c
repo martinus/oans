@@ -83,6 +83,47 @@ MU_TEST(test_a_file_that_became_a_directory_is_skipped) {
 		 before[SCAN_SKIP_NOT_REGULAR] + 1);
 }
 
+static void probe_alarm(int sig) { (void)sig; }
+
+/*
+ * The FIDEDUPERANGE probe opens a file the walk listed as regular, and a FIFO
+ * may sit at that name by now. A 0444 one fails the read-write open with
+ * EACCES, and a plain read-only fallback then waits for a writer, holding up
+ * the whole walk. It must neither block nor be counted: it says nothing about
+ * the filesystem. An alarm without SA_RESTART turns a blocked open into
+ * EINTR, so a regression fails here instead of hanging the suite.
+ */
+MU_TEST(test_the_probe_skips_a_fifo_without_blocking) {
+	struct statx st = { .stx_mode = S_IFREG | 0444, .stx_size = 1 << 20,
+			    .stx_uid = geteuid() };
+	struct sigaction sa = { .sa_handler = probe_alarm }, old;
+	unsigned int tries = locked_fs.dedupe_probe_tries;
+	unsigned int unasked = locked_fs.dedupe_probe_unasked;
+	enum dedupe_support dedupe = locked_fs.dedupe;
+	char path[PATH_MAX];
+	bool settled;
+
+	if ((size_t)snprintf(path, sizeof(path), "%s/oans-probe-fifo-%d",
+			     test_scratch_dir(), (int)getpid()) >= sizeof(path))
+		abort();
+	unlink(path);
+	if (mkfifo(path, 0444))
+		abort();
+
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGALRM, &sa, &old);
+	alarm(2);
+	settled = fs_dedupe_probe_settled(path, &st);
+	alarm(0);
+	sigaction(SIGALRM, &old, NULL);
+	unlink(path);
+
+	mu_check(settled);
+	mu_check(locked_fs.dedupe_probe_tries == tries);
+	mu_check(locked_fs.dedupe_probe_unasked == unasked);
+	mu_check(locked_fs.dedupe == dedupe);
+}
+
 MU_TEST(test_is_file_renamed) {
 	char *new_path = "/tmp/somefile";
 	char *path_in_db = "/tmp/somefile";

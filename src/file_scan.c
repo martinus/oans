@@ -694,9 +694,22 @@ struct locked_fs locked_fs = {0,};
  * inconclusive result must not condemn the tree; but a filesystem that never
  * answers must not read the whole tree first either. Files that cannot host
  * the probe at all -- too small, not writable -- are not asked and do not
- * count (fs_dedupe_probe_settled).
+ * count toward it, but toward FS_PROBE_MAX_UNASKED (fs_dedupe_probe_settled).
  */
 #define FS_PROBE_MAX_TRIES	16
+
+/*
+ * How many files that cannot host the probe the walk may hand over before
+ * oans gives up without having asked. Each of them is hashed while the
+ * question is open, so without a cap a user scanning a tree they may not
+ * write, on a filesystem without the ioctl, hashed all of it before the
+ * refusal. Larger than FS_PROBE_MAX_TRIES because these files say nothing
+ * about the filesystem: a supported one is refused only if this many files,
+ * before any that can host the probe, are under two blocks or not writable.
+ * A directory of small files is common; a thousand of them ahead of every
+ * larger file the walk reaches is not.
+ */
+#define FS_PROBE_MAX_UNASKED	1024
 
 /*
  * Test hook (DUPEREMOVE_FORCE_FS_PROBE): drop the allowlist fast path so the
@@ -1517,17 +1530,23 @@ bool filescan_seed_failed(void)
 
 /*
  * The one place that says this filesystem cannot be deduplicated (#224). Which
- * of the three cases it is decides the advice, so they are worded here together
+ * of the cases it is decides the advice, so they are worded here together
  * rather than assembled by whoever noticed: a definite no; files asked that
  * could not answer (the shape a stacking filesystem produces, and the one a
- * user is least likely to guess); and a walk that ended without the question
- * ever being put.
+ * user is least likely to guess); FS_PROBE_MAX_UNASKED files that could not be
+ * asked; and a walk that ended without the question ever being put.
  */
 static void report_fs_unusable(void)
 {
 	if (locked_fs.dedupe == DEDUPE_SUPPORT_NO)
 		eprintf("Error: this filesystem does not support "
 			"FIDEDUPERANGE.\n");
+	else if (locked_fs.dedupe_probe_unasked >= FS_PROBE_MAX_UNASKED)
+		eprintf("Error: could not determine whether this filesystem "
+			"supports FIDEDUPERANGE - gave up after %u file(s) that "
+			"were too small (under two blocks) or not writable, "
+			"before any file could answer.\n",
+			locked_fs.dedupe_probe_unasked);
 	else if (locked_fs.dedupe_probe_tries)
 		eprintf("Error: could not determine whether this filesystem "
 			"supports FIDEDUPERANGE - %u file(s) were asked and "
@@ -1543,6 +1562,10 @@ static void report_fs_unusable(void)
 		eprintf("Error: no file was available to test whether this "
 			"filesystem supports FIDEDUPERANGE.\n");
 
+	if (locked_fs.dedupe != DEDUPE_SUPPORT_NO &&
+	    locked_fs.dedupe_probe_unasked)
+		eprintf("A file can be asked, and deduplicated, only if the user "
+			"running oans may write to it or owns it.\n");
 	eprintf("oans needs FIDEDUPERANGE to deduplicate; it is known to work "
 		"on btrfs and XFS.\n");
 }
@@ -2305,19 +2328,6 @@ static void seed_checkpointed_files(struct dbhandle *db)
 	free(paths);
 }
 
-/* A file that cannot host the probe: the walk offers the next one. */
-static bool fs_probe_not_asked(const char *path, const char *why)
-{
-	locked_fs.dedupe_probe_unasked++;
-	if (verbose) {
-		declare_display_path(disp, path);
-
-		vprintf("Not asking %s about FIDEDUPERANGE support: %s\n",
-			disp, why);
-	}
-	return true;
-}
-
 /*
  * Open for reading a file the walk listed as regular. Anything may have been
  * put at that name since the walker's statx, and opening a FIFO without
@@ -2330,10 +2340,12 @@ static bool fs_probe_not_asked(const char *path, const char *why)
  * Returns the descriptor, back in blocking mode, or -1 with errno set. A name
  * that is no longer a regular file sets *not_regular instead of errno; the
  * caller counts it as SCAN_SKIP_NOT_REGULAR, as __scan_file() does.
+ *
+ * open_listed() takes the access mode, for the probe, which asks for O_RDWR.
  */
-static int open_listed_file(const char *path, bool *not_regular)
+static int open_listed(const char *path, int mode, bool *not_regular)
 {
-	int fd = longpath_open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	int fd = longpath_open(path, mode | O_NOFOLLOW | O_NONBLOCK);
 	struct stat st;
 	int fl;
 
@@ -2357,6 +2369,46 @@ fail:
 	close(fd);
 	errno = fl;
 	return -1;
+}
+
+static int open_listed_file(const char *path, bool *not_regular)
+{
+	return open_listed(path, O_RDONLY, not_regular);
+}
+
+/*
+ * The locked filesystem is settled as unusable: say so, and stop the walk.
+ * Returns false, which fs_dedupe_probe_settled() hands back.
+ */
+static bool fs_probe_refuse(void)
+{
+	report_fs_unusable();
+	filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
+	/*
+	 * The walkers have to stop too. Without this they readdir/statx the
+	 * whole tree after the error is already on screen - minutes of pure
+	 * metadata I/O on a big one, which reads as a hang - because the
+	 * consumer's error stops the hashing, not the walk that feeds it.
+	 */
+	atomic_store_explicit(&walk_abort, true, memory_order_relaxed);
+	return false;
+}
+
+/*
+ * A file that cannot host the probe: the walk offers the next one, until
+ * FS_PROBE_MAX_UNASKED of them have gone by with the question still open.
+ */
+static bool fs_probe_not_asked(const char *path, const char *why)
+{
+	if (verbose) {
+		declare_display_path(disp, path);
+
+		vprintf("Not asking %s about FIDEDUPERANGE support: %s\n",
+			disp, why);
+	}
+	if (++locked_fs.dedupe_probe_unasked < FS_PROBE_MAX_UNASKED)
+		return true;
+	return fs_probe_refuse();
 }
 
 /*
@@ -2385,15 +2437,25 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 	 * would otherwise be refused on a filesystem that supports the ioctl.
 	 * Only a read-only mount, which no file of it can get past, still
 	 * counts.
+	 *
+	 * Both opens go through open_listed(): the name may be a FIFO by now,
+	 * and a read-only open of one waits for a writer, holding up the walk.
 	 */
-	bool owned_fallback = false;
-	_cleanup_(closefd) int fd = longpath_open(path, O_RDWR);
+	bool owned_fallback = false, not_regular;
+	_cleanup_(closefd) int fd = open_listed(path, O_RDWR, &not_regular);
 	enum dedupe_support support;
 
-	if (fd == -1 && errno != EROFS && st->stx_uid == geteuid()) {
-		fd = longpath_open(path, O_RDONLY);
+	if (fd == -1 && !not_regular && errno != EROFS &&
+	    st->stx_uid == geteuid()) {
+		fd = open_listed(path, O_RDONLY, &not_regular);
 		owned_fallback = true;
 	}
+	/*
+	 * No longer a regular file: __scan_file() skips and counts it, and it
+	 * says nothing about the filesystem.
+	 */
+	if (fd == -1 && not_regular)
+		return true;
 	if (fd == -1 && errno != EROFS)
 		return fs_probe_not_asked(path, "it cannot be opened for it");
 	if (fd != -1 && !dedupe_probe_len(fd, st->stx_size))
@@ -2427,16 +2489,7 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 		break;
 	}
 
-	report_fs_unusable();
-	filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
-	/*
-	 * The walkers have to stop too. Without this they readdir/statx the
-	 * whole tree after the error is already on screen - minutes of pure
-	 * metadata I/O on a big one, which reads as a hang - because the
-	 * consumer's error stops the hashing, not the walk that feeds it.
-	 */
-	atomic_store_explicit(&walk_abort, true, memory_order_relaxed);
-	return false;
+	return fs_probe_refuse();
 }
 
 /*

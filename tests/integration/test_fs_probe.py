@@ -126,3 +126,21 @@ class FsProbeBudgetTest(DuperemoveTest):
         self.run_forced()
         self.assertNotEqual(0, self.rc, self.out)
         self.assertIn(f"{self.COUNT} file(s) were too small", self.out)
+
+    def test_files_that_cannot_host_it_are_capped(self):
+        """Each file not asked is hashed while the question is open, so they
+        get a cap of their own, FS_PROBE_MAX_UNASKED (1024): without it a
+        user who may not write a tree on a filesystem without the ioctl hashed
+        the whole tree before the refusal. Past the cap the run gives up,
+        even with a file below that could have answered."""
+        cap = 1024
+        for i in range(cap + 10):
+            self.mkrand(f"tree/f{i:04}", 100)
+        self.mkrand("tree/z/big.bin", 1 * MiB)
+        self.run_forced()
+        self.assertNotEqual(0, self.rc, self.out)
+        self.assertIn(f"gave up after {cap} file(s) that were too small",
+                      self.out)
+        self.assertIn("owns it", self.out)
+        self.assertNotIn(self.path("tree/z/big.bin"), self.scanned_files(),
+                         "the walk went on past the refusal")
