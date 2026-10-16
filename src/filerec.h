@@ -67,6 +67,7 @@ struct filerec *filerec_find(int64_t fileid);
  */
 void filerec_get(struct filerec *file);
 void filerec_put(struct filerec *file);
+void filerec_free_unreferenced(void);
 
 int filerec_open(struct filerec *file, bool quiet);
 void filerec_close(struct filerec *file);

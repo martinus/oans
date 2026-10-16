@@ -392,6 +392,7 @@ static void find_dupes_thread(void *item, void *priv [[maybe_unused]])
 int find_additional_dedupe(struct results_tree *dupe_extents)
 {
 	int ret = 0;
+	unsigned long long searched = 0;
 	struct filerec *file;
 
 	qprintf("Using %u threads to search within extents for "
@@ -409,6 +410,18 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 			psearch_update_processed_count(1);
 			continue;
 		}
+
+		/*
+		 * No duplicate block in this window, so search_extent() can
+		 * find nothing - but only after a get_nondupe_extents query.
+		 * Whole-file and extent group members of this window are on
+		 * the list too, and most of them have no block here.
+		 */
+		if (RB_EMPTY_ROOT(&file->block_tree)) {
+			psearch_update_processed_count(1);
+			continue;
+		}
+		searched++;
 
 		struct cmp_ctxt *ctxt = malloc(sizeof(*ctxt));
 
@@ -441,6 +454,9 @@ int find_additional_dedupe(struct results_tree *dupe_extents)
 	threads_pool_wait_idle(&search_pool);
 
 	psearch_join();
+
+	dprintf("find_additional_dedupe: searched %llu of %llu filerecs\n",
+		searched, num_filerecs);
 
 	return ret;
 }

@@ -1388,8 +1388,9 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 
 		/*
 		 * The previous window's batches were already reaped before this
-		 * one was begun (see stream_duplicates), so the global filerec
-		 * list holds only this window's files.
+		 * one was begun (see stream_duplicates), and the filerecs no
+		 * batch held were freed at the end of the previous load (below),
+		 * so the global filerec list holds only this window's files.
 		 */
 		init_hash_tree(&dups_tree);
 		pdedupe_set_activity("loading duplicate blocks");
@@ -1406,6 +1407,16 @@ static void stream_load_batch(struct dbhandle *pdb, bool inmem,
 		free_hash_tree(&dups_tree);
 	}
 	dedupe_push(batch, false);
+
+	/*
+	 * A file with a duplicate block that the search matched to nothing is
+	 * in no group, so no batch holds it. Left on the global list, every
+	 * later window's search would walk it again, and the list would grow
+	 * for the whole run. Every filerec this batch references holds its ref
+	 * now that it is pushed.
+	 */
+	if (options.do_block_hash)
+		filerec_free_unreferenced();
 }
 
 /*

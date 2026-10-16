@@ -1880,6 +1880,12 @@ extent passes. Lives in `run_dedupe.c` (`dedupe_phase_begin/end`,
     still in flight while the next one loads; on a test-sized tree the window
     never opens without it (`test_partial_cross_window.py`). Sibling of
     `DUPEREMOVE_SEARCH_DELAY_MS` below.
+  - **The drain frees only what a batch holds.** The block-hash loader makes
+    a filerec for every file with a duplicate block, and one the search
+    matches to nothing is in no group, so no batch refs it. Those stayed on
+    the list all run and every later window searched them again.
+    `filerec_free_unreferenced()` drops them after the batch's push
+    (`test_partial_stale_filerecs.py`).
 - **The search must outlive nothing.** `find_additional_dedupe()` waits for
   every worker it pushed (its own counter/cond in `find_dupes.c`) before
   returning, because the caller reaps batches — freeing filerecs — right after.

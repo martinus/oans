@@ -125,8 +125,23 @@
 # deliberately not listed: the file then goes to the pool, whose worker counts
 # it instead, and nothing downstream can tell the two apart.
 <<<
+		if (file->size == 0) {
 			psearch_update_processed_count(1);
 			continue;
 ===
+		if (file->size == 0) {
+			continue;
+>>>
+
+# a file with no duplicate block is skipped without being counted
+# The same contract for the second skip: a filerec the search passes over
+# because nothing in its block_tree can match still counts as processed, or
+# the search progress never reaches its total.
+<<<
+		if (RB_EMPTY_ROOT(&file->block_tree)) {
+			psearch_update_processed_count(1);
+			continue;
+===
+		if (RB_EMPTY_ROOT(&file->block_tree)) {
 			continue;
 >>>

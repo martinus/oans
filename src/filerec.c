@@ -233,6 +233,26 @@ void filerec_put(struct filerec *file)
 		filerec_free(file);
 }
 
+/*
+ * Free every filerec no batch holds. The block-hash loader creates one for each
+ * file with a duplicate block, and a file the search then matched to nothing is
+ * in no group, so no batch ever takes a ref on it: it would stay on the global
+ * list for the rest of the run, and every later search would walk it again.
+ * Producer thread only, and only once every filerec a batch's trees reference
+ * holds that batch's ref - after its push - and the hash tree is freed.
+ */
+void filerec_free_unreferenced(void)
+{
+	struct filerec *file, *tmp;
+
+	list_for_each_entry_safe(file, tmp, &filerec_head, rec_list) {
+		if (file->refs)
+			continue;
+		abort_on(!RB_EMPTY_ROOT(&file->block_tree));
+		filerec_free(file);
+	}
+}
+
 void free_all_filerecs(void)
 {
 	struct filerec *file, *tmp;

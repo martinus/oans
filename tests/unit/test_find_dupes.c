@@ -526,6 +526,24 @@ MU_TEST(test_the_extent_search_driven_by_its_pool) {
 		  "an empty file was not counted as processed exactly once");
 
 	/*
+	 * A file with bytes but no duplicate block in this window - a whole-file
+	 * or extent group member, say - is skipped the same way (it would cost a
+	 * get_nondupe_extents query to find nothing), and must be counted the
+	 * same way, or the search bar never reaches its total.
+	 */
+	search_reset(&s, db);
+	search_file(&s, db, "/tree/e", 5, 45, blocks, ARRAY_SIZE(blocks));
+	search_file(&s, db, "/tree/f", 6, 46, blocks, ARRAY_SIZE(blocks));
+	if (!filerec_new("/tree/noblocks", 98, FD_BLOCK))
+		abort();
+
+	mu_check(find_additional_dedupe(&s.fd.res) == 0);
+	mu_assert(s.fd.res.num_dupes == 1, "a blockless file disturbed the search");
+	mu_check(extents_search_idle());
+	mu_assert(search_processed == 3,
+		  "a file with no duplicate block was not counted as processed");
+
+	/*
 	 * Two halves of one file are not matched against each other unless
 	 * asked for. oans will deduplicate a file against itself on request and
 	 * must not by default - the win is usually nil and the surprise is not.
