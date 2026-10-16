@@ -833,6 +833,8 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 	struct extent *extent;
 	struct pscan_thread *slot = gp->slot;
 	struct dbhandle *db = dbfile_get_handle();
+	bool *rescanned = NULL;
+	unsigned int i = 0;
 
 	ret = dedupe_extent_list(dext, gp, whole_file_dedup, res, fiemap_bytes,
 				 freed_bytes, passno);
@@ -841,6 +843,23 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 			return 0;
 		/* dedupe_extent_list already printed to stderr for us */
 		return ret;
+	}
+
+	/*
+	 * Rescan the members' physical offsets before taking the lock. Each one
+	 * is an open + FIEMAP + close, about half of what the commit below used
+	 * to hold dbfile_lock() for, and every other worker's commit (and, with
+	 * an in-memory hashfile, the producer's loads) waits on that lock.
+	 */
+	if (!whole_file_dedup) {
+		unsigned int n = 0;
+
+		list_for_each_entry(extent, &dext->de_extents, e_list)
+			n++;
+		rescanned = g_new(bool, n);
+		n = 0;
+		list_for_each_entry(extent, &dext->de_extents, e_list)
+			rescanned[n++] = fiemap_scan_extent(extent) == 0;
 	}
 
 	slot->status = thread_waiting_lock;
@@ -863,15 +882,14 @@ static int extent_dedupe_worker(struct dupe_extents *dext,
 			 * the new extents mapping as well as their new hashes
 			 */
 			dbfile_remove_extent_hashes(db, extent->e_file->fileid);
-		} else {
-			/* Rescan physical offset and update the hashfile accordingly */
-			ret = fiemap_scan_extent(extent);
-			if (!ret)
-				dbfile_update_extent_poff(db, extent->e_file->fileid, extent->e_loff, extent->e_poff);
+		} else if (rescanned[i++]) {
+			/* Store the physical offset rescanned above */
+			dbfile_update_extent_poff(db, extent->e_file->fileid, extent->e_loff, extent->e_poff);
 		}
 	}
 	dbfile_commit_trans(db->db);
 	dbfile_unlock();
+	g_free(rescanned);
 
 	if (!list_empty(&dext->de_extents)) {
 		g_mutex_lock(&mutex);
