@@ -213,5 +213,9 @@ class UnflushedTest(DuperemoveTest):
         self.write("tree/c", a)
         self.dm("-r", self.path("tree"), settle=False)
         self.assertDmOk()
-        self.assertEqual(self.digest("c"), self.digest("a"),
+        a_digest, c_digest = self.digest("a"), self.digest("c")
+        # Two missing rows would compare equal too.
+        self.assertIsNotNone(a_digest, "a was hashed")
+        self.assertIsNotNone(c_digest, "c was hashed")
+        self.assertEqual(c_digest, a_digest,
                          "the digest describes the bytes, not zeroes")
