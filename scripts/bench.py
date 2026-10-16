@@ -260,10 +260,13 @@ def ensure_tree(name: str, prof: Profile, workdir: Path, seed: int = 1) -> Path:
         cf = root / f".chunk_{ci:02d}"
         cf.write_text("".join(f"{b}\t{p}\n" for b, p in chunk))
         procs.append(subprocess.Popen([sys.executable, str(GEN_PY), str(cf)]))
-    for pr in procs:
-        pr.wait()
+    failed = [pr.args for pr in procs if pr.wait() != 0]
     for cf in root.glob(".chunk_*"):
         cf.unlink()
+    # A generator that died leaves short or missing files, and the manifest
+    # below would then mark that tree as built, for every later run.
+    if failed:
+        sys.exit(f"tree generation failed: {failed}")
 
     # Duplicate copies. --reflink=never is essential: on btrfs cp reflinks by
     # default, leaving oans nothing to reclaim.
@@ -414,7 +417,10 @@ def run_profile(name: str, prof: Profile, cells: list[Cell], args) -> None:
           f"rounds={args.rounds}", file=sys.stderr)
 
     if not cold:  # prime cache once so the first warm run isn't a cold outlier
-        subprocess.run(["bash", "-c", f"find {tree!s} -type f -exec cat {{}} + >/dev/null"])
+        # No shell: the tree path is the user's --workdir, and may hold
+        # spaces or anything else.
+        subprocess.run(["find", str(tree), "-type", "f", "-exec", "cat", "{}", "+"],
+                       stdout=subprocess.DEVNULL, check=True)
 
     order = list(range(len(cells)))
     for r in range(1, args.rounds + 1):

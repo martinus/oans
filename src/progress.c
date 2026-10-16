@@ -1187,12 +1187,17 @@ static struct pscan_thread *pscan_register_thread(pid_t tid,
 						  enum pscan_thread_status status)
 {
 	struct pscan_thread *tprogress = calloc(1, sizeof(struct pscan_thread));
+	struct pscan_thread **threads;
+
+	abort_on(!tprogress);
 	tprogress->tid = tid;
 	tprogress->status = status;
 
 	g_mutex_lock(&pscan.mutex);
-	pscan.threads = realloc(pscan.threads, (pscan.thread_count + 1) *
-						sizeof(struct pscan_thread *));
+	threads = realloc(pscan.threads, (pscan.thread_count + 1) *
+					 sizeof(struct pscan_thread *));
+	abort_on(!threads);
+	pscan.threads = threads;
 	pscan.threads[pscan.thread_count] = tprogress;
 	pscan.thread_count++;
 	g_mutex_unlock(&pscan.mutex);

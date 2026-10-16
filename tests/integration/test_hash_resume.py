@@ -303,5 +303,9 @@ class HashResumeTest(DuperemoveTest):
         process - so an in-memory run must not pay for checkpoints, and must
         not trip over the machinery either."""
         tree = self.build_tree()
-        self.dm("-r", tree, hashfile=False, env=STOP)
+        # -v, because what says a checkpoint was written is the STOP hook's
+        # message: exit 0 alone holds whether or not any were.
+        self.dm("-rv", tree, hashfile=False, env=STOP, quiet=False)
         self.assertDmOk()
+        self.assertNotIn("DUPEREMOVE_CHECKPOINT_STOP", self.out)
+        self.assertNotIn("could not checkpoint", self.out)

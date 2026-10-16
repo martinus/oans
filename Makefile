@@ -33,8 +33,11 @@ WARN_EXTRA += $(if $(call cc-option,-Wgnu-variable-sized-type-not-at-end),\
 	-Wno-gnu-variable-sized-type-not-at-end)
 
 # make WERROR=1 to make any warning fatal. CI builds this way so a warning can
-# never land silently; locally `scripts/verify.sh` greps the build log instead.
-ifdef WERROR
+# never land silently, and so does `scripts/verify.sh`. Only an affirmative
+# value turns it on: `ifdef` was true for WERROR=0 as well. `override` is
+# load-bearing in the release block below (see the comment there), and
+# scripts/lint-build-flags.py checks both halves of this.
+ifneq ($(filter 1 yes true,$(WERROR)),)
 	override CFLAGS += -Werror
 endif
 
@@ -342,7 +345,7 @@ pandoc:
 	@echo "Fetched $$(.pandoc/pandoc --version | head -1) -> .pandoc/pandoc"
 
 DIST         = oans-$(VERSION)
-DIST_TARBALL = $(VERSION).tar.gz
+DIST_TARBALL = $(DIST).tar.gz
 DIST_SOURCES = $(CFILES) $(sort $(wildcard src/*.h)) LICENSE Makefile \
 	README.md docs/man/oans.md docs/nas-quickstart.md $(MANPAGE) $(COMPLETION) \
 	systemd/oans@.service systemd/oans@.timer systemd/README.md
@@ -357,4 +360,4 @@ tarball: clean $(DIST_SOURCES)
 	rm -fr "$$tmp"
 
 clean:
-	rm -f $(OBJECTS) $(DEPENDS) $(TEST_OBJECTS) $(TEST_DEPENDS) oans test test.d $(DIST_TARBALL) .version-stamp *~
+	rm -f $(OBJECTS) $(DEPENDS) $(TEST_OBJECTS) $(TEST_DEPENDS) oans test test.d $(DIST_TARBALL) .version-stamp .test-hooks-stamp *~

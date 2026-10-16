@@ -327,23 +327,41 @@ static int abort_query_cb(void *unused [[maybe_unused]])
  * callers treat as a skip rather than as a failure. */
 struct fm_file {
 	int fd;
-	char path[128];
+	char path[PATH_MAX];
 	uint64_t size;
 };
+
+/*
+ * Where a test puts a real file: the integration suite's scratch, so both
+ * suites run on the same filesystem - DUPEREMOVE_TEST_DIR, else .itest-scratch
+ * in the repo (`./test` runs from there). Not /tmp: it is tmpfs on most
+ * distributions, which has no FIEMAP, so every test that needs one skipped
+ * and the suite still went green.
+ */
+[[maybe_unused]] static const char *test_scratch_dir(void)
+{
+	const char *dir = getenv("DUPEREMOVE_TEST_DIR");
+
+	if (dir && *dir)
+		return dir;
+	if (mkdir(".itest-scratch", 0777) < 0 && errno != EEXIST)
+		abort();
+	return ".itest-scratch";
+}
 
 [[maybe_unused]] static struct fm_file fm_open(const char *name, unsigned int chunks, bool sparse)
 {
 	struct fm_file f = { .fd = -1 };
 	_cleanup_(freep) char *buf = malloc(FM_CHUNK);
-	const char *dir = getenv("DUPEREMOVE_TEST_DIR");
 	struct fiemap probe = { .fm_length = ~0ULL };
 	int fd;
 
 	if (!buf)
 		abort();
 	memset(buf, 0xa5, FM_CHUNK);
-	snprintf(f.path, sizeof(f.path), "%s/oans-fiemap-XXXXXX",
-		 dir && *dir ? dir : "/tmp");
+	if ((size_t)snprintf(f.path, sizeof(f.path), "%s/oans-fiemap-XXXXXX",
+			     test_scratch_dir()) >= sizeof(f.path))
+		abort();
 	fd = mkstemp(f.path);
 	if (fd < 0)
 		abort();

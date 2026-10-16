@@ -231,8 +231,13 @@ def verify_sharing(bins: list[tuple[str, str]], *, tree: Path, source: Path,
         restore(source, tree, copies)
         for suf in ("", "-wal", "-shm"):
             Path(str(hf) + suf).unlink(missing_ok=True)
-        subprocess.run([binary, "-dr", f"--hashfile={hf}", str(tree)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A run that died shares nothing, and two of them share equally:
+        # without this, both binaries crashing read as IDENTICAL.
+        r = subprocess.run([binary, "-dr", f"--hashfile={hf}", str(tree)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            sys.exit(f"--verify: {label} ({binary}) exited {r.returncode}:\n"
+                     f"{r.stderr.decode(errors='replace')[-2000:]}")
         subprocess.run(["sync"])
         # --raw for exact bytes: Total, Exclusive, Set-shared.
         total, excl, sh = (int(x) for x in subprocess.check_output(

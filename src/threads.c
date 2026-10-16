@@ -143,13 +143,16 @@ void threads_pool_wait_idle(struct threads_pool *pool)
 
 void register_cleanup(struct threads_pool *pool, void *function, void *ptr)
 {
-	struct threads_cleanup_item *item;
+	struct threads_cleanup_item *item, **items;
 	item = calloc(1, sizeof(struct threads_cleanup_item));
+	abort_on(!item);
 	item->ptr = ptr;
 	item->function = function;
 
 	g_mutex_lock(&pool->mutex);
-	pool->items = realloc(pool->items, (pool->item_count + 1) * sizeof(struct threads_cleanup_item*));
+	items = realloc(pool->items, (pool->item_count + 1) * sizeof(struct threads_cleanup_item*));
+	abort_on(!items);
+	pool->items = items;
 	pool->items[pool->item_count] = item;
 	pool->item_count += 1;
 	g_mutex_unlock(&pool->mutex);

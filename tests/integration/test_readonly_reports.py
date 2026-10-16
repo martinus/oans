@@ -124,12 +124,48 @@ class ReadonlyReportsTest(DuperemoveTest):
             proc = subprocess.Popen(
                 [DUPEREMOVE, "--stats", "--hashfile", self.hf],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            time.sleep(1)
+            # Release only once oans is waiting on the lock. A fixed sleep
+            # let a slow start (valgrind, a loaded runner) reach the file
+            # after the rollback, and the test then passed without any lock
+            # having been met.
+            blocked = self._wait_until_blocked_on(self.hf, proc)
             con.execute("rollback")
         finally:
             con.close()
         out, _ = proc.communicate(timeout=60)
+        self.assertTrue(blocked, "oans never waited on the lock:\n" + out)
         self.assertEqual(0, proc.returncode, out)
+
+    @staticmethod
+    def _wait_until_blocked_on(path, proc, limit=20.0):
+        """True once a process holding `path` open sleeps in a retry - which
+        is SQLite's busy handler, the lock having been met. Any process: under
+        the valgrind wrapper oans is a child of `proc`, not `proc` itself.
+        Bounded well inside oans's 30 s busy timeout."""
+        def holds(pid):
+            try:
+                return any(os.readlink(f"/proc/{pid}/fd/{fd}") == path
+                           for fd in os.listdir(f"/proc/{pid}/fd"))
+            except OSError:
+                return False
+
+        def sleeping(pid):
+            try:
+                for tid in os.listdir(f"/proc/{pid}/task"):
+                    with open(f"/proc/{pid}/task/{tid}/wchan") as f:
+                        if "nanosleep" in f.read():
+                            return True
+            except OSError:
+                pass
+            return False
+
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline and proc.poll() is None:
+            for pid in filter(str.isdigit, os.listdir("/proc")):
+                if holds(pid) and sleeping(pid):
+                    return True
+            time.sleep(0.02)
+        return False
 
     def test_a_report_leaves_the_journal_mode_alone(self):
         """The journal mode is stored in the file, so setting it is a write.

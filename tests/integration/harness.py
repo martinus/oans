@@ -54,6 +54,21 @@ _NET_CHANGE_RE = re.compile(r"net change in shared extents of:\s*(\d+)")
 _RECLAIMED_RE = re.compile(r"Reclaimed\s+([\d.]+ [A-Za-z]+)\s+across\s+(\d+)\s+group")
 _ALREADY_SHARED_RE = re.compile(r"Already shared (\d+) file")
 
+# What a sanitizer build prints on a finding. ASAN and UBSAN abort (see
+# SANITIZE_RUN in the Makefile), but ThreadSanitizer runs with
+# halt_on_error=0 and only changes the exit status at the very end - so a
+# test that never looks at the status passed with a race report in its output.
+_SANITIZER_RE = re.compile(
+    r"(?:ERROR|WARNING): \w*Sanitizer|^SUMMARY: \w+Sanitizer|runtime error: ",
+    re.MULTILINE)
+
+
+def sanitizer_findings(output):
+    """The lines of `output` (str or bytes) that report a sanitizer finding."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return [ln for ln in output.splitlines() if _SANITIZER_RE.search(ln)]
+
 
 # --------------------------------------------------------------------------
 # FIEMAP - read a file's physical extents to detect reflink sharing.
@@ -355,7 +370,14 @@ class DuperemoveTest(unittest.TestCase):
     def tearDown(self):
         # Innermost first: a snapshot must go before the subvolume it lives in.
         for path in reversed(self._subvols):
-            btrfs_ok("subvolume", "delete", path)
+            if btrfs_ok("subvolume", "delete", path):
+                continue
+            # Unprivileged, the delete fails with EPERM unless the fs is
+            # mounted user_subvol_rm_allowed, and rmtree cannot unlink inside
+            # a read-only snapshot - so they piled up in the scratch dir. The
+            # owner may clear the flag, and an emptied subvolume rmdir()s.
+            btrfs_ok("property", "set", "-ts", path, "ro", "false")
+            shutil.rmtree(path, ignore_errors=True)
         shutil.rmtree(self.work, ignore_errors=True)
 
     # -- running oans ------------------------------------------------
@@ -392,7 +414,15 @@ class DuperemoveTest(unittest.TestCase):
                               timeout=timeout)
         self.out = proc.stdout
         self.rc = proc.returncode
+        self.assertNoSanitizerReport(self.out)
         return self.out
+
+    def assertNoSanitizerReport(self, output):
+        """Fail if `output` carries a sanitizer finding, whatever the test
+        then goes on to assert about the run."""
+        hits = sanitizer_findings(output)
+        if hits:
+            self.fail("sanitizer report:\n    " + "\n    ".join(hits[:20]))
 
     def scan(self, path, *extra):
         return self.dm("-r", path, *extra)
@@ -650,7 +680,8 @@ class DuperemoveTest(unittest.TestCase):
     #
     # Subvolumes cannot be removed with rmtree (a read-only one refuses even
     # to have its files unlinked), so anything created here is tracked and
-    # deleted with the ioctl in tearDown, innermost first.
+    # deleted with the ioctl in tearDown, innermost first (or, where that
+    # needs privileges we lack, made writable and removed like a directory).
 
     def subvol(self, name):
         """Create a btrfs subvolume under the scratch dir; skips if it can't."""

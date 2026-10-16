@@ -253,6 +253,11 @@ exactly where UB-sensitive differences hide, and this file already records that
   `WERROR` and compares the `-O` level. `-Bn` and not `-n`: with the tree built,
   `make -n` prints nothing and a check reading an empty command list passes for
   the wrong reason.
+- **Only `WERROR=1`/`yes`/`true` turn it on now**: `ifdef` was true for
+  `WERROR=0` too. The lint asserts that as well, and runs its "plain" build
+  with `WERROR` scrubbed from the environment and `MAKEFLAGS`, since CI
+  exports it to every job and the comparison was otherwise a build against
+  itself.
 - **Diagnose this from the binary, not the makefile.** `readelf
   --debug-dump=info ./test | grep DW_AT_producer` prints the flags gcc actually
   compiled with, grouped - which is how the mixed build was found (19 TUs at

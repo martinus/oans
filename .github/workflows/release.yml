@@ -25,9 +25,17 @@ jobs:
     # also runs on older distributions.
     runs-on: ubuntu-22.04
     steps:
+      # The tag reaches every script through the environment, never through
+      # ${{ }} inside `run:`: that is pasted into the script text before the
+      # shell sees it, so a workflow_dispatch input (or a tag name) holding
+      # quotes or $(...) would run as code with a write token in scope.
       - name: Resolve tag
         id: tag
-        run: echo "tag=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: $TAG"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -48,12 +56,20 @@ jobs:
       - name: Smoke-test the binary
         run: ./oans --version
 
+      # The unit suite, on the toolchain and libraries this binary is built
+      # with: CI runs on ubuntu-latest, so nothing else has ever tested a
+      # 22.04 build before it is published. Runs after the binary is built
+      # and adds only ./test and its objects, which are not packaged.
+      - name: Unit tests
+        run: make -j"$(nproc)" test
+
       - name: Package
         id: pkg
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag='${{ steps.tag.outputs.tag }}'
-          ver="${tag#v}"
+          ver="${TAG#v}"
           dist="oans-${ver}-linux-x86_64"
 
           strip oans
@@ -97,8 +113,8 @@ jobs:
       - name: Upload assets to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          ARTIFACT: ${{ steps.pkg.outputs.artifact }}
         run: |
-          gh release upload '${{ steps.tag.outputs.tag }}' \
-            "${{ steps.pkg.outputs.artifact }}" \
-            "${{ steps.pkg.outputs.artifact }}.sha256" \
+          gh release upload "$TAG" "$ARTIFACT" "$ARTIFACT.sha256" \
             --clobber --repo "$GITHUB_REPOSITORY"

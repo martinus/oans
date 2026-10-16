@@ -59,9 +59,6 @@ jobs:
       - name: Build
         run: make
 
-      - name: Unit tests
-        run: make test
-
       # #295: a build without the test hooks must compile under both
       # compilers, say so in --version (the suite reads it to skip), and keep
       # none of their names. Then back to the default build the steps below
@@ -94,6 +91,14 @@ jobs:
           sudo mkdir -p /mnt/oans-scratch
           sudo mount -o loop "$IMG" /mnt/oans-scratch
           sudo chmod 1777 /mnt/oans-scratch
+
+      # After the scratch mount, and pointed at it: the unit suite's real-file
+      # FIEMAP tests skip on a filesystem without FIEMAP, so this is what makes
+      # them run on btrfs and XFS rather than wherever the checkout sits.
+      - name: Unit tests
+        run: make test
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
 
       - name: Integration tests
         run: make integration
@@ -197,9 +202,6 @@ jobs:
       - name: Build (${{ matrix.sanitize }})
         run: make
 
-      - name: Unit tests (${{ matrix.sanitize }})
-        run: make test
-
       - name: Set up a scratch btrfs
         run: |
           sudo modprobe btrfs || true
@@ -209,6 +211,11 @@ jobs:
           sudo mkdir -p /mnt/oans-scratch
           sudo mount -o loop "$IMG" /mnt/oans-scratch
           sudo chmod 1777 /mnt/oans-scratch
+
+      - name: Unit tests (${{ matrix.sanitize }})
+        run: make test
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
 
       - name: Integration tests (${{ matrix.sanitize }})
         run: make integration

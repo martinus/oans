@@ -63,7 +63,10 @@ struct running_checksum *start_running_checksum(void)
 {
 	struct xxhash_running_checksum *c =
 		calloc(1, sizeof(struct xxhash_running_checksum));
+
+	abort_on(!c);
 	c->state = XXH3_createState();
+	abort_on(!c->state);
 	/*
 	 * Zero the whole struct before resetting it, which xxhash sanctions
 	 * (XXH3_INITSTATE is a field-wise version of the same thing). A reset

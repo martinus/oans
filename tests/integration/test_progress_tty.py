@@ -21,11 +21,12 @@ import struct
 import termios
 import tempfile
 import shutil
+import signal
 import sqlite3
 import unittest
 
 from harness import (DUPEREMOVE, DuperemoveTest, requires_reflink,
-                     skip_without_hooks)
+                     sanitizer_findings, skip_without_hooks)
 
 COLS, ROWS = 100, 30
 
@@ -36,11 +37,16 @@ _CSI = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
 _ANSI_TEXT = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS):
+def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS,
+                status=0):
     """Run argv on a COLS x ROWS pty; return its raw output bytes.
 
     With `stderr_path`, the child's stderr is redirected to that file while
     stdout stays on the pty - the `2>errors.log` case of #203.
+
+    Raises AssertionError unless the child exited with `status`, and on a
+    sanitizer finding in what it printed: a crash still draws (and wipes) the
+    block up to the point it died, so the screen alone reads it as a pass.
     """
     skip_without_hooks(env)
     pid, fd = pty.fork()
@@ -56,9 +62,12 @@ def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS):
             os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     chunks = []
+    hung = False
     while True:
         if not select.select([fd], [], [], 60)[0]:
-            break                                 # hung; let the assert report
+            hung = True                           # reported below
+            os.kill(pid, signal.SIGKILL)
+            break
         try:
             data = os.read(fd, 65536)
         except OSError:                           # EIO: the child closed the pty
@@ -67,8 +76,28 @@ def _run_in_pty(argv, env=None, stderr_path=None, cols=COLS, rows=ROWS):
             break
         chunks.append(data)
     os.close(fd)
-    os.waitpid(pid, 0)
-    return b"".join(chunks)
+    _, wstatus = os.waitpid(pid, 0)
+    data = b"".join(chunks)
+    if hung:
+        raise AssertionError(f"{argv} printed nothing for 60 s; killed")
+    if os.WIFSIGNALED(wstatus):
+        raise AssertionError(f"{argv} was killed by signal "
+                             f"{os.WTERMSIG(wstatus)}:\n{_tail(data)}")
+    if status is not None and os.WEXITSTATUS(wstatus) != status:
+        raise AssertionError(f"{argv} exited {os.WEXITSTATUS(wstatus)}, "
+                             f"expected {status}:\n{_tail(data)}")
+    hits = sanitizer_findings(data)
+    if stderr_path is not None:
+        with open(stderr_path, "rb") as f:
+            hits += sanitizer_findings(f.read())
+    if hits:
+        raise AssertionError("sanitizer report:\n    " + "\n    ".join(hits[:20]))
+    return data
+
+
+def _tail(data, n=15):
+    text = _ANSI_TEXT.sub("", data.decode("utf-8", "replace"))
+    return "\n".join(text.splitlines()[-n:])
 
 
 def _worker_rows(data, name, status="hashing"):
@@ -218,7 +247,8 @@ class ProgressTtyTest(DuperemoveTest):
         # filter, as a stranded worker row. See #236.
         screen = _render(_run_in_pty(
             [DUPEREMOVE, "-dr", "--hashfile", self.hf, tree],
-            env=dict(os.environ, DUPEREMOVE_INTERRUPT_AFTER="4")))
+            env=dict(os.environ, DUPEREMOVE_INTERRUPT_AFTER="4"),
+            status=128 + signal.SIGINT))
         shown = "\n  ".join(screen)
 
         stranded = [ln for ln in screen if WORKER_ROW.match(ln)]
@@ -363,7 +393,9 @@ class ProgressTtyTest(DuperemoveTest):
             with open(os.path.join(tree, f"f{i}"), "wb") as f:
                 f.write(os.urandom(64 * 1024))
 
-        data = _run_in_pty([DUPEREMOVE, "-dr", "--hashfile", self.hf, tree])
+        # Exit 1: the filesystem cannot dedupe, so the scan is refused.
+        data = _run_in_pty([DUPEREMOVE, "-dr", "--hashfile", self.hf, tree],
+                           status=1)
         self.assertGreater(data.rfind(b"\x1b[?25h"), data.rfind(b"\x1b[?25l"),
                            "the cursor was left hidden")
         stranded = [ln for ln in _render(data) if WORKER_ROW.match(ln)]

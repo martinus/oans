@@ -105,3 +105,4 @@ class InterruptResumeTest(DuperemoveTest):
         fifo = self.path("fifo")
         os.mkfifo(fifo)
         self.dm("-r", fifo, timeout=30)
+        self.assertEqual(0, self.rc, self.out)
