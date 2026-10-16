@@ -816,8 +816,9 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
  * lists every scanned path, and SQLite creates the -wal and -shm sidecars
  * with the database file's mode: a chmod after the open left them at the
  * umask's mode (0644 under 022) for the whole first scan, and for good if
- * that run crashed. Only a file this run creates is chmod'ed - the mode of an
- * existing hashfile is the admin's - and a failure there is a warning.
+ * that run crashed. Only a file this run creates or finds empty is chmod'ed -
+ * the mode of a hashfile with data in it is the admin's - and a failure there
+ * is a warning.
  */
 static void precreate_hashfile(const char *filename)
 {
@@ -839,6 +840,26 @@ static void precreate_hashfile(const char *filename)
 			filename, strerror(errno));
 	close(fd);
 }
+
+/*
+ * An empty file this run initialises - one an admin created with touch, or a
+ * `file:` URI that precreate_hashfile() cannot read - gets the same 0600,
+ * before the WAL pragma creates the sidecars. sqlite3_db_filename() is the
+ * path SQLite opened, whichever form the name was given in.
+ */
+static void make_new_hashfile_private(sqlite3 *db)
+{
+	const char *path = sqlite3_db_filename(db, "main");
+
+	if (!path || !*path)
+		return;
+	/* longpath-ok: the hashfile itself. */
+	if (chmod(path, S_IRUSR | S_IWUSR))
+		/* escape-ok: oans's own --hashfile argument. */
+		eprintf("Warning: cannot set the mode of hashfile %s: %s\n",
+			path, strerror(errno));
+}
+
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly)
 {
@@ -901,8 +922,10 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 			}
 			break;
 		case HASHFILE_NEW:
-			if (!readonly)
+			if (!readonly) {
+				make_new_hashfile_private(db);
 				break;
+			}
 			/* escape-ok: oans's own --hashfile argument. */
 			eprintf("Hashfile %s is empty\n", filename);
 			sqlite3_close(db);
