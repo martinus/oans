@@ -19,7 +19,8 @@
  *   - A trailing '/' restricts the pattern to directories.
  *   - `*` matches any run of characters except '/', `?` matches one non-'/'
  *     character, `[abc]` / `[a-z]` / `[!a-z]` are character classes, and `**`
- *     crosses directory boundaries.
+ *     crosses directory boundaries. A backslash makes the next character
+ *     literal, inside a class too.
  *
  * Excluding a directory prunes the walk there, so a pattern naming a directory
  * also drops everything under it; you need not add a wildcard for its

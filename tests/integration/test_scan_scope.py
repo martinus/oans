@@ -29,6 +29,26 @@ class ScanScopeTest(DuperemoveTest):
         self.assertIn("on another filesystem", self.out)
         self.assertEqual(1, self.hf_count("files"), "the first root is scanned")
 
+    def test_a_hashfile_locked_on_another_filesystem_names_both(self):
+        """One line naming both filesystems: the message used to be five
+        separate prints, and on a tty each one redraws the live block (#179).
+        """
+        self.mkrand("tree/a", 8000)
+        self.dm("-r", self.path("tree"))
+        self.assertEqual(0, self.rc, self.out)
+        real = self.hf_query("select keyval from config "
+                             "where keyname = 'fs_uuid'")[0][0]
+        if isinstance(real, bytes):
+            real = real.decode()
+        other = "01234567-89ab-cdef-0123-456789abcdef"
+        self.hf_exec("update config set keyval = ? where keyname = 'fs_uuid'",
+                     (other,))
+
+        self.dm("-r", self.path("tree"))
+        self.assertNotEqual(0, self.rc, self.out)
+        self.assertIn(f"lives on fs {real} while the hashfile is locked on "
+                      f"fs {other}.\n", self.out)
+
     def test_a_relative_hashfile_inside_the_tree_is_not_scanned(self):
         self.mkrand("tree/a", 8000)
         hf = os.path.relpath(self.path("tree/h.db"))

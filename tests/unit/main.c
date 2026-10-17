@@ -48,6 +48,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_is_file_renamed);
 	MU_RUN(test_seen_inode);
 	MU_RUN(test_a_file_that_became_a_directory_is_skipped);
+	MU_RUN(test_the_probe_skips_a_fifo_without_blocking);
 	MU_RUN(test_get_extent);
 	MU_RUN(test_fiemap_layout_key);
 	MU_RUN(test_fiemap_maps_share);
@@ -55,6 +56,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_fiemap_unshared_bytes_accumulates);
 	MU_RUN(test_fiemap_phys_set_grows);
 	MU_RUN(test_sanitize_ctrl);
+	MU_RUN(test_utf8_seq_len);
+	MU_RUN(test_print_macros_take_an_else);
 	MU_RUN(test_progress_copy_path);
 	MU_RUN(test_ellipsize_path_stays_inside_the_path);
 	MU_RUN(test_progress_path_two_stage_render);
@@ -87,6 +90,8 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_glob_directory_only);
 	MU_RUN(test_glob_literal_paths_are_not_globs);
 	MU_RUN(test_glob_reports_matching_pattern_and_counts);
+	MU_RUN(test_glob_a_backslash_in_a_class_escapes);
+	MU_RUN(test_glob_a_repeated_pattern_is_one_pattern);
 	MU_RUN(test_glob_rejects_malformed);
 	MU_RUN(test_glob_empty_set_matches_nothing);
 	MU_RUN(test_prop_a_layout_matches_only_itself);
@@ -133,6 +138,7 @@ MU_TEST_SUITE(test_suite) {
 	MU_RUN(test_the_wind_down_notice_is_said_once);
 	MU_RUN(test_fiemap_maps_a_real_file);
 	MU_RUN(test_fiemap_map_never_claims_more_than_it_holds);
+	MU_RUN(test_fiemap_map_complete);
 	MU_RUN(test_fiemap_range_answers_for_the_range_asked_for);
 	MU_RUN(test_fiemap_counts_nothing_shared_in_a_fresh_file);
 	MU_RUN(test_a_refused_ioctl_is_an_error_not_a_zero_answer);

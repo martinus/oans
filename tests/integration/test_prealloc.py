@@ -47,6 +47,35 @@ class PreallocTest(DuperemoveTest):
         self.assertEqual(self.digest("a"), self.digest("c"),
                          "the digest describes the bytes, not zeroes")
 
+    def test_blocks_after_a_preallocated_buffer_stay_on_the_block_grid(self):
+        """A buffer that is all preallocated is skipped, not read. With a -b
+        that does not divide the 1 MiB buffer, skipping all of it moved every
+        later block off the grid a plain read uses, so the data after it was
+        hashed at offsets no written-out copy has."""
+        bs = 96 * 1024
+        head, tail = os.urandom(100 * 1024), os.urandom(512 * 1024)
+        p = self.prealloc("tree/a", head, 0, 5 * MiB - len(head))
+        with open(p, "r+b") as f:
+            f.seek(5 * MiB)
+            f.write(tail)
+        self.write("tree/c", head + bytes(5 * MiB - len(head)) + tail)
+        self.sync()
+        self.scan(self.path("tree"), "-b", "96K",
+                  "--dedupe-options=partial")
+        self.assertDmOk()
+
+        def blocks(name):
+            return set(self.hf_query(
+                "select b.loff, hex(b.digest) from blocks b join files f "
+                "on f.id = b.fileid where f.filename like ?", ("%/" + name,)))
+
+        a, c = blocks("a"), blocks("c")
+        self.assertTrue(any(loff >= 5 * MiB for loff, _d in a),
+                        "the data after the preallocated extent was hashed")
+        self.assertEqual(set(), {loff for loff, _d in a if loff % bs},
+                         "every block on the -b grid")
+        self.assertLessEqual(a, c, "the same blocks as the written-out copy")
+
     def test_data_before_a_hole_and_a_preallocated_extent_is_hashed(self):
         """On a hole, the next extent can start far past the buffer: it must
         not decide what the buffer holds."""

@@ -202,6 +202,7 @@ static const struct {
 	[SCAN_SKIP_NOT_REGULAR]	  = { "not_regular",	"not a regular file",	false },
 	[SCAN_SKIP_READONLY_SUBVOL] = { "readonly_subvol",
 					"read-only subvolume",		false },
+	[SCAN_SKIP_CHANGED]	  = { "changed",	"changed while hashing", false },
 };
 
 bool scan_skip_is_error(enum scan_skip_bucket b)
@@ -684,17 +685,32 @@ struct locked_fs {
 	 */
 	enum dedupe_support dedupe;
 	unsigned int dedupe_probe_tries;
+	unsigned int dedupe_probe_unasked;	/* could not host it */
 };
 struct locked_fs locked_fs = {0,};
 
 /*
  * How many files may be asked before giving up on a filesystem oans does not
- * recognise. A file can fail to answer for reasons of its own -- unreadable,
- * unwritable, empty -- so one inconclusive result must not condemn the tree;
- * but a filesystem that never answers must not read the whole tree first
- * either.
+ * recognise. A file can fail to answer for reasons of its own, so one
+ * inconclusive result must not condemn the tree; but a filesystem that never
+ * answers must not read the whole tree first either. Files that cannot host
+ * the probe at all -- too small, not writable -- are not asked and do not
+ * count toward it, but toward FS_PROBE_MAX_UNASKED (fs_dedupe_probe_settled).
  */
 #define FS_PROBE_MAX_TRIES	16
+
+/*
+ * How many files that cannot host the probe the walk may hand over before
+ * oans gives up without having asked. Each of them is hashed while the
+ * question is open, so without a cap a user scanning a tree they may not
+ * write, on a filesystem without the ioctl, hashed all of it before the
+ * refusal. Larger than FS_PROBE_MAX_TRIES because these files say nothing
+ * about the filesystem: a supported one is refused only if this many files,
+ * before any that can host the probe, are under two blocks or not writable.
+ * A directory of small files is common; a thousand of them ahead of every
+ * larger file the walk reaches is not.
+ */
+#define FS_PROBE_MAX_UNASKED	1024
 
 /*
  * Test hook (DUPEREMOVE_FORCE_FS_PROBE): drop the allowlist fast path so the
@@ -1011,6 +1027,21 @@ void filescan_free_late(void)
 	g_clear_pointer(&ro_subvols, g_hash_table_destroy);
 }
 
+/* The cached answer for `dev`, if it has one. */
+static bool ro_subvol_cached(dev_t dev, bool *rdonly)
+{
+	gpointer key = GSIZE_TO_POINTER((gsize)dev), val;
+	bool found;
+
+	g_mutex_lock(&ro_subvol_lock);
+	found = ro_subvols &&
+		g_hash_table_lookup_extended(ro_subvols, key, NULL, &val);
+	if (found)
+		*rdonly = GPOINTER_TO_INT(val);
+	g_mutex_unlock(&ro_subvol_lock);
+	return found;
+}
+
 /*
  * Core lookup: is `fd`'s subvolume read-only? `fd` must be open on a file or
  * directory inside it, and `dev` is its device, used as the cache key.
@@ -1025,13 +1056,8 @@ static bool ro_subvol_lookup(int fd, dev_t dev, bool count_skip)
 	gpointer key = GSIZE_TO_POINTER((gsize)dev), val;
 	bool rdonly = false;
 
-	g_mutex_lock(&ro_subvol_lock);
-	if (ro_subvols &&
-	    g_hash_table_lookup_extended(ro_subvols, key, NULL, &val)) {
-		g_mutex_unlock(&ro_subvol_lock);
-		return GPOINTER_TO_INT(val);
-	}
-	g_mutex_unlock(&ro_subvol_lock);
+	if (ro_subvol_cached(dev, &rdonly))
+		return rdonly;
 
 	/*
 	 * Probe outside the lock: the ioctl is the slow part, and a duplicate
@@ -1086,7 +1112,12 @@ static bool dev_is_readonly_subvol(dev_t dev, const char *path)
 	bool rdonly;
 	int fd;
 
-	fd = longpath_open(path, O_RDONLY | O_NONBLOCK);	/* a FIFO: #281 */
+	/* Every entry comes through here: open only for a device not yet asked. */
+	if (ro_subvol_cached(dev, &rdonly))
+		return rdonly;
+
+	/* O_NONBLOCK for a FIFO (#281); O_NOFOLLOW, as the walk's statx. */
+	fd = longpath_open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
 	if (fd == -1)
 		return false;	/* unreadable is someone else's error to report */
 	rdonly = ro_subvol_lookup(fd, dev, true);
@@ -1193,9 +1224,14 @@ static int probe_fs(char *path, struct fs_probe *probe)
 		 * (Linux 6.4+). This is unprivileged and works on XFS without
 		 * root, unlike the libblkid device probe below. Older kernels
 		 * return ENOTTY, so fall through to mountinfo + libblkid.
+		 *
+		 * A null UUID is no answer either: a null locked UUID reads as
+		 * "not locked yet" on every walker (#282), so libblkid is asked
+		 * instead, and it refuses one too.
 		 */
 		if (ioctl(fd, FS_IOC_GETFSUUID, &fsuuid) == 0 &&
-		    fsuuid.len == sizeof(uuid_t)) {
+		    fsuuid.len == sizeof(uuid_t) &&
+		    !uuid_is_null(fsuuid.uuid)) {
 			uuid_copy(probe->uuid, fsuuid.uuid);
 			return 0;
 		}
@@ -1448,12 +1484,14 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 
 		if (uuid_compare(probe.uuid, locked_fs.uuid) != 0) {
 			declare_display_path(disp, path);
+			/* 36-byte uuid + NUL; not UUID_STR_LEN, which older libuuid lacks */
+			char found[37], locked[37];
 
-			eprintf("%s lives on fs ", disp);
-			debug_print_uuid(probe.uuid);
-			eprintf(" while the hashfile is locked on fs ");
-			debug_print_uuid(locked_fs.uuid);
-			eprintf(".\n");
+			/* One call: a line in pieces breaks the live block (#179). */
+			uuid_unparse(probe.uuid, found);
+			uuid_unparse(locked_fs.uuid, locked);
+			eprintf("%s lives on fs %s while the hashfile is locked "
+				"on fs %s.\n", disp, found, locked);
 			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			if (!parent_checked)
 				nr_roots_unusable++;
@@ -1515,27 +1553,42 @@ bool filescan_seed_failed(void)
 
 /*
  * The one place that says this filesystem cannot be deduplicated (#224). Which
- * of the three cases it is decides the advice, so they are worded here together
+ * of the cases it is decides the advice, so they are worded here together
  * rather than assembled by whoever noticed: a definite no; files asked that
  * could not answer (the shape a stacking filesystem produces, and the one a
- * user is least likely to guess); and a walk that ended without the question
- * ever being put.
+ * user is least likely to guess); FS_PROBE_MAX_UNASKED files that could not be
+ * asked; and a walk that ended without the question ever being put.
  */
 static void report_fs_unusable(void)
 {
 	if (locked_fs.dedupe == DEDUPE_SUPPORT_NO)
 		eprintf("Error: this filesystem does not support "
 			"FIDEDUPERANGE.\n");
+	else if (locked_fs.dedupe_probe_unasked >= FS_PROBE_MAX_UNASKED)
+		eprintf("Error: could not determine whether this filesystem "
+			"supports FIDEDUPERANGE - gave up after %u file(s) that "
+			"were too small (under two blocks) or not writable, "
+			"before any file could answer.\n",
+			locked_fs.dedupe_probe_unasked);
 	else if (locked_fs.dedupe_probe_tries)
 		eprintf("Error: could not determine whether this filesystem "
 			"supports FIDEDUPERANGE - %u file(s) were asked and "
 			"none could answer. A stacking filesystem such as "
 			"overlayfs reports its lower filesystem's refusal this "
 			"way.\n", locked_fs.dedupe_probe_tries);
+	else if (locked_fs.dedupe_probe_unasked)
+		eprintf("Error: no file could test whether this filesystem "
+			"supports FIDEDUPERANGE - %u file(s) were too small "
+			"(under two blocks) or not writable.\n",
+			locked_fs.dedupe_probe_unasked);
 	else
 		eprintf("Error: no file was available to test whether this "
 			"filesystem supports FIDEDUPERANGE.\n");
 
+	if (locked_fs.dedupe != DEDUPE_SUPPORT_NO &&
+	    locked_fs.dedupe_probe_unasked)
+		eprintf("A file can be asked, and deduplicated, only if the user "
+			"running oans may write to it or owns it.\n");
 	eprintf("oans needs FIDEDUPERANGE to deduplicate; it is known to work "
 		"on btrfs and XFS.\n");
 }
@@ -1574,47 +1627,19 @@ static bool walk_aborted(void)
 	       filescan_batch_lost();
 }
 
-static int get_dirent_type(struct dirent *entry, int fd, const char *path)
+/*
+ * Whether the walk takes an entry of this type: a regular file, or a directory
+ * under --recurse. Counts only what is genuinely neither (symlinks, sockets,
+ * devices - see #126); a directory passed over because --recurse was not given
+ * is the user's own choice, not a skip worth reporting.
+ */
+static bool walk_takes(bool reg, bool dir)
 {
-	int ret;
-	struct statx st;
-
-	if (entry->d_type != DT_UNKNOWN)
-		return entry->d_type;
-
-	/*
-	 * FS doesn't support file type in dirent, do this the old
-	 * fashioned way. We translate mode to DT_* for the
-	 * convenience of the caller.
-	 */
-	ret = statx(fd, entry->d_name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &st);
-	if (ret || !(st.stx_mask & STATX_BASIC_STATS)) {
-		declare_display_path(disp, path);
-		declare_display_path(dname, entry->d_name);
-
-		eprintf("Error %d: %s while getting type of file %s/%s. "
-			"Skipping.\n", errno, strerror(errno),
-			disp, dname);
-		filescan_count_errno_skip(errno);
-		return DT_UNKNOWN;
-	}
-
-	if (S_ISREG(st.stx_mode))
-		return DT_REG;
-	if (S_ISDIR(st.stx_mode))
-		return DT_DIR;
-	if (S_ISBLK(st.stx_mode))
-		return DT_BLK;
-	if (S_ISCHR(st.stx_mode))
-		return DT_CHR;
-	if (S_ISFIFO(st.stx_mode))
-		return DT_FIFO;
-	if (S_ISLNK(st.stx_mode))
-		return DT_LNK;
-	if (S_ISSOCK(st.stx_mode))
-		return DT_SOCK;
-
-	return DT_UNKNOWN;
+	if (reg || (dir && options.recurse_dirs))
+		return true;
+	if (!dir)
+		filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+	return false;
 }
 
 /*
@@ -1776,23 +1801,16 @@ static void process_dir(const char *path, struct dbhandle *db)
 		    || strcmp(entry->d_name, "..") == 0)
 			continue;
 
-		entry->d_type = get_dirent_type(entry, dirfd(dirp), path);
-
-		if (entry->d_type != DT_REG &&
-		    !(options.recurse_dirs && entry->d_type == DT_DIR)) {
-			/*
-			 * Count only entries that are genuinely neither a file
-			 * nor a directory (symlinks, sockets, devices - see
-			 * #126). A directory passed over because --recurse was
-			 * not given is the user's own choice, not a skip worth
-			 * reporting, and DT_UNKNOWN was already counted by
-			 * get_dirent_type() as the errno that produced it.
-			 */
-			if (entry->d_type != DT_DIR &&
-			    entry->d_type != DT_UNKNOWN)
-				filescan_count_skip(SCAN_SKIP_NOT_REGULAR);
+		/*
+		 * A filesystem that leaves d_type DT_UNKNOWN is answered by
+		 * the statx below, which every entry the walk takes gets
+		 * anyway; asking a statx of its own here cost such an entry
+		 * two.
+		 */
+		if (entry->d_type != DT_UNKNOWN &&
+		    !walk_takes(entry->d_type == DT_REG,
+				entry->d_type == DT_DIR))
 			continue;
-		}
 
 		/* A component is bounded by NAME_MAX; guard defensively so the
 		 * child buffer can never overflow. */
@@ -1817,8 +1835,8 @@ static void process_dir(const char *path, struct dbhandle *db)
 		 * kernel would reject with ENAMETOOLONG (#117).
 		 */
 		/*
-		 * AT_SYMLINK_NOFOLLOW: d_type already left symlinks out, and
-		 * what goes where is decided from this statx, not from d_type.
+		 * AT_SYMLINK_NOFOLLOW: d_type, where known, already left
+		 * symlinks out, and what goes where is decided from this statx.
 		 * An entry replaced between readdir() and here - a file by a
 		 * directory, or by a symlink to one - used to be pushed as a
 		 * file and abort the run in the consumer (#278).
@@ -1833,6 +1851,10 @@ static void process_dir(const char *path, struct dbhandle *db)
 			filescan_count_errno_skip(errno);
 			continue;
 		}
+
+		if (entry->d_type == DT_UNKNOWN &&
+		    !walk_takes(S_ISREG(st.stx_mode), S_ISDIR(st.stx_mode)))
+			continue;
 
 		if (!check_file(db, child, &st, true))
 			continue;
@@ -2307,17 +2329,27 @@ static void seed_checkpointed_files(struct dbhandle *db)
  * blocks nor follows a symlink (#278), and what it opened must still be a
  * regular file.
  *
+ * O_NOATIME: a scan reads every byte of every file, and must not stamp every
+ * file as read, which also costs a metadata write per file on a relatime
+ * mount. Only the owner (or CAP_FOWNER) may ask, and that is decided per file,
+ * so an EPERM is retried without it rather than remembered.
+ *
  * Returns the descriptor, back in blocking mode, or -1 with errno set. A name
  * that is no longer a regular file sets *not_regular instead of errno; the
  * caller counts it as SCAN_SKIP_NOT_REGULAR, as __scan_file() does.
+ *
+ * open_listed() takes the access mode, for the probe, which asks for O_RDWR.
  */
-static int open_listed_file(const char *path, bool *not_regular)
+static int open_listed(const char *path, int mode, bool *not_regular)
 {
-	int fd = longpath_open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	const int flags = mode | O_NOFOLLOW | O_NONBLOCK;
+	int fd = longpath_open(path, flags | O_NOATIME);
 	struct stat st;
 	int fl;
 
 	*not_regular = false;
+	if (fd == -1 && errno == EPERM)
+		fd = longpath_open(path, flags);
 	if (fd == -1)
 		return -1;
 	if (fstat(fd, &st) == -1)
@@ -2339,6 +2371,46 @@ fail:
 	return -1;
 }
 
+static int open_listed_file(const char *path, bool *not_regular)
+{
+	return open_listed(path, O_RDONLY, not_regular);
+}
+
+/*
+ * The locked filesystem is settled as unusable: say so, and stop the walk.
+ * Returns false, which fs_dedupe_probe_settled() hands back.
+ */
+static bool fs_probe_refuse(void)
+{
+	report_fs_unusable();
+	filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
+	/*
+	 * The walkers have to stop too. Without this they readdir/statx the
+	 * whole tree after the error is already on screen - minutes of pure
+	 * metadata I/O on a big one, which reads as a hang - because the
+	 * consumer's error stops the hashing, not the walk that feeds it.
+	 */
+	atomic_store_explicit(&walk_abort, true, memory_order_relaxed);
+	return false;
+}
+
+/*
+ * A file that cannot host the probe: the walk offers the next one, until
+ * FS_PROBE_MAX_UNASKED of them have gone by with the question still open.
+ */
+static bool fs_probe_not_asked(const char *path, const char *why)
+{
+	if (verbose) {
+		declare_display_path(disp, path);
+
+		vprintf("Not asking %s about FIDEDUPERANGE support: %s\n",
+			disp, why);
+	}
+	if (++locked_fs.dedupe_probe_unasked < FS_PROBE_MAX_UNASKED)
+		return true;
+	return fs_probe_refuse();
+}
+
 /*
  * Settle whether the locked filesystem can be deduplicated, by asking one of
  * its files for FIDEDUPERANGE (#224). Returns false only once the answer is
@@ -2352,16 +2424,51 @@ fail:
 static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 {
 	/*
-	 * The ioctl's destination must be writable, so this opens O_RDWR. It
-	 * issues a real dedupe request, which cannot change anything anyone can
-	 * observe about the file (see dedupe_probe_fd). A file that cannot be
-	 * opened that way -- read-only file, read-only mount -- or that is too
-	 * small to hold the two ranges the probe compares simply cannot answer;
-	 * those are the inconclusive cases.
+	 * The ioctl's destination must be writable or the caller's own, so
+	 * this opens O_RDWR, and O_RDONLY for a file we own but may not write
+	 * (the dedupe phase opens every file that way, and the kernel accepts
+	 * it). It issues a real dedupe request, which cannot change anything
+	 * anyone can observe about the file (see dedupe_probe_fd).
+	 *
+	 * A file that cannot host the probe - too small to hold the two
+	 * ranges it compares, or not one we may write - is not asked, and
+	 * does not count toward FS_PROBE_MAX_TRIES: it says nothing about the
+	 * filesystem, and a tree whose first files are small or read-only
+	 * would otherwise be refused on a filesystem that supports the ioctl.
+	 * Only a read-only mount, which no file of it can get past, still
+	 * counts.
+	 *
+	 * Both opens go through open_listed(): the name may be a FIFO by now,
+	 * and a read-only open of one waits for a writer, holding up the walk.
 	 */
-	_cleanup_(closefd) int fd = longpath_open(path, O_RDWR);
-	enum dedupe_support support = fd == -1
-		? DEDUPE_SUPPORT_UNKNOWN : dedupe_probe_fd(fd, st->stx_size);
+	bool owned_fallback = false, not_regular;
+	_cleanup_(closefd) int fd = open_listed(path, O_RDWR, &not_regular);
+	enum dedupe_support support;
+
+	if (fd == -1 && !not_regular && errno != EROFS &&
+	    st->stx_uid == geteuid()) {
+		fd = open_listed(path, O_RDONLY, &not_regular);
+		owned_fallback = true;
+	}
+	/*
+	 * No longer a regular file: __scan_file() skips and counts it, and it
+	 * says nothing about the filesystem.
+	 */
+	if (fd == -1 && not_regular)
+		return true;
+	if (fd == -1 && errno != EROFS)
+		return fs_probe_not_asked(path, "it cannot be opened for it");
+	if (fd != -1 && !dedupe_probe_len(fd, st->stx_size))
+		return fs_probe_not_asked(path, "it is too small");
+
+	support = fd == -1 ? DEDUPE_SUPPORT_UNKNOWN
+			   : dedupe_probe_fd(fd, st->stx_size);
+	/*
+	 * Through a read-only fd, a kernel that predates owner dedupe answers
+	 * EINVAL for the file, not the filesystem.
+	 */
+	if (owned_fallback && support == DEDUPE_SUPPORT_UNKNOWN)
+		return fs_probe_not_asked(path, "it is not writable");
 
 	switch (support) {
 	case DEDUPE_SUPPORT_YES:
@@ -2382,16 +2489,7 @@ static bool fs_dedupe_probe_settled(const char *path, const struct statx *st)
 		break;
 	}
 
-	report_fs_unusable();
-	filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
-	/*
-	 * The walkers have to stop too. Without this they readdir/statx the
-	 * whole tree after the error is already on screen - minutes of pure
-	 * metadata I/O on a big one, which reads as a hang - because the
-	 * consumer's error stops the hashing, not the walk that feeds it.
-	 */
-	atomic_store_explicit(&walk_abort, true, memory_order_relaxed);
-	return false;
+	return fs_probe_refuse();
 }
 
 /*
@@ -2506,6 +2604,7 @@ static int __scan_file(char *path, struct dbhandle *db, struct statx *st)
 			eprintf("Error %d: %s while finding subvol for file "
 				"\"%s\". Skipping.\n", ret, strerror(ret),
 				disp);
+			filescan_count_errno_skip(ret);
 			return 0;
 		}
 
@@ -3275,20 +3374,27 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 {
 	ssize_t ret;
+	/*
+	 * A whole number of blocks, so the offset after a faked buffer stays
+	 * on the block grid: -b need not divide the 1 MiB buffer (96K does
+	 * not), and a block hashed at an offset a plain read would not use
+	 * matches no other file's.
+	 */
+	size_t fake = buffer->size - buffer->size % blocksize;
 
 	/*
 	 * The entire buffer could be ignored. Let's fast forward
 	 * and mark the buffer as faked
 	 */
-	if (is_area_ignored(ctxt->fiemap, ctxt->off, buffer->size,
+	if (is_area_ignored(ctxt->fiemap, ctxt->off, fake,
 			    &ctxt->extent_cursor)
-			&& ctxt->off + buffer->size <= ctxt->filesize) {
-		memset(buffer->buf, 0, buffer->size);
-		buffer->dl_len = buffer->size;
+			&& ctxt->off + fake <= ctxt->filesize) {
+		memset(buffer->buf, 0, fake);
+		buffer->dl_len = fake;
 		buffer->dl_offset = 0;
 		buffer->faked = true;
 
-		if (ctxt->filesize <= ctxt->off + buffer->size)
+		if (ctxt->filesize <= ctxt->off + fake)
 			return 0; /* Simulate EOF */
 		return 1;
 	}
@@ -3874,8 +3980,17 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 	posix_fadvise(ctxt.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 	ctxt.fiemap = do_fiemap(ctxt.fd);
-	if (!ctxt.fiemap)
+	if (!ctxt.fiemap) {
+		if (errno == EAGAIN) {
+			declare_display_path(disp, file->path);
+
+			eprintf("%s: extents changed while mapping it. "
+				"Skipped - it is probably still being written; "
+				"the next run will hash it.\n", disp);
+			filescan_count_skip(SCAN_SKIP_CHANGED);
+		}
 		return;
+	}
 
 	/* Take over the interrupted run's state, if the layout still backs it. */
 	if (file->resume &&
@@ -4073,6 +4188,7 @@ static void csum_whole_file(struct file_to_scan *file, struct buffer *buffer,
 			"being written; the next run will hash it.\n",
 			disp, (uint64_t)ctxt.off,
 			(uint64_t)ctxt.filesize);
+		filescan_count_skip(SCAN_SKIP_CHANGED);
 		return;
 	}
 

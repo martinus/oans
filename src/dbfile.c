@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -749,15 +750,6 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 	if (ret)
 		return ret;
 
-	if (strcmp("(null)", dbpath) != 0) {
-		/* longpath-ok: the hashfile itself. */
-	ret = chmod(dbpath, S_IRUSR|S_IWUSR);
-		if (ret) {
-			perror("setting db file permissions");
-			return ret;
-		}
-	}
-
 	/*
 	 * dbfile_identify() let only an empty file through unbranded, so one
 	 * without the brand here is new and ours: brand it before the strict
@@ -818,6 +810,56 @@ static int dbfile_prepare(sqlite3 **db_p, bool readonly)
 #define MEMDB_FILENAME		"file::memory:?cache=shared"
 #define OPEN_FLAGS		(SQLITE_OPEN_READWRITE|SQLITE_OPEN_NOMUTEX|SQLITE_OPEN_URI)
 #define OPEN_FLAGS_CREATE	(OPEN_FLAGS|SQLITE_OPEN_CREATE)
+
+/*
+ * Create a missing hashfile as 0600 before SQLite opens it. The hashfile
+ * lists every scanned path, and SQLite creates the -wal and -shm sidecars
+ * with the database file's mode: a chmod after the open left them at the
+ * umask's mode (0644 under 022) for the whole first scan, and for good if
+ * that run crashed. Only a file this run creates or finds empty is chmod'ed -
+ * the mode of a hashfile with data in it is the admin's - and a failure there
+ * is a warning.
+ */
+static void precreate_hashfile(const char *filename)
+{
+	int fd;
+
+	/* A URI names its file in a form open(2) does not read. */
+	if (!strncmp(filename, "file:", 5))
+		return;
+
+	/* longpath-ok: the hashfile itself. */
+	fd = open(filename, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
+		  S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return;	/* there already, or SQLite reports why it is not */
+	/* A umask can only take bits away; this puts back exactly 0600. */
+	if (fchmod(fd, S_IRUSR | S_IWUSR))
+		/* escape-ok: oans's own --hashfile argument. */
+		eprintf("Warning: cannot set the mode of hashfile %s: %s\n",
+			filename, strerror(errno));
+	close(fd);
+}
+
+/*
+ * An empty file this run initialises - one an admin created with touch, or a
+ * `file:` URI that precreate_hashfile() cannot read - gets the same 0600,
+ * before the WAL pragma creates the sidecars. sqlite3_db_filename() is the
+ * path SQLite opened, whichever form the name was given in.
+ */
+static void make_new_hashfile_private(sqlite3 *db)
+{
+	const char *path = sqlite3_db_filename(db, "main");
+
+	if (!path || !*path)
+		return;
+	/* longpath-ok: the hashfile itself. */
+	if (chmod(path, S_IRUSR | S_IWUSR))
+		/* escape-ok: oans's own --hashfile argument. */
+		eprintf("Warning: cannot set the mode of hashfile %s: %s\n",
+			path, strerror(errno));
+}
+
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 				     bool readonly)
 {
@@ -830,6 +872,9 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 		filename = MEMDB_FILENAME;
 		force_create = true;
 	}
+
+	if (force_create && !memdb)
+		precreate_hashfile(filename);
 
 	if (force_create)
 		ret = sqlite3_open_v2(filename, &db, OPEN_FLAGS_CREATE, NULL);
@@ -877,8 +922,10 @@ static sqlite3 *__dbfile_open_handle(char *filename, bool force_create,
 			}
 			break;
 		case HASHFILE_NEW:
-			if (!readonly)
+			if (!readonly) {
+				make_new_hashfile_private(db);
 				break;
+			}
 			/* escape-ok: oans's own --hashfile argument. */
 			eprintf("Hashfile %s is empty\n", filename);
 			sqlite3_close(db);

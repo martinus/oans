@@ -130,7 +130,19 @@
 # With fewer slots than extents the kernel only counts; every reader walks
 # fm_mapped_extents, so it read past the buffer.
 <<<
-		if (fiemap->fm_mapped_extents > count)
-			fiemap->fm_mapped_extents = count;
+	if (fm->fm_mapped_extents > count)
+		return false;	/* no slots: the kernel only counted (#288) */
 ===
+>>>
+
+# a full buffer is trusted to hold the whole range
+# When the file gains extents between the count and the map, the buffer fills
+# before the last record; two maps cut at the same index then compare their
+# unknown tails as matching holes and fiemap_maps_share() skips a destination
+# as already shared.
+<<<
+	return (last->fe_flags & FIEMAP_EXTENT_LAST) ||
+	       last->fe_logical + last->fe_length >= end;
+===
+	return true;
 >>>
