@@ -605,6 +605,14 @@ enum { checkpoint_stop_after = 0, checkpoint_pause_at = 0 };
 #endif
 
 /*
+ * DUPEREMOVE_OLD_HOLE_DIGESTS hashes a hole the scan reads into the next
+ * extent's digest and saves version 1 checksum states (running_checksum_save()
+ * reads it too): what binaries before FILE_HOLE_EXTENT_CHECKED did, so a test
+ * can leave the checkpoints such a binary leaves and resume them with this one.
+ */
+static bool old_hole_digests;
+
+/*
  * DUPEREMOVE_WRITE_FAIL_AT=N fails the final write of the Nth file to finish
  * hashing, as a full disk or an I/O error would (#274). With
  * DUPEREMOVE_WRITE_FAIL_LOSES_BATCH set, the failure also rolls back the whole
@@ -2139,12 +2147,12 @@ static bool resume_scan(struct dbhandle *db, int64_t fileid, uint64_t size,
 	if (cp.size == size && cp.mtime == mtime &&
 	    cp.loff > 0 && cp.loff < size) {
 		resume->csum = running_checksum_restore(cp.file_state, cap);
-		if (cp.has_ext_state) {
+		/* Every checkpoint has a file state, and one binary wrote both. */
+		resume->v1 = running_checksum_state_version(cp.file_state,
+							    cap) == 1;
+		if (cp.has_ext_state)
 			resume->ext_csum = running_checksum_restore(cp.ext_state,
 								    cap);
-			resume->ext_v1 = running_checksum_state_version(
-					cp.ext_state, cap) == 1;
-		}
 		/* Both or neither: half a checkpoint is no checkpoint. */
 		usable = resume->csum &&
 			 (!cp.has_ext_state || resume->ext_csum);
@@ -3070,6 +3078,30 @@ static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 	struct fiemap_extent *e = get_extent(ctxt->fiemap, r->off,
 					     &ctxt->extent_cursor);
 
+	/*
+	 * A version 1 checkpoint was written by a binary that hashed a hole it
+	 * read into the next extent's digest. What it hashed before the offset
+	 * survives the resume - the extent rows it stored, which
+	 * dbfile_remove_hashes_from() keeps, and the digest in progress - and the
+	 * row this run finishes is marked as hashed by this binary, so a wrong
+	 * digest would stay for good. Refuse it if any data extent the old run
+	 * reached sits behind a hole it may have read. Only here: a checkpoint
+	 * saved again is version 2, and the evidence is gone.
+	 */
+	if (r->v1) {
+		for (unsigned int i = 0; i < ctxt->fiemap->fm_mapped_extents; i++) {
+			const struct fiemap_extent *x =
+				&ctxt->fiemap->fm_extents[i];
+
+			if (x->fe_logical >= r->off)
+				break;
+			if (!(x->fe_flags & FIEMAP_SKIP_FLAGS) &&
+			    hole_read_before(ctxt->fiemap, i))
+				return decline_resume(ctxt, file, tprogress, db,
+					"an older binary's checkpoint follows a hole it may have hashed");
+		}
+	}
+
 	if (r->ext_csum) {
 		if (!e || e->fe_logical != r->ext_loff ||
 		    e->fe_length != r->ext_len)
@@ -3084,18 +3116,6 @@ static bool adopt_resume(struct scan_ctxt *ctxt, struct file_to_scan *file,
 		if (e->fe_logical >= r->off)
 			return decline_resume(ctxt, file, tprogress, db,
 				"the checkpoint's extent state covers a hole");
-		/*
-		 * Inside the extent, the state is right unless an older binary
-		 * started it in a hole it read: that one holds the hole's
-		 * zeroes, and the row it ends in is marked as hashed by this
-		 * binary, so the digest would stay wrong for good. The state's
-		 * version says who wrote it; one this binary wrote, or adopted
-		 * and saved again after this check, is version 2.
-		 */
-		if (r->ext_v1 &&
-		    hole_read_before(ctxt->fiemap, e - ctxt->fiemap->fm_extents))
-			return decline_resume(ctxt, file, tprogress, db,
-				"the checkpoint's extent state holds a hole an older binary read");
 	} else if (!options.only_whole_files && e &&
 		   e->fe_logical < r->off &&
 		   !(e->fe_flags & FIEMAP_SKIP_FLAGS)) {
@@ -3381,7 +3401,7 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 		 * extent a different digest behind every hole size, and the
 		 * extent pass never matched it. Step over the gap.
 		 */
-		if (file_off < extent->fe_logical) {
+		if (file_off < extent->fe_logical && !old_hole_digests) {
 			size_t gap = extent->fe_logical - file_off;
 
 			if (gap > bytes - buf_off)
@@ -4679,6 +4699,7 @@ void filescan_init(void)
 	const char *ckpt_env = test_hook_env("DUPEREMOVE_CHECKPOINT_BYTES");
 
 	force_fs_probe = test_hook_env("DUPEREMOVE_FORCE_FS_PROBE") != NULL;
+	old_hole_digests = test_hook_env("DUPEREMOVE_OLD_HOLE_DIGESTS") != NULL;
 
 	env_uint("DUPEREMOVE_BLOCK_BATCH", BLOCK_BATCH_MAX, &block_batch_max);
 #if OANS_TEST_HOOKS

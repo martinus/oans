@@ -1312,18 +1312,30 @@ databases all have that layout.
   a data extent follows a gap that is unaligned to the hash block or follows a
   preallocated extent - wider than the exact cases, on purpose
   (`hole_read_before()`, shared with the check below).
-  - **An older binary's checkpoint is refused there too, and only there.** In
+  - **An older binary's checkpoint is refused if it follows such a gap.** In
     the hole it carries extent state started before its extent (`ext_loff >=
-    loff`); *inside* the extent the state looks fine and still holds the
-    hole's zeroes, and the row the resumed run finishes gets the bit, so that
-    digest would stay for good. A row flag cannot tell who wrote a checkpoint
-    (a checkpointed row has no flags yet), so the saved checksum state does:
-    its magic is `OANSCSM2` now, `OANSCSM1` before, same layout. Restore takes
-    both; `adopt_resume()` refuses a version 1 extent state only behind a gap
-    `hole_read_before()` names, so an upgrade does not restart every
-    interrupted huge file. Older binaries refuse version 2 and rehash. Pinned
-    by the `test_an_older_binarys_extent_state_*` pair, which rewrite the magic
-    of a real checkpoint.
+    loff`, refused whoever wrote it). Anywhere *after* the hole the damage is
+    already done and looks fine: in the extent state, or in the extent rows
+    stored before the checkpoint, which `dbfile_remove_hashes_from()` keeps -
+    a checkpoint in a later hole has no extent state at all. The row the
+    resumed run finishes then gets the bit, so the digest would stay for good.
+    A row flag cannot tell who wrote a checkpoint (a checkpointed row has no
+    flags yet), so the saved checksum state does: its magic is `OANSCSM2` now,
+    `OANSCSM1` before, same layout, and every checkpoint has a file state.
+    `adopt_resume()` refuses a version 1 checkpoint when any data extent before
+    its offset is one `hole_read_before()` names, so an upgrade does not
+    restart every interrupted huge file. It has to decide at adoption: a
+    checkpoint saved again is version 2. Older binaries refuse version 2 and
+    rehash.
+  - **The tests make an older binary's checkpoints with this one.**
+    `DUPEREMOVE_OLD_HOLE_DIGESTS` puts back the old gap hashing and saves
+    version 1 states. Checked against a real older binary on the review's
+    two-hole layout: the same extent rows and checkpoints, and state bytes
+    identical but for XXH3's `extSecret` pointer. Rewriting the magic of a
+    current checkpoint, as the first tests did, cannot produce a wrong digest,
+    so it could only ever fail on a message. Pinned by
+    `test_an_older_binarys_checkpoint_*`, whose refusal case fails on the
+    extent fingerprint, in all three positions, without the check.
 
 ## SIGINT/SIGTERM flush the batch (#201)
 

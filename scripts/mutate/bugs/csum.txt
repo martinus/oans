@@ -95,7 +95,7 @@
 # Every checkpoint this binary writes is then taken for one an older binary
 # wrote, and an interrupted extent behind a hole starts over on every run.
 <<<
-		.magic		= CSUM_STATE_MAGIC,
+				  CSUM_STATE_MAGIC_V1 : CSUM_STATE_MAGIC,
 ===
-		.magic		= CSUM_STATE_MAGIC_V1,
+				  CSUM_STATE_MAGIC_V1 : CSUM_STATE_MAGIC_V1,
 >>>

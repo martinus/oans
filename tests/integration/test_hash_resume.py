@@ -19,7 +19,8 @@ racing a signal against a read.
 """
 
 import os
-from harness import DuperemoveTest, fiemap_extents, requires_reflink
+from harness import (DuperemoveTest, fiemap_extents, punch_hole,
+                     requires_reflink)
 
 KiB = 1 << 10
 MiB = 1 << 20
@@ -280,50 +281,85 @@ class HashResumeTest(DuperemoveTest):
         self.assertEqual(expected, self.fingerprints(),
                          "the file was not re-hashed from the start")
 
-    # The checksum state's magic is "OANSCSM2" since extent digests leave the
-    # hole before their extent out; "OANSCSM1" is what older binaries wrote.
-    # Stored as a little-endian integer, so the version is the first byte.
-    def as_older_binary(self, name):
-        """Mark the checkpoint of `name` as written by an older binary."""
-        rows = self.hf_query(
-            "select c.loff, c.ext_loff, substr(c.ext_state, 1, 8) from "
-            "scan_checkpoints c join files f on f.id = c.fileid "
-            "where f.filename like ?", ("%/" + name,))
-        self.assertEqual(1, len(rows), "one checkpoint for the file")
-        loff, ext_loff, magic = rows[0]
-        self.assertIsNotNone(magic, "the checkpoint carries extent state")
-        self.assertEqual(b"2MSCSNAO", bytes(magic),
-                         "this binary writes version 2")
-        self.hf_exec(
-            "update scan_checkpoints set "
-            "state = X'314d5343534e414f' || substr(state, 9), "
-            "ext_state = X'314d5343534e414f' || substr(ext_state, 9) "
-            "where fileid = (select id from files where filename like ?)",
-            ("%/" + name,))
-        return loff, ext_loff
+    # What a binary from before FILE_HOLE_EXTENT_CHECKED leaves behind, made
+    # by this one: DUPEREMOVE_OLD_HOLE_DIGESTS hashes a hole the scan reads
+    # into the next extent's digest and saves version 1 checksum states
+    # ("OANSCSM1", stored little-endian, so the version is the first byte).
+    # Checked against a real older binary on the two-hole layout below: the
+    # same rows and checkpoints, and the same state bytes but for XXH3's
+    # pointer to its secret.
+    OLD = {"DUPEREMOVE_OLD_HOLE_DIGESTS": "1"}
+    V1 = b"1MSCSNAO"
 
-    def test_an_older_binarys_extent_state_behind_a_hole_is_refused(self):
-        """An older binary started the extent's digest in the hole it read,
-        so its state, saved inside the extent, holds the hole's zeroes - and
-        the row this run finishes says the digest is right."""
-        tree, (loff, length) = self.build_gap_tree()
-        expected = self.scan_straight_through(tree)
-        self.drop_hashfile()
-        # The first checkpoint lands in the hole, the second in the extent.
-        self.dm("-r", tree, env=dict(CKPT, DUPEREMOVE_CHECKPOINT_STOP="2"))
+    def old_checkpoint(self, tree, name, stop):
+        """Hash `tree` as an older binary that stops at checkpoint `stop`;
+        returns where the checkpoint of `name` is."""
+        self.dm("-r", tree, env=dict(CKPT, **self.OLD,
+                                     DUPEREMOVE_CHECKPOINT_STOP=str(stop)))
         self.assertDmOk("interrupted scan")
-        at, ext_loff = self.as_older_binary("gap")
-        self.assertEqual(loff, ext_loff)
-        self.assertGreater(at, loff, "the checkpoint is inside the extent")
+        rows = self.hf_query(
+            "select c.loff, substr(c.state, 1, 8) from scan_checkpoints c "
+            "join files f on f.id = c.fileid where f.filename like ?",
+            ("%/" + name,))
+        self.assertEqual(1, len(rows), "one checkpoint for the file")
+        self.assertEqual(self.V1, bytes(rows[0][1]), "a version 1 checkpoint")
+        return rows[0][0]
 
-        self.dm("-rv", tree, quiet=False)
-        self.assertDmOk()
-        self.assertIn("holds a hole an older binary read", self.out)
-        self.assertEqual(0, self.hf_count("scan_checkpoints"))
-        self.assertEqual(expected, self.fingerprints(),
-                         "the file was not re-hashed from the start")
+    # The layout from the review of #315: data, an unaligned hole the scan
+    # reads, extent B, an aligned hole it skips, extent C. The older binary
+    # hashed the first hole into B; a checkpoint anywhere after B's start -
+    # inside B, in the hole before C (no extent state at all) or inside C -
+    # carries that, in the state or in B's stored row.
+    B = 1184 * KiB
+    B_END = 3200 * KiB
+    C = 3456 * KiB
 
-    def test_an_older_binarys_extent_state_without_a_hole_is_adopted(self):
+    def build_two_hole_tree(self):
+        p = self.path("tree/f")
+        with open(p, "wb") as f:
+            f.write(os.urandom(960 * KiB))
+            f.seek(self.B)
+            f.write(os.urandom(self.B_END - self.B))
+            f.seek(self.C)
+            f.write(os.urandom(2 * MiB))
+            f.flush()
+            punch_hole(f.fileno(), 960 * KiB, self.B - 960 * KiB)
+            punch_hole(f.fileno(), self.B_END, self.C - self.B_END)
+        self.sync()
+        starts = [l for l, _p, _n, _fl in fiemap_extents(p)]
+        if self.B not in starts or self.C not in starts:
+            self.skipTest(f"B and C do not start extents here: {starts}")
+        return self.path("tree")
+
+    def test_an_older_binarys_checkpoint_after_a_hole_it_read_is_refused(self):
+        """Resumed, the hole's zeroes stay in B's digest, and the row this run
+        finishes says the digest is right, so it is never repaired."""
+        tree = self.build_two_hole_tree()
+        expected = self.scan_straight_through(tree)
+        b_digest = self.tail_digest("f", self.B)
+        for stop, where, lo, hi in (
+                (2, "inside B", self.B, self.B_END),
+                (3, "in the hole before C", self.B_END, self.C),
+                (4, "inside C", self.C, self.C + 2 * MiB)):
+            with self.subTest(where):
+                self.drop_hashfile()
+                at = self.old_checkpoint(tree, "f", stop)
+                self.assertTrue(lo < at < hi or (lo == self.B_END and at == lo),
+                                f"the checkpoint at {at} is {where}")
+                if at >= self.B_END:
+                    self.assertNotEqual(
+                        b_digest, self.tail_digest("f", self.B),
+                        "the older binary hashed the hole into B")
+
+                self.dm("-rv", tree, quiet=False)
+                self.assertDmOk()
+                self.assertEqual(0, self.hf_count("scan_checkpoints"))
+                self.assertEqual(expected, self.fingerprints(),
+                                 f"resumed {where}, the digests differ from "
+                                 "a straight-through scan")
+                self.assertIn("hashing from the start", self.out)
+
+    def test_an_older_binarys_checkpoint_without_a_hole_is_adopted(self):
         """The control: with no hole in front of the extent there was nothing
         to get wrong, and an interrupted huge file must not start over just
         because the binary was upgraded."""
@@ -332,8 +368,7 @@ class HashResumeTest(DuperemoveTest):
         tree = self.path("tree")
         expected = self.scan_straight_through(tree)
         self.drop_hashfile()
-        self.interrupt_after_one_checkpoint(tree)
-        at, _ext_loff = self.as_older_binary("plain")
+        at = self.old_checkpoint(tree, "plain", 1)
 
         self.dm("-rv", tree, quiet=False)
         self.assertDmOk()

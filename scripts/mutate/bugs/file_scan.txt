@@ -55,7 +55,7 @@
 # buffer holds the hole as zeroes. Hashed in, one extent behind holes of
 # different sizes got a different digest each time.
 <<<
-		if (file_off < extent->fe_logical) {
+		if (file_off < extent->fe_logical && !old_hole_digests) {
 			size_t gap = extent->fe_logical - file_off;
 ===
 		if (0) {

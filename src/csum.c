@@ -21,6 +21,7 @@
 
 #include "csum.h"
 #include "debug.h"
+#include "test_hooks.h"
 #include "util.h"
 
 #define XXH_STATIC_LINKING_ONLY
@@ -158,8 +159,10 @@ size_t running_checksum_state_size(void)
 int running_checksum_save(struct running_checksum *_c, void *buf, size_t len)
 {
 	struct xxhash_running_checksum *c = rc_to_priv(_c);
+	/* The version an older binary wrote, for DUPEREMOVE_OLD_HOLE_DIGESTS. */
 	struct csum_state_hdr hdr = {
-		.magic		= CSUM_STATE_MAGIC,
+		.magic		= test_hook_env("DUPEREMOVE_OLD_HOLE_DIGESTS") ?
+				  CSUM_STATE_MAGIC_V1 : CSUM_STATE_MAGIC,
 		.xxh_version	= XXH_versionNumber(),
 		.state_size	= sizeof(XXH3_state_t),
 	};
