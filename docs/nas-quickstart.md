@@ -95,10 +95,12 @@ cleanly until that hashfile exists, so set it up first.)
 
 Done. Weekly from here, oans re-scans `/srv/media`, hashes only what changed,
 and deduplicates — with no arguments, because the hashfile remembers everything.
-To change the frequency, override `OnCalendar=`:
+To change the frequency, override `OnCalendar=` in a drop-in. Reset it with an
+empty `OnCalendar=` line first, or the job runs on both schedules (see
+[systemd/README.md](../systemd/README.md#tuning-with-drop-ins-reset-a-list-before-you-set-it)):
 
 ```sh
-sudo systemctl edit oans@media.timer     # e.g. OnCalendar=daily
+sudo systemctl edit oans@media.timer     # [Timer] OnCalendar= then OnCalendar=daily
 ```
 
 ## Step 4 — Monitor
@@ -147,7 +149,9 @@ oans -qd --progress=json --hashfile=/var/cache/oans/media.hash \
 ```
 
 To capture that from the scheduled job, add `--progress=json` to the unit's
-command (`sudo systemctl edit oans@.service`); the JSON lines then land in the
+command with a drop-in that resets `ExecStart=` first, as
+[systemd/README.md](../systemd/README.md#tuning-with-drop-ins-reset-a-list-before-you-set-it)
+shows; the JSON lines then land in the
 journal, where `journalctl -u oans@media.service -o cat` gives you a clean
 stream to parse.
 
@@ -175,9 +179,12 @@ stream to parse.
   replayed under the new rules, so a scheduled job could now exclude more (or
   less) than it did. Run the job once by hand and check the output before
   trusting the next timer firing.
-- **The hashfile is just a cache** (under `/var/cache/oans`). Deleting it only
-  forces the next run to re-hash from scratch; it can live on your system SSD,
-  separate from the data pool.
+- **The hashfile holds the job, not only a cache** (under `/var/cache/oans`).
+  The hashes are rebuilt by a scan, but the paths, excludes and options of the
+  job exist only in the hashfile. Delete it and the timer silently skips the job
+  from then on; write down `oans --stats` first and re-run the setup command
+  (see [systemd/README.md](../systemd/README.md#the-hashfile-holds-the-job-not-only-a-cache)).
+  It can live on your system SSD, separate from the data pool.
 - **Compressed btrfs:** the reported "Reclaimed" figure is *logical* — the
   real disk space freed is smaller (roughly the compression ratio times that).
   Compare `compsize` before and after for the true reclaimed amount.
