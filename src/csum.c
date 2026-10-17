@@ -21,6 +21,7 @@
 
 #include "csum.h"
 #include "debug.h"
+#include "test_hooks.h"
 #include "util.h"
 
 #define XXH_STATIC_LINKING_ONLY
@@ -112,13 +113,43 @@ void finish_running_checksum(struct running_checksum *_c, unsigned char *digest)
  * being wrong is a rehash, never a wrong digest. oans links xxhash from the
  * system, so a distro upgrade genuinely can invalidate a saved state.
  */
-#define CSUM_STATE_MAGIC	0x4f414e5343534d31ULL	/* "OANSCSM1" */
+#define CSUM_STATE_MAGIC	0x4f414e5343534d32ULL	/* "OANSCSM2" */
+
+/*
+ * The magic doubles as the writer's generation; the layout behind it is the
+ * same. Version 1 is what binaries wrote before an extent digest left out the
+ * hole in front of its extent, so an extent state of that version may hold the
+ * hole's zeroes, and only the caller can tell from the layout whether it does.
+ * Binaries that know only version 1 refuse version 2 and rehash, which is safe.
+ */
+#define CSUM_STATE_MAGIC_V1	0x4f414e5343534d31ULL	/* "OANSCSM1" */
 
 struct csum_state_hdr {
 	uint64_t	magic;
 	uint32_t	xxh_version;	/* XXH_versionNumber() at save time */
 	uint32_t	state_size;	/* sizeof(XXH3_state_t) at save time */
 };
+
+static unsigned int state_version(uint64_t magic)
+{
+	switch (magic) {
+	case CSUM_STATE_MAGIC_V1:
+		return 1;
+	case CSUM_STATE_MAGIC:
+		return 2;
+	}
+	return 0;
+}
+
+unsigned int running_checksum_state_version(const void *buf, size_t len)
+{
+	struct csum_state_hdr hdr;
+
+	if (len != running_checksum_state_size())
+		return 0;
+	memcpy(&hdr, buf, sizeof(hdr));
+	return state_version(hdr.magic);
+}
 
 size_t running_checksum_state_size(void)
 {
@@ -128,8 +159,10 @@ size_t running_checksum_state_size(void)
 int running_checksum_save(struct running_checksum *_c, void *buf, size_t len)
 {
 	struct xxhash_running_checksum *c = rc_to_priv(_c);
+	/* The version an older binary wrote, for DUPEREMOVE_OLD_HOLE_DIGESTS. */
 	struct csum_state_hdr hdr = {
-		.magic		= CSUM_STATE_MAGIC,
+		.magic		= test_hook_env("DUPEREMOVE_OLD_HOLE_DIGESTS") ?
+				  CSUM_STATE_MAGIC_V1 : CSUM_STATE_MAGIC,
 		.xxh_version	= XXH_versionNumber(),
 		.state_size	= sizeof(XXH3_state_t),
 	};
@@ -152,7 +185,7 @@ struct running_checksum *running_checksum_restore(const void *buf, size_t len)
 		return NULL;
 
 	memcpy(&hdr, buf, sizeof(hdr));
-	if (hdr.magic != CSUM_STATE_MAGIC ||
+	if (!state_version(hdr.magic) ||
 	    hdr.xxh_version != XXH_versionNumber() ||
 	    hdr.state_size != sizeof(XXH3_state_t))
 		return NULL;

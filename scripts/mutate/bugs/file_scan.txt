@@ -6,7 +6,8 @@
 #
 # Only the unit suite runs here. The #273 recheck of rows an older binary
 # wrote is pinned by tests/integration/test_prealloc.py instead, which drives
-# a real fallocate().
+# a real fallocate(); the hole recheck and the resume across a hole, by
+# test_hole_extent.py and test_hash_resume.py.
 
 # ---------------------------------------------------------------- #273
 
@@ -45,4 +46,28 @@
 	}
 ===
 	abort_on(!S_ISREG(st->stx_mode));
+>>>
+
+# ------------------------------------------------- extent digest and holes
+
+# the hole before an extent is hashed into its digest again
+# get_extent() answers the next extent for an offset in a hole, and the
+# buffer holds the hole as zeroes. Hashed in, one extent behind holes of
+# different sizes got a different digest each time.
+<<<
+		if (file_off < extent->fe_logical && !old_hole_digests) {
+			size_t gap = extent->fe_logical - file_off;
+===
+		if (0) {
+			size_t gap = extent->fe_logical - file_off;
+>>>
+
+# a gap after a preallocated extent is taken for one the scan skipped
+# The scan skips a hole only when it reaches it from a data extent or from the
+# start of the file; after a preallocated one it reads it, so an older binary
+# hashed it in. Missed here, that row and that checkpoint are kept.
+<<<
+	       (prev_skip || prev_end % blocksize || e->fe_logical % blocksize);
+===
+	       (prev_end % blocksize || e->fe_logical % blocksize);
 >>>

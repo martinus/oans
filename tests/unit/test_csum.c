@@ -5,6 +5,41 @@
  * into are #included.
  */
 
+/*
+ * A state saved by a binary whose extent digests took in the hole before their
+ * extent still restores, and says so: the scan refuses such an extent state
+ * only where a hole was read, so it has to be able to tell.
+ */
+MU_TEST(test_running_checksum_state_version) {
+	size_t len = running_checksum_state_size();
+	_cleanup_(freep) unsigned char *blob = malloc(len);
+	unsigned char data[1000], want[DIGEST_LEN], got[DIGEST_LEN];
+	struct running_checksum *c = start_running_checksum();
+	/* The magic's last character is its low byte. */
+	unsigned char *gen = blob + (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ ? 7 : 0);
+
+	for (unsigned int i = 0; i < sizeof(data); i++)
+		data[i] = (unsigned char)(i * 13 + 5);
+	add_to_running_checksum(c, data, sizeof(data));
+	mu_check(running_checksum_save(c, blob, len) == 0);
+	finish_running_checksum(c, want);
+	mu_check(running_checksum_state_version(blob, len) == 2);
+
+	/* "OANSCSM2" -> "OANSCSM1": the magic is the only difference. */
+	mu_check(*gen == '2');
+	*gen = '1';
+	mu_check(running_checksum_state_version(blob, len) == 1);
+	c = running_checksum_restore(blob, len);
+	mu_check(c != NULL);
+	finish_running_checksum(c, got);
+	mu_check(memcmp(want, got, DIGEST_LEN) == 0);
+
+	mu_check(running_checksum_state_version(blob, len - 1) == 0);
+	*gen = '3';
+	mu_check(running_checksum_state_version(blob, len) == 0);
+	mu_check(running_checksum_restore(blob, len) == NULL);
+}
+
 MU_TEST(test_running_checksum_survives_save_restore) {
 	unsigned char data[8192];
 	unsigned char whole[DIGEST_LEN], resumed[DIGEST_LEN];

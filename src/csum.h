@@ -69,6 +69,12 @@ void finish_running_checksum(struct running_checksum *c, unsigned char *digest);
 size_t running_checksum_state_size(void);
 int running_checksum_save(struct running_checksum *c, void *buf, size_t len);
 struct running_checksum *running_checksum_restore(const void *buf, size_t len);
+/*
+ * Which generation of binary wrote a saved state: 1 for the binaries whose
+ * extent digests took in the hole before their extent, 2 since; 0 for a blob
+ * that is not a state at all. Restore accepts both.
+ */
+unsigned int running_checksum_state_version(const void *buf, size_t len);
 
 #define	DECLARE_RUNNING_CSUM_CAST_FUNCS(_type)				\
 static inline struct _type *						\

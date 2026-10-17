@@ -68,6 +68,153 @@ MU_TEST(test_is_area_ignored) {
 }
 
 /*
+ * Run process_extents() over one buffer holding [0, len) of a file laid out
+ * as `recs`, with the file's bytes in `buf` (holes as zeroes, as a read gives
+ * them). Leaves what it stored in `h`; the caller frees h->extents.
+ */
+static void extents_of(const struct fm_rec *recs, unsigned int n,
+		       char *buf, size_t len, struct hashes *h,
+		       bool *csum_left)
+{
+	struct buffer b = { .buf = buf, .size = len, .dl_len = len };
+	struct scan_ctxt ctxt = { .fd = -1, .filesize = len,
+				  .fiemap = mkmap(recs, n) };
+
+	if (process_extents(&ctxt, &b, h, len))
+		abort();
+	*csum_left = ctxt.extent_csum != NULL;
+	if (ctxt.extent_csum)
+		finish_running_checksum(ctxt.extent_csum, NULL);
+	free(ctxt.fiemap);
+}
+
+/*
+ * A hole that does not fill whole hash blocks is read, and comes back as
+ * zeroes. They are no part of the extent after it, whose row says it starts
+ * at fe_logical: hashed in, the same extent behind holes of different sizes
+ * got a different digest each time and the extent pass never matched it.
+ */
+MU_TEST(test_an_extent_digest_leaves_out_the_hole_before_it) {
+	const uint64_t K = 1024;
+	/* hole [0, 64K), data [64K, 128K) */
+	const struct fm_rec lead[] = { { 64 * K, 1024 * K, 64 * K,
+					 FIEMAP_EXTENT_LAST } };
+	/* data [0, 16K), hole, data [48K, 128K) */
+	const struct fm_rec mid[] = { { 0, 1024 * K, 16 * K, 0 },
+				      { 48 * K, 2048 * K, 80 * K,
+					FIEMAP_EXTENT_LAST } };
+	/* data [0, 16K), hole past the buffer, data [1M, 1M + 4K) */
+	const struct fm_rec far[] = { { 0, 1024 * K, 16 * K, 0 },
+				      { 1024 * K, 2048 * K, 4 * K,
+					FIEMAP_EXTENT_LAST } };
+	static char buf[128 * 1024];
+	unsigned char want[DIGEST_LEN];
+	struct hashes h = {0,};
+	bool left;
+
+	for (size_t i = 0; i < sizeof(buf); i++)
+		buf[i] = (char)(i * 7 + 3);
+
+	memset(buf, 0, 64 * K);
+	extents_of(lead, 1, buf, sizeof(buf), &h, &left);
+	mu_check(h.extents_index == 1);
+	mu_check(h.extents[0].loff == 64 * K && h.extents[0].len == 64 * K);
+	checksum_block(buf + 64 * K, 64 * K, want);
+	mu_check(memcmp(h.extents[0].digest, want, DIGEST_LEN) == 0);
+	free(h.extents);
+
+	for (size_t i = 0; i < sizeof(buf); i++)
+		buf[i] = (char)(i * 7 + 3);
+	memset(buf + 16 * K, 0, 32 * K);
+	h = (struct hashes){0,};
+	extents_of(mid, 2, buf, sizeof(buf), &h, &left);
+	mu_check(h.extents_index == 2);
+	checksum_block(buf, 16 * K, want);
+	mu_check(memcmp(h.extents[0].digest, want, DIGEST_LEN) == 0);
+	mu_check(h.extents[1].loff == 48 * K && h.extents[1].len == 80 * K);
+	checksum_block(buf + 48 * K, 80 * K, want);
+	mu_check(memcmp(h.extents[1].digest, want, DIGEST_LEN) == 0);
+	free(h.extents);
+
+	/*
+	 * The buffer ends in the hole: nothing of the next extent was read, so
+	 * there is no digest in progress for a checkpoint to carry (#159).
+	 */
+	memset(buf + 16 * K, 0, sizeof(buf) - 16 * K);
+	h = (struct hashes){0,};
+	extents_of(far, 2, buf, sizeof(buf), &h, &left);
+	mu_check(h.extents_index == 1);
+	mu_check(!left);
+	free(h.extents);
+}
+
+/*
+ * Which gaps a binary older than FILE_HOLE_EXTENT_CHECKED read into the next
+ * extent's digest. A row is rehashed for it, and an extent state such a binary
+ * checkpointed after one is refused, so a "no" here is a digest kept for good.
+ */
+MU_TEST(test_hole_read_before) {
+	/* Set, not read: test_is_block_zeroed() leaves it at 100. */
+	const uint64_t B = DEFAULT_BLOCKSIZE, K = 1024;
+	unsigned int saved = blocksize;
+	const uint32_t L = FIEMAP_EXTENT_LAST;
+	/* Contiguous from 0, and a whole-block hole after whole-block data. */
+	const struct fm_rec clean[] = { { 0, 1 * B, B, 0 },
+					{ B, 2 * B, B, 0 },
+					{ 3 * B, 4 * B, B, L } };
+	/* A whole-block hole at the start of the file: skipped, too. */
+	const struct fm_rec lead_aligned[] = { { B, 1 * B, B, L } };
+	/* A hole at the start that ends mid-block. */
+	const struct fm_rec lead_unaligned[] = { { 64 * K, 1 * B, B, L } };
+	/* Data that ends mid-block, then a hole up to a block boundary. */
+	const struct fm_rec after_short[] = { { 0, 1 * B, 16 * K, 0 },
+					      { B, 2 * B, B, L } };
+	/* Whole-block data, then a hole that ends mid-block. */
+	const struct fm_rec into_block[] = { { 0, 1 * B, B, 0 },
+					     { 2 * B + 4 * K, 2 * B, B, L } };
+	/* A whole-block hole after a preallocated extent. */
+	const struct fm_rec after_prealloc[] = {
+		{ 0, 1 * B, B, FIEMAP_EXTENT_UNWRITTEN },
+		{ 2 * B, 2 * B, B, L } };
+	/* Data that ends mid-block, but no gap after it. */
+	const struct fm_rec no_gap[] = { { 0, 1 * B, 16 * K, 0 },
+					 { 16 * K, 2 * B, B, L } };
+	struct fiemap *fm;
+
+	blocksize = B;
+	fm = mkmap(clean, 3);
+	mu_check(!hole_read_before(fm, 0));
+	mu_check(!hole_read_before(fm, 1));
+	mu_check(!hole_read_before(fm, 2));
+	free(fm);
+
+	fm = mkmap(lead_aligned, 1);
+	mu_check(!hole_read_before(fm, 0));
+	free(fm);
+
+	fm = mkmap(lead_unaligned, 1);
+	mu_check(hole_read_before(fm, 0));
+	free(fm);
+
+	fm = mkmap(after_short, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(into_block, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(after_prealloc, 2);
+	mu_check(hole_read_before(fm, 1));
+	free(fm);
+
+	fm = mkmap(no_gap, 2);
+	mu_check(!hole_read_before(fm, 1));
+	free(fm);
+	blocksize = saved;
+}
+
+/*
  * A file the walk queued can be something else by the time the consumer gets
  * it. That used to abort the run, losing the open write batch (#278); it is
  * skipped and counted, before anything touches the hashfile.

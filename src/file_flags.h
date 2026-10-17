@@ -40,7 +40,17 @@
  */
 #define FILE_EOF_EXTENT_CHECKED	0x0008
 
+/*
+ * The extent digests were computed by a binary that leaves a hole out of the
+ * extent after it. Older ones hashed the zeroes of a hole that does not fill
+ * whole hash blocks into the next extent's digest, so one extent behind holes
+ * of different sizes got different digests and was never extent-deduped.
+ * Rechecked once like FILE_UNWRITTEN_CHECKED, and set together with it.
+ */
+#define FILE_HOLE_EXTENT_CHECKED	0x0010
+
 /* Every recheck bit: a row with all of them needs no fiemap. */
-#define FILE_SCAN_CHECKED	(FILE_UNWRITTEN_CHECKED | FILE_EOF_EXTENT_CHECKED)
+#define FILE_SCAN_CHECKED	(FILE_UNWRITTEN_CHECKED | FILE_EOF_EXTENT_CHECKED | \
+				 FILE_HOLE_EXTENT_CHECKED)
 
 #endif
