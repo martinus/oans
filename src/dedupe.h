@@ -141,10 +141,17 @@ enum dedupe_support {
 enum dedupe_support dedupe_classify_probe(int rc, int err, int64_t status);
 
 /*
+ * The length of each of the two ranges the probe compares in the file behind
+ * `fd`, `size` bytes long, or 0 when it is too small to hold them. Such a file
+ * is not asked at all.
+ */
+uint64_t dedupe_probe_len(int fd, uint64_t size);
+
+/*
  * Ask the filesystem behind `fd` whether it implements FIDEDUPERANGE. `fd`
- * must be open for writing (the ioctl's destination must be writable) and
- * refer to a regular file of `size` bytes; a file too small to hold two
- * disjoint ranges cannot answer.
+ * must be one the ioctl accepts as a destination (open for writing, or a file
+ * the caller owns) and refer to a regular file of `size` bytes; a file too
+ * small to hold two disjoint ranges cannot answer.
  */
 enum dedupe_support dedupe_probe_fd(int fd, uint64_t size);
 

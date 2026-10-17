@@ -85,3 +85,62 @@ class FsProbeTest(DuperemoveTest):
                          "the probe altered the file's size")
         self.assertEqual(st_before.st_mtime, st_after.st_mtime,
                          "the probe altered the file's mtime")
+
+
+@requires_reflink
+class FsProbeBudgetTest(DuperemoveTest):
+    """A file that cannot host the probe is not asked, and does not spend
+    FS_PROBE_MAX_TRIES (16). Counting them refused a supported filesystem
+    whenever the walk handed over enough small or read-only files first.
+
+    One walker, so the files at the top come out before the one below them.
+    """
+    COUNT = 40          # well past FS_PROBE_MAX_TRIES
+
+    def run_forced(self):
+        self.dm("-r", "--io-threads=1", self.path("tree"), env=FORCED)
+
+    def test_small_files_first_do_not_spend_the_budget(self):
+        for i in range(self.COUNT):
+            self.mkrand(f"tree/f{i:02}", 100)   # under two blocks
+        self.mkrand("tree/z/big.bin", 1 * MiB)
+        self.run_forced()
+        self.assertDmOk("the large file settles it; the small ones say "
+                        "nothing about the filesystem")
+        self.assertEqual(self.COUNT + 1, len(self.scanned_files()))
+
+    def test_read_only_files_first_do_not_spend_the_budget(self):
+        """Owned but 0444: asked through a read-only fd, as the dedupe phase
+        opens them. (As root they open read-write anyway.)"""
+        for i in range(self.COUNT):
+            os.chmod(self.mkrand(f"tree/f{i:02}", 1 * MiB), 0o444)
+        self.run_forced()
+        self.assertDmOk()
+        self.assertEqual(self.COUNT, len(self.scanned_files()))
+
+    def test_a_tree_no_file_can_test_is_still_refused(self):
+        """Not asking is not an answer: the walk ends unsettled, and says
+        why."""
+        for i in range(self.COUNT):
+            self.mkrand(f"tree/f{i:02}", 100)
+        self.run_forced()
+        self.assertNotEqual(0, self.rc, self.out)
+        self.assertIn(f"{self.COUNT} file(s) were too small", self.out)
+
+    def test_files_that_cannot_host_it_are_capped(self):
+        """Each file not asked is hashed while the question is open, so they
+        get a cap of their own, FS_PROBE_MAX_UNASKED (1024): without it a
+        user who may not write a tree on a filesystem without the ioctl hashed
+        the whole tree before the refusal. Past the cap the run gives up,
+        even with a file below that could have answered."""
+        cap = 1024
+        for i in range(cap + 10):
+            self.mkrand(f"tree/f{i:04}", 100)
+        self.mkrand("tree/z/big.bin", 1 * MiB)
+        self.run_forced()
+        self.assertNotEqual(0, self.rc, self.out)
+        self.assertIn(f"gave up after {cap} file(s) that were too small",
+                      self.out)
+        self.assertIn("owns it", self.out)
+        self.assertNotIn(self.path("tree/z/big.bin"), self.scanned_files(),
+                         "the walk went on past the refusal")
