@@ -529,6 +529,10 @@ static int dedupe_extent_list(struct dupe_extents *dext,
 				dbfile_lock();
 				dbfile_remove_file(dbfile_get_handle(), extent->e_file->filename);
 				dbfile_unlock();
+			} else {
+				/* Still there, and not deduped: a failure the
+				 * summary has to name (EACCES, EIO, ...). */
+				atomic_fetch_add(&dedupe_dest_errors, 1);
 			}
 			/*
 			 * Verbose-only: worker threads run while the in-place
@@ -766,11 +770,22 @@ close_files:
 			ret = filerec_open_once(tgt_extent->e_file,
 						&open_files);
 			if (ret) {
+				struct extent *rest = extent;
+				uint64_t dropped = 0;
 				declare_display_path(disp,
-						     extent->e_file->filename);
+						     tgt_extent->e_file->filename);
 
-				eprintf("%s: Could not re-open as target.\n",
-					disp);
+				/* No target, so the members not yet reached
+				 * are not deduped: count them as failed. */
+				list_for_each_entry_continue(rest,
+							     &dext->de_extents,
+							     e_list)
+					dropped++;
+				atomic_fetch_add(&dedupe_dest_errors, dropped);
+				eprintf("%s: Could not re-open as target: %s; "
+					"%"PRIu64" remaining duplicates not "
+					"deduped.\n", disp, strerror(ret),
+					dropped);
 				break;
 			}
 		}

@@ -732,7 +732,14 @@ taught the same thing from opposite directions.
 - **`fm_mapped_extents` never exceeds the buffer (#288).** With fewer slots
   than extents - none, when the count pass found none or failed - the kernel
   only counts and reports the real number, so every reader walked past the
-  allocation. `fiemap_map()` clamps it; the file changed between the calls.
+  allocation. The file changed between the calls.
+  - **A clamp is not enough: a short map must never be returned.** With
+    *some* slots the kernel fills them and stops, which looks exactly like a
+    complete map, and readers take running out of records for a hole - so two
+    maps cut at the same index compared their unknown tails as shared and the
+    destination was skipped. `fiemap_map()` asks about the remainder when the
+    buffer is full and the last record is neither `LAST` nor at the range's
+    end, retries once, then returns NULL.
 - **A synthetic record array cannot reach `do_fiemap()` itself.** Every fiemap
   test until now built `struct fm_rec` fixtures and called the map walkers
   directly, which is right for `fiemap_maps_share()` and the layout key — but

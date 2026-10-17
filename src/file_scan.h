@@ -90,6 +90,7 @@ enum scan_skip_bucket {
 	SCAN_SKIP_TOO_LARGE,		/* above --max-filesize */
 	SCAN_SKIP_NOT_REGULAR,		/* neither a regular file nor a directory */
 	SCAN_SKIP_READONLY_SUBVOL,	/* read-only btrfs subvolume, see #156 */
+	SCAN_SKIP_CHANGED,		/* changed while hashing: next run's work */
 	SCAN_SKIP__COUNT
 };
 

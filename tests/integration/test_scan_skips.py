@@ -85,6 +85,25 @@ class ScanSkipsTest(DuperemoveTest):
         metrics = json.loads(self.dm("--json"))
         self.assertEqual(0, metrics["scan_skipped_errors_total"])
 
+    def test_a_file_whose_extents_keep_changing_is_counted_as_changed(self):
+        """A file that outruns fiemap twice is skipped with a line and a count.
+
+        do_fiemap() refuses a map whose tail it cannot vouch for, and the
+        scan used to return on that NULL with only a debug line: the file was
+        neither hashed nor reported anywhere. It is the same situation as a
+        size that moves while hashing, so it is reported the same way.
+        """
+        self.mkrand("tree/a.bin", 200000)
+        self.dm("-r", "-v", self.path("tree"),
+                env={"DUPEREMOVE_FIEMAP_UNSTABLE": "1"})
+
+        self.assertIn("extents changed while mapping it", self.out)
+        self.assertIn("1 changed while hashing", self.out,
+                      "the skipped file was not counted")
+        self.assertEqual([(None,)], self.hf_query(
+            "select digest from files"),
+            "a file with no map must not be stored as hashed")
+
     def test_history_marks_a_degraded_run(self):
         """--history must distinguish 'reclaimed nothing' from 'lost a subtree'.
 

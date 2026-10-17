@@ -18,9 +18,9 @@ struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 				 unsigned int *index);
 
 /*
- * Extract the extents mapping of a file.
- * May not return all extents if the file changed while this function is
- * running.
+ * Extract the extents mapping of a file. Returns NULL on error, and with errno
+ * set to EAGAIN when the file kept gaining extents while it was being mapped:
+ * a map that cannot vouch for its tail is no map at all.
  */
 struct fiemap *do_fiemap(int fd);
 
