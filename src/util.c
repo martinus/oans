@@ -257,13 +257,6 @@ int increase_limits(void) {
 	return 0;
 }
 
-void debug_print_uuid(uuid_t uuid)
-{
-	char buf[37];
-	uuid_unparse(uuid, buf);
-	eprintf("%s", buf);
-}
-
 /*
  * Render one control byte into `buf` (at least SANITIZE_CTRL_MAX bytes) and
  * return how many characters it took. Not NUL-terminated.
