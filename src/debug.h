@@ -51,9 +51,22 @@ extern int quiet;
 #undef dprintf
 #undef vprintf
 
-#define dprintf(format, ...) if (debug) progress_printf(stdout, format, ##__VA_ARGS__)
-#define vprintf(format, ...) if (verbose) progress_printf(stdout, format, ##__VA_ARGS__)
-#define qprintf(format, ...) if (!quiet) progress_printf(stdout, format, ##__VA_ARGS__)
+/*
+ * do { } while (0), not a bare `if`: `if (x) vprintf(...); else ...` bound the
+ * `else` to the macro's own `if`, so it ran whenever -v was off.
+ */
+#define dprintf(format, ...) do {					\
+		if (debug)						\
+			progress_printf(stdout, format, ##__VA_ARGS__);	\
+	} while (0)
+#define vprintf(format, ...) do {					\
+		if (verbose)						\
+			progress_printf(stdout, format, ##__VA_ARGS__);	\
+	} while (0)
+#define qprintf(format, ...) do {					\
+		if (!quiet)						\
+			progress_printf(stdout, format, ##__VA_ARGS__);	\
+	} while (0)
 #define eprintf(format, ...) progress_printf(stderr, format, ##__VA_ARGS__)
 
 void print_stack_trace(void);/* defined in util.c */

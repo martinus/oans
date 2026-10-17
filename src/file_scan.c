@@ -3373,20 +3373,27 @@ static int process_extents(struct scan_ctxt *ctxt, struct buffer *buffer,
 static int fill_buffer(struct scan_ctxt *ctxt, struct buffer *buffer)
 {
 	ssize_t ret;
+	/*
+	 * A whole number of blocks, so the offset after a faked buffer stays
+	 * on the block grid: -b need not divide the 1 MiB buffer (96K does
+	 * not), and a block hashed at an offset a plain read would not use
+	 * matches no other file's.
+	 */
+	size_t fake = buffer->size - buffer->size % blocksize;
 
 	/*
 	 * The entire buffer could be ignored. Let's fast forward
 	 * and mark the buffer as faked
 	 */
-	if (is_area_ignored(ctxt->fiemap, ctxt->off, buffer->size,
+	if (is_area_ignored(ctxt->fiemap, ctxt->off, fake,
 			    &ctxt->extent_cursor)
-			&& ctxt->off + buffer->size <= ctxt->filesize) {
-		memset(buffer->buf, 0, buffer->size);
-		buffer->dl_len = buffer->size;
+			&& ctxt->off + fake <= ctxt->filesize) {
+		memset(buffer->buf, 0, fake);
+		buffer->dl_len = fake;
 		buffer->dl_offset = 0;
 		buffer->faked = true;
 
-		if (ctxt->filesize <= ctxt->off + buffer->size)
+		if (ctxt->filesize <= ctxt->off + fake)
 			return 0; /* Simulate EOF */
 		return 1;
 	}

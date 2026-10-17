@@ -349,7 +349,7 @@ static int print_hashfile_stats(char *filename)
 	printf("  %stracked%s         %"PRIu64"\n", col_dim, col_reset, files);
 	printf("  %shashed%s          %"PRIu64"\n", col_dim, col_reset, hashed);
 	if (unhashed)
-		printf("  %sunread%s          %"PRIu64"   %s(unique size, whole-file mode)%s\n",
+		printf("  %sunread%s          %"PRIu64"   %s(no file digest: unique size, or hashing not finished)%s\n",
 		       col_dim, col_reset, unhashed, col_dim, col_reset);
 	printf("  %sextent hashes%s   %"PRIu64"\n", col_dim, col_reset, st.num_e_hashes);
 	printf("  %sblock hashes%s    %"PRIu64, col_dim, col_reset, st.num_b_hashes);
@@ -420,24 +420,36 @@ static int print_hashfile_stats(char *filename)
 	return 0;
 }
 
-/* Print s as a JSON string literal (quotes + minimal escaping). */
+/*
+ * Print s as a JSON string literal (quotes + minimal escaping).
+ *
+ * JSON text is UTF-8, and a path is any bytes: a byte that starts no valid
+ * UTF-8 sequence (a Latin-1 name, say) is written as \u00NN of the byte, as if
+ * it were Latin-1. Lossy - a real U+00E9 and a raw 0xE9 byte print the same -
+ * but the output stays valid JSON, where passing the byte through made every
+ * consumer reject the whole object.
+ */
 static void print_json_str(const char *s)
 {
 	putchar('"');
 	for (; *s; s++) {
-		unsigned char c = (unsigned char)*s, cp;
+		const unsigned char *p = (const unsigned char *)s;
+		unsigned char c = *p, cp;
 		/* Same policy as sanitize_ctrl(), a different rendering: JSON
 		 * spells a dangerous byte \u00NN. Asking one classifier keeps
 		 * the two from drifting apart. */
-		size_t n = ctrl_seq_len((const unsigned char *)s, &cp);
+		size_t n = ctrl_seq_len(p, &cp);
 
 		if (n) {
 			printf("\\u%04x", cp);
 			s += n - 1;
 		} else if (c == '"' || c == '\\') {
 			printf("\\%c", c);
+		} else if ((n = utf8_seq_len(p))) {
+			fwrite(s, 1, n, stdout);
+			s += n - 1;
 		} else {
-			putchar(c);
+			printf("\\u%04x", c);
 		}
 	}
 	putchar('"');
@@ -471,7 +483,7 @@ static int print_hashfile_history(char *filename)
 	       since, col_dim, sum.runs, sum.runs == 1 ? "" : "s", col_reset);
 	printf("  %sreclaimed%s    %s%s%s total\n", col_dim, col_reset, col_green,
 	       human_size(sum.total_reclaimed), col_reset);
-	printf("  %sfiles seen%s   %"PRIu64" %s(cumulative)%s\n", col_dim, col_reset,
+	printf("  %sfiles hashed%s %"PRIu64" %s(cumulative)%s\n", col_dim, col_reset,
 	       sum.total_files, col_dim, col_reset);
 
 	printf("\n  %srecent%s   %sdate · reclaimed · elapsed · files · mode%s\n",
@@ -567,11 +579,12 @@ static int print_metrics_json(char *filename)
 	/*
 	 * Whether the stored config deduplicates at all. A job seeded without -d
 	 * reports 0 reclaimed forever, which is also what a healthy job on a
-	 * clean tree reports - this is what tells them apart (#149).
+	 * clean tree reports - this is what tells them apart (#149). null, not
+	 * absent, when no run has stored a configuration: a consumer can test
+	 * the key without guarding for it.
 	 */
-	if (have_sc > 0)
-		printf("  \"scan_configured_dedupe\": %s,\n",
-		       sc.run_dedupe ? "true" : "false");
+	printf("  \"scan_configured_dedupe\": %s,\n",
+	       have_sc == 0 ? "null" : sc.run_dedupe ? "true" : "false");
 	scan_config_free(&sc);
 	/*
 	 * Deliberately outside the error object: a skipped snapshot is a saving,
@@ -582,6 +595,22 @@ static int print_metrics_json(char *filename)
 	printf("  \"last_run_ts\": %"PRId64"\n", sum.last_ts);
 	printf("}\n");
 	return 0;
+}
+
+/*
+ * Opening a hashfile creates it, so a mode that only makes sense on an
+ * existing one checks first: a typo in the path used to leave an empty
+ * hashfile behind (#284). Prints why and answers false when it is missing.
+ */
+static bool hashfile_exists(const char *what)
+{
+	/* longpath-ok: the hashfile itself. */
+	if (access(options.hashfile, F_OK) == 0)
+		return true;
+	/* escape-ok: oans's own --hashfile argument. */
+	eprintf("Error: %s, and there is no hashfile %s: %s\n", what,
+		options.hashfile, strerror(errno));
+	return false;
 }
 
 /*
@@ -604,6 +633,8 @@ static int prune_block_hashes(char *filename)
 	uint64_t before_bytes = 0, after_bytes = 0;
 	int64_t dropped;
 
+	if (!hashfile_exists("nothing to prune"))
+		return -1;
 	db = dbfile_open_handle(filename);
 	if (!db) {
 		/* escape-ok: oans's own --hashfile argument. */
@@ -738,7 +769,11 @@ static int rm_one_path(char *path, void *db)
 static int rm_db_files(int numfiles, char **files)
 {
 	int i, ret = 0;
-	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = dbfile_open_handle(options.hashfile);
+	_cleanup_(sqlite3_close_cleanup) struct dbhandle *db = NULL;
+
+	if (!hashfile_exists("nothing to remove"))
+		return -1;
+	db = dbfile_open_handle(options.hashfile);
 	if (!db) {
 		eprintf("Error: Could not open \"%s\"\n", options.hashfile);
 		return -1;
@@ -902,7 +937,8 @@ static void help(void)
 "                              a bare 'oans --hashfile=FILE' replays the last run\n"
 "\n"
 "Scan tuning:\n"
-"  -b SIZE                     hashing block size, 4K-1M (default 128K)\n"
+"  -b SIZE                     hashing block size, a multiple of 4K from 4K\n"
+"                              to 1M (default 128K)\n"
 "  -B, --batchsize=N           files per scan generation (default 1024)\n"
 "  -m, --min-filesize=SIZE     skip files smaller than SIZE (default 1)\n"
 "      --max-filesize=SIZE     skip files larger than SIZE (default: no limit)\n"
@@ -1015,7 +1051,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		exit(1);
 	}
 
-	while ((c = getopt_long(argc, argv, "b:vdrh?LRqB:m:", long_ops, NULL))
+	while ((c = getopt_long(argc, argv, "b:vdrhLRqB:m:", long_ops, NULL))
 	       != -1) {
 		switch (c) {
 		case 'b': {
@@ -1025,10 +1061,16 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			 * 4K (#284). */
 			if (parse_size(optarg, &bs))
 				return EINVAL;
-			if (bs < MIN_BLOCKSIZE || bs > MAX_BLOCKSIZE) {
-				eprintf("Error: Blocksize is bounded by %u and %u, "
-					"%s found\n", MIN_BLOCKSIZE, MAX_BLOCKSIZE,
-					optarg);
+			/* A multiple of 4K, the smallest filesystem block: a
+			 * block that ends inside one can never be shared whole
+			 * (5000 used to be accepted). A power of two is not
+			 * needed; fill_buffer() keeps the block grid. */
+			if (bs < MIN_BLOCKSIZE || bs > MAX_BLOCKSIZE ||
+			    bs % MIN_BLOCKSIZE) {
+				eprintf("Error: Blocksize must be a multiple of "
+					"%uK from %uK to %uM, %s found\n",
+					MIN_BLOCKSIZE / 1024, MIN_BLOCKSIZE / 1024,
+					MAX_BLOCKSIZE / (1024 * 1024), optarg);
 				return EINVAL;
 			}
 			blocksize = (unsigned int)bs;
@@ -1153,6 +1195,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case '?':
 		default:
+			/* getopt named the bad option; say where to look. */
+			usage();
 			return 1;
 		}
 	}
@@ -1210,6 +1254,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			eprintf("Error: --hashfile= option is required with "
 				"'-L', '-R', '--stats', '--history', '--json' "
 				"or '--prune-block-hashes'.\n");
+			return 1;
+		}
+		if (rm_only_opt && !numfiles) {
+			eprintf("Error: -R takes the paths to remove, or '-' "
+				"to read them from standard input\n");
 			return 1;
 		}
 		if (nofile_report && numfiles) {
@@ -2207,11 +2256,7 @@ int main(int argc, char **argv)
 	 * path then left an empty hashfile behind (#284).
 	 */
 	if (argc == filelist_idx && !stdin_filelist &&
-	    /* longpath-ok: the hashfile itself. */
-	    access(options.hashfile, F_OK) != 0) {
-		/* escape-ok: oans's own --hashfile argument. */
-		eprintf("Error: no files given, and there is no hashfile %s to "
-			"replay: %s\n", options.hashfile, strerror(errno));
+	    !hashfile_exists("no files given to scan or replay")) {
 		ret = 1;
 		goto out;
 	}
@@ -2273,8 +2318,13 @@ int main(int argc, char **argv)
 			numfiles, numfiles == 1 ? "" : "s");
 	}
 
-	/* Pick io-threads to suit the target's storage (unless set explicitly). */
-	apply_storage_defaults(roots[0]);
+	/*
+	 * Pick io-threads to suit the target's storage (unless set explicitly).
+	 * A file list on stdin names no root up front - roots[0] is "-", which
+	 * would probe whatever happens to be called that in the cwd - so it
+	 * gets the default for unknown media.
+	 */
+	apply_storage_defaults(stdin_filelist ? NULL : roots[0]);
 
 	print_header();
 
