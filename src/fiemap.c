@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <linux/fs.h>
 
 #include "csum.h"
@@ -142,6 +143,95 @@ static bool fiemap_map_truncated(int fd, const struct fiemap *fm,
 }
 
 /*
+ * DEBUG BRANCH ONLY (debug/fiemap-eagain): print everything fiemap_map() based
+ * its "the file changed" verdict on, so a false EAGAIN can be told from a file
+ * that really changed.
+ */
+static void debug_dump_rec(const char *what, unsigned int i,
+			   const struct fiemap_extent *e)
+{
+	eprintf("  %s #%u: logical=%llu length=%llu physical=%llu end=%llu "
+		"flags=0x%x\n", what, i,
+		(unsigned long long)e->fe_logical,
+		(unsigned long long)e->fe_length,
+		(unsigned long long)e->fe_physical,
+		(unsigned long long)(e->fe_logical + e->fe_length),
+		e->fe_flags);
+}
+
+static void debug_dump_rejected_map(int fd, const struct fiemap *fm,
+				    unsigned int count, uint64_t start,
+				    uint64_t length, int attempt)
+{
+	uint64_t end = length > UINT64_MAX - start ? UINT64_MAX : start + length;
+	unsigned int n = fm->fm_mapped_extents;
+	unsigned int shown = n < count ? n : count;
+	unsigned int nlast = 0, nonmono = 0;
+	struct stat st;
+
+	if (fstat(fd, &st) == 0)
+		eprintf("FIEMAP-DEBUG attempt %d: size=%llu blocks=%llu "
+			"mtime=%lld.%09ld ctime=%lld.%09ld\n", attempt,
+			(unsigned long long)st.st_size,
+			(unsigned long long)st.st_blocks,
+			(long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
+			(long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+	eprintf("FIEMAP-DEBUG attempt %d: range=[%llu, %llu) slots=%u "
+		"mapped=%u recount(sync)=%u recount=%u\n", attempt,
+		(unsigned long long)start, (unsigned long long)end, count, n,
+		count_extents(fd, start, length, FIEMAP_FLAG_SYNC),
+		count_extents(fd, start, length, 0));
+
+	for (unsigned int i = 0; i < shown; i++) {
+		const struct fiemap_extent *e = &fm->fm_extents[i];
+
+		if (e->fe_flags & FIEMAP_EXTENT_LAST)
+			nlast++;
+		if (i > 0 && e->fe_logical <
+		    fm->fm_extents[i - 1].fe_logical +
+		    fm->fm_extents[i - 1].fe_length) {
+			if (nonmono < 5) {
+				debug_dump_rec("overlap prev", i - 1,
+					       &fm->fm_extents[i - 1]);
+				debug_dump_rec("overlap this", i, e);
+			}
+			nonmono++;
+		}
+	}
+	eprintf("FIEMAP-DEBUG attempt %d: records with LAST=%u, "
+		"overlapping/unordered=%u\n", attempt, nlast, nonmono);
+
+	for (unsigned int i = shown > 3 ? shown - 3 : 0; i < shown; i++)
+		debug_dump_rec("tail", i, &fm->fm_extents[i]);
+
+	if (shown == count && count > 0) {
+		const struct fiemap_extent *last = &fm->fm_extents[count - 1];
+		uint64_t from = last->fe_logical + last->fe_length;
+		unsigned int rc = from < end ?
+			count_extents(fd, from, end - from, 0) : 0;
+		struct fiemap *r;
+
+		eprintf("FIEMAP-DEBUG attempt %d: remainder [%llu, %llu) "
+			"counts %u\n", attempt, (unsigned long long)from,
+			(unsigned long long)end, rc);
+		if (!rc)
+			return;
+		r = calloc(1, sizeof(*r) + 4 * sizeof(struct fiemap_extent));
+		if (!r)
+			return;
+		r->fm_start = from;
+		r->fm_length = end - from;
+		r->fm_extent_count = 4;
+		if (ioctl(fd, FS_IOC_FIEMAP, r) == 0)
+			for (unsigned int i = 0; i < r->fm_mapped_extents &&
+			     i < 4; i++)
+				debug_dump_rec("remainder", i,
+					       &r->fm_extents[i]);
+		free(r);
+	}
+}
+
+/*
  * Map `count` extents of [start, start+length) into a freshly allocated fiemap.
  * `count` normally comes from a preceding fiemap_count_extents() pass. Returns
  * NULL on allocation or ioctl error, and when the file keeps gaining extents
@@ -183,6 +273,9 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 		if (!fiemap_map_truncated(fd, fiemap, count, start, length) &&
 		    !test_hook_env("DUPEREMOVE_FIEMAP_UNSTABLE"))
 			return fiemap;
+
+		debug_dump_rejected_map(fd, fiemap, count, start, length,
+					attempt);
 
 		dprintf("fiemap: file changed between fiemap calls\n");
 		free(fiemap);
