@@ -1179,8 +1179,14 @@ static bool is_fs_allowlisted(const struct statfs *fs)
  * statfs() on the path separately, and the latter two would fail
  * ENAMETOOLONG on exactly the deep paths this file now supports -- silently
  * dropping, for instance, a whole btrfs subvolume nested below PATH_MAX depth.
+ *
+ * With `btrfs_only`, a filesystem that is not btrfs answers is_btrfs = false
+ * and no UUID: a run locked on btrfs needs nothing more to know it is another
+ * filesystem. Asking for its UUID failed on every squashfs or loop mount below
+ * a root, printed a libblkid error at default verbosity and counted it as an
+ * unsupported filesystem.
  */
-static int probe_fs(char *path, struct fs_probe *probe)
+static int probe_fs(char *path, struct fs_probe *probe, bool btrfs_only)
 {
 	struct statx st;
 	struct statfs fs;
@@ -1220,6 +1226,8 @@ static int probe_fs(char *path, struct fs_probe *probe)
 			filescan_count_skip(SCAN_SKIP_UNSUPPORTED_FS);
 			return 1;
 		}
+	} else if (btrfs_only) {
+		return 0;
 	} else {
 		const char *fs_source;
 		char *first_device;
@@ -1455,7 +1463,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	/* hashfile was empty. We lock on the file. */
 	if (uuid_is_null(locked_fs.uuid)) {
 		dprintf("Empty hashfile, locking on the current file\n");
-		ret = probe_fs(path, &probe);
+		ret = probe_fs(path, &probe, false);
 		if (ret)
 			return seed_reject(parent_checked);
 
@@ -1486,7 +1494,7 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	 * and store them for future calls
 	 */
 	if (locked_fs.dev == 0) {
-		ret = probe_fs(path, &probe);
+		ret = probe_fs(path, &probe, false);
 		if (ret)
 			return seed_reject(parent_checked);
 
@@ -1529,14 +1537,14 @@ bool check_file(struct dbhandle *db, char *path, struct statx *st, bool parent_c
 	if (verified_dev_get(dev))
 		return true;
 
-	ret = probe_fs(path, &probe);
+	ret = probe_fs(path, &probe, true);
 	if (ret) {
 		if (!parent_checked)
 			nr_roots_unusable++;
 		return false;
 	}
 
-	if (uuid_compare(probe.uuid, locked_fs.uuid) != 0)
+	if (!probe.is_btrfs || uuid_compare(probe.uuid, locked_fs.uuid) != 0)
 		return other_fs(path, parent_checked);
 
 	verified_dev_put(dev);
