@@ -739,7 +739,16 @@ taught the same thing from opposite directions.
     maps cut at the same index compared their unknown tails as shared and the
     destination was skipped. `fiemap_map()` asks about the remainder when the
     buffer is full and the last record is neither `LAST` nor at the range's
-    end, retries once, then returns NULL.
+    end, retries with more slots, then returns NULL.
+  - **The count is a lower bound on btrfs, so a retry doubles the slots and
+    never recounts.** btrfs skips its shared check when only counting
+    (`fi_extents_max == 0`), so physically adjacent extents of which only one
+    is shared merge into one record when counted and stay two when mapped.
+    Every deduplicated file can have that layout. With a recount, both tries
+    came back one short, and an idle 50 GiB qcow2 was skipped as "extents
+    changed while mapping it" on every run.
+    `test_fiemap_map_outgrows_a_short_count` builds the layout with clones,
+    and skips on a filesystem that counts it right.
 - **A synthetic record array cannot reach `do_fiemap()` itself.** Every fiemap
   test until now built `struct fm_rec` fixtures and called the map walkers
   directly, which is right for `fiemap_maps_share()` and the layout key — but
