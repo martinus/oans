@@ -142,12 +142,25 @@ static bool fiemap_map_truncated(int fd, const struct fiemap *fm,
 }
 
 /*
+ * Tries fiemap_map() makes before it calls the file changed. Each one doubles
+ * the slots, so the last has 8x what the count said.
+ */
+#define FIEMAP_MAP_TRIES	4
+
+/*
  * Map `count` extents of [start, start+length) into a freshly allocated fiemap.
  * `count` normally comes from a preceding fiemap_count_extents() pass. Returns
  * NULL on allocation or ioctl error, and when the file keeps gaining extents
- * between the count and the map: one retry, then a map that cannot vouch for
- * its tail is no map at all, and errno says EAGAIN so that the scan can tell
- * that case from an error and count the file as changed.
+ * faster than the retries grow the buffer: a map that cannot vouch for its
+ * tail is no map at all, and errno says EAGAIN so that the scan can tell that
+ * case from an error and count the file as changed.
+ *
+ * The count is only a lower bound, so a retry does not count again. btrfs
+ * counts without its shared check (`fi_extents_max == 0` in
+ * fs/btrfs/fiemap.c), and two physically adjacent extents only one of which
+ * is shared then merge into one record when counting and stay two when
+ * mapping. A deduplicated file is that layout, and a recount comes back
+ * exactly as short: a 50 GiB VM image was skipped as changed on every run.
  *
  * DUPEREMOVE_FIEMAP_UNSTABLE makes every map read as one the file outran: a
  * file that changes twice between two ioctls cannot be arranged from a test.
@@ -156,8 +169,9 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 				 unsigned int count)
 {
 	struct fiemap *fiemap;
+	unsigned int next;
 
-	for (int attempt = 0; attempt < 2; attempt++) {
+	for (int attempt = 0; attempt < FIEMAP_MAP_TRIES; attempt++) {
 		/*
 		 * The structure must be large enough to fit one struct fiemap
 		 * plus $count struct fiemap_extent. We over-allocate a pointer
@@ -184,9 +198,13 @@ static struct fiemap *fiemap_map(int fd, uint64_t start, uint64_t length,
 		    !test_hook_env("DUPEREMOVE_FIEMAP_UNSTABLE"))
 			return fiemap;
 
-		dprintf("fiemap: file changed between fiemap calls\n");
+		/* With no slots the kernel reported its count instead (#288). */
+		next = 2 * (fiemap->fm_mapped_extents > count ?
+			    fiemap->fm_mapped_extents : count);
+		dprintf("fiemap: %u slots did not hold the whole map, "
+			"trying %u\n", count, next);
 		free(fiemap);
-		count = fiemap_count_extents(fd, start, length);
+		count = next;
 	}
 	errno = EAGAIN;
 	return NULL;

@@ -841,6 +841,186 @@ MU_TEST(test_fiemap_map_never_claims_more_than_it_holds) {
 }
 
 /*
+ * A file whose extent count the kernel gets wrong. Two extents that sit next to
+ * each other on disk, the first also referenced by another file and the second
+ * not, cloned one after the other into one file. btrfs counts without its
+ * shared check, so the two have the same flags while it counts and merge into
+ * one record; mapped, the first is SHARED and they stay two. That is a
+ * deduplicated file, and a 50 GiB VM image was skipped as "extents changed
+ * while mapping it" on every run.
+ *
+ * Each donor is written and fsynced in turn, which on btrfs lays some of them
+ * out back to back, and the pair is found by asking fiemap rather than assumed.
+ * Incompressible, since a compressed extent never merges with its neighbour.
+ * Skipped where no pair turns up, and where the count is right (XFS).
+ */
+#define ADJ_DONORS	16
+#define ADJ_LEN		(64 * 1024)
+
+struct adj_file {
+	int fd;			/* the file with the two extents */
+	int keep;		/* the donor whose extent stays shared */
+	char path[PATH_MAX];
+	char keep_path[PATH_MAX];
+};
+
+static void adj_close(struct adj_file *f)
+{
+	if (f->fd >= 0)
+		close(f->fd);
+	if (f->keep >= 0)
+		close(f->keep);
+	if (f->path[0])
+		unlink(f->path);
+	if (f->keep_path[0])
+		unlink(f->keep_path);
+}
+
+/* The one record a donor maps to, or false when it is not one plain record. */
+static bool adj_record(int fd, struct fiemap_extent *rec)
+{
+	struct {
+		struct fiemap fm;
+		struct fiemap_extent ext[2];
+	} m = { .fm = { .fm_length = ~0ULL, .fm_extent_count = 2 } };
+
+	if (ioctl(fd, FS_IOC_FIEMAP, &m.fm) < 0 || m.fm.fm_mapped_extents != 1)
+		return false;
+	*rec = m.ext[0];
+	return rec->fe_logical == 0 && rec->fe_length == ADJ_LEN &&
+	       !(rec->fe_flags & ~FIEMAP_EXTENT_LAST);
+}
+
+static int adj_mkstemp(char *path)
+{
+	int fd;
+
+	if ((size_t)snprintf(path, PATH_MAX, "%s/oans-adj-XXXXXX",
+			     test_scratch_dir()) >= PATH_MAX)
+		abort();
+	fd = mkstemp(path);
+	if (fd < 0)
+		abort();
+	return fd;
+}
+
+/*
+ * One round of donors. Returns why the layout could not be built, or NULL
+ * with f->fd holding it.
+ */
+static const char *adj_try(struct adj_file *f, uint64_t *seed)
+{
+	char paths[ADJ_DONORS][PATH_MAX];
+	int fds[ADJ_DONORS];
+	struct fiemap_extent recs[ADJ_DONORS];
+	bool mapped[ADJ_DONORS];
+	_cleanup_(freep) uint64_t *buf = malloc(ADJ_LEN);
+	int first = -1, second = -1;
+	const char *why = NULL;
+
+	if (!buf)
+		abort();
+	for (int i = 0; i < ADJ_DONORS; i++) {
+		fds[i] = adj_mkstemp(paths[i]);
+		for (size_t w = 0; w < ADJ_LEN / sizeof(*buf); w++) {
+			*seed ^= *seed << 13;
+			*seed ^= *seed >> 7;
+			*seed ^= *seed << 17;
+			buf[w] = *seed;
+		}
+		if (pwrite(fds[i], buf, ADJ_LEN, 0) != ADJ_LEN || fsync(fds[i]))
+			abort();
+	}
+	for (int i = 0; i < ADJ_DONORS; i++)
+		mapped[i] = adj_record(fds[i], &recs[i]);
+	for (int i = 0; i < ADJ_DONORS && first < 0; i++)
+		for (int j = 0; j < ADJ_DONORS && mapped[i]; j++)
+			if (mapped[j] && recs[i].fe_physical + ADJ_LEN ==
+			    recs[j].fe_physical) {
+				first = i;
+				second = j;
+				break;
+			}
+	if (first < 0) {
+		why = "no two donors were allocated back to back";
+		goto out;
+	}
+
+	f->fd = adj_mkstemp(f->path);
+	for (int k = 0; k < 2; k++) {
+		struct file_clone_range r = {
+			.src_fd = fds[k ? second : first],
+			.src_length = ADJ_LEN,
+			.dest_offset = (uint64_t)k * ADJ_LEN,
+		};
+
+		if (ioctl(f->fd, FICLONERANGE, &r) < 0) {
+			why = "the filesystem cannot clone";
+			goto out;
+		}
+	}
+	/* Only `first` survives, so only the first extent is still shared. */
+	f->keep = fds[first];
+	fds[first] = -1;
+	memcpy(f->keep_path, paths[first], PATH_MAX);
+	paths[first][0] = '\0';
+out:
+	for (int i = 0; i < ADJ_DONORS; i++) {
+		if (fds[i] >= 0)
+			close(fds[i]);
+		if (paths[i][0])
+			unlink(paths[i]);
+	}
+	return why;
+}
+
+static struct adj_file adj_open(const char *name)
+{
+	struct adj_file f = { .fd = -1, .keep = -1 };
+	uint64_t seed = 0x9e3779b97f4a7c15ULL;
+	const char *why = NULL;
+
+	/* Where the allocator puts a donor is up to it, so try a few rounds. */
+	for (int round = 0; round < 8; round++) {
+		why = adj_try(&f, &seed);
+		if (!why || f.fd >= 0)
+			break;
+	}
+	if (!why) {
+		struct {
+			struct fiemap fm;
+			struct fiemap_extent ext[4];
+		} m = { .fm = { .fm_length = ~0ULL, .fm_extent_count = 4 } };
+
+		if (ioctl(f.fd, FS_IOC_FIEMAP, &m.fm) < 0)
+			abort();
+		/* Only btrfs is known to count this short. */
+		if (fiemap_count_extents(f.fd, 0, ~0ULL) >= m.fm.fm_mapped_extents)
+			why = "the filesystem counts this layout right";
+	}
+	if (why) {
+		printf("\n[fiemap] skipping %s: %s\n", name, why);
+		adj_close(&f);
+		f = (struct adj_file){ .fd = -1, .keep = -1 };
+	}
+	return f;
+}
+
+MU_TEST(test_fiemap_map_outgrows_a_short_count) {
+	_cleanup_(adj_close) struct adj_file f = adj_open(__func__);
+	_cleanup_(freep) struct fiemap *fm = NULL;
+
+	if (f.fd < 0)
+		return;
+	fm = do_fiemap(f.fd);
+	mu_assert(fm != NULL, "a file nobody writes was mapped as changed");
+	mu_assert_int_eq(2, fm->fm_mapped_extents);
+	mu_check(fm->fm_extents[0].fe_flags & FIEMAP_EXTENT_SHARED);
+	mu_check(!(fm->fm_extents[1].fe_flags & FIEMAP_EXTENT_SHARED));
+	mu_check(fm->fm_extents[1].fe_flags & FIEMAP_EXTENT_LAST);
+}
+
+/*
  * The part of that decision the records alone can answer. A full buffer whose
  * last record is neither the file's last nor reaches the range's end is
  * "cannot tell", and only then is the kernel asked about the rest.

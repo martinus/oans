@@ -146,3 +146,16 @@
 ===
 	return true;
 >>>
+
+# ---------------------------------------------------------------- short count
+
+# a retry recounts instead of growing the buffer
+# btrfs counts without its shared check, so adjacent extents of which only one
+# is shared merge while counting and stay two while mapping. The recount is
+# exactly as short, both tries fail, and an idle deduplicated file is skipped
+# as "extents changed while mapping it" on every run.
+<<<
+		count = next;
+===
+		count = fiemap_count_extents(fd, start, length);
+>>>
