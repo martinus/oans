@@ -232,8 +232,10 @@ jobs:
   #
   # Cheap enough to gate on, unlike the same idea in the other two repositories
   # that share this tool: a mutant is one compile of tests/unit/main.c and one run of
-  # a suite that takes a third of a second. It needs no scratch filesystem,
-  # which is why it is one job and not a matrix.
+  # a suite that takes a third of a second. One scratch btrfs is enough, which
+  # is why it is one job and not a matrix: the short-count block needs a
+  # filesystem that clones and counts short, and on the runner's ext4 root its
+  # test skips and the block survives.
   mutation:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -256,5 +258,17 @@ jobs:
       # retyping it out of this file. `--baseline-runs 1` because the suite is
       # deterministic - a fixed property seed included - so the second green run
       # the tool insists on by default buys nothing here.
+      - name: Set up a scratch btrfs
+        run: |
+          sudo modprobe btrfs || true
+          IMG="$RUNNER_TEMP/oans-scratch.img"
+          truncate -s 2G "$IMG"
+          mkfs.btrfs -q "$IMG"
+          sudo mkdir -p /mnt/oans-scratch
+          sudo mount -o loop "$IMG" /mnt/oans-scratch
+          sudo chmod 1777 /mnt/oans-scratch
+
       - name: Replay known bugs
         run: make mutation-replay MUTATE_ARGS="--baseline-runs 1"
+        env:
+          DUPEREMOVE_TEST_DIR: /mnt/oans-scratch
