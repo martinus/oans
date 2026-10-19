@@ -8,8 +8,17 @@ compared, as typed, against the walk's absolute paths, so the hashfile and its
 
 import os
 import shutil
+import subprocess
 import tempfile
-from harness import DuperemoveTest, TEST_ROOT
+from harness import DUPEREMOVE, DuperemoveTest, TEST_ROOT
+
+
+def _can_mount_in_userns():
+    try:
+        return subprocess.run(["unshare", "-rm", "true"],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 class ScanScopeTest(DuperemoveTest):
@@ -28,6 +37,31 @@ class ScanScopeTest(DuperemoveTest):
         self.assertEqual(2, self.rc, self.out)
         self.assertIn("on another filesystem", self.out)
         self.assertEqual(1, self.hf_count("files"), "the first root is scanned")
+
+    def test_a_mount_below_the_root_is_not_an_unsupported_filesystem(self):
+        """A run locked on btrfs asked every non-btrfs mount below a root for
+        its UUID. A squashfs loop mount has none, so each one printed a
+        libblkid error at default verbosity, and every such mount was counted
+        as an unsupported filesystem with nothing under -v to say which.
+        ramfs has no UUID either and can be mounted without root.
+        """
+        if not _can_mount_in_userns():
+            self.skipTest("no unprivileged mount namespace")
+        self.mkrand("tree/a", 8000)
+        os.makedirs(self.path("tree/mnt"))
+        script = 'mount -t ramfs none "$1" && shift && exec "$@"'
+        proc = subprocess.run(
+            ["unshare", "-rm", "sh", "-c", script, "sh",
+             self.path("tree/mnt"), DUPEREMOVE, "-rv", "--io-threads=4",
+             "--hashfile", self.hf, self.path("tree")],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.out, self.rc = proc.stdout, proc.returncode
+        self.assertNoSanitizerReport(self.out)
+        self.assertDmOk()
+        self.assertIn(f"Skipping {self.path('tree/mnt')}: another filesystem "
+                      "is mounted there", self.out)
+        self.assertNotIn("unsupported filesystem", self.out)
+        self.assertEqual(1, self.hf_count("files"))
 
     def test_a_hashfile_locked_on_another_filesystem_names_both(self):
         """One line naming both filesystems: the message used to be five
