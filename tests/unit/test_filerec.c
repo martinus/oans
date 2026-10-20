@@ -31,10 +31,11 @@ MU_TEST(test_filerec_the_registry_finds_what_was_put_in_it) {
  * pointer to freed memory.
  *
  * Deliberately *not* claiming this pins the cross-batch lifetime rule from
- * CLAUDE.md. That rule is about run_dedupe.c holding a ref per batch, and it
- * is not even true of this module in isolation: free_all_filerecs() frees
- * every filerec whatever its refs, which is what the teardown on the last
- * line of this test does. What is testable here is the smaller claim above.
+ * .claude/rules/dedupe-pipeline.md. That rule is about run_dedupe.c holding
+ * a ref per batch, and it is not even true of this module in isolation:
+ * free_all_filerecs() frees every filerec whatever its refs, which is what
+ * the teardown on the last line of this test does. What is testable here is
+ * the smaller claim above.
  */
 MU_TEST(test_filerec_is_unfindable_once_its_last_reference_goes) {
 	struct filerec *f;

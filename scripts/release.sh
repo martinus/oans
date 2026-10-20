@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# release.sh - cut an oans release, following the convention in CLAUDE.md.
+# release.sh - cut an oans release, following the convention in
+# .claude/skills/release/SKILL.md.
 #
 # The version lives only in git tags (the Makefile derives it from
 # `git describe`), plus a human-facing string in the two man pages. A release is

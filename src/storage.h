@@ -55,7 +55,7 @@ int storage_detect(const char *path, struct storage_profile *p);
  * Recommend a default --io-threads for this profile and CPU count. Pure, so
  * it is unit-tested directly (see tests.c). The SSD/unknown path (min(nproc,8))
  * is the measured one; the HDD and pool constants are conservative estimates,
- * not measured -- see CLAUDE.md before changing them.
+ * not measured -- see .claude/rules/io-threads.md before changing them.
  */
 unsigned int storage_recommend_io_threads(const struct storage_profile *p,
 					  unsigned int ncpus);
