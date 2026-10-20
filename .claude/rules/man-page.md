@@ -5,15 +5,12 @@ paths:
 
 # The man page
 
-- **`make doc`** regenerates the man page from `docs/man/oans.md` and needs
-  `pandoc` (on `PATH` via `devenv.sh`). roff escapes `-` as `\-`, so grep the
-  generated `.8` accordingly.
-  - **No pandoc? `make pandoc`** fetches a pinned prebuilt one into `.pandoc/`
-    from PyPI (`pypandoc_binary`) — for sandboxes where GitHub is blocked but
-    PyPI works; `make doc` picks it up. It's the sandbox counterpart to devenv's
-    `OANS_PANDOC_BIN`. That pandoc (3.9) is newer than the committed `.8`'s, so a
-    full `make doc` reformats the whole file — expected, not a bug.
-  - **Multi-paragraph def-list gotcha:** pandoc ≥3.9 collapses *tight* def-list
-    items (e.g. `--hashfile`) into one blob; a blank line after the term makes it
-    *loose* and restores the breaks (a no-op under older pandoc). Keep the
-    guarding `<!-- -->`; repeat for any new multi-paragraph option.
+- `make doc` builds the man page from `docs/man/oans.md`; needs `pandoc` (on
+  `PATH` via `devenv.sh`). roff escapes `-` as `\-` in the generated `.8`.
+- No pandoc (sandbox without GitHub): `make pandoc` fetches a pinned
+  `pypandoc_binary` from PyPI into `.pandoc/`, which `make doc` uses (devenv
+  uses `OANS_PANDOC_BIN`). It is pandoc 3.9, newer than the committed `.8`'s,
+  so a full `make doc` reformats the whole file; expected.
+- pandoc ≥3.9 collapses a *tight* multi-paragraph def-list item (e.g.
+  `--hashfile`): put a blank line after the term and keep the guarding
+  `<!-- -->`, for every multi-paragraph option.
