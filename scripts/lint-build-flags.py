@@ -12,8 +12,9 @@ error, just a different binary.
 .github/workflows/ci.yml sets `WERROR: 1` for every job, so every check this
 project runs - btrfs, xfs, the four valgrind shards, the three sanitizer legs,
 the mutation sweep - was verifying -O0 code while what ships is -O2. That is
-the configuration where UB-sensitive differences hide, and CLAUDE.md already
-records that 17 of dbfile.c's 1,879 mutants differ between the two builds.
+the configuration where UB-sensitive differences hide, and
+.claude/rules/mutation-testing.md records that 17 of dbfile.c's 1,879
+mutants differ between the two builds.
 
 Nothing noticed because a build that is merely *slower and less checked* still
 passes every test. A comment would rot the same way the original did, so the

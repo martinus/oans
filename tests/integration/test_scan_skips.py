@@ -120,8 +120,9 @@ class ScanSkipsTest(DuperemoveTest):
     def test_history_columns_survive_an_older_hashfile(self):
         """The new columns are additive: an existing hashfile is migrated.
 
-        Per CLAUDE.md this must not bump DB_FILE_MINOR -- a bump would discard
-        every user's hashfile and force a full re-scan for a reporting change.
+        Per .claude/rules/hashfile-schema.md this must not bump DB_FILE_MINOR
+        -- a bump would discard every user's hashfile and force a full re-scan
+        for a reporting change.
         So a hashfile whose run_history predates the columns must be brought up
         by ALTER TABLE, keeping its rows.
         """

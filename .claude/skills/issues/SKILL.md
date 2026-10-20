@@ -1,6 +1,6 @@
 ---
 name: issues
-description: Work every open GitHub issue to done — grouped into PRs by subject, each merged when CI is green, re-reading the issue list after every merge. Use when the reader says "do the issues", "work the issues", or asks to keep going until nothing is left.
+description: Works every open GitHub issue to done — grouped into PRs by subject, each merged when CI is green, re-reading the issue list after every merge. Use when the reader says "do the issues", "work the issues", or asks to keep going until nothing is left.
 argument-hint: "[optional: an issue number or subject to start with]"
 ---
 
@@ -16,8 +16,9 @@ the moment CI is green**, and only then. This is the one exception to
 `CLAUDE.md`'s "merge it" rule, and it ends when the loop ends. Nothing else
 is relaxed.
 
-**This file is the order of the work. `CLAUDE.md` is the rules.** Where it
-answers a question, it answers it here too, and it is not restated below. One
+**This file is the order of the work. `CLAUDE.md` and `.claude/rules/` are
+the rules.** Where they answer a question, they answer it here too, and it is
+not restated below. One
 rule in two files is two rules that drift.
 
 ## One pass
@@ -59,7 +60,7 @@ on top of the first.**
 
 Where the box has no btrfs or XFS: a scratch copy of the tree where
 `dedupe_probe_fd()` answers `DEDUPE_SUPPORT_YES` runs the whole scan and
-dedupe pipeline on ext4 (`CLAUDE.md`, **Mutation & property testing**).
+dedupe pipeline on ext4 (`.claude/rules/mutation-testing.md`).
 Never scan `/tmp`: it is tmpfs.
 
 ### 3. Ask before you build, never after
@@ -68,15 +69,15 @@ Two or three options, each with its real cost, one marked recommended. A
 design question answered after the code is written is a question you
 answered yourself.
 
-**Ask one level up when an issue asks for something `CLAUDE.md` rules out**:
-an item under **Measured dead-ends**, or a "don't" rule anywhere. If a rule
+**Ask one level up when an issue asks for something the rules rule out**:
+an item in `.claude/rules/dead-ends.md`, or a "don't" rule anywhere. If a rule
 has to change, that is the question, and the rule is rewritten in the same
 PR.
 
 Stop and ask about:
 
 - a change to the hashfile schema, above all a `DB_FILE_MINOR` bump, which
-  makes every user rescan (**Hashfile identity & schema version**);
+  makes every user rescan (`.claude/rules/hashfile-schema.md`);
 - a new dependency;
 - a new command-line option, a changed default, or a changed exit status;
 - a change to what `--json`, `--progress=json` or `--history` print, since
@@ -84,23 +85,23 @@ Stop and ask about:
 - anything that changes what `FIDEDUPERANGE` is asked to do, or which files
   a scan reaches;
 - an edit to the vendored `scripts/mutate/mutate_core.py` (a three-repo
-  errand, per `CLAUDE.md`);
+  errand, per `.claude/rules/mutation-testing.md`);
 - any choice where two readings lead to different work.
 
 Decide everything else yourself and say what you decided.
 
 ### 4. Build it
 
-`CLAUDE.md` has one section per subject. **Grep it for the file or symbol
-you are about to touch, and read that section before editing**, not after
-the tests go red. The **Where to look** table at its top routes from a
-source file to its sections.
+`.claude/rules/` has one file per subject, and a file loads by itself only
+when you open a path it lists. **Grep `.claude/rules/` for the file or
+symbol you are about to touch, and read what it finds before editing**, not
+after the tests go red.
 
 Prove every new test by breaking the code it guards: add a block to
 `scripts/mutate/bugs/<source>.txt` and run
 `scripts/mutate/mutate.py --bugs scripts/mutate/bugs/<source>.txt`. A block
-no test catches means the test cannot fail. `CLAUDE.md` (**What eight
-iterations of this actually taught**) says why that happens more often than
+no test catches means the test cannot fail. `mutation-testing.md` (**What
+eight iterations of this actually taught**) says why that happens more often than
 it seems.
 
 Read the count, not the colour:
@@ -116,15 +117,14 @@ Read the count, not the colour:
 
 | Where | What |
 | --- | --- |
-| `CLAUDE.md` | a rule the next agent needs, in the section for its subject |
+| `.claude/rules/<subject>.md` | a rule the next agent needs, in the file for its subject |
 | `scripts/mutate/bugs/*.txt` | the bug put back, so a test must catch it |
 | `docs/man/oans.md` (then `make doc`) | anything a user of the program sees: an option, an exit status, an output |
 | `README.md` | anything a new reader needs before the man page |
 
 The rule and the code that keeps it land together, or the rule is not true
-yet. **Grep `CLAUDE.md` for the symbol before you add a bullet**: the same
-kind of bug again goes into the bullet that already holds it. A new source
-file or subject gets a row in the **Where to look** table.
+yet. `CLAUDE.md` (**Subsystem notes**) says which file and which bullet it
+goes into.
 
 ### 6. Review it when review is worth it
 
@@ -141,7 +141,7 @@ Fix what they find before the PR goes up. Say which you ran.
 
 ### 7. The checks, then push, then watch CI
 
-Before the push, run what `CLAUDE.md` asks for the code you touched, in the
+Before the push, run what the rules ask for the code you touched, in the
 background, and write the scar and the PR text in the meantime:
 
 - `WERROR=1` builds with **both** gcc and clang, and `./test` after each.

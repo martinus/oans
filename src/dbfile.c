@@ -538,9 +538,10 @@ static int create_tables(sqlite3 *db)
 
 	/*
 	 * Bring a run_history created before the skip columns existed (#145) up
-	 * to date. Purely additive, so per CLAUDE.md this must NOT bump
-	 * DB_FILE_MINOR: a bump would discard every existing hashfile and force
-	 * a full re-scan for what is only a reporting change, and an older
+	 * to date. Purely additive, so per .claude/rules/hashfile-schema.md
+	 * this must NOT bump DB_FILE_MINOR: a bump would discard every
+	 * existing hashfile and force a full re-scan for what is only a
+	 * reporting change, and an older
 	 * binary simply never selects these columns.
 	 *
 	 * "duplicate column name" is the expected steady state - every open
@@ -551,9 +552,10 @@ static int create_tables(sqlite3 *db)
 	 * Extent count as of the scan that recorded the file. The dedupe phase
 	 * ranks a group's members on it to choose a target, and that ranking has
 	 * to give the same answer in every generation window - a live fiemap
-	 * does not, which is #197. Additive, so per CLAUDE.md no DB_FILE_MINOR
-	 * bump: an old hashfile gets the column with 0 everywhere, which ranks
-	 * purely by id, and an older binary never selects it.
+	 * does not, which is #197. Additive, so per
+	 * .claude/rules/hashfile-schema.md no DB_FILE_MINOR bump: an old
+	 * hashfile gets the column with 0 everywhere, which ranks purely by
+	 * id, and an older binary never selects it.
 	 */
 	sqlite3_exec(db, "ALTER TABLE files ADD COLUMN nr_extents INTEGER NOT NULL DEFAULT 0",
 		     NULL, NULL, NULL);
@@ -1123,7 +1125,7 @@ static struct dbhandle *open_handle(char *filename, bool readonly)
  * The rows come out in the order the loaders need: every anchor first, then
  * the window's rows by file and then by rowid. So within one digest the older
  * copy leads, and the new copies follow in file order. Measurements are in
- * CLAUDE.md ("Hashfile / SQLite gotchas").
+ * .claude/rules/hashfile-sqlite.md.
  */
 #define GET_DUPLICATE_BLOCKS						\
 "with g0(digest, cnt, anchor) as ( "					\

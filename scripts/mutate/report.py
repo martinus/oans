@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Read a mutation run's --json report by function, and diff two of them.
 
-CLAUDE.md says to read a survivor count by function and never as a total, and
-every sweep in this tree has proved it: src/util.c came back 213 survivors of
-413, which says nothing at all - grouped, it was 5-9% survival everywhere a
-test existed and 85-94% in four pure functions that had no test, and only the
-grouping tells an absent test from a weak one. The tool prints the total. This
-prints what the total hides.
+.claude/rules/mutation-testing.md says to read a survivor count by function
+and never as a total, and every sweep in this tree has proved it: src/util.c
+came back 213 survivors of 413, which says nothing at all - grouped, it was
+5-9% survival everywhere a test existed and 85-94% in four pure functions
+that had no test, and only the grouping tells an absent test from a weak one.
+The tool prints the total. This prints what the total hides.
 
     scripts/mutate/report.py sweep.json                 # survivors by function
     scripts/mutate/report.py before.json after.json     # what a change moved

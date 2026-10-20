@@ -328,8 +328,8 @@ static int disk_extent_grew(struct dupe_extents *dext, struct extent *extent)
  * The two tiers only coexist safely under one rule: **this must never cull
  * anything fiemap_maps_share() would not also skip.** Both are therefore
  * relative to the target. Culling pairwise instead - one survivor per distinct
- * poff - is what broke that and made dedupe non-convergent; see CLAUDE.md for
- * why (#186).
+ * poff - is what broke that and made dedupe non-convergent; see
+ * .claude/rules/dedupe-convergence.md for why (#186).
  *
  * Whole-file groups load with poff 0 (GET_DUPLICATE_FILES has no fiemap to draw
  * on), so they bail below and lean entirely on the exact check.
